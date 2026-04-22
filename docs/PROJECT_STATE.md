@@ -2,7 +2,7 @@
 
 ## 当前目标
 
-验证一个纯外围方案是否能对 Codex Desktop 已创建、且当前桌面端私有 `app-server` 正在持有的 thread 做外部注入，而不修改上游 `codex` 仓库。
+验证一套纯外围方案，分别覆盖 Codex Desktop 与 CLI 两条交互路径，让长时间后台任务可以在不修改上游 `codex` 仓库的前提下恢复或继续 caller thread。
 
 ## 已确认事实
 
@@ -114,3 +114,37 @@ scripts/desktop_thread_inject_poc.py
   - notification thread
 - 独立设计文档已记录在：
   - `docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md`
+
+## CLI 补充结论
+
+- 当前 CLI TUI 不能直接复用 Desktop 的 `automation_update` / heartbeat bridge 方案。
+- 这不是推断，而是 TUI 自身对 `ServerRequest::DynamicToolCall` 直接返回 unsupported；对应单测名字就是 `rejects_dynamic_tool_calls_as_unsupported`，文案为 `Dynamic tool calls are not available in TUI yet.`。
+- 因此，CLI 方向仍应以 `wrapper + shared app-server + sidecar` 作为主方案。
+- 已新增一个最小 CLI 正向 PoC：
+  - `scripts/cli_shared_app_server_poc.mjs`
+  - 使用本机安装的 `codex app-server --listen ws://127.0.0.1:4311`
+  - 由脚本同时模拟 frontend client 与 sidecar client
+  - frontend 先创建 thread 并完成一个 seed turn
+  - sidecar 随后对同一 thread 执行 `thread/resume + turn/start`
+  - frontend 成功收到 sidecar turn 的 `turn/started` 与 `turn/completed` 通知
+  - `thread/read` 中也能看到 sidecar marker
+- 本次实测结果：
+  - `thread_id = 019db60d-97d8-7e73-b992-afe8073d7fe6`
+  - `frontend_seed_turn_id = 019db60d-97f2-7742-90ec-dfdf2c6e9436`
+  - `sidecar_turn_id = 019db60d-a9bd-7ad1-a372-931865554a89`
+  - `frontend_saw_turn_started = true`
+  - `frontend_saw_turn_completed = true`
+  - `sidecar_turn_status = completed`
+  - `marker_visible_in_thread_read = true`
+- 这说明 CLI wrapper 路线的关键前提已经被正向验证：在共享 `app-server` 模式下，第二个 sidecar client 可以续跑同一个 live thread，而且前台 client 会感知到对应 thread 事件。
+- 又补做了一次真实 PTY 级别的前台 TUI 实测，而不只是协议层脚本模拟。
+- 实测方式：
+  - 启动共享 `codex app-server --listen ws://127.0.0.1:4312`
+  - 前台启动真实 `codex --remote ws://127.0.0.1:4312 --no-alt-screen -C /Users/hoteng/Program/GitHub/codex-background-task-handler`
+  - 先在前台 TUI 中完成 seed turn，marker 为 `TUI_SEED_MARKER_20260422`
+  - 再由外部 sidecar client 对同一 thread 发起第二轮 turn，marker 为 `TUI_SIDECAR_MARKER_20260422`
+- 对应 thread 为 `019db614-1fb7-70a3-956f-7a96c48f0226`。
+- PTY 输出中确实出现了 sidecar 触发的第二轮用户输入与 assistant 最终结果 `TUI_SIDECAR_MARKER_20260422`。
+- 因此，CLI 方向的结论已经不只是“协议层上的前台 client 会收到通知”，而是“真实前台 TUI 会把 sidecar 触发的新 turn 展示给用户”。
+- 独立设计文档已记录在：
+  - `docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md`

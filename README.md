@@ -4,15 +4,15 @@ Reference experiments and companion tooling for making long-running background w
 
 ## Status
 
-The current validated Desktop direction is:
+Two directions are now validated:
 
-- keep the real long-running work in an external sidecar
-- expose sidecar state through a small local interface
-- use a dedicated Desktop heartbeat bridge thread to watch for ready jobs
-- arm a caller-thread heartbeat only when a job is actually ready
-- let the original caller thread resume the task inside Codex Desktop
+- Desktop: keep the long-running work in an external sidecar, expose state through a small local interface, use a dedicated heartbeat bridge thread, and arm a caller-thread heartbeat only when a job is ready.
+- CLI: use a wrapper that starts a shared `codex app-server`, run the foreground TUI with `codex --remote`, and attach one or more sidecar clients to the same live thread.
 
-The design is captured in [docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md).
+Design docs:
+
+- [docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md)
+- [docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md](docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md)
 
 ## Repository Layout
 
@@ -38,6 +38,10 @@ uv run python scripts/desktop_thread_inject_poc.py --thread-id <thread-id> --mod
 ```
 
 The current PoC script is [scripts/desktop_thread_inject_poc.py](scripts/desktop_thread_inject_poc.py). It starts a standalone `codex app-server`, targets an existing thread, and records whether external injection or `turn/start` operations persist into the rollout.
+
+The current CLI shared-server PoC is [scripts/cli_shared_app_server_poc.mjs](scripts/cli_shared_app_server_poc.mjs). It connects two websocket clients to the same shared `codex app-server`, seeds a frontend thread, then validates that a sidecar client can resume the same thread and that the frontend client receives the resulting live turn notifications.
+
+In addition to the protocol-level PoC, the shared-server CLI route has also been validated against a real foreground TUI session running through `codex --remote`, confirming that the user-facing TUI output reflects the sidecar-triggered turn.
 
 ## Planned Implementation Direction
 

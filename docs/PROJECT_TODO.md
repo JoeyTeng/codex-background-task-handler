@@ -19,3 +19,8 @@
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
 - [ ] 为 bridge thread 设计一个最小共享状态面（文件 / socket / helper CLI 其一），让它能读取 sidecar 任务状态而不依赖 Codex thread 之间的 live push。
 - [ ] 用 Rust 实现 sidecar supervisor 的最小骨架，负责长任务状态写入与结果交接。
+- [x] 验证 CLI 在 shared `app-server` 模式下，第二个 sidecar client 能否对同一个 thread 执行 `thread/resume + turn/start`，并让前台 client 收到 live 通知。
+- [x] 验证真实前台 `codex --remote` TUI 在 PTY 中是否会把 sidecar 触发的新 turn 展示给用户。
+- [x] 单独沉淀 CLI shared `app-server` + sidecar 技术方案文档。
+- [ ] 为 CLI 设计最小 wrapper 进程模型：shared `app-server`、前台 `codex --remote`、sidecar、以及清理策略。
+- [ ] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为。
