@@ -31,6 +31,7 @@
   - directories `0700`
   - regular files `0600`
 - [ ] 设计并实现 `helper_cli_read` fallback：
+  - `cbth desktop claim-next-ready --bridge-thread-id ... --json`
   - `cbth desktop read-envelope --source-thread-id ... --expected-attempt-id ... --expected-generation ... --expected-snapshot-revision ... --json`
   - `cbth desktop read-artifact --artifact-id ... --offset ... --max-bytes ... --json`
   - chunked payload return contract
@@ -40,6 +41,11 @@
   - `cbth desktop note-delivered --source-thread-id ... --attempt-id ... --generation ... --json`
 - [ ] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
+- [ ] 定死 caller heartbeat 的长期生命周期合同：
+  - 预绑定 `caller_automation_id`
+  - 正常路径只 `pause` / `update` / `reuse`
+  - 不在正常投递路径里 `delete`
+  - 只有 operator unbind / destroy 才允许删除
 - [ ] 为 Desktop bridge 设计基于 delivery envelope 的共享状态面，不把后台 heartbeat 对通用 `cbth job ...` CLI 的执行能力当成前提。
 - [ ] 为共享核心设计 thread-scoped FIFO 队列、batch 合并规则和最小连续发送间隔。
 - [ ] 为共享核心落地可机判的 delivery policy 字段，至少包括：
@@ -56,6 +62,10 @@
   - optional `automation_id`
   - stale wake no-op 规则
 - [ ] 明确 Desktop 第一版的 `close_reason` / redelivery window contract，保证 `closed` 只表示停止自动重投，而不是隐含“caller 已消费”。
+- [ ] 把 `max_attempts_exhausted` 的自动关闭条件落进 durable schema 和实现：
+  - `delivery_attempt_count >= max_delivery_attempts`
+  - 自动转为 `close_reason=max_attempts_exhausted`
+  - 不再继续 redelivery
 - [ ] 明确 `binding_state=degraded` 的收敛与恢复规则：
   - degraded 后 bridge 不再自动 arm
   - 当前 attempt 收敛到 `abandoned`
@@ -84,6 +94,10 @@
   - shared `app-server` 归 daemon 持有
   - 前台退出但 active jobs 未结束时继续保活
   - 后续重连 / resume contract
+- [ ] 定死 CLI managed session 的 thread-routing contract：
+  - durable `session_id + current_thread_id`
+  - 前台切换 thread 时更新 `current_thread_id`
+  - ready batch 只允许续跑最新的 `current_thread_id`
 - [ ] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
   - 基于 `turn/started` / `turn/completed` / `thread/status/changed`
   - `turn/start` race 失败后回到等待下一个 idle

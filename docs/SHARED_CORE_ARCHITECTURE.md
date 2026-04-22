@@ -378,6 +378,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 prepared -> cooldown -> closed
 prepared -> abandoned
 prepared -> superseded
+cooldown -> abandoned
 cooldown -> superseded
 ```
 
@@ -556,7 +557,10 @@ cooldown -> superseded
 - 推荐行为是：
   - arm 成功 -> attempt 进入 `cooldown`
   - `cooldown_until` 到期后，如果该 batch 仍是 head、`now < redelivery_window_ends_at`、且 `delivery_attempt_count < max_delivery_attempts` -> 创建新 attempt 并再次 arm
-  - 只有在 operator 关闭、batch 被 supersede、caller 明确回写成功、或 redelivery window 结束时，batch 才进入 `closed`
+  - 如果 `delivery_attempt_count >= max_delivery_attempts`，该 batch 必须自动进入：
+    - `close_reason=max_attempts_exhausted`
+    - `closed`
+  - 只有在 operator 关闭、batch 被 supersede、caller 明确回写成功、redelivery window 结束、或 `max_attempts_exhausted` 时，batch 才进入 `closed`
 - caller 的“明确回写成功”在第一版里应实现为一个窄 helper：
 
 ```text

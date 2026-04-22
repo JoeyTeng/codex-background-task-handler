@@ -81,6 +81,11 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
    - 被唤醒后，在原 caller thread 中读取自己的 delivery envelope，并继续原任务。
    - 第一版不要求它在关键路径上执行通用 `cbth job ...` CLI。
    - 但它必须在成功读取当前 envelope 后调用 `cbth desktop note-delivered ...`，把当前 head batch durable 关闭。
+   - 这个已绑定 automation 的生命周期合同是：
+     - 正常路径下只 `pause` / `update` / `reuse`
+     - stale wake、snapshot 不可读、成功送达、degraded 都优先回到 `PAUSED`
+     - 不在正常投递路径里 `delete`
+     - 只有明确的 operator unbind / destroy 才允许删除它
 
 ## 设计原则
 
@@ -359,6 +364,9 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 - 但一旦 caller 已成功执行 `cbth desktop note-delivered ...`，该 head batch 就必须自动进入：
   - `close_reason=caller_acknowledged`
   - 不再继续 redelivery
+- 如果 `delivery_attempt_count >= max_delivery_attempts`，该 head batch 也必须自动进入：
+  - `close_reason=max_attempts_exhausted`
+  - `closed`
 
 ## 失败与重试
 
@@ -434,6 +442,16 @@ cbth batch close-head --source-thread-id <thread_id> --reason operator_closed --
   - 必要时再次 pause/update
   - 只有在最终状态被验证为 paused 后，binding 才允许进入 `bound`
 - 如果 pause 状态无法被验证，binding 必须保持 `degraded` 或 `unbound`，而不是继续接受自动续跑。
+
+## Caller Heartbeat 生命周期
+
+- 预绑定的 `caller_automation_id` 是一个长期复用的 heartbeat automation，不是一次性 disposable automation。
+- 第一版规则：
+  - ready 时：bridge 更新 prompt 并切到 `ACTIVE`
+  - 正常送达后：caller 或 bridge 把它切回 `PAUSED`
+  - stale wake / snapshot 不可读：当前 turn no-op 后切回 `PAUSED`
+  - degraded：切回 `PAUSED`，等待 operator repair
+  - 只有 operator 明确执行 unbind/destroy，才允许删除
 - 未完成 bootstrap 的 thread 仍可提交 job，但只允许：
   - sidecar 继续跑任务
   - `cbth` 保留结果

@@ -48,9 +48,31 @@
 - 同时又补上了 caller 成功分支：
   - `cbth desktop note-delivered ...`
   - 用于在 caller 成功读取当前 envelope 后，把 head batch 自动关闭到 `caller_acknowledged`
+- Desktop helper fallback 也进一步补成完整链路：
+  - `cbth desktop claim-next-ready ...`
+  - `cbth desktop read-envelope ...`
+  - `cbth desktop read-artifact ...`
+  - `cbth desktop note-arm ...`
+  - `cbth desktop note-delivered ...`
+- Desktop 的 delivery state machine 也继续收紧：
+  - attempt 不再保留单独的 durable `armed`
+  - bridge arm 成功并 durable 记录后，attempt 直接进入 `cooldown`
+  - `cooldown` 期满后若仍可重投，再创建新 attempt
+  - 若 `delivery_attempt_count >= max_delivery_attempts`，batch 必须自动关闭到 `close_reason=max_attempts_exhausted`
+- caller heartbeat lifecycle 也已收口：
+  - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
+  - 正常路径只 `pause` / `update` / `reuse`
+  - stale wake、snapshot 不可读、成功送达、degraded 都优先回到 `PAUSED`
+  - 正常投递路径不做 `delete`
+  - 只有明确 operator unbind / destroy 才允许删除
 - CLI 侧 reviewer 指出的 idle/race 缺口也已收口：
   - idle 必须来自 app-server live event stream
   - `turn/start` 失败要被当成 benign race，回到等待下一个 idle，而不是视为成功送达
+- CLI managed session contract 也已补硬：
+  - shared `app-server` 由 daemon 持有
+  - 一个 managed session 只承诺一个当前 caller thread
+  - daemon 必须 durable 跟踪 `session_id + current_thread_id`
+  - 当前台在同一 managed session 中切换 thread 时，只允许后续 ready batch 续跑最新的 `current_thread_id`
 - 结果保留责任也已收敛：
   - `cbth job complete --result-file <path>` 的语义改为 ingest/copy 到 `cbth` 自己管理的 artifact store
   - 原始外部文件不再承担长期保留责任
