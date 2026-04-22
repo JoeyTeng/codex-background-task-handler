@@ -44,7 +44,7 @@
   - `delivery_attempt_count`
 - Desktop 运行期还新增了一条窄控制面：
   - `cbth desktop note-arm ...`
-  - 用于在 bridge 成功 `automation_update` 后，把 attempt durable 推进到 `armed`
+  - 用于在 bridge 成功 `automation_update` 后，把 attempt durable 推进到 `cooldown`
 - 同时又补上了 caller 成功分支：
   - `cbth desktop note-delivered ...`
   - 用于在 caller 成功读取当前 envelope 后，把 head batch 自动关闭到 `caller_acknowledged`

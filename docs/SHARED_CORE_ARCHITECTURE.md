@@ -127,6 +127,7 @@
 2. `helper_cli_read`
 
 ```text
+cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
 cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
 ```
@@ -326,7 +327,6 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 #### Attempt 状态
 
 - `prepared`
-- `armed`
 - `cooldown`
 - `closed`
 - `superseded`
@@ -342,7 +342,6 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 - 对 Desktop target 来说，新 attempt 只有在存在 `binding_state=bound` 的 desktop binding 时才允许进入可投递状态。
 - 同一 `source_thread_id` 任何时刻最多只能有一个非终态 attempt：
   - `prepared`
-  - `armed`
   - `cooldown`
 - bridge 为 caller arm heartbeat 时，必须把以下值同时写入 caller prompt：
   - `batch_id`
@@ -350,6 +349,9 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - `generation`
   - `snapshot_revision`
   - `snapshot_path`
+- bridge 获取这组 token 的来源合同必须是二选一：
+  - `direct_file_read` 路径：`ready-threads.json` 的每个 ready entry 必须直接携带这整组 prompt token
+  - `helper_cli_read` 路径：`cbth desktop claim-next-ready ...` 必须一次性返回这整组 prompt token 与 `caller_automation_id`
 - caller 读取 envelope 后，必须先比较：
   - `snapshot.batch_id`
   - `snapshot.attempt_id`
@@ -373,11 +375,9 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 #### Attempt 迁移
 
 ```text
-prepared -> armed -> cooldown -> closed
+prepared -> cooldown -> closed
 prepared -> abandoned
-armed -> abandoned
 prepared -> superseded
-armed -> superseded
 cooldown -> superseded
 ```
 
@@ -386,7 +386,8 @@ cooldown -> superseded
 - `closed` 表示 `cbth` 不会再自动重投该 attempt 绑定的 batch。
 - `abandoned` 表示本次投递尝试失败，需要调度器决定是否生成新 attempt。
 - `superseded` 表示同一 thread 上出现了更新 generation 的 attempt，旧 attempt 必须彻底失效。
-- `armed` 只表示一次 wakeup arm 已被 Codex 侧接受，不代表 caller 已实际消费结果。
+- 第一版 durable 状态里不再保留单独的 `armed`。
+- 一次 wakeup arm 一旦被 delivery channel 接受并被 `note-arm` durable 记录，attempt 就直接进入 `cooldown`。
 - `cooldown` 表示 `cbth` 正在等待这次 wakeup 的最短观察窗口结束；窗口结束后，如果 batch 仍是 head 且仍允许自动重投，就会生成新 attempt，而不是直接把旧 attempt 视为成功关闭。
 
 ### 最小连续发送间隔
@@ -471,7 +472,6 @@ cooldown -> superseded
 
 - `queued`
 - `materialized`
-- `armed`
 - `cooldown`
 - `closed`
 
@@ -480,7 +480,7 @@ cooldown -> superseded
 - `delivery_attempt_count` 统计的是“被投递通道接受的尝试次数”，不是“生成过多少 prepared attempt”。
 - 第一版统一规则：
   - Desktop：
-    - 只有 `cbth desktop note-arm ...` 成功后，才递增 `delivery_attempt_count`
+    - 只有 `cbth desktop note-arm ...` 成功并把 attempt durable 推进到 `cooldown` 后，才递增 `delivery_attempt_count`
   - CLI idle path：
     - 只有 `turn/start` 被 server 接受后，才递增 `delivery_attempt_count`
   - CLI steer path：
@@ -668,11 +668,20 @@ cbth batch close-head --source-thread-id <thread_id> --reason operator_closed --
   - `helper_cli_read`：只读 envelope/helper
   - `cbth desktop note-arm ...`：bridge 成功 arm 后的窄写回
 - 第一版如果不用 `direct_file_read`，则 helper 链路必须是完整可用的：
+  - `cbth desktop claim-next-ready ...`
   - `cbth desktop read-envelope ...`
   - `cbth desktop read-artifact ...`
   - `cbth desktop note-arm ...`
   - `cbth desktop note-delivered ...`
 - 其中 `cbth desktop read-artifact ...` 必须提供 chunked payload 协议，而不是返回一个需要再次 file-read 的路径。
+- 其中 `cbth desktop claim-next-ready ...` 必须一次性返回 bridge 写 prompt 所需的整组 token：
+  - `source_thread_id`
+  - `batch_id`
+  - `attempt_id`
+  - `generation`
+  - `snapshot_revision`
+  - `snapshot_path`
+  - `caller_automation_id`
 - 当前首选路径是：
   - bridge heartbeat 只读 `ready-threads.json`
   - caller heartbeat 通过 `direct_file_read` 读取自己的 per-thread envelope 与 artifact

@@ -51,6 +51,16 @@ codex --remote-auth-token-env CBTH_REMOTE_AUTH_TOKEN --remote ws://127.0.0.1:<po
    - sidecar 不直接从外部任务脚本拿结果，而是消费共享核心里的 thread-scoped queue / delivery batch。
    - 但就“第二个 client 能否续跑同一 live thread”这一核心能力而言，不需要 heartbeat 或 Desktop 那套 bridge 结构。
 
+5. `managed session routing`
+   - 第一版一个 managed CLI session 只承诺一个当前 caller thread。
+   - daemon 必须维护：
+     - `session_id`
+     - `current_thread_id`
+   - 当前台 TUI 在同一 managed session 中显式新建、恢复或切换到另一个 thread 时：
+     - daemon 必须把 `current_thread_id` 更新为新的前台 thread
+     - 后续 ready batch 只允许续跑这个最新的 `current_thread_id`
+   - 第一版不承诺一个 managed session 同时自动续跑多个 foreground-active threads。
+
 ## 本地信任边界
 
 - 上游 `app-server` 现在已经支持 websocket auth：
@@ -286,7 +296,7 @@ thread/resume + turn/start
 - benign race 的处理规则：
   - 不得关闭 batch
   - 不得创建第二个并发 attempt
-  - 当前 attempt 保持在 `prepared`，不得推进到 `armed`
+  - 当前 attempt 保持在 `prepared`，不得推进到 `cooldown`
   - `last_delivery_attempt_at` 不得因为这次 race 被当成成功投递而更新
   - `delivery_attempt_count` 不得递增
   - 必须清除本地 idle 视图

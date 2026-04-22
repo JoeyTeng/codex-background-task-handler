@@ -76,7 +76,8 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 
 5. `caller thread heartbeat`
    - 不是常驻轮询器。
-   - 只在 bridge 判定当前 thread 有可投递 batch 时，才被创建、激活、重定向或更新。
+   - 第一版按“预绑定、运行期只更新”来建模。
+   - 也就是：bootstrap 时创建并绑定；运行期只做激活、暂停和 prompt 更新，不再重定向到别的 thread。
    - 被唤醒后，在原 caller thread 中读取自己的 delivery envelope，并继续原任务。
    - 第一版不要求它在关键路径上执行通用 `cbth job ...` CLI。
    - 但它必须在成功读取当前 envelope 后调用 `cbth desktop note-delivered ...`，把当前 head batch durable 关闭。
@@ -113,18 +114,24 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 
 bridge heartbeat 每分钟醒一次：
 
-1. 读取只读 ready index，例如：
+1. 读取 bridge 侧的 ready 来源：
 
 ```text
-~/.cbth/inbox/ready-threads.json
+preferred: ~/.cbth/inbox/ready-threads.json
+fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 ```
 
 2. 如果没有可投递 thread，本次 turn 直接结束。
 3. 如果有可投递 thread：
-   - 选择最早到期且未处于 cooldown 的 `source_thread_id`
+   - 无论来自 `ready-threads.json` 还是 `claim-next-ready` helper，都必须直接拿到一个 ready entry：
+     - `source_thread_id`
+     - `batch_id`
+     - `attempt_id`
+     - `generation`
+     - `snapshot_revision`
+     - `snapshot_path`
+     - `caller_automation_id`
    - 该 thread 必须已经存在 `binding_state=bound` 的 desktop binding
-   - `cbth` 调度器必须已经为当前 head batch 原子创建新的 attempt，并递增 `generation`
-   - bridge 使用 binding 中已知的 `caller_automation_id`
    - 用 `automation_update` 更新这个已知 caller heartbeat
    - heartbeat prompt 中带上：
      - `batch_id`
@@ -138,7 +145,7 @@ bridge heartbeat 每分钟醒一次：
 cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
 ```
 
-   - 这一步负责把 attempt durable 推进到 `armed`，并更新：
+   - 这一步负责把 attempt durable 推进到 `cooldown`，并更新：
      - `head_attempt_id`
      - `last_delivery_attempt_at`
      - `delivery_attempt_count`
@@ -198,14 +205,12 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 
 - `queued`
 - `materialized`
-- `armed`
 - `cooldown`
 - `closed`
 
 ### Delivery attempt 状态
 
 - `prepared`
-- `armed`
 - `cooldown`
 - `closed`
 - `superseded`
@@ -260,6 +265,7 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 ### Helper fallback
 
 ```text
+cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
 cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
 cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
@@ -334,8 +340,7 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 
 - Desktop 第一版的目标不是“精确证明 caller 已消费”，而是“在 batch 仍为 head 且允许重投时，至少安排一次 wakeup，并在必要时重投”。
 - 因此：
-  - `armed` 表示 bridge 已成功为 caller 安排了一次 heartbeat wakeup
-  - `cooldown` 表示 `cbth` 正在等待这次 wakeup 的最短观察窗口
+  - `cooldown` 表示 bridge 已成功为 caller 安排了一次 heartbeat wakeup，且 `cbth` 正在等待这次 wakeup 的最短观察窗口
   - `closed` 表示 `cbth` 不会再自动为这个 batch 重新 arm heartbeat
 - `closed` 不是以下任一命题的证明：
   - caller 一定读取了 snapshot
