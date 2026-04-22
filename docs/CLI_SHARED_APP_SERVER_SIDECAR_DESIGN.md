@@ -23,7 +23,8 @@
 ### 组件
 
 1. `shared app-server`
-   - 由 CLI 入口启动；在第一版共享架构里，这个入口是主 binary 的一个子命令，而不是独立产品。
+   - 由 daemon 持有，作为 managed CLI session process。
+   - `cbth cli run` 负责创建或附着到这个 managed session，而不是长期直接持有该进程。
    - 例如可表现为：
 
 ```text
@@ -287,6 +288,7 @@ thread/resume + turn/start
   - 不得创建第二个并发 attempt
   - 当前 attempt 保持在 `prepared`，不得推进到 `armed`
   - `last_delivery_attempt_at` 不得因为这次 race 被当成成功投递而更新
+  - `delivery_attempt_count` 不得递增
   - 必须清除本地 idle 视图
   - 必须等待下一次 idle 观测后再重试
 - 换句话说，CLI 第一版的串行化依赖：
@@ -316,7 +318,7 @@ CLI 的可行产品化路线是：
 
 ```text
 cbth cli run
-  -> spawn shared codex app-server
+  -> ask daemon for a managed CLI session
   -> spawn foreground codex --remote
   -> spawn sidecar client(s)
 ```

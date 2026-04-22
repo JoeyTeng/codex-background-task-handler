@@ -19,7 +19,12 @@
 - `automation_update` 是 Codex thread 内置能力。
 - `automation_update` 可以创建或更新指向其他 thread 的 heartbeat automation。
 - heartbeat 触发出来的 turn 本身也可以继续调用 `automation_update`。
-- 第一版不把“heartbeat turn 稳定执行本地 `cbth ...` CLI”当作既定前提。
+- 第一版不把“heartbeat turn 稳定执行通用 `cbth job ...` CLI”当作既定前提。
+- 但 Desktop adapter 明确依赖一组窄 helper：
+  - `cbth desktop read-envelope ...`
+  - `cbth desktop read-artifact ...`
+  - `cbth desktop note-arm ...`
+  - `cbth desktop note-delivered ...`
 - 因此，Desktop 上最可靠的方案不是“外部 sidecar 直接推送 caller thread”，而是“由 app 内部 automation scheduler 去唤醒 caller thread”。
 
 ## 核心设计
@@ -43,7 +48,7 @@
 
 ```text
 cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
-cbth desktop read-artifact --artifact-id <artifact_id> --json
+cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
 ```
 
    - 底层仍可用 SQLite / 普通文件 / `mmap`，但这属于内部实现细节。
@@ -72,8 +77,9 @@ cbth desktop read-artifact --artifact-id <artifact_id> --json
 5. `caller thread heartbeat`
    - 不是常驻轮询器。
    - 只在 bridge 判定当前 thread 有可投递 batch 时，才被创建、激活、重定向或更新。
-   - 被唤醒后，在原 caller thread 中读取自己的 inbox snapshot，并继续原任务。
-   - 第一版不要求它在关键路径上写回 ack；artifact retention 与清理由 `cbth` 自己负责。
+   - 被唤醒后，在原 caller thread 中读取自己的 delivery envelope，并继续原任务。
+   - 第一版不要求它在关键路径上执行通用 `cbth job ...` CLI。
+   - 但它必须在成功读取当前 envelope 后调用 `cbth desktop note-delivered ...`，把当前 head batch durable 关闭。
 
 ## 设计原则
 
@@ -135,6 +141,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
    - 这一步负责把 attempt durable 推进到 `armed`，并更新：
      - `head_attempt_id`
      - `last_delivery_attempt_at`
+     - `delivery_attempt_count`
    - 如果 `note-arm` 不可用，则该 desktop binding 必须视为 `degraded`，而不是继续假设状态已经推进成功。
 
 ### 3. caller thread 被唤醒
@@ -164,7 +171,7 @@ fallback:  cbth desktop read-envelope --source-thread-id <thread_id> --expected-
      - `helper_cli_read` 路径下调用：
 
 ```text
-cbth desktop read-artifact --artifact-id <artifact_id> --json
+cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
 ```
 
    - 在原 caller thread 中继续后续工作
@@ -254,10 +261,23 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 
 ```text
 cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
-cbth desktop read-artifact --artifact-id <artifact_id> --json
+cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
 cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
 cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
 ```
+
+`read-artifact` 的第一版返回合同至少包括：
+
+- `artifact_id`
+- `content_type`
+- `size_bytes`
+- `offset`
+- `bytes_returned`
+- `data_base64`
+- `next_offset`
+- `eof`
+
+也就是说，`helper_cli_read` 对大 artifact 的 fallback 不是返回一个路径，而是返回一个显式 chunked payload 协议。
 
 这样 bridge prompt 和 caller prompt 都可以很短，而且不需要知道底层 store 是 SQLite、普通文件还是 `mmap`。
 
@@ -380,7 +400,21 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
   - 当前 in-flight attempt 必须收敛到 `abandoned`
   - 当前 head batch 保持未关闭
   - 调度器只保留结果与元数据，不继续自动 redelivery
-- operator 完成重新验证后，binding 才允许从 `degraded` 回到 `bound`。
+- operator 必须通过显式 CLI 路径来解开这个状态，至少支持两类动作：
+
+```text
+cbth desktop binding repair --source-thread-id <thread_id> --caller-automation-id <automation_id> --read-transport <transport> --json
+cbth batch close-head --source-thread-id <thread_id> --reason operator_closed --json
+```
+
+- 推荐语义：
+  - `binding repair`：
+    - 重新验证 paused status / read transport / narrow helpers
+    - 成功后把 binding 从 `degraded` 恢复到 `bound`
+    - 并把当前 head batch 重新放回可投递状态
+  - `batch close-head`：
+    - 显式关闭当前 head batch
+    - 让后续 FIFO 队列继续前进
 
 ## Bootstrap 约束
 
@@ -421,7 +455,7 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 
 - 不尝试外部进程直接向 Desktop 当前 live thread push 消息。
 - 不依赖外部直接改 Codex automation DB。
-- 不把后台 heartbeat 的本地 CLI 执行能力当成关键前提。
+- 不把后台 heartbeat 对通用 `cbth job ...` CLI 的执行能力当成关键前提。
 - 不以“不留下任何 caller thread 唤醒痕迹”为目标；当前目标是把痕迹压缩到“任务 ready 时的一次唤醒”。
 - 不覆盖 Desktop app 退出后的常驻通知场景。
 - 不把“单次读取后立即删除 artifact”当成第一版语义；artifact 生命周期由 `cbth` 统一管理。

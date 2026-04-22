@@ -45,7 +45,12 @@
 
 ### 4. Desktop 关键路径优先只读
 
-- 第一版不把“Desktop heartbeat turn 能稳定执行本地 `cbth ...` CLI”当作既定前提。
+- 第一版不把“Desktop heartbeat turn 能稳定执行通用 `cbth job ...` CLI”当作既定前提。
+- 但 Desktop adapter 明确依赖一组窄 helper：
+  - `cbth desktop read-envelope ...`
+  - `cbth desktop read-artifact ...`
+  - `cbth desktop note-arm ...`
+  - `cbth desktop note-delivered ...`
 - Desktop 的关键投递路径优先依赖只读状态面：
   - 只读 inbox snapshot 文件
   - 只读 artifact manifest / artifact 文件
@@ -123,7 +128,7 @@
 
 ```text
 cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
-cbth desktop read-artifact --artifact-id <artifact_id> --json
+cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
 ```
 
 两种传输必须返回同一个 envelope schema。
@@ -233,6 +238,9 @@ cbth desktop read-artifact --artifact-id <artifact_id> --json
   - 当前 attempt 必须收敛到 `abandoned`
   - 当前 head batch 保持未关闭，等待 operator 恢复或人工处理
 - 如果 caller 已成功读取 envelope，但 `cbth desktop note-delivered ...` 失败，也必须走同一条 `degraded` 收敛路径，而不是继续自动 redelivery。
+- 为了避免 FIFO 队列永久卡死，第一版必须给 operator 至少两条显式恢复路径：
+  - `cbth desktop binding repair --source-thread-id ... --caller-automation-id ... --read-transport ... --json`
+  - `cbth batch close-head --source-thread-id ... --reason operator_closed --json`
 
 ### 10. `long-run task runners`
 
@@ -467,6 +475,21 @@ cooldown -> superseded
 - `cooldown`
 - `closed`
 
+### Attempt 计数语义
+
+- `delivery_attempt_count` 统计的是“被投递通道接受的尝试次数”，不是“生成过多少 prepared attempt”。
+- 第一版统一规则：
+  - Desktop：
+    - 只有 `cbth desktop note-arm ...` 成功后，才递增 `delivery_attempt_count`
+  - CLI idle path：
+    - 只有 `turn/start` 被 server 接受后，才递增 `delivery_attempt_count`
+  - CLI steer path：
+    - 只有 `turn/steer` 被 server 接受后，才递增 `delivery_attempt_count`
+- 因此：
+  - `prepared` attempt 本身不消耗 attempt budget
+  - CLI benign race 不得递增 `delivery_attempt_count`
+  - 只有真正进入 delivery channel 的尝试才会逼近 `max_delivery_attempts`
+
 ### Artifact 关键字段
 
 - `artifact_id`
@@ -629,6 +652,15 @@ cbth job fail --job-id <job_id> --reason <text> --json
 cbth job query <job_id> --json
 ```
 
+### Operator recovery
+
+给人工排障和恢复 Desktop degraded thread 使用：
+
+```text
+cbth desktop binding repair --source-thread-id <thread_id> --caller-automation-id <automation_id> --read-transport <transport> --json
+cbth batch close-head --source-thread-id <thread_id> --reason operator_closed --json
+```
+
 ## Desktop 只读快照约束
 
 - 第一版不要求 Desktop heartbeat turn 在关键路径上执行通用 `cbth job ...` CLI。
@@ -640,6 +672,7 @@ cbth job query <job_id> --json
   - `cbth desktop read-artifact ...`
   - `cbth desktop note-arm ...`
   - `cbth desktop note-delivered ...`
+- 其中 `cbth desktop read-artifact ...` 必须提供 chunked payload 协议，而不是返回一个需要再次 file-read 的路径。
 - 当前首选路径是：
   - bridge heartbeat 只读 `ready-threads.json`
   - caller heartbeat 通过 `direct_file_read` 读取自己的 per-thread envelope 与 artifact
@@ -677,4 +710,4 @@ cbth job query <job_id> --json
 - 不做动态插件加载框架。
 - 不把 `turn/steer` 当成必需能力。
 - 第一版默认不打开 `turn/steer`。
-- 不把 Desktop heartbeat 的本地 CLI 执行能力当成关键前提。
+- 不把 Desktop heartbeat 对通用 `cbth job ...` CLI 的执行能力当成关键前提。

@@ -32,14 +32,15 @@
   - regular files `0600`
 - [ ] 设计并实现 `helper_cli_read` fallback：
   - `cbth desktop read-envelope --source-thread-id ... --expected-attempt-id ... --expected-generation ... --expected-snapshot-revision ... --json`
-  - `cbth desktop read-artifact --artifact-id ... --json`
+  - `cbth desktop read-artifact --artifact-id ... --offset ... --max-bytes ... --json`
+  - chunked payload return contract
 - [ ] 设计并实现 Desktop bridge 的窄写回 helper：
   - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --json`
 - [ ] 设计并实现 caller 成功关闭当前 head batch 的窄 helper：
   - `cbth desktop note-delivered --source-thread-id ... --attempt-id ... --generation ... --json`
 - [ ] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
-- [ ] 为 Desktop bridge 设计基于只读快照的共享状态面，不把后台 heartbeat 的本地 CLI 执行能力当成前提。
+- [ ] 为 Desktop bridge 设计基于 delivery envelope 的共享状态面，不把后台 heartbeat 对通用 `cbth job ...` CLI 的执行能力当成前提。
 - [ ] 为共享核心设计 thread-scoped FIFO 队列、batch 合并规则和最小连续发送间隔。
 - [ ] 为共享核心落地可机判的 delivery policy 字段，至少包括：
   - `delivery_read_only`
