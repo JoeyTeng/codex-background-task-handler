@@ -14,7 +14,8 @@
 - [ ] 验证外部进程在 Desktop 运行时改写 automation 调度状态（尤其是 `next_run_at` / 状态切换）后，caller thread heartbeat 是否会被及时触发。
 - [x] 验证 bridge automation thread 是否能通过 `automation_update` 稳定为别的 caller thread 创建/更新 heartbeat automation，而无需外部直接改 Codex automation DB。
 - [x] 单独沉淀 Desktop background-task bridge 技术方案文档。
-- [ ] 实现 `background-taskctl` 最小共享状态接口，优先考虑本地 helper CLI。
+- [ ] 用 Rust 实现 `background-taskctl` 最小共享状态接口，优先考虑本地 helper CLI。
 - [ ] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
 - [ ] 为 bridge thread 设计一个最小共享状态面（文件 / socket / helper CLI 其一），让它能读取 sidecar 任务状态而不依赖 Codex thread 之间的 live push。
+- [ ] 用 Rust 实现 sidecar supervisor 的最小骨架，负责长任务状态写入与结果交接。
