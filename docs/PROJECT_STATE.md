@@ -16,9 +16,12 @@
 - 第一版稳定外部接口只做 CLI，不承诺公开 socket / Web / plugin 协议。
 - 因此，之前设计里提到的 `background-taskctl` helper，应收敛成主 binary 的 `cbth job ...` 子命令，而不是第二个长期维护的独立工具。
 - 经过 reviewer 复核后，Desktop 关键路径又做了一个更保守的收口：
-  - 不再把“heartbeat turn 稳定执行本地 `cbth ...` CLI”当作既定前提
-  - 改为以只读 inbox snapshot / artifact 文件作为第一版候选主路径
-  - 但“heartbeat 无审批读取这些文件”仍待实证，不算已验证能力
+  - 不再把“heartbeat turn 稳定执行通用 `cbth job ...` CLI”当作既定前提
+  - 改为定义统一 delivery envelope schema，并给出两条受支持传输：
+    - `direct_file_read`
+    - `helper_cli_read`
+  - 其中 `direct_file_read` 仍是候选优先路径，`helper_cli_read` 是已定义 fallback
+  - 同时又补了一层 explicit desktop binding：bridge 运行期只更新已知 caller automation，不做 blind create/discovery
 - 同时，CLI 关键路径也收口为：
   - 明确依赖实验 RPC
   - 启动时 capability probe
@@ -34,12 +37,25 @@
 - Desktop 第一版的送达语义也已收口：
   - 目标是 `at-least-once wakeup scheduling`
   - `closed` 只表示 `cbth` 停止自动重投，不表示 caller 一定已消费
+- 为了让 redelivery 语义真正可实现，batch schema 也进一步要求 durable 记录：
+  - `redelivery_window_ends_at`
+  - `max_delivery_attempts`
+  - `delivery_attempt_count`
+- Desktop 运行期还新增了一条窄控制面：
+  - `cbth desktop note-arm ...`
+  - 用于在 bridge 成功 `automation_update` 后，把 attempt durable 推进到 `armed`
+- CLI 侧 reviewer 指出的 idle/race 缺口也已收口：
+  - idle 必须来自 app-server live event stream
+  - `turn/start` 失败要被当成 benign race，回到等待下一个 idle，而不是视为成功送达
 - 结果保留责任也已收敛：
   - `cbth job complete --result-file <path>` 的语义改为 ingest/copy 到 `cbth` 自己管理的 artifact store
   - 原始外部文件不再承担长期保留责任
   - artifact GC 也被绑定到 batch 终态与最小保留窗口，而不是外部临时文件生命周期
 - 但 reviewer 第二轮指出，设计还没有完全闭环；当前剩余的是 contract 细化和实证，不再是路线选择问题。
 - 上游 CLI/shared app-server 侧也确认存在现成的 websocket auth 能力与 `--remote-auth-token-env` 接口，因此 CLI 第一版不需要把“本机 loopback 默认可信”当成唯一安全前提。
+- `~/.cbth` 的 Desktop 侧文件路径也新增了权限合同：
+  - directory `0700`
+  - file `0600`
 - 这套共通核心设计已单独沉淀在：
   - `docs/SHARED_CORE_ARCHITECTURE.md`
 

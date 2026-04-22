@@ -6,7 +6,7 @@ Reference experiments and companion tooling for making long-running background w
 
 Validated foundations plus the current first-version direction:
 
-- Desktop foundation validated: automation-based bridge/retargeting works. The current first-version delivery contract uses read-only inbox snapshots and managed artifacts, but the “heartbeat can read those files without approval” assumption is still pending validation.
+- Desktop foundation validated: automation-based bridge/retargeting works. The current first-version delivery contract is built around a bound caller-heartbeat plus a delivery-envelope abstraction, with `direct_file_read` as the preferred path and a narrow helper fallback when approval-free file reads are not available.
 - CLI foundation validated: the shared `app-server` route works and foreground TUI visibility is proven. The current first-version contract depends on capability probing around the experimental RPC surface, defaults to loopback plus per-session bearer-token auth, and keeps `turn/steer` as a gated optimization instead of a default path.
 
 The shared architecture is converging on one Rust binary with thin integration entrypoints:

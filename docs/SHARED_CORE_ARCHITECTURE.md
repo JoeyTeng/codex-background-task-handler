@@ -101,14 +101,33 @@
 - `--result-file` 只是提交输入，不是长期保留路径。
 - 一旦 `cbth job complete` 成功，后续生命周期就归 `cbth`，不再依赖外部脚本原始文件是否仍存在。
 
-### 4. `read-only inbox snapshots`
+### 4. `Desktop delivery envelope transports`
 
 职责：
 
-- 为 Desktop 和调试工具暴露只读投递视图。
-- 避免让 Codex heartbeat turn 在关键路径上依赖本地 CLI 执行能力。
+- 为 Desktop 和调试工具暴露统一的只读投递视图。
+- 把“投递 envelope 的语义”与“具体读取传输”拆开。
 
-第一版候选路径：
+第一版定义两种传输：
+
+1. `direct_file_read`
+
+```text
+~/.cbth/inbox/ready-threads.json
+~/.cbth/inbox/by-thread/<thread_id>.json
+~/.cbth/artifacts/<artifact_id>/manifest.json
+~/.cbth/artifacts/<artifact_id>/payload
+```
+
+2. `helper_cli_read`
+
+```text
+cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
+```
+
+两种传输必须返回同一个 envelope schema。
+
+`direct_file_read` 的第一版候选路径：
 
 ```text
 ~/.cbth/inbox/ready-threads.json
@@ -122,7 +141,12 @@
 - 用 `write temp + rename` 原子替换。
 - 外部语义固定为“读快照文件”。
 - 后续如果内部改成 `mmap` / shared memory，只能在不改变这一语义的前提下做。
-- 这些路径在 Desktop 无审批读取能力得到实证前，仍视为候选内部 contract，而不是已冻结接口。
+- `direct_file_read` 在 Desktop 无审批读取能力得到实证前，仍视为候选内部 contract，而不是已冻结接口。
+- 如果 `direct_file_read` 无法满足无审批读取约束，Desktop 第一版必须退回 `helper_cli_read`，而不是继续把未验证前提当主链路。
+- 无论哪种传输，`~/.cbth` 根目录默认要求：
+  - directory mode `0700`
+  - regular file mode `0600`
+  - 临时写入文件在 rename 前也必须保持同等权限
 
 ### 5. `local IPC`
 
@@ -166,12 +190,45 @@
   - idle 时 `thread/resume + turn/start`
   - active 时只有在受限条件下才允许 `turn/steer`
 - Desktop adapter：
+  - desktop thread binding
   - bridge heartbeat thread
   - caller heartbeat
-  - `automation_update` arm / cleanup
-  - 只读 inbox snapshot 读取
+  - `automation_update` update/pause on a bound caller automation
+  - delivery envelope 读取（`direct_file_read` 或 `helper_cli_read`）
+  - narrow helper writeback (`cbth desktop note-arm ...`)
 
-### 9. `long-run task runners`
+### 9. `desktop thread bindings`
+
+职责：
+
+- 把某个 Desktop source thread 绑定到一个稳定的 caller heartbeat automation。
+- 让 bridge 在运行期只做“更新已知 automation”，而不是 blind create / discover。
+- 为每个 source thread 选择允许的 delivery-envelope 读取传输。
+
+关键字段：
+
+- `binding_id`
+- `source_thread_id`
+- `binding_state`
+  - `unbound`
+  - `bound`
+  - `degraded`
+- `caller_automation_id`
+- `bridge_thread_id`
+- `read_transport`
+  - `direct_file_read`
+  - `helper_cli_read`
+- `created_at`
+- `updated_at`
+- `last_verified_at`
+
+约束：
+
+- Desktop 自动续跑只对 `binding_state=bound` 的 thread 生效。
+- `unbound` thread 可以继续提交 job，但 bridge 不得尝试自动 arm caller heartbeat。
+- 运行期 bridge 不负责发现新的 caller automation id；第一版要求这个 id 通过 bootstrap 预先 durable 绑定。
+
+### 10. `long-run task runners`
 
 共享核心不关心任务到底是：
 
@@ -239,6 +296,7 @@
 - `batch_id`
 - `generation`
 - `state`
+- `binding_id` (optional)
 - `automation_id` (optional)
 - `automation_binding_state`
   - `unknown`
@@ -267,6 +325,7 @@
   - 递增该 thread 的 `generation`
   - 物化新 snapshot
   - 把当前 head attempt 指向新的 `attempt_id`
+- 对 Desktop target 来说，新 attempt 只有在存在 `binding_state=bound` 的 desktop binding 时才允许进入可投递状态。
 - 同一 `source_thread_id` 任何时刻最多只能有一个非终态 attempt：
   - `prepared`
   - `armed`
@@ -275,11 +334,13 @@
   - `batch_id`
   - `attempt_id`
   - `generation`
+  - `snapshot_revision`
   - `snapshot_path`
-- caller 读取 snapshot 后，必须先比较：
+- caller 读取 envelope 后，必须先比较：
   - `snapshot.batch_id`
   - `snapshot.attempt_id`
   - `snapshot.generation`
+  - `snapshot.snapshot_revision`
   与 prompt 中的期望值是否完全一致；任一不一致都视为 stale wake，立即退出。
 - 第一版 Desktop 路线的 head-batch 安全性不建立在 `automation_id` 必定可同步回填这一前提上。
 - 第一版真正的安全锚点是：
@@ -287,6 +348,7 @@
   - `attempt_id`
   - `generation`
   - `snapshot_revision`
+- 对于 Desktop target，bridge 运行期必须直接使用 binding 中已知的 `caller_automation_id`；运行期不允许 blind create 新 caller heartbeat automation。
 - `automation_id` 在第一版里只是可选的协调/观测字段：
   - bridge 如果能直接观察到 `automation_update` 返回值，就写入 attempt
   - 如果关键路径上拿不到，就允许保持 `null + automation_binding_state=unknown`
@@ -372,6 +434,9 @@ cooldown -> superseded
 - `materialized_at`
 - `last_delivery_attempt_at`
 - `next_delivery_not_before`
+- `redelivery_window_ends_at`
+- `max_delivery_attempts`
+- `delivery_attempt_count`
 - `head_attempt_id`
 - `generation`
 - `closed_at`
@@ -446,6 +511,7 @@ cooldown -> superseded
 
 - `closed` 不是“用户一定已经消费”的证明
 - 它只是“`cbth` 不再自动重投该 batch”的 durable 决策点
+- `redelivery_window_ends_at` 与 `max_delivery_attempts` 必须 durable 落在 batch 上，而不是只存在于单次 attempt 的临时计算里。
 
 ### Desktop 第一版送达语义
 
@@ -460,7 +526,7 @@ cooldown -> superseded
 - 因此，Desktop batch 不应在第一次 arm 成功后直接 `closed`。
 - 推荐行为是：
   - arm 成功 -> attempt 进入 `cooldown`
-  - `cooldown_until` 到期后，如果该 batch 仍是 head 且 redelivery window 未结束 -> 创建新 attempt 并再次 arm
+  - `cooldown_until` 到期后，如果该 batch 仍是 head、`now < redelivery_window_ends_at`、且 `delivery_attempt_count < max_delivery_attempts` -> 创建新 attempt 并再次 arm
   - 只有在 operator 关闭、batch 被 supersede、caller 明确回写成功、或 redelivery window 结束时，batch 才进入 `closed`
 
 ## 第一版稳定外部接口
@@ -550,12 +616,15 @@ cbth job query <job_id> --json
 
 ## Desktop 只读快照约束
 
-- 第一版不要求 Desktop heartbeat turn 在关键路径上执行本地 CLI。
-- 当前候选路径是：
+- 第一版不要求 Desktop heartbeat turn 在关键路径上执行通用 `cbth job ...` CLI。
+- 但 Desktop adapter 可以依赖两类窄接口：
+  - `helper_cli_read`：只读 envelope/helper
+  - `cbth desktop note-arm ...`：bridge 成功 arm 后的窄写回
+- 当前首选路径是：
   - bridge heartbeat 只读 `ready-threads.json`
-  - caller heartbeat 只读自己的 per-thread inbox snapshot 与 artifact 路径
-- 这条路径在“Desktop heartbeat 可无审批读取 `~/.cbth` 路径”得到实证前，仍按候选主路径处理。
-- 是否存在后台无审批写回能力，先不当作架构前提。
+  - caller heartbeat 通过 `direct_file_read` 读取自己的 per-thread envelope 与 artifact
+- 如果 `direct_file_read` 不能满足无审批读取约束，则第一版 Desktop 必须切回 `helper_cli_read`，而不是继续假设文件读取成立。
+- Desktop 自动续跑只对已完成 binding 的 thread 生效；未绑定 thread 不得被 bridge 自动 arm。
 
 ## 为什么第一版只做 CLI 脚本
 

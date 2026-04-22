@@ -241,6 +241,32 @@ CLI adapter 不直接按单 job 投递，而是消费共享核心为每个 threa
 thread/resume + turn/start
 ```
 
+### Idle 判定与 race contract
+
+- CLI adapter 的 idle 判定源必须来自 shared `app-server` 的 live event stream，而不是 TUI 屏幕解析。
+- 第一版至少使用以下信号维护本地 thread liveness 视图：
+  - `turn/started`
+  - `turn/completed`
+  - `thread/status/changed`（如果可用）
+- 一个 thread 只有在以下条件同时满足时，才允许被本地视图判为 idle：
+  - 最近一次已观察到的 regular turn 已完成/中断
+  - 且在那之后没有新的 `turn/started`
+- `turn/start` 本身必须被视为最后一道 compare-and-swap：
+  - 如果 sidecar 观察到 idle 后发起 `thread/resume + turn/start`
+  - 但在请求到达前用户又启动了新 turn
+  - adapter 必须把这种失败当成 benign race，而不是成功送达
+- benign race 的处理规则：
+  - 不得关闭 batch
+  - 不得创建第二个并发 attempt
+  - 当前 attempt 保持在 `prepared`，不得推进到 `armed`
+  - `last_delivery_attempt_at` 不得因为这次 race 被当成成功投递而更新
+  - 必须清除本地 idle 视图
+  - 必须等待下一次 idle 观测后再重试
+- 换句话说，CLI 第一版的串行化依赖：
+  - daemon 的 per-thread attempt lease
+  - app-server 的 live event stream
+  - `turn/start` 失败时的 retry-on-next-idle 约束
+
 ### `turn/steer` 的策略
 
 - `turn/steer` 是可选优化，不是默认主路径。
@@ -305,4 +331,4 @@ cbth cli run
 - CLI 入口的进程生命周期和清理策略
 - sidecar 长时间运行时的状态持久化与 resume 策略
 - capability probe 的具体实现与版本策略
-- 多个 background jobs 同时命中同一 caller thread 时的串行化与 batch 合并策略
+- 多个 background jobs 同时命中同一 caller thread 时的 batch 合并参数

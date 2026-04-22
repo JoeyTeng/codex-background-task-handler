@@ -32,25 +32,43 @@
 
 2. `shared job state`
    - 由 sidecar 暴露给 Codex thread 读取的共享状态面。
-   - 第一版关键路径优先暴露成只读快照文件，而不是本地 CLI 调用。
-   - 建议至少包含：
+   - 第一版定义统一的 delivery envelope schema，但允许两种读取传输：
+     - `direct_file_read`
+     - `helper_cli_read`
+   - `direct_file_read` 建议至少包含：
      - `~/.cbth/inbox/ready-threads.json`
      - `~/.cbth/inbox/by-thread/<thread_id>.json`
      - `~/.cbth/artifacts/<artifact_id>/manifest.json`
+   - `helper_cli_read` 建议提供一个窄 helper：
+
+```text
+cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
+```
+
    - 底层仍可用 SQLite / 普通文件 / `mmap`，但这属于内部实现细节。
    - 明确不依赖直接改 Codex 自己的 automation DB。
-   - 这条只读文件路径目前仍是候选主路径，待“heartbeat 无审批读取”实证后再升级为已验证主路径。
+   - `direct_file_read` 目前仍是候选主路径，待“heartbeat 无审批读取”实证后再升级为已验证主路径。
+   - 如果 `direct_file_read` 在目标安装上不可行，Desktop 第一版必须退回 `helper_cli_read`，而不是继续把文件读取当作既定前提。
 
-3. `bridge heartbeat thread`
+3. `desktop thread binding`
+   - 每个要支持自动续跑的 caller thread，都必须先完成一次 binding。
+   - binding 至少要 durable 记录：
+     - `source_thread_id`
+     - `caller_automation_id`
+     - `read_transport`
+   - bridge 在运行期只允许更新这个已知 `caller_automation_id`，不做 blind create / discovery。
+   - 未完成 binding 的 thread 可以提交 job，但不会被 bridge 自动续跑。
+
+4. `bridge heartbeat thread`
    - 一个固定存在的专用 thread。
    - 低成本、快模型即可。
    - 当前验证使用的 bridge thread：
      - `thread_id = 019db5e6-ba6a-7b80-95d2-a6867163281a`
      - `model = gpt-5.3-codex-spark-preview`
      - `reasoning_effort = low`
-   - 职责只有一件事：轮询共享 job state，并在发现某个 caller thread 对应 head batch 可投递时，用 `automation_update` 为该 caller thread 武装 heartbeat。
+   - 职责只有一件事：轮询共享 job state，并在发现某个已绑定 caller thread 的 head batch 可投递时，用 `automation_update` 更新那个已知 caller heartbeat。
 
-4. `caller thread heartbeat`
+5. `caller thread heartbeat`
    - 不是常驻轮询器。
    - 只在 bridge 判定当前 thread 有可投递 batch 时，才被创建、激活、重定向或更新。
    - 被唤醒后，在原 caller thread 中读取自己的 inbox snapshot，并继续原任务。
@@ -62,7 +80,8 @@
 - 周期性检查集中在 bridge thread，不污染所有 caller thread。
 - caller thread 只在“确实有结果可消费”时被唤醒。
 - 不要求 bridge thread 与 caller thread 之间直接 live push；两者都只依赖 automation scheduler 和共享 job state。
-- 关键读取路径优先只读，不把后台 heartbeat 的本地 CLI 执行能力当成前提。
+- 关键读取路径优先只读，但 Desktop 第一版允许一个窄的 `helper_cli_read` fallback。
+- 运行期 bridge 不得 blind create caller heartbeat；它只能更新已绑定 automation。
 - 旧 heartbeat prompt 必须能够通过 attempt token / generation 检测自己已经过期，并立即 no-op。
 
 ## 时序
@@ -80,7 +99,8 @@
    - `task_summary`
    - `updated_at`
 4. caller thread 不长时间等待，当前 turn 可以结束。
-5. daemon 把 ready jobs 聚合成该 thread 的 `delivery batch`，并物化为只读 inbox snapshot。
+5. 如果该 thread 还没有 desktop binding，job 仍可继续运行，但 bridge 不会对它做自动续跑。
+6. daemon 把 ready jobs 聚合成该 thread 的 `delivery batch`，并物化 delivery envelope。
 
 ### 2. bridge thread 轮询
 
@@ -95,34 +115,45 @@ bridge heartbeat 每分钟醒一次：
 2. 如果没有可投递 thread，本次 turn 直接结束。
 3. 如果有可投递 thread：
    - 选择最早到期且未处于 cooldown 的 `source_thread_id`
-   - `cbth` 先为当前 head batch 原子创建新的 attempt，并递增 `generation`
-   - 用 `automation_update` 为目标 caller thread 创建或更新 heartbeat
+   - 该 thread 必须已经存在 `binding_state=bound` 的 desktop binding
+   - `cbth` 调度器必须已经为当前 head batch 原子创建新的 attempt，并递增 `generation`
+   - bridge 使用 binding 中已知的 `caller_automation_id`
+   - 用 `automation_update` 更新这个已知 caller heartbeat
    - heartbeat prompt 中带上：
      - `batch_id`
      - `attempt_id`
      - `generation`
+     - `snapshot_revision`
      - `snapshot_path`
-   - `cbth` durable 记录：
+   - `automation_update` 成功后，bridge 调用一个窄 helper：
+
+```text
+cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
+```
+
+   - 这一步负责把 attempt durable 推进到 `armed`，并更新：
      - `head_attempt_id`
-     - `automation_id` (if observable)
      - `last_delivery_attempt_at`
+   - 如果 `note-arm` 不可用，则该 desktop binding 必须视为 `degraded`，而不是继续假设状态已经推进成功。
 
 ### 3. caller thread 被唤醒
 
 caller thread heartbeat 在下一次调度中醒来：
 
-1. 根据 prompt 读取自己的只读 inbox snapshot，例如：
+1. 根据 prompt 读取自己的 delivery envelope：
 
 ```text
-~/.cbth/inbox/by-thread/<thread_id>.json
+preferred: ~/.cbth/inbox/by-thread/<thread_id>.json
+fallback:  cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
 ```
 
-2. 如果 snapshot 不存在、当前 batch 已被撤回，或只包含旧内容，本次 turn 直接结束。
-3. 如果 snapshot 存在并指向一个可消费 batch：
-   - 先比较 snapshot header 中的：
+2. 如果 envelope 不存在、当前 batch 已被撤回，或只包含旧内容，本次 turn 直接结束。
+3. 如果 envelope 存在并指向一个可消费 batch：
+   - 先比较 envelope header 中的：
      - `batch_id`
      - `attempt_id`
      - `generation`
+     - `snapshot_revision`
      与 prompt 中的期望值是否一致
    - 任一不一致都视为 stale wake，立即退出
    - 读取 batch 摘要
@@ -170,24 +201,24 @@ caller thread heartbeat 在下一次调度中醒来：
   - `batch_id`
   - `attempt_id`
   - `generation`
+  - `snapshot_revision`
   - `automation_id` (optional)
   - `snapshot_path`
   - `delivery_deadline`
   - `cooldown_until`
 - bridge arm caller heartbeat 前，必须先原子创建/更新 attempt。
-- caller prompt 中必须显式携带 `batch_id + attempt_id + generation`。
-- caller 读取 snapshot 后，必须先比较这三者；只要 mismatch 就立即 no-op。
+- caller prompt 中必须显式携带 `batch_id + attempt_id + generation + snapshot_revision`。
+- caller 读取 envelope 后，必须先比较这四者；只要 mismatch 就立即 no-op。
 - 同一 thread 上出现新的 generation 后，所有旧 heartbeat prompt 都只能看到 mismatch，不得重复消费当前 head batch。
 - 第一版不要求 `cbth` 在关键路径上同步拿到 `automation_id`。
 - 对第一版来说：
-  - `attempt_id + generation + snapshot header` 才是防止 stale wake 的硬约束
+  - `attempt_id + generation + snapshot_revision + envelope header` 才是防止 stale wake 的硬约束
+  - `caller_automation_id` 来自 binding，而不是运行期 discovery
   - `automation_id` 只是 bridge 侧可选的协调/诊断信息
-  - 如果 bridge 在 turn 内能直接拿到 `automation_update` 返回的 id，可以 best-effort 记录
-  - 如果拿不到，也不影响 stale-wake no-op 与 supersede 规则成立
 
 ## 共享状态面的推荐接口
 
-优先建议对 Desktop heartbeat 暴露只读快照文件，而不是要求它在关键路径上执行 CLI。
+优先建议对 Desktop heartbeat 暴露统一 delivery envelope，而不是让 prompt 直接理解内部 SQLite。
 
 ### Bridge 侧
 
@@ -203,6 +234,13 @@ caller thread heartbeat 在下一次调度中醒来：
 ~/.cbth/artifacts/<artifact_id>/payload
 ```
 
+### Helper fallback
+
+```text
+cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
+cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
+```
+
 这样 bridge prompt 和 caller prompt 都可以很短，而且不需要知道底层 store 是 SQLite、普通文件还是 `mmap`。
 
 ## Automation 策略
@@ -212,12 +250,12 @@ caller thread heartbeat 在下一次调度中醒来：
 - 常驻、低成本。
 - 固定 1 分钟 cadence 即可。
 - 挂在专用 bridge thread 上。
-- 只负责读取 ready index，并为有可投递 batch 的 caller thread arm heartbeat。
+- 只负责读取 ready index，并为有可投递 batch 的已绑定 caller thread arm heartbeat。
 
 ### Caller heartbeat
 
 - 不做固定轮询。
-- 只在 bridge 发现当前 thread 有可投递 batch 时创建或更新。
+- 只在 bridge 发现当前 thread 有可投递 batch 时更新已绑定 heartbeat。
 - 目标是“一次唤醒、一次读取、一次继续”。
 
 ### 对 `run now` 的态度
@@ -231,23 +269,27 @@ caller thread heartbeat 在下一次调度中醒来：
 ### Bridge prompt 要求
 
 - 每次醒来只做一次状态检查。
-- 只读取 ready index，不依赖本地 CLI 调用。
+- 只读取 ready index，不依赖通用 `cbth job ...` CLI。
 - 没有 ready thread 就立即结束。
-- 有 ready thread 时，只为对应 caller thread 武装 heartbeat，不直接展开主任务。
-- 避免创建重复 automation。
+- 有 ready thread 时，只更新对应 caller thread 的已绑定 heartbeat，不直接展开主任务。
+- 运行期不得 blind create 新 caller heartbeat automation。
 - arm 完成后如果能直接拿到 `automation_id`，可以把它写进 prompt / automation metadata 作为协调信息；拿不到时也不能阻塞关键路径。
 - bridge arm 的 durable 完成条件是：
   - attempt 已存在
   - snapshot 已物化
   - 当前 generation 的 caller heartbeat arm 请求已被 Codex 接受
+  - `cbth desktop note-arm ...` 已成功执行
 
 ### Caller prompt 要求
 
-- 先读取自己的 per-thread inbox snapshot。
-- 只处理当前 snapshot 指向的 head batch。
+- 先读取自己的 per-thread delivery envelope。
+- 只处理当前 envelope 指向的 head batch。
 - 对小结果可以直接读取 inline payload；对大结果读取 `cbth` 管理的 artifact。
 - 任务处理完成后可以清理或暂停当前 heartbeat，但不要求在关键路径上回写 `consumed`。
 - 旧 generation 的 prompt 只允许 no-op，不允许“顺手处理当前 head batch”。
+- 读取传输由 binding 预先决定：
+  - `direct_file_read`
+  - 或 `helper_cli_read`
 
 ## Delivery 关闭语义
 
@@ -265,6 +307,7 @@ caller thread heartbeat 在下一次调度中醒来：
   - `operator_closed`
   - `cancelled`
   - `redelivery_window_exhausted`
+  - `max_attempts_exhausted`
   - `caller_acknowledged` (future optional)
 - 也就是说，Desktop 第一版的自动续跑语义是：
   - `at-least-once wakeup scheduling`
@@ -296,7 +339,19 @@ caller thread heartbeat 在下一次调度中醒来：
 
 - 第一版不依赖 caller 回写失败状态。
 - `cbth` 通过保留 batch、cooldown 与 redelivery timeout 决定是否再次 arm。
-- 如果 `cooldown_until` 到期后，该 batch 仍然是当前 head batch，且 `close_reason` 仍为空、redelivery window 也未结束，就应该创建新 attempt 并再次 arm，而不是把旧 attempt 直接视为成功送达。
+- 如果 `cooldown_until` 到期后，该 batch 仍然是当前 head batch，且 `close_reason` 仍为空、`now < redelivery_window_ends_at`、并且 `delivery_attempt_count < max_delivery_attempts`，就应该创建新 attempt 并再次 arm，而不是把旧 attempt 直接视为成功送达。
+
+## Bootstrap 约束
+
+- Desktop 第一版不是零配置 attach。
+- 一个 caller thread 要支持自动续跑，必须先完成 bootstrap：
+  - 创建一个 paused caller heartbeat automation
+  - 把该 `caller_automation_id` durable 绑定到 `source_thread_id`
+  - 为该 thread 选择 `read_transport`
+- 未完成 bootstrap 的 thread 仍可提交 job，但只允许：
+  - sidecar 继续跑任务
+  - `cbth` 保留结果
+  - 不允许 bridge 自动 arm caller heartbeat
 
 ## Artifact 生命周期
 

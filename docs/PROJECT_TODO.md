@@ -18,10 +18,21 @@
 - [ ] 用 Rust 实现主 binary 的共享 `job` CLI 子命令，替代单独的 `background-taskctl` helper。
 - [ ] 实现按需启动的本地 daemon：自动拉起、idle timeout、无 active jobs/clients 时自动退出。
 - [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 `cbth` 物化出的只读 inbox snapshot / artifact 文件，且不会卡审批。
+- [ ] 为 Desktop bootstrap 设计并实现 `desktop binding` 流程，至少 durable 记录：
+  - `source_thread_id`
+  - `caller_automation_id`
+  - `read_transport`
 - [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
   - `ready-threads.json`
   - `by-thread/<thread_id>.json`
   - `artifacts/<artifact_id>/manifest.json`
+- [ ] 落实 `~/.cbth` 的权限合同：
+  - directories `0700`
+  - regular files `0600`
+- [ ] 设计并实现 `helper_cli_read` fallback：
+  - `cbth desktop read-envelope --source-thread-id ... --expected-attempt-id ... --expected-generation ... --expected-snapshot-revision ... --json`
+- [ ] 设计并实现 Desktop bridge 的窄写回 helper：
+  - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --json`
 - [ ] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
 - [ ] 为 Desktop bridge 设计基于只读快照的共享状态面，不把后台 heartbeat 的本地 CLI 执行能力当成前提。
@@ -40,6 +51,10 @@
   - optional `automation_id`
   - stale wake no-op 规则
 - [ ] 明确 Desktop 第一版的 `close_reason` / redelivery window contract，保证 `closed` 只表示停止自动重投，而不是隐含“caller 已消费”。
+- [ ] 为 batch durable schema 增补：
+  - `redelivery_window_ends_at`
+  - `max_delivery_attempts`
+  - `delivery_attempt_count`
 - [ ] 用 Rust 实现 managed artifact store，并把 `cbth job complete --result-file <path>` 定义成 ingest/copy 语义。
 - [ ] 实现 artifact retention / GC contract：
   - `min_artifact_ttl = 24h`
@@ -54,6 +69,9 @@
   - loopback-only listener
   - per-session bearer token
   - `--remote-auth-token-env` 注入前台 TUI
+- [ ] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
+  - 基于 `turn/started` / `turn/completed` / `thread/status/changed`
+  - `turn/start` race 失败后回到等待下一个 idle
 - [x] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为，且不会导致当前 turn 提前结束。
 - [ ] 为 CLI adapter 明确定义实验 RPC 的最小能力集、capability probe 和 fail-closed 策略。
 - [ ] 把 `turn/steer` 维持为默认关闭的 gated optimization，并明确不满足条件时的 idle-only fallback。
