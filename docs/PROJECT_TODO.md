@@ -17,12 +17,22 @@
 - [x] 单独沉淀共享核心架构文档，明确单 binary、多入口、按需启动 daemon 的生命周期方案。
 - [ ] 用 Rust 实现主 binary 的共享 `job` CLI 子命令，替代单独的 `background-taskctl` helper。
 - [ ] 实现按需启动的本地 daemon：自动拉起、idle timeout、无 active jobs/clients 时自动退出。
+- [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 `cbth` 物化出的只读 inbox snapshot / artifact 文件，且不会卡审批。
+- [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
+  - `ready-threads.json`
+  - `by-thread/<thread_id>.json`
+  - `artifacts/<artifact_id>/manifest.json`
 - [ ] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
-- [ ] 为 bridge thread 设计一个最小共享状态面（共享 `cbth job ...` CLI + 内部 store/socket），让它能读取 sidecar 任务状态而不依赖 Codex thread 之间的 live push。
+- [ ] 为 Desktop bridge 设计基于只读快照的共享状态面，不把后台 heartbeat 的本地 CLI 执行能力当成前提。
+- [ ] 为共享核心设计 thread-scoped FIFO 队列、batch 合并规则和最小连续发送间隔。
+- [ ] 为共享核心定义“同一 thread 同时最多一个 in-flight delivery attempt”的仲裁契约。
+- [ ] 用 Rust 实现 managed artifact store，并把 `cbth job complete --result-file <path>` 定义成 ingest/copy 语义。
 - [ ] 用 Rust 实现 sidecar supervisor 的最小骨架，负责长任务状态写入与结果交接。
 - [x] 验证 CLI 在 shared `app-server` 模式下，第二个 sidecar client 能否对同一个 thread 执行 `thread/resume + turn/start`，并让前台 client 收到 live 通知。
 - [x] 验证真实前台 `codex --remote` TUI 在 PTY 中是否会把 sidecar 触发的新 turn 展示给用户。
 - [x] 单独沉淀 CLI shared `app-server` + sidecar 技术方案文档。
 - [ ] 为 CLI 设计最小 `cbth cli run` 进程模型：shared `app-server`、前台 `codex --remote`、sidecar、以及清理策略。
 - [x] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为，且不会导致当前 turn 提前结束。
+- [ ] 为 CLI adapter 明确定义实验 RPC 的最小能力集、capability probe 和 fail-closed 策略。
+- [ ] 把 `turn/steer` 收口为只读、低风险场景下的可选优化，并明确不满足条件时的 idle-only fallback。

@@ -19,6 +19,7 @@
 - `automation_update` 是 Codex thread 内置能力。
 - `automation_update` 可以创建或更新指向其他 thread 的 heartbeat automation。
 - heartbeat 触发出来的 turn 本身也可以继续调用 `automation_update`。
+- 第一版不把“heartbeat turn 稳定执行本地 `cbth ...` CLI”当作既定前提。
 - 因此，Desktop 上最可靠的方案不是“外部 sidecar 直接推送 caller thread”，而是“由 app 内部 automation scheduler 去唤醒 caller thread”。
 
 ## 核心设计
@@ -31,8 +32,12 @@
 
 2. `shared job state`
    - 由 sidecar 暴露给 Codex thread 读取的共享状态面。
-   - 第一版优先通过主 binary 的 CLI 子命令暴露，而不是单独再做一个 helper binary。
-   - 底层仍可用本地 SQLite / socket，但这属于内部实现细节。
+   - 第一版关键路径优先暴露成只读快照文件，而不是本地 CLI 调用。
+   - 建议至少包含：
+     - `~/.cbth/inbox/ready-threads.json`
+     - `~/.cbth/inbox/by-thread/<thread_id>.json`
+     - `~/.cbth/artifacts/<artifact_id>/manifest.json`
+   - 底层仍可用 SQLite / 普通文件 / `mmap`，但这属于内部实现细节。
    - 明确不依赖直接改 Codex 自己的 automation DB。
 
 3. `bridge heartbeat thread`
@@ -46,9 +51,9 @@
 
 4. `caller thread heartbeat`
    - 不是常驻轮询器。
-   - 只在 bridge 判定任务 ready 后，才被创建、激活、重定向或更新。
-   - 被唤醒后，在原 caller thread 中读取结果并继续原任务。
-   - 处理完成后删除或暂停自己，避免 caller thread 出现持续定时 wake 痕迹。
+   - 只在 bridge 判定当前 thread 有可投递 batch 时，才被创建、激活、重定向或更新。
+   - 被唤醒后，在原 caller thread 中读取自己的 inbox snapshot，并继续原任务。
+   - 第一版不要求它在关键路径上写回 ack；artifact retention 与清理由 `cbth` 自己负责。
 
 ## 设计原则
 
@@ -56,6 +61,7 @@
 - 周期性检查集中在 bridge thread，不污染所有 caller thread。
 - caller thread 只在“确实有结果可消费”时被唤醒。
 - 不要求 bridge thread 与 caller thread 之间直接 live push；两者都只依赖 automation scheduler 和共享 job state。
+- 关键读取路径优先只读，不把后台 heartbeat 的本地 CLI 执行能力当成前提。
 
 ## 时序
 
@@ -70,43 +76,44 @@
    - `source_thread_id`
    - `status`
    - `task_summary`
-   - `result_ref`
    - `updated_at`
 4. caller thread 不长时间等待，当前 turn 可以结束。
+5. daemon 把 ready jobs 聚合成该 thread 的 `delivery batch`，并物化为只读 inbox snapshot。
 
 ### 2. bridge thread 轮询
 
 bridge heartbeat 每分钟醒一次：
 
-1. 调用本地 helper，例如：
+1. 读取只读 ready index，例如：
 
 ```text
-cbth job list-ready --json
+~/.cbth/inbox/ready-threads.json
 ```
 
-2. 如果没有 ready job，本次 turn 直接结束。
-3. 如果有 ready job：
-   - 选择目标 `source_thread_id`
+2. 如果没有可投递 thread，本次 turn 直接结束。
+3. 如果有可投递 thread：
+   - 选择最早到期且未处于 cooldown 的 `source_thread_id`
    - 用 `automation_update` 为目标 caller thread 创建或更新 heartbeat
-   - heartbeat prompt 中带上 `job_id`
-   - 可选地把 job 标记为 `armed`
+   - heartbeat prompt 中带上对应 inbox snapshot 路径
+   - `cbth` 自己在内部记录 `last_delivery_attempt_at`
 
 ### 3. caller thread 被唤醒
 
 caller thread heartbeat 在下一次调度中醒来：
 
-1. 根据 prompt 中的 `job_id` 调用 helper，例如：
+1. 根据 prompt 读取自己的只读 inbox snapshot，例如：
 
 ```text
-cbth job claim-ready <job_id> --json
+~/.cbth/inbox/by-thread/<thread_id>.json
 ```
 
-2. 如果 claim 失败，说明结果已被消费或重复武装，本次 turn 直接结束并清理 heartbeat。
-3. 如果 claim 成功：
-   - 读取任务结果
+2. 如果 snapshot 不存在、当前 batch 已被撤回，或只包含旧内容，本次 turn 直接结束。
+3. 如果 snapshot 存在并指向一个可消费 batch：
+   - 读取 batch 摘要
+   - 对小结果可直接读取 inline payload
+   - 对大结果读取 `cbth` 管理的 artifact 路径
    - 在原 caller thread 中继续后续工作
-   - 完成后调用 helper 标记 `consumed`
-   - 删除或暂停自己的 heartbeat automation
+4. 第一版不要求 caller 在关键路径上写回 `consumed`；批次的 retention、redelivery 与 GC 由 `cbth` 自己管理。
 
 ## 最小状态机
 
@@ -114,48 +121,42 @@ cbth job claim-ready <job_id> --json
 
 - `running`
 - `ready`
-- `armed`
-- `claimed`
-- `consumed`
 - `failed`
 - `cancelled`
 
-### 推荐迁移
+### Delivery batch 状态
 
-```text
-running -> ready -> armed -> claimed -> consumed
-running -> failed
-running -> cancelled
-armed -> ready
-claimed -> ready
-```
+- `queued`
+- `materialized`
+- `armed`
+- `cooldown`
+- `closed`
 
-说明：
+### Thread 级约束
 
-- `armed -> ready` 用于 caller heartbeat 没有按预期消费时的重试。
-- `claimed -> ready` 用于 caller thread 醒来后中途失败，需要重新投递。
+- 同一个 `source_thread_id` 只允许一个 in-flight delivery attempt。
+- ready jobs 先进入 thread-scoped FIFO 队列，再聚合成 batch。
+- bridge 只读取“当前可投递 head batch”的快照，不直接操作单个 job。
 
 ## 共享状态面的推荐接口
 
-优先建议直接复用主 binary 的 CLI 子命令，避免让 Codex thread 自己解析复杂文件格式，也避免把入口再拆成第二个工具。
+优先建议对 Desktop heartbeat 暴露只读快照文件，而不是要求它在关键路径上执行 CLI。
 
 ### Bridge 侧
 
 ```text
-cbth job list-ready --json
-cbth job mark-armed <job_id> <automation_id>
-cbth job requeue <job_id>
+~/.cbth/inbox/ready-threads.json
 ```
 
 ### Caller 侧
 
 ```text
-cbth job claim-ready <job_id> --json
-cbth job mark-consumed <job_id>
-cbth job fail --job-id <job_id> --reason <text> --json
+~/.cbth/inbox/by-thread/<thread_id>.json
+~/.cbth/artifacts/<artifact_id>/manifest.json
+~/.cbth/artifacts/<artifact_id>/payload
 ```
 
-这样 bridge prompt 和 caller prompt 都可以很短，而且不需要知道底层 store 是文件、SQLite 还是 socket。
+这样 bridge prompt 和 caller prompt 都可以很短，而且不需要知道底层 store 是 SQLite、普通文件还是 `mmap`。
 
 ## Automation 策略
 
@@ -164,13 +165,13 @@ cbth job fail --job-id <job_id> --reason <text> --json
 - 常驻、低成本。
 - 固定 1 分钟 cadence 即可。
 - 挂在专用 bridge thread 上。
-- 只负责检查 ready job 和 arm caller heartbeat。
+- 只负责读取 ready index，并为有可投递 batch 的 caller thread arm heartbeat。
 
 ### Caller heartbeat
 
 - 不做固定轮询。
-- 只在 bridge 发现 ready job 时创建或更新。
-- 目标是“一次唤醒、一次消费、一次清理”。
+- 只在 bridge 发现当前 thread 有可投递 batch 时创建或更新。
+- 目标是“一次唤醒、一次读取、一次继续”。
 
 ### 对 `run now` 的态度
 
@@ -183,17 +184,18 @@ cbth job fail --job-id <job_id> --reason <text> --json
 ### Bridge prompt 要求
 
 - 每次醒来只做一次状态检查。
-- 没有 ready job 就立即结束。
-- 有 ready job 时，只为对应 caller thread 武装 heartbeat，不直接展开主任务。
+- 只读取 ready index，不依赖本地 CLI 调用。
+- 没有 ready thread 就立即结束。
+- 有 ready thread 时，只为对应 caller thread 武装 heartbeat，不直接展开主任务。
 - 避免创建重复 automation。
-- arm 完成后记录或回写 `automation_id`。
+- arm 完成后可把 `automation_id` 写进 prompt / automation metadata，但不要求在关键路径上调用外部 helper。
 
 ### Caller prompt 要求
 
-- 先 claim 指定 `job_id`。
-- claim 成功才继续任务。
-- 任务处理完成后立即清理或暂停当前 heartbeat。
-- 失败时把 job 退回 `ready` 或写回错误状态，避免静默丢失。
+- 先读取自己的 per-thread inbox snapshot。
+- 只处理当前 snapshot 指向的 head batch。
+- 对小结果可以直接读取 inline payload；对大结果读取 `cbth` 管理的 artifact。
+- 任务处理完成后可以清理或暂停当前 heartbeat，但不要求在关键路径上回写 `consumed`。
 
 ## 失败与重试
 
@@ -203,18 +205,18 @@ cbth job fail --job-id <job_id> --reason <text> --json
 
 ### Bridge arm 失败
 
-- job 保持 `ready`。
+- batch 保持可投递。
 - 下一次 bridge heartbeat 重试。
 
-### Caller heartbeat 醒来但 claim 失败
+### Caller heartbeat 醒来但 snapshot 不可读
 
-- 说明已被其他 turn 消费或状态已变化。
+- 说明快照暂时不可用、路径变化，或当前 batch 已被撤回。
 - 当前 turn 直接退出并清理 heartbeat。
 
 ### Caller 处理中途失败
 
-- 把 job 放回 `ready` 或显式标为 `failed`。
-- 由 bridge 决定是否再次 arm。
+- 第一版不依赖 caller 回写失败状态。
+- `cbth` 通过保留 batch、cooldown 与 redelivery timeout 决定是否再次 arm。
 
 ## 已实证支持的关键能力
 
@@ -227,21 +229,25 @@ cbth job fail --job-id <job_id> --reason <text> --json
 
 - 不尝试外部进程直接向 Desktop 当前 live thread push 消息。
 - 不依赖外部直接改 Codex automation DB。
+- 不把后台 heartbeat 的本地 CLI 执行能力当成关键前提。
 - 不以“不留下任何 caller thread 唤醒痕迹”为目标；当前目标是把痕迹压缩到“任务 ready 时的一次唤醒”。
 - 不覆盖 Desktop app 退出后的常驻通知场景。
+- 不把“单次读取后立即删除 artifact”当成第一版语义；artifact 生命周期由 `cbth` 统一管理。
 
 ## 第一版实现建议
 
 1. 固定一个 bridge heartbeat thread。
-2. 实现共享主 binary 的 `cbth job ...` 最小 CLI 面。
-3. 让 sidecar 只负责写 job 状态。
-4. 让 bridge thread 每分钟查询 `list-ready --json`。
-5. bridge 发现 ready job 后，为对应 caller thread arm 一次 heartbeat。
-6. caller thread 醒来后 `claim-ready`，继续任务，并在结束后清理 heartbeat。
+2. 让 sidecar 只负责写 job 状态与完成结果。
+3. 由 `cbth` 自己把结果 ingest 到 managed artifact store。
+4. 由 `cbth` 物化 `ready-threads.json` 与 per-thread inbox snapshot。
+5. 让 bridge thread 每分钟读取 `ready-threads.json`。
+6. bridge 发现可投递 batch 后，为对应 caller thread arm 一次 heartbeat。
+7. caller thread 醒来后读取自己的 inbox snapshot，继续任务。
 
 这套方案的关键优点是：
 
 - 不改 Codex Desktop 内部实现。
 - 不依赖外部 live push。
+- 不依赖后台 heartbeat 的本地 CLI 执行能力。
 - 不需要用户手动切回某个 notification thread。
 - caller thread 可以在原上下文内继续任务。

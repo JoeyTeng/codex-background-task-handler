@@ -6,14 +6,14 @@ Reference experiments and companion tooling for making long-running background w
 
 Two directions are now validated:
 
-- Desktop: keep the long-running work in an external sidecar, expose state through a small local interface, use a dedicated heartbeat bridge thread, and arm a caller-thread heartbeat only when a job is ready.
-- CLI: use a thin CLI entrypoint that starts a shared `codex app-server`, runs the foreground TUI with `codex --remote`, and attaches one or more sidecar clients to the same live thread.
+- Desktop: keep the long-running work in an external sidecar, expose state through read-only inbox snapshots, use a dedicated heartbeat bridge thread, and arm a caller-thread heartbeat only when a delivery batch is ready.
+- CLI: use a thin CLI entrypoint that starts a shared `codex app-server`, runs the foreground TUI with `codex --remote`, and attaches one or more sidecar clients to the same live thread, with capability probing around the experimental RPC surface.
 
 The shared architecture is converging on one Rust binary with thin integration entrypoints:
 
 - a CLI entrypoint that launches the shared `app-server` path
 - a Desktop-facing helper/bridge entrypoint
-- a shared local daemon, store, and job-control CLI surface underneath
+- a shared local daemon, store, artifact manager, and job-control CLI surface underneath
 
 Design docs:
 
@@ -31,7 +31,7 @@ Design docs:
   - lightweight Python probes and reference PoCs
 - future Rust crates
   - sidecar supervisor
-  - shared-state helper CLI
+  - job-control CLI / daemon entrypoints
   - production background-task bridge components
 
 ## Python Usage
@@ -57,8 +57,9 @@ The current CLI active-turn steering PoC is [scripts/cli_turn_steer_poc.mjs](scr
 This repo is expected to grow around one shared Rust core with thin per-surface entrypoints:
 
 1. A Rust daemon/store/job-control core with a stable CLI surface.
-2. Thin CLI and Desktop integration entrypoints on top of that core.
-3. Small reference probes for one-off Desktop or protocol experiments.
+2. A managed artifact store plus thread-scoped inbox / delivery-batch scheduler inside that core.
+3. Thin CLI and Desktop integration entrypoints on top of that core.
+4. Small reference probes for one-off Desktop or protocol experiments.
 
 Rust is the preferred implementation language for the real sidecar because it keeps resource usage low and is a better fit for cross-platform deployment anywhere Codex itself can run.
 

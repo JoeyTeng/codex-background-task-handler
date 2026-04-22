@@ -16,6 +16,7 @@
 - 当前 CLI TUI 不能直接复用 Desktop 的 heartbeat / automation bridge 方案。
 - 原因不是产品层面猜测，而是 TUI 目前直接拒绝 dynamic tool call，报错文案就是 `Dynamic tool calls are not available in TUI yet.`。
 - 因此，CLI 方向的可靠方案不是 `automation_update`，而是共享 `app-server`。
+- 当前这条路线依赖实验 RPC，因此第一版必须把 capability probe 与 fail-closed 当成正式设计的一部分。
 
 ## 核心设计
 
@@ -41,8 +42,38 @@ codex --remote ws://127.0.0.1:<port>
    - 负责等待 CI、等待 reviewer、等待外部系统结果、以及在结果 ready 后恢复 caller thread。
 
 4. `optional shared job state`
-   - 如果 sidecar 需要脱离当前进程继续工作，可以直接复用共享核心里的 store 与 `cbth job ...` CLI 子命令。
+   - sidecar 不直接从外部任务脚本拿结果，而是消费共享核心里的 thread-scoped queue / delivery batch。
    - 但就“第二个 client 能否续跑同一 live thread”这一核心能力而言，不需要 heartbeat 或 Desktop 那套 bridge 结构。
+
+## 实验 RPC 依赖面
+
+### 当前 PoC 实际依赖
+
+当前 PoC 在 `initialize` 时显式声明：
+
+```text
+capabilities.experimentalApi = true
+```
+
+并使用了以下 RPC：
+
+- 关键能力：
+  - `thread/resume`
+  - `turn/start`
+  - `turn/started`
+  - `turn/completed`
+- 可选优化：
+  - `turn/steer`
+- 仅用于 PoC 验证，不应作为第一版正式依赖：
+  - `thread/start`
+  - `item/completed`
+
+### 第一版要求
+
+- 启动时必须做 capability probe。
+- 如果缺少 `thread/resume` 或 `turn/start`，CLI adapter 必须 fail-closed。
+- 如果缺少 `turn/steer`，CLI adapter 仍可工作，但只能在 caller idle 时投递。
+- 不能把 PoC 中碰巧可用的实验 RPC 直接当成长期稳定契约。
 
 ## 已实证支持的关键能力
 
@@ -159,6 +190,43 @@ PoC 流程：
 - steer 也不会导致当前 turn 提前 `turn/completed`
 - 最终结果会吸收 steer 的后续指令
 
+但要注意：
+
+- 这个 PoC 只覆盖了一个很窄的场景：
+  - regular turn
+  - `sleep 10`
+  - `approvalPolicy: never`
+  - 无网络 I/O
+- 因此它只能支持“`turn/steer` 可作为受限优化”。
+- 它不足以支持“任何 active turn 都默认优先 steer”的更强结论。
+
+## 投递策略
+
+CLI adapter 不直接按单 job 投递，而是消费共享核心为每个 thread 生成的 `delivery batch`。
+
+### 默认策略
+
+- 同一 `source_thread_id` 只允许一个 in-flight delivery attempt。
+- ready jobs 先进入 thread-scoped FIFO 队列。
+- daemon 对同一 thread 上的相邻 jobs 做 batch 合并。
+- 默认只在 caller thread idle 时使用：
+
+```text
+thread/resume + turn/start
+```
+
+### `turn/steer` 的策略
+
+- `turn/steer` 是可选优化，不是默认主路径。
+- 只有在以下条件同时满足时才允许使用：
+  - capability probe 明确支持
+  - 当前 caller turn 仍处于 active regular turn
+  - 当前 batch 是只读投递，不依赖审批
+  - 当前 batch 不需要网络 I/O
+  - 当前 batch 足够小
+  - 当前 thread 未触发最小连续发送间隔限制
+- 不满足上述任一条件时，batch 保持排队，等 caller idle 后再 `turn/start`。
+
 ## 架构结论
 
 CLI 的可行产品化路线是：
@@ -176,6 +244,7 @@ cbth cli run
 - sidecar 不需要 hack TUI 本身
 - sidecar 只需要作为第二个 `app-server` client 操作同一个 thread
 - 这条路不依赖 dynamic tools / automations
+- 但它依赖实验 RPC，因此必须有 capability probe 与 fail-closed 策略
 
 ## 不适用的方案
 
@@ -189,16 +258,19 @@ cbth cli run
 ## 第一版实现建议
 
 1. `cbth cli run` 启动共享 `codex app-server`
-2. `cbth cli run` 启动前台 `codex --remote`
-3. CLI 入口为当前会话保存 `thread_id`
-4. sidecar 监听外部任务状态
-5. 任务 ready 后：
-   - 如果 caller thread idle：`thread/resume + turn/start`
-   - 如果 caller thread active：优先使用 `turn/steer`
-6. 前台 TUI 通过已有线程订阅自然感知新 turn
+2. 启动时对实验 RPC 做 capability probe
+3. `cbth cli run` 启动前台 `codex --remote`
+4. CLI 入口为当前会话保存 `thread_id`
+5. sidecar 从共享核心读取 per-thread `delivery batch`
+6. 任务 ready 后：
+   - 默认只在 caller thread idle 时：`thread/resume + turn/start`
+   - 如果 `turn/steer` 能力存在且满足只读/低风险策略：允许 steer
+7. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
+8. 前台 TUI 通过已有线程订阅自然感知新 turn
 
 ## 仍待补的边界
 
 - CLI 入口的进程生命周期和清理策略
 - sidecar 长时间运行时的状态持久化与 resume 策略
-- 多个 background jobs 同时命中同一 caller thread 时的串行化策略
+- capability probe 的具体实现与版本策略
+- 多个 background jobs 同时命中同一 caller thread 时的串行化与 batch 合并策略

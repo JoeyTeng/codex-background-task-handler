@@ -15,6 +15,22 @@
 - 该 daemon 生命周期独立于单个 Codex 前台实例，但在没有 active jobs 且没有活跃接入端时会自动退出。
 - 第一版稳定外部接口只做 CLI，不承诺公开 socket / Web / plugin 协议。
 - 因此，之前设计里提到的 `background-taskctl` helper，应收敛成主 binary 的 `cbth job ...` 子命令，而不是第二个长期维护的独立工具。
+- 经过 reviewer 复核后，Desktop 关键路径又做了一个更保守的收口：
+  - 不再把“heartbeat turn 稳定执行本地 `cbth ...` CLI”当作既定前提
+  - 改为优先使用只读 inbox snapshot / artifact 文件
+- 同时，CLI 关键路径也收口为：
+  - 明确依赖实验 RPC
+  - 启动时 capability probe
+  - 默认仅在 idle 时 `turn/start`
+  - `turn/steer` 只作为只读、低风险场景下的受限优化
+- 共享核心也补上了 reviewer 指出的 thread 级缺口：
+  - 引入 thread-scoped FIFO 队列
+  - 引入 `delivery batch`
+  - 引入最小连续发送间隔
+  - 同一 thread 同时最多一个 in-flight delivery attempt
+- 结果保留责任也已收敛：
+  - `cbth job complete --result-file <path>` 的语义改为 ingest/copy 到 `cbth` 自己管理的 artifact store
+  - 原始外部文件不再承担长期保留责任
 - 这套共通核心设计已单独沉淀在：
   - `docs/SHARED_CORE_ARCHITECTURE.md`
 
@@ -119,12 +135,13 @@ scripts/desktop_thread_inject_poc.py
 - Desktop 方向的技术方案已经收敛为：
   - 外部 `sidecar supervisor` 跑长任务
   - 共享 `job state` 作为 bridge / caller 读取面
-  - 固定 `bridge heartbeat thread` 负责轮询 ready job
+  - 固定 `bridge heartbeat thread` 负责轮询可投递 thread / batch
   - bridge 通过内建 `automation_update` 为 caller thread 创建、激活、更新或重定向 heartbeat
-  - caller thread 被唤醒后消费结果、继续原任务，并清理自己的 heartbeat
+  - caller thread 被唤醒后读取只读 inbox snapshot、消费结果、继续原任务
 - 该方案不依赖：
   - 外部 live push 当前 Desktop thread
   - 外部直接改 Codex automation DB
+  - 后台 heartbeat 稳定执行本地 CLI
   - notification thread
 - 独立设计文档已记录在：
   - `docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md`
@@ -134,6 +151,7 @@ scripts/desktop_thread_inject_poc.py
 - 当前 CLI TUI 不能直接复用 Desktop 的 `automation_update` / heartbeat bridge 方案。
 - 这不是推断，而是 TUI 自身对 `ServerRequest::DynamicToolCall` 直接返回 unsupported；对应单测名字就是 `rejects_dynamic_tool_calls_as_unsupported`，文案为 `Dynamic tool calls are not available in TUI yet.`。
 - 因此，CLI 方向仍应以 `wrapper + shared app-server + sidecar` 作为主方案。
+- 但 reviewer 指出了一个重要约束：这条路线实际建立在实验 RPC 上，因此文档已进一步收口为“必须 capability probe + fail-closed”，不能把当前 PoC 可用的所有 RPC 都当成长期稳定契约。
 - 已新增一个最小 CLI 正向 PoC：
   - `scripts/cli_shared_app_server_poc.mjs`
   - 使用本机安装的 `codex app-server --listen ws://127.0.0.1:4311`
@@ -184,6 +202,7 @@ scripts/desktop_thread_inject_poc.py
   - steer 不会额外开启一个新 turn
   - steer 之后原 turn 继续运行并正常 `turn/completed`
   - steer 内容会被最终 assistant 结果吸收
+- 但 reviewer 也指出：当前 steer PoC 只覆盖了无审批、无网络、固定 `sleep 10` 的窄场景，因此设计已进一步收口为“`turn/steer` 只作为只读、低风险投递场景下的可选优化”，而不是一般性的默认主路径。
 - 第一轮同类实测还从 rollout 侧拿到了更底层的补充证据：
   - 模型实际发起了 `exec_command: sleep 10`
   - steer 文本作为新的 user message 被写入同一个 rollout
