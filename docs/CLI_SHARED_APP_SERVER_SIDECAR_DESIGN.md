@@ -61,14 +61,41 @@ codex --remote-auth-token-env CBTH_REMOTE_AUTH_TOKEN --remote ws://127.0.0.1:<po
 - 因此，第一版不应把“本机 loopback 默认可信”当成唯一安全前提。
 - 第一版推荐的最小安全边界是：
   - shared `app-server` 只监听 `127.0.0.1` / `localhost`
-  - wrapper 为每次会话生成一枚新的 bearer token
+  - daemon 为每次 managed session 生成一枚新的 bearer token
+  - token 必须落在 session-scoped token file，权限至少 `0600`
   - app-server 以 websocket auth 模式启动
   - 前台 `codex --remote` 通过 `--remote-auth-token-env` 读取同一 token
   - sidecar client 也使用同一 token
+- token 生命周期合同：
+  - 每个 managed CLI session 一枚独立 token
+  - session 结束后立即作废
+  - wrapper 自己的环境不长期保留 token
+  - 不把 token 写入持久日志或 thread 历史
+- 信任边界合同：
+  - bearer token 主要防护“无关的本地进程/旧会话”误连 shared `app-server`
+  - 由当前前台 Codex session 自己启动的命令，如果继承了同一进程环境，则视为同一 trust domain，而不是额外隔离边界
 - 如果当前运行环境无法同时满足：
   - loopback-only 监听
   - bearer token 注入
   则第一版实现应 fail-closed，而不是退化成长期开放的本地 websocket 控制面。
+
+## Shared App-Server 所有权
+
+- shared `app-server` 不应只是前台 `cbth cli run` 的短生命周期子进程。
+- 第一版应把它建模成：
+  - daemon-owned managed session process
+  - 前台 `codex --remote` 和 sidecar 都只是这个 session process 的 client
+- 这样当：
+  - 前台 TUI 退出
+  - 但 active jobs 仍存在
+  时，daemon 仍可保留：
+  - shared `app-server`
+  - sidecar session metadata
+  - 当前 thread 的 live continuation 能力
+- 当同时满足以下条件时，daemon 才允许清理该 managed session：
+  - 没有 active jobs
+  - 没有连接中的 foreground client
+  - 没有需要继续投递的 sidecar client
 
 ## 实验 RPC 依赖面
 
@@ -313,18 +340,19 @@ cbth cli run
 
 ## 第一版实现建议
 
-1. `cbth cli run` 启动共享 `codex app-server`
+1. daemon 创建或恢复一个 managed CLI session
+2. daemon 为该 session 启动共享 `codex app-server`
    - 监听 loopback
    - 启用 websocket bearer-token auth
-2. 启动时对实验 RPC 做 capability probe
-3. `cbth cli run` 启动前台 `codex --remote --remote-auth-token-env ...`
-4. CLI 入口为当前会话保存 `thread_id`
-5. sidecar 从共享核心读取 per-thread `delivery batch`
-6. 任务 ready 后：
+3. 启动时对实验 RPC 做 capability probe
+4. `cbth cli run` 连接该 managed session，并启动前台 `codex --remote --remote-auth-token-env ...`
+5. CLI 入口为当前会话保存 `thread_id`
+6. sidecar 从共享核心读取 per-thread `delivery batch`
+7. 任务 ready 后：
    - 默认只在 caller thread idle 时：`thread/resume + turn/start`
    - 只有显式打开 steer feature flag，且 `turn/steer` 能力存在并满足只读/低风险策略时：允许 steer
-7. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
-8. 前台 TUI 通过已有线程订阅自然感知新 turn
+8. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
+9. 前台 TUI 通过已有线程订阅自然感知新 turn
 
 ## 仍待补的边界
 

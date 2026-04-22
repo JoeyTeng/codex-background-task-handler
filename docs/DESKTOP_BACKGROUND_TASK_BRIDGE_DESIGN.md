@@ -39,10 +39,11 @@
      - `~/.cbth/inbox/ready-threads.json`
      - `~/.cbth/inbox/by-thread/<thread_id>.json`
      - `~/.cbth/artifacts/<artifact_id>/manifest.json`
-   - `helper_cli_read` 建议提供一个窄 helper：
+   - `helper_cli_read` 建议提供一组窄 helper：
 
 ```text
 cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
+cbth desktop read-artifact --artifact-id <artifact_id> --json
 ```
 
    - 底层仍可用 SQLite / 普通文件 / `mmap`，但这属于内部实现细节。
@@ -158,9 +159,24 @@ fallback:  cbth desktop read-envelope --source-thread-id <thread_id> --expected-
    - 任一不一致都视为 stale wake，立即退出
    - 读取 batch 摘要
    - 对小结果可直接读取 inline payload
-   - 对大结果读取 `cbth` 管理的 artifact 路径
+   - 对大结果：
+     - `direct_file_read` 路径下读取 `cbth` 管理的 artifact 路径
+     - `helper_cli_read` 路径下调用：
+
+```text
+cbth desktop read-artifact --artifact-id <artifact_id> --json
+```
+
    - 在原 caller thread 中继续后续工作
-4. 第一版不要求 caller 在关键路径上写回 `consumed`；批次的 retention、redelivery 与 GC 由 `cbth` 自己管理。
+4. caller 成功读取当前 envelope 后，必须调用一个窄 helper：
+
+```text
+cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
+```
+
+5. 这一步负责把当前 batch durable 关闭到：
+   - `close_reason=caller_acknowledged`
+   - 并停止该 head batch 的自动重投
 
 ## 最小状态机
 
@@ -238,7 +254,9 @@ fallback:  cbth desktop read-envelope --source-thread-id <thread_id> --expected-
 
 ```text
 cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
+cbth desktop read-artifact --artifact-id <artifact_id> --json
 cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
+cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
 ```
 
 这样 bridge prompt 和 caller prompt 都可以很短，而且不需要知道底层 store 是 SQLite、普通文件还是 `mmap`。
@@ -284,8 +302,9 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 
 - 先读取自己的 per-thread delivery envelope。
 - 只处理当前 envelope 指向的 head batch。
-- 对小结果可以直接读取 inline payload；对大结果读取 `cbth` 管理的 artifact。
-- 任务处理完成后可以清理或暂停当前 heartbeat，但不要求在关键路径上回写 `consumed`。
+- 对小结果可以直接读取 inline payload；对大结果通过当前 transport 读取 artifact 内容。
+- 成功读取当前 envelope 后，必须调用 `cbth desktop note-delivered ...`，把当前 batch durable 关闭为 `caller_acknowledged`，从而停止自动 redelivery。
+- 任务处理完成后可以清理或暂停当前 heartbeat，但不要求做更细粒度的 per-job `consumed` 记账。
 - 旧 generation 的 prompt 只允许 no-op，不允许“顺手处理当前 head batch”。
 - 读取传输由 binding 预先决定：
   - `direct_file_read`
@@ -308,10 +327,13 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
   - `cancelled`
   - `redelivery_window_exhausted`
   - `max_attempts_exhausted`
-  - `caller_acknowledged` (future optional)
+  - `caller_acknowledged`
 - 也就是说，Desktop 第一版的自动续跑语义是：
   - `at-least-once wakeup scheduling`
   - not `exactly-once consumption`
+- 但一旦 caller 已成功执行 `cbth desktop note-delivered ...`，该 head batch 就必须自动进入：
+  - `close_reason=caller_acknowledged`
+  - 不再继续 redelivery
 
 ## 失败与重试
 
@@ -341,13 +363,38 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 - `cbth` 通过保留 batch、cooldown 与 redelivery timeout 决定是否再次 arm。
 - 如果 `cooldown_until` 到期后，该 batch 仍然是当前 head batch，且 `close_reason` 仍为空、`now < redelivery_window_ends_at`、并且 `delivery_attempt_count < max_delivery_attempts`，就应该创建新 attempt 并再次 arm，而不是把旧 attempt 直接视为成功送达。
 
+### Caller 已读到 envelope，但 `note-delivered` 失败
+
+- 这条路径不能回退成“继续自动 redelivery”，否则会把重复续跑重新变成默认行为。
+- 因此，如果 caller 已成功读取 envelope，但 `cbth desktop note-delivered ...` 失败：
+  - 当前 binding 必须进入 `degraded`
+  - 当前 attempt 必须收敛到 `abandoned`
+  - 当前 head batch 保持未关闭
+  - bridge 不再继续自动 redelivery，等待 operator 恢复
+
+### Binding degraded
+
+- `binding_state=degraded` 表示该 thread 暂时失去自动续跑能力，但 job / artifact 仍可继续累积。
+- degraded 之后：
+  - bridge 不得再为该 thread 自动 arm caller heartbeat
+  - 当前 in-flight attempt 必须收敛到 `abandoned`
+  - 当前 head batch 保持未关闭
+  - 调度器只保留结果与元数据，不继续自动 redelivery
+- operator 完成重新验证后，binding 才允许从 `degraded` 回到 `bound`。
+
 ## Bootstrap 约束
 
 - Desktop 第一版不是零配置 attach。
 - 一个 caller thread 要支持自动续跑，必须先完成 bootstrap：
-  - 创建一个 paused caller heartbeat automation
+  - 创建或接管一个 caller heartbeat automation
   - 把该 `caller_automation_id` durable 绑定到 `source_thread_id`
   - 为该 thread 选择 `read_transport`
+- bootstrap 不能只相信一次 `status=PAUSED` 请求。
+- 由于已观察到“创建时请求 `PAUSED` 但实际落成 `ACTIVE`”的 quirk，bootstrap 必须：
+  - create/update 后立刻读回 automation 状态
+  - 必要时再次 pause/update
+  - 只有在最终状态被验证为 paused 后，binding 才允许进入 `bound`
+- 如果 pause 状态无法被验证，binding 必须保持 `degraded` 或 `unbound`，而不是继续接受自动续跑。
 - 未完成 bootstrap 的 thread 仍可提交 job，但只允许：
   - sidecar 继续跑任务
   - `cbth` 保留结果

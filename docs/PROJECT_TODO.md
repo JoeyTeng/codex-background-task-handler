@@ -22,6 +22,7 @@
   - `source_thread_id`
   - `caller_automation_id`
   - `read_transport`
+  - paused 状态读回校验
 - [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
   - `ready-threads.json`
   - `by-thread/<thread_id>.json`
@@ -31,8 +32,11 @@
   - regular files `0600`
 - [ ] 设计并实现 `helper_cli_read` fallback：
   - `cbth desktop read-envelope --source-thread-id ... --expected-attempt-id ... --expected-generation ... --expected-snapshot-revision ... --json`
+  - `cbth desktop read-artifact --artifact-id ... --json`
 - [ ] 设计并实现 Desktop bridge 的窄写回 helper：
   - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --json`
+- [ ] 设计并实现 caller 成功关闭当前 head batch 的窄 helper：
+  - `cbth desktop note-delivered --source-thread-id ... --attempt-id ... --generation ... --json`
 - [ ] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
 - [ ] 为 Desktop bridge 设计基于只读快照的共享状态面，不把后台 heartbeat 的本地 CLI 执行能力当成前提。
@@ -51,6 +55,10 @@
   - optional `automation_id`
   - stale wake no-op 规则
 - [ ] 明确 Desktop 第一版的 `close_reason` / redelivery window contract，保证 `closed` 只表示停止自动重投，而不是隐含“caller 已消费”。
+- [ ] 明确 `binding_state=degraded` 的收敛与恢复规则：
+  - degraded 后 bridge 不再自动 arm
+  - 当前 attempt 收敛到 `abandoned`
+  - operator 验证后才允许恢复 `bound`
 - [ ] 为 batch durable schema 增补：
   - `redelivery_window_ends_at`
   - `max_delivery_attempts`
@@ -69,6 +77,12 @@
   - loopback-only listener
   - per-session bearer token
   - `--remote-auth-token-env` 注入前台 TUI
+  - `0600` token file
+  - session-end revocation
+- [ ] 为 CLI 的 daemon-owned managed session 设计并实现：
+  - shared `app-server` 归 daemon 持有
+  - 前台退出但 active jobs 未结束时继续保活
+  - 后续重连 / resume contract
 - [ ] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
   - 基于 `turn/started` / `turn/completed` / `thread/status/changed`
   - `turn/start` race 失败后回到等待下一个 idle

@@ -26,6 +26,7 @@
   - 明确依赖实验 RPC
   - 启动时 capability probe
   - 默认使用 loopback-only shared `app-server` + per-session bearer-token auth
+  - shared `app-server` 由 daemon 持有，而不是前台 wrapper 临时持有
   - 默认仅在 idle 时 `turn/start`
   - `turn/steer` 只作为只读、低风险场景下的受限优化
 - 共享核心也补上了 reviewer 指出的 thread 级缺口：
@@ -44,6 +45,9 @@
 - Desktop 运行期还新增了一条窄控制面：
   - `cbth desktop note-arm ...`
   - 用于在 bridge 成功 `automation_update` 后，把 attempt durable 推进到 `armed`
+- 同时又补上了 caller 成功分支：
+  - `cbth desktop note-delivered ...`
+  - 用于在 caller 成功读取当前 envelope 后，把 head batch 自动关闭到 `caller_acknowledged`
 - CLI 侧 reviewer 指出的 idle/race 缺口也已收口：
   - idle 必须来自 app-server live event stream
   - `turn/start` 失败要被当成 benign race，回到等待下一个 idle，而不是视为成功送达
@@ -53,9 +57,18 @@
   - artifact GC 也被绑定到 batch 终态与最小保留窗口，而不是外部临时文件生命周期
 - 但 reviewer 第二轮指出，设计还没有完全闭环；当前剩余的是 contract 细化和实证，不再是路线选择问题。
 - 上游 CLI/shared app-server 侧也确认存在现成的 websocket auth 能力与 `--remote-auth-token-env` 接口，因此 CLI 第一版不需要把“本机 loopback 默认可信”当成唯一安全前提。
+- CLI token 合同也已收口：
+  - per-session token
+  - `0600` token file
+  - session 结束即作废
+  - 当前前台 Codex session 自己启动的命令仍视为同一 trust domain
 - `~/.cbth` 的 Desktop 侧文件路径也新增了权限合同：
   - directory `0700`
   - file `0600`
+- Desktop bootstrap 合约也已收紧：
+  - 不能只相信一次 `PAUSED` 创建请求
+  - 必须 create/update 后读回验证 paused 状态
+  - 否则 binding 不能进入 `bound`
 - 这套共通核心设计已单独沉淀在：
   - `docs/SHARED_CORE_ARCHITECTURE.md`
 

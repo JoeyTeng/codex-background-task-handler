@@ -123,6 +123,7 @@
 
 ```text
 cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
+cbth desktop read-artifact --artifact-id <artifact_id> --json
 ```
 
 两种传输必须返回同一个 envelope schema。
@@ -184,7 +185,7 @@ cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id 
 这是端侧专属层，但依赖同一套共享核心：
 
 - CLI adapter：
-  - shared `app-server`
+  - daemon-owned shared `app-server`
   - `codex --remote`
   - capability probe
   - idle 时 `thread/resume + turn/start`
@@ -227,6 +228,11 @@ cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id 
 - Desktop 自动续跑只对 `binding_state=bound` 的 thread 生效。
 - `unbound` thread 可以继续提交 job，但 bridge 不得尝试自动 arm caller heartbeat。
 - 运行期 bridge 不负责发现新的 caller automation id；第一版要求这个 id 通过 bootstrap 预先 durable 绑定。
+- `degraded` 表示该 thread 暂时失去自动续跑能力：
+  - bridge 不再自动 arm
+  - 当前 attempt 必须收敛到 `abandoned`
+  - 当前 head batch 保持未关闭，等待 operator 恢复或人工处理
+- 如果 caller 已成功读取 envelope，但 `cbth desktop note-delivered ...` 失败，也必须走同一条 `degraded` 收敛路径，而不是继续自动 redelivery。
 
 ### 10. `long-run task runners`
 
@@ -528,6 +534,15 @@ cooldown -> superseded
   - arm 成功 -> attempt 进入 `cooldown`
   - `cooldown_until` 到期后，如果该 batch 仍是 head、`now < redelivery_window_ends_at`、且 `delivery_attempt_count < max_delivery_attempts` -> 创建新 attempt 并再次 arm
   - 只有在 operator 关闭、batch 被 supersede、caller 明确回写成功、或 redelivery window 结束时，batch 才进入 `closed`
+- caller 的“明确回写成功”在第一版里应实现为一个窄 helper：
+
+```text
+cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
+```
+
+- 一旦该 helper 成功，当前 head batch 必须自动进入：
+  - `close_reason=caller_acknowledged`
+  - 不再继续 redelivery
 
 ## 第一版稳定外部接口
 
@@ -620,6 +635,11 @@ cbth job query <job_id> --json
 - 但 Desktop adapter 可以依赖两类窄接口：
   - `helper_cli_read`：只读 envelope/helper
   - `cbth desktop note-arm ...`：bridge 成功 arm 后的窄写回
+- 第一版如果不用 `direct_file_read`，则 helper 链路必须是完整可用的：
+  - `cbth desktop read-envelope ...`
+  - `cbth desktop read-artifact ...`
+  - `cbth desktop note-arm ...`
+  - `cbth desktop note-delivered ...`
 - 当前首选路径是：
   - bridge heartbeat 只读 `ready-threads.json`
   - caller heartbeat 通过 `direct_file_read` 读取自己的 per-thread envelope 与 artifact
