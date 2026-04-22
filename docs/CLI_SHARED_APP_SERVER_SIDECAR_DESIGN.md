@@ -105,6 +105,55 @@ TUI_SIDECAR_MARKER_20260422
 
 这一步把结论从“协议层前台 client 能收到通知”进一步推进到了“真实前台 TUI 会把 sidecar 触发的新 turn 展示给用户”。
 
+### 3. Active turn 可以被 `turn/steer`，且不会提前结束
+
+针对 active-turn 边界，新增了最小 PoC：
+
+```text
+scripts/cli_turn_steer_poc.mjs
+```
+
+PoC 流程：
+
+1. frontend client 连接共享 `app-server`
+2. frontend 创建 thread
+3. frontend 启动一个会调用 shell `sleep 10` 的 regular turn
+4. 在该 turn 已经 `turn/started` 且仍处于 active 状态时
+5. sidecar client 对同一 thread 调用 `turn/steer`
+6. 等待原 turn 正常完成，并检查：
+   - steer 返回的是否还是同一个 `turn_id`
+   - steer 后是否没有额外新 turn 被启动
+   - 原 turn 是否继续完成而不是被提前截断
+   - 最终 assistant 文本是否吸收 steer 指令
+
+已验证结果：
+
+- `thread_id = 019db65d-2df2-7941-8871-b8ed1fe0b73b`
+- `turn_id = 019db65d-2e9c-7ff2-9690-f84b725a9a12`
+- `same_turn_id_after_steer = true`
+- `turn_completed_same_turn = true`
+- `turn_status = completed`
+- `turn_started_notification_count = 1`
+- `no_additional_turn_started = true`
+- `notifications_have_command_execution = true`
+- `final_agent_message_from_notifications = CLI_TURN_STEER_APPLIED_MARKER_20260422`
+- `final_message_matches_steer_via_notifications = true`
+- `no_premature_completion_signal = true`
+
+观测到的关键时序：
+
+- 原 turn 总耗时约 `24.8s`
+- steer 发生在完成前约 `23.3s`
+- steer 之后没有出现新的 `turn/started`
+- 原 turn 最终以同一个 `turn_id` 正常完成
+
+这说明：
+
+- `turn/steer` 在 CLI shared `app-server` 路线下可以安全落在同一个 active regular turn 上
+- steer 不会把当前 turn 直接截断成一个新的 turn
+- steer 也不会导致当前 turn 提前 `turn/completed`
+- 最终结果会吸收 steer 的后续指令
+
 ## 架构结论
 
 CLI 的可行产品化路线是：
@@ -140,12 +189,11 @@ wrapper
 4. sidecar 监听外部任务状态
 5. 任务 ready 后：
    - 如果 caller thread idle：`thread/resume + turn/start`
-   - 如果 caller thread active：后续再补 `turn/steer` 边界处理
+   - 如果 caller thread active：优先使用 `turn/steer`
 6. 前台 TUI 通过已有线程订阅自然感知新 turn
 
 ## 仍待补的边界
 
-- `turn/steer` 在 caller thread 仍处于 active turn 时的行为
 - wrapper 的进程生命周期和清理策略
 - sidecar 长时间运行时的状态持久化与 resume 策略
 - 多个 background jobs 同时命中同一 caller thread 时的串行化策略

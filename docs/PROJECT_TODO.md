@@ -23,4 +23,4 @@
 - [x] 验证真实前台 `codex --remote` TUI 在 PTY 中是否会把 sidecar 触发的新 turn 展示给用户。
 - [x] 单独沉淀 CLI shared `app-server` + sidecar 技术方案文档。
 - [ ] 为 CLI 设计最小 wrapper 进程模型：shared `app-server`、前台 `codex --remote`、sidecar、以及清理策略。
-- [ ] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为。
+- [x] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为，且不会导致当前 turn 提前结束。

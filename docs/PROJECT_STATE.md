@@ -148,3 +148,29 @@ scripts/desktop_thread_inject_poc.py
 - 因此，CLI 方向的结论已经不只是“协议层上的前台 client 会收到通知”，而是“真实前台 TUI 会把 sidecar 触发的新 turn 展示给用户”。
 - 独立设计文档已记录在：
   - `docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md`
+- 又补做了 active-turn `turn/steer` 的定点 PoC，用来验证“caller thread 还在 running 时，sidecar 能否把同一个 turn steer 下去，而且不会让 turn 提前结束”。
+- 新脚本位于：
+  - `scripts/cli_turn_steer_poc.mjs`
+- PoC 通过共享 `codex app-server` 启动一个 regular turn，并明确让模型使用 shell 执行 `sleep 10`。
+- 在该 turn 仍处于 active 状态时，第二个 sidecar client 对同一 thread 调用 `turn/steer`。
+- 第二轮实测结果：
+  - `thread_id = 019db65d-2df2-7941-8871-b8ed1fe0b73b`
+  - `turn_id = 019db65d-2e9c-7ff2-9690-f84b725a9a12`
+  - `same_turn_id_after_steer = true`
+  - `turn_completed_same_turn = true`
+  - `turn_status = completed`
+  - `turn_started_notification_count = 1`
+  - `no_additional_turn_started = true`
+  - `notifications_have_command_execution = true`
+  - `final_agent_message_from_notifications = CLI_TURN_STEER_APPLIED_MARKER_20260422`
+  - `final_message_matches_steer_via_notifications = true`
+  - `no_premature_completion_signal = true`
+- 这说明：
+  - sidecar 对 active caller turn 使用 `turn/steer` 时，server 接受的是同一个 `turn_id`
+  - steer 不会额外开启一个新 turn
+  - steer 之后原 turn 继续运行并正常 `turn/completed`
+  - steer 内容会被最终 assistant 结果吸收
+- 第一轮同类实测还从 rollout 侧拿到了更底层的补充证据：
+  - 模型实际发起了 `exec_command: sleep 10`
+  - steer 文本作为新的 user message 被写入同一个 rollout
+  - 最终 `agent_message` 与 `task_complete.last_agent_message` 都是 `CLI_TURN_STEER_APPLIED_MARKER_20260422`

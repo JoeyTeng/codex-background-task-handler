@@ -43,6 +43,8 @@ The current CLI shared-server PoC is [scripts/cli_shared_app_server_poc.mjs](scr
 
 In addition to the protocol-level PoC, the shared-server CLI route has also been validated against a real foreground TUI session running through `codex --remote`, confirming that the user-facing TUI output reflects the sidecar-triggered turn.
 
+The current CLI active-turn steering PoC is [scripts/cli_turn_steer_poc.mjs](scripts/cli_turn_steer_poc.mjs). It starts a long-running turn, submits `turn/steer` from a second client while that turn is still active, and validates that the same turn completes normally instead of ending early.
+
 ## Planned Implementation Direction
 
 This repo is expected to grow in two layers:
