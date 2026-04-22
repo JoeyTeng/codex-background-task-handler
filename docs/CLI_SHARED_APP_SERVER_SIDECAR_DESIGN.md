@@ -27,14 +27,19 @@
    - 例如可表现为：
 
 ```text
-codex app-server --listen ws://127.0.0.1:<port>
+codex app-server --listen ws://127.0.0.1:<port> --ws-auth capability-token --ws-token-file <token-file>
 ```
+
+第一版安全边界必须再加两条：
+
+- 只绑定 loopback 地址，不允许监听非本机可达地址。
+- 默认启用 websocket bearer-token auth，而不是把本地 loopback 当成唯一控制面。
 
 2. `foreground TUI`
    - 使用原生 Codex TUI，通过 `--remote` 连接共享 `app-server`：
 
 ```text
-codex --remote ws://127.0.0.1:<port>
+codex --remote-auth-token-env CBTH_REMOTE_AUTH_TOKEN --remote ws://127.0.0.1:<port>
 ```
 
 3. `sidecar client`
@@ -44,6 +49,26 @@ codex --remote ws://127.0.0.1:<port>
 4. `optional shared job state`
    - sidecar 不直接从外部任务脚本拿结果，而是消费共享核心里的 thread-scoped queue / delivery batch。
    - 但就“第二个 client 能否续跑同一 live thread”这一核心能力而言，不需要 heartbeat 或 Desktop 那套 bridge 结构。
+
+## 本地信任边界
+
+- 上游 `app-server` 现在已经支持 websocket auth：
+  - `--ws-auth capability-token --ws-token-file <path>`
+  - `--ws-auth capability-token --ws-token-sha256 <hex>`
+  - `--ws-auth signed-bearer-token --ws-shared-secret-file <path>`
+- 上游 `codex --remote` 也支持：
+  - `--remote-auth-token-env <ENV_VAR>`
+- 因此，第一版不应把“本机 loopback 默认可信”当成唯一安全前提。
+- 第一版推荐的最小安全边界是：
+  - shared `app-server` 只监听 `127.0.0.1` / `localhost`
+  - wrapper 为每次会话生成一枚新的 bearer token
+  - app-server 以 websocket auth 模式启动
+  - 前台 `codex --remote` 通过 `--remote-auth-token-env` 读取同一 token
+  - sidecar client 也使用同一 token
+- 如果当前运行环境无法同时满足：
+  - loopback-only 监听
+  - bearer token 注入
+  则第一版实现应 fail-closed，而不是退化成长期开放的本地 websocket 控制面。
 
 ## 实验 RPC 依赖面
 
@@ -223,9 +248,12 @@ thread/resume + turn/start
 - 只有在以下条件同时满足时才允许使用：
   - capability probe 明确支持
   - 当前 caller turn 仍处于 active regular turn
-  - 当前 batch 是只读投递，不依赖审批
-  - 当前 batch 不需要网络 I/O
-  - 当前 batch 足够小
+  - 当前 batch 的 `delivery_read_only=true`
+  - 当前 batch 的 `delivery_requires_approval=false`
+  - 当前 batch 的 `delivery_requires_network=false`
+  - 当前 batch 的 `delivery_requires_write_access=false`
+  - 当前 batch 的 `steer_candidate=true`
+  - 当前 batch 的 `inline_payload_bytes` 没超过 CLI adapter 的 steer 上限
   - 当前 thread 未触发最小连续发送间隔限制
 - 不满足上述任一条件时，batch 保持排队，等 caller idle 后再 `turn/start`。
 
@@ -260,8 +288,10 @@ cbth cli run
 ## 第一版实现建议
 
 1. `cbth cli run` 启动共享 `codex app-server`
+   - 监听 loopback
+   - 启用 websocket bearer-token auth
 2. 启动时对实验 RPC 做 capability probe
-3. `cbth cli run` 启动前台 `codex --remote`
+3. `cbth cli run` 启动前台 `codex --remote --remote-auth-token-env ...`
 4. CLI 入口为当前会话保存 `thread_id`
 5. sidecar 从共享核心读取 per-thread `delivery batch`
 6. 任务 ready 后：

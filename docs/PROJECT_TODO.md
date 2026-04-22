@@ -26,12 +26,20 @@
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
 - [ ] 为 Desktop bridge 设计基于只读快照的共享状态面，不把后台 heartbeat 的本地 CLI 执行能力当成前提。
 - [ ] 为共享核心设计 thread-scoped FIFO 队列、batch 合并规则和最小连续发送间隔。
+- [ ] 为共享核心落地可机判的 delivery policy 字段，至少包括：
+  - `delivery_read_only`
+  - `delivery_requires_approval`
+  - `delivery_requires_network`
+  - `delivery_requires_write_access`
+  - `inline_payload_bytes`
+  - `steer_candidate`
 - [ ] 实现 durable delivery-attempt 合约：
   - `batch_id`
   - `attempt_id`
   - `generation`
-  - `automation_id`
+  - optional `automation_id`
   - stale wake no-op 规则
+- [ ] 明确 Desktop 第一版的 `close_reason` / redelivery window contract，保证 `closed` 只表示停止自动重投，而不是隐含“caller 已消费”。
 - [ ] 用 Rust 实现 managed artifact store，并把 `cbth job complete --result-file <path>` 定义成 ingest/copy 语义。
 - [ ] 实现 artifact retention / GC contract：
   - `min_artifact_ttl = 24h`
@@ -42,6 +50,10 @@
 - [x] 验证真实前台 `codex --remote` TUI 在 PTY 中是否会把 sidecar 触发的新 turn 展示给用户。
 - [x] 单独沉淀 CLI shared `app-server` + sidecar 技术方案文档。
 - [ ] 为 CLI 设计最小 `cbth cli run` 进程模型：shared `app-server`、前台 `codex --remote`、sidecar、以及清理策略。
+- [ ] 把 CLI 第一版的 shared `app-server` 安全边界定死为：
+  - loopback-only listener
+  - per-session bearer token
+  - `--remote-auth-token-env` 注入前台 TUI
 - [x] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为，且不会导致当前 turn 提前结束。
 - [ ] 为 CLI adapter 明确定义实验 RPC 的最小能力集、capability probe 和 fail-closed 策略。
 - [ ] 把 `turn/steer` 维持为默认关闭的 gated optimization，并明确不满足条件时的 idle-only fallback。

@@ -104,7 +104,7 @@ bridge heartbeat 每分钟醒一次：
      - `snapshot_path`
    - `cbth` durable 记录：
      - `head_attempt_id`
-     - `automation_id`
+     - `automation_id` (if observable)
      - `last_delivery_attempt_at`
 
 ### 3. caller thread 被唤醒
@@ -170,7 +170,7 @@ caller thread heartbeat 在下一次调度中醒来：
   - `batch_id`
   - `attempt_id`
   - `generation`
-  - `automation_id`
+  - `automation_id` (optional)
   - `snapshot_path`
   - `delivery_deadline`
   - `cooldown_until`
@@ -178,6 +178,12 @@ caller thread heartbeat 在下一次调度中醒来：
 - caller prompt 中必须显式携带 `batch_id + attempt_id + generation`。
 - caller 读取 snapshot 后，必须先比较这三者；只要 mismatch 就立即 no-op。
 - 同一 thread 上出现新的 generation 后，所有旧 heartbeat prompt 都只能看到 mismatch，不得重复消费当前 head batch。
+- 第一版不要求 `cbth` 在关键路径上同步拿到 `automation_id`。
+- 对第一版来说：
+  - `attempt_id + generation + snapshot header` 才是防止 stale wake 的硬约束
+  - `automation_id` 只是 bridge 侧可选的协调/诊断信息
+  - 如果 bridge 在 turn 内能直接拿到 `automation_update` 返回的 id，可以 best-effort 记录
+  - 如果拿不到，也不影响 stale-wake no-op 与 supersede 规则成立
 
 ## 共享状态面的推荐接口
 
@@ -229,11 +235,11 @@ caller thread heartbeat 在下一次调度中醒来：
 - 没有 ready thread 就立即结束。
 - 有 ready thread 时，只为对应 caller thread 武装 heartbeat，不直接展开主任务。
 - 避免创建重复 automation。
-- arm 完成后可把 `automation_id` 写进 prompt / automation metadata，但不要求在关键路径上调用外部 helper。
+- arm 完成后如果能直接拿到 `automation_id`，可以把它写进 prompt / automation metadata 作为协调信息；拿不到时也不能阻塞关键路径。
 - bridge arm 的 durable 完成条件是：
   - attempt 已存在
-  - `automation_id` 已与该 attempt 绑定
   - snapshot 已物化
+  - 当前 generation 的 caller heartbeat arm 请求已被 Codex 接受
 
 ### Caller prompt 要求
 
@@ -242,6 +248,27 @@ caller thread heartbeat 在下一次调度中醒来：
 - 对小结果可以直接读取 inline payload；对大结果读取 `cbth` 管理的 artifact。
 - 任务处理完成后可以清理或暂停当前 heartbeat，但不要求在关键路径上回写 `consumed`。
 - 旧 generation 的 prompt 只允许 no-op，不允许“顺手处理当前 head batch”。
+
+## Delivery 关闭语义
+
+- Desktop 第一版的目标不是“精确证明 caller 已消费”，而是“在 batch 仍为 head 且允许重投时，至少安排一次 wakeup，并在必要时重投”。
+- 因此：
+  - `armed` 表示 bridge 已成功为 caller 安排了一次 heartbeat wakeup
+  - `cooldown` 表示 `cbth` 正在等待这次 wakeup 的最短观察窗口
+  - `closed` 表示 `cbth` 不会再自动为这个 batch 重新 arm heartbeat
+- `closed` 不是以下任一命题的证明：
+  - caller 一定读取了 snapshot
+  - caller 一定读取了 artifact
+  - caller 一定完成了后续工作
+- 第一版推荐的 `close_reason` 至少包括：
+  - `superseded`
+  - `operator_closed`
+  - `cancelled`
+  - `redelivery_window_exhausted`
+  - `caller_acknowledged` (future optional)
+- 也就是说，Desktop 第一版的自动续跑语义是：
+  - `at-least-once wakeup scheduling`
+  - not `exactly-once consumption`
 
 ## 失败与重试
 
@@ -269,6 +296,7 @@ caller thread heartbeat 在下一次调度中醒来：
 
 - 第一版不依赖 caller 回写失败状态。
 - `cbth` 通过保留 batch、cooldown 与 redelivery timeout 决定是否再次 arm。
+- 如果 `cooldown_until` 到期后，该 batch 仍然是当前 head batch，且 `close_reason` 仍为空、redelivery window 也未结束，就应该创建新 attempt 并再次 arm，而不是把旧 attempt 直接视为成功送达。
 
 ## Artifact 生命周期
 

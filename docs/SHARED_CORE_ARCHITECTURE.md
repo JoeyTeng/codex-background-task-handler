@@ -239,7 +239,11 @@
 - `batch_id`
 - `generation`
 - `state`
-- `automation_id`
+- `automation_id` (optional)
+- `automation_binding_state`
+  - `unknown`
+  - `observed`
+  - `reconciled`
 - `snapshot_path`
 - `snapshot_revision`
 - `delivery_deadline`
@@ -277,9 +281,17 @@
   - `snapshot.attempt_id`
   - `snapshot.generation`
   与 prompt 中的期望值是否完全一致；任一不一致都视为 stale wake，立即退出。
-- `automation_id` 一旦已知，必须 durable 绑定到当前 attempt；重 arm 同一 thread 时只能：
-  - 复用同一个 `automation_id`
-  - 或显式把旧 attempt 标成 `superseded`
+- 第一版 Desktop 路线的 head-batch 安全性不建立在 `automation_id` 必定可同步回填这一前提上。
+- 第一版真正的安全锚点是：
+  - `batch_id`
+  - `attempt_id`
+  - `generation`
+  - `snapshot_revision`
+- `automation_id` 在第一版里只是可选的协调/观测字段：
+  - bridge 如果能直接观察到 `automation_update` 返回值，就写入 attempt
+  - 如果关键路径上拿不到，就允许保持 `null + automation_binding_state=unknown`
+  - 后续如果能通过 automation metadata、operator helper 或诊断流程补齐，再把状态提升为 `observed` 或 `reconciled`
+- 因此，Desktop 第一版的重 arm / supersede / stale-wake 安全性不得依赖 `automation_id` 是否已知。
 - 任何旧 generation 的 heartbeat，即使被延迟触发，也只能看到 mismatch 并 no-op，不得再次消费 head batch。
 
 #### Attempt 迁移
@@ -298,6 +310,8 @@ cooldown -> superseded
 - `closed` 表示 `cbth` 不会再自动重投该 attempt 绑定的 batch。
 - `abandoned` 表示本次投递尝试失败，需要调度器决定是否生成新 attempt。
 - `superseded` 表示同一 thread 上出现了更新 generation 的 attempt，旧 attempt 必须彻底失效。
+- `armed` 只表示一次 wakeup arm 已被 Codex 侧接受，不代表 caller 已实际消费结果。
+- `cooldown` 表示 `cbth` 正在等待这次 wakeup 的最短观察窗口结束；窗口结束后，如果 batch 仍是 head 且仍允许自动重投，就会生成新 attempt，而不是直接把旧 attempt 视为成功关闭。
 
 ### 最小连续发送间隔
 
@@ -366,6 +380,13 @@ cooldown -> superseded
   - `desktop_heartbeat`
   - `cli_turn_start`
   - `cli_turn_steer`
+- `delivery_read_only`
+- `delivery_requires_approval`
+- `delivery_requires_network`
+- `delivery_requires_write_access`
+- `inline_payload_bytes`
+- `artifact_count`
+- `steer_candidate`
 
 ### Delivery batch 状态
 
@@ -425,6 +446,22 @@ cooldown -> superseded
 
 - `closed` 不是“用户一定已经消费”的证明
 - 它只是“`cbth` 不再自动重投该 batch”的 durable 决策点
+
+### Desktop 第一版送达语义
+
+- Desktop 第一版的自动续跑保证应表述为：
+  - `at-least-once wakeup scheduling while the batch remains head and redelivery is still allowed`
+- 对 Desktop 来说，一次 attempt 的“成功”只表示：
+  - bridge 已为 caller thread 成功 arm 了一次 heartbeat wakeup
+- 这还不等于：
+  - caller 一定读取了 snapshot
+  - caller 一定消费了 batch
+  - caller 一定完成了后续工作
+- 因此，Desktop batch 不应在第一次 arm 成功后直接 `closed`。
+- 推荐行为是：
+  - arm 成功 -> attempt 进入 `cooldown`
+  - `cooldown_until` 到期后，如果该 batch 仍是 head 且 redelivery window 未结束 -> 创建新 attempt 并再次 arm
+  - 只有在 operator 关闭、batch 被 supersede、caller 明确回写成功、或 redelivery window 结束时，batch 才进入 `closed`
 
 ## 第一版稳定外部接口
 

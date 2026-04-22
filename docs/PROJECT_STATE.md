@@ -22,6 +22,7 @@
 - 同时，CLI 关键路径也收口为：
   - 明确依赖实验 RPC
   - 启动时 capability probe
+  - 默认使用 loopback-only shared `app-server` + per-session bearer-token auth
   - 默认仅在 idle 时 `turn/start`
   - `turn/steer` 只作为只读、低风险场景下的受限优化
 - 共享核心也补上了 reviewer 指出的 thread 级缺口：
@@ -29,12 +30,16 @@
   - 引入 `delivery batch`
   - 引入最小连续发送间隔
   - 同一 thread 同时最多一个 in-flight delivery attempt
-  - 并进一步补上了 durable `attempt_id + generation + automation_id` 合约
+  - 并进一步补上了 durable `attempt_id + generation` 合约，以及 optional `automation_id` 协调字段
+- Desktop 第一版的送达语义也已收口：
+  - 目标是 `at-least-once wakeup scheduling`
+  - `closed` 只表示 `cbth` 停止自动重投，不表示 caller 一定已消费
 - 结果保留责任也已收敛：
   - `cbth job complete --result-file <path>` 的语义改为 ingest/copy 到 `cbth` 自己管理的 artifact store
   - 原始外部文件不再承担长期保留责任
   - artifact GC 也被绑定到 batch 终态与最小保留窗口，而不是外部临时文件生命周期
 - 但 reviewer 第二轮指出，设计还没有完全闭环；当前剩余的是 contract 细化和实证，不再是路线选择问题。
+- 上游 CLI/shared app-server 侧也确认存在现成的 websocket auth 能力与 `--remote-auth-token-env` 接口，因此 CLI 第一版不需要把“本机 loopback 默认可信”当成唯一安全前提。
 - 这套共通核心设计已单独沉淀在：
   - `docs/SHARED_CORE_ARCHITECTURE.md`
 
