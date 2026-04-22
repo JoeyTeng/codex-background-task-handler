@@ -4,7 +4,7 @@
 
 验证一套纯外围方案，分别覆盖 Codex Desktop 与 CLI 两条交互路径，让长时间后台任务可以在不修改上游 `codex` 仓库的前提下恢复或继续 caller thread。
 
-## 当前架构收敛
+## 当前架构方向
 
 - 双端方案现在共享一套更清晰的核心抽象：
   - 一个共享的本地 daemon
@@ -17,7 +17,8 @@
 - 因此，之前设计里提到的 `background-taskctl` helper，应收敛成主 binary 的 `cbth job ...` 子命令，而不是第二个长期维护的独立工具。
 - 经过 reviewer 复核后，Desktop 关键路径又做了一个更保守的收口：
   - 不再把“heartbeat turn 稳定执行本地 `cbth ...` CLI”当作既定前提
-  - 改为优先使用只读 inbox snapshot / artifact 文件
+  - 改为以只读 inbox snapshot / artifact 文件作为第一版候选主路径
+  - 但“heartbeat 无审批读取这些文件”仍待实证，不算已验证能力
 - 同时，CLI 关键路径也收口为：
   - 明确依赖实验 RPC
   - 启动时 capability probe
@@ -28,9 +29,12 @@
   - 引入 `delivery batch`
   - 引入最小连续发送间隔
   - 同一 thread 同时最多一个 in-flight delivery attempt
+  - 并进一步补上了 durable `attempt_id + generation + automation_id` 合约
 - 结果保留责任也已收敛：
   - `cbth job complete --result-file <path>` 的语义改为 ingest/copy 到 `cbth` 自己管理的 artifact store
   - 原始外部文件不再承担长期保留责任
+  - artifact GC 也被绑定到 batch 终态与最小保留窗口，而不是外部临时文件生命周期
+- 但 reviewer 第二轮指出，设计还没有完全闭环；当前剩余的是 contract 细化和实证，不再是路线选择问题。
 - 这套共通核心设计已单独沉淀在：
   - `docs/SHARED_CORE_ARCHITECTURE.md`
 
@@ -152,6 +156,7 @@ scripts/desktop_thread_inject_poc.py
 - 这不是推断，而是 TUI 自身对 `ServerRequest::DynamicToolCall` 直接返回 unsupported；对应单测名字就是 `rejects_dynamic_tool_calls_as_unsupported`，文案为 `Dynamic tool calls are not available in TUI yet.`。
 - 因此，CLI 方向仍应以 `wrapper + shared app-server + sidecar` 作为主方案。
 - 但 reviewer 指出了一个重要约束：这条路线实际建立在实验 RPC 上，因此文档已进一步收口为“必须 capability probe + fail-closed”，不能把当前 PoC 可用的所有 RPC 都当成长期稳定契约。
+- 目前文档已经进一步规定：第一版 shipping 配置默认关闭 `turn/steer`，只有在 feature flag 打开且满足只读/低风险门槛时，才允许作为可选优化启用。
 - 已新增一个最小 CLI 正向 PoC：
   - `scripts/cli_shared_app_server_poc.mjs`
   - 使用本机安装的 `codex app-server --listen ws://127.0.0.1:4311`

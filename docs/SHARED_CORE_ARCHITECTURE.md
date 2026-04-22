@@ -50,6 +50,7 @@
   - 只读 inbox snapshot 文件
   - 只读 artifact manifest / artifact 文件
 - 后续内部实现可以用普通文件、`mmap` 或 shared memory 优化，但外部语义先固定为“读一个稳定路径下的只读快照”。
+- 这条只读文件路径当前仍是第一版候选主路径，必须在 Desktop heartbeat 无审批读取实证通过后，才升级成“已验证主路径”。
 
 ### 5. CLI 依赖实验 RPC，但必须收口
 
@@ -60,6 +61,7 @@
   - 启动时做 capability probe
   - 缺能力时 fail-closed
   - 把 `turn/steer` 仅当作受限优化，而不是主路径
+  - 默认 shipping 配置下先关闭 `turn/steer`
 
 ## 共享组件
 
@@ -106,7 +108,7 @@
 - 为 Desktop 和调试工具暴露只读投递视图。
 - 避免让 Codex heartbeat turn 在关键路径上依赖本地 CLI 执行能力。
 
-第一版建议路径：
+第一版候选路径：
 
 ```text
 ~/.cbth/inbox/ready-threads.json
@@ -120,6 +122,7 @@
 - 用 `write temp + rename` 原子替换。
 - 外部语义固定为“读快照文件”。
 - 后续如果内部改成 `mmap` / shared memory，只能在不改变这一语义的前提下做。
+- 这些路径在 Desktop 无审批读取能力得到实证前，仍视为候选内部 contract，而不是已冻结接口。
 
 ### 5. `local IPC`
 
@@ -225,6 +228,77 @@
   - CLI `turn/start`
   - CLI `turn/steer`
 
+### Delivery attempt contract
+
+每个 `source_thread_id` 都必须有一条 durable 的当前 attempt 记录。
+
+#### Attempt 关键字段
+
+- `attempt_id`
+- `source_thread_id`
+- `batch_id`
+- `generation`
+- `state`
+- `automation_id`
+- `snapshot_path`
+- `snapshot_revision`
+- `delivery_deadline`
+- `cooldown_until`
+- `created_at`
+- `updated_at`
+
+#### Attempt 状态
+
+- `prepared`
+- `armed`
+- `cooldown`
+- `closed`
+- `superseded`
+- `abandoned`
+
+#### Attempt 规则
+
+- 新 attempt 创建时必须原子地：
+  - 绑定一个 `batch_id`
+  - 递增该 thread 的 `generation`
+  - 物化新 snapshot
+  - 把当前 head attempt 指向新的 `attempt_id`
+- 同一 `source_thread_id` 任何时刻最多只能有一个非终态 attempt：
+  - `prepared`
+  - `armed`
+  - `cooldown`
+- bridge 为 caller arm heartbeat 时，必须把以下值同时写入 caller prompt：
+  - `batch_id`
+  - `attempt_id`
+  - `generation`
+  - `snapshot_path`
+- caller 读取 snapshot 后，必须先比较：
+  - `snapshot.batch_id`
+  - `snapshot.attempt_id`
+  - `snapshot.generation`
+  与 prompt 中的期望值是否完全一致；任一不一致都视为 stale wake，立即退出。
+- `automation_id` 一旦已知，必须 durable 绑定到当前 attempt；重 arm 同一 thread 时只能：
+  - 复用同一个 `automation_id`
+  - 或显式把旧 attempt 标成 `superseded`
+- 任何旧 generation 的 heartbeat，即使被延迟触发，也只能看到 mismatch 并 no-op，不得再次消费 head batch。
+
+#### Attempt 迁移
+
+```text
+prepared -> armed -> cooldown -> closed
+prepared -> abandoned
+armed -> abandoned
+prepared -> superseded
+armed -> superseded
+cooldown -> superseded
+```
+
+说明：
+
+- `closed` 表示 `cbth` 不会再自动重投该 attempt 绑定的 batch。
+- `abandoned` 表示本次投递尝试失败，需要调度器决定是否生成新 attempt。
+- `superseded` 表示同一 thread 上出现了更新 generation 的 attempt，旧 attempt 必须彻底失效。
+
 ### 最小连续发送间隔
 
 - 每个 thread 都有最小连续发送间隔。
@@ -236,6 +310,7 @@
 - `turn/steer` 不是共享核心的默认投递手段。
 - 它只是 CLI adapter 的受限优化。
 - 默认行为仍然应当是“等 caller idle 后再投递 batch”。
+- 第一版默认 shipping 配置中，`turn/steer` 应视为关闭；只有在 capability probe 与 active-turn 分类能力都成熟后，才作为 feature flag 打开。
 
 ## 共享数据模型
 
@@ -283,6 +358,10 @@
 - `materialized_at`
 - `last_delivery_attempt_at`
 - `next_delivery_not_before`
+- `head_attempt_id`
+- `generation`
+- `closed_at`
+- `close_reason`
 - `delivery_mode`
   - `desktop_heartbeat`
   - `cli_turn_start`
@@ -305,7 +384,47 @@
 - `content_type`
 - `size_bytes`
 - `created_at`
+- `min_retention_until`
+- `last_batch_closed_at`
+- `operator_pin_until`
+- `gc_eligible_at`
 - `retention_until`
+
+## Artifact retention / GC contract
+
+第一版必须把 artifact 生命周期绑定到 batch 生命周期，而不是外部临时文件生命周期。
+
+### 默认约束
+
+- `min_artifact_ttl = 24h`
+- `post_close_ttl = 72h`
+
+### 规则
+
+- `cbth job complete --result-file <path>` 成功后，artifact 必须先被 ingest 到 managed store。
+- 只要仍有非终态 batch 引用该 artifact，就绝不能 GC。
+- 当最后一个引用该 artifact 的 batch 进入终态时，记录 `last_batch_closed_at`。
+- `gc_eligible_at` 计算为以下三者的最大值：
+  - `created_at + min_artifact_ttl`
+  - `last_batch_closed_at + post_close_ttl`
+  - `operator_pin_until`
+- 只有在：
+  - 没有非终态 batch 再引用该 artifact
+  - 且 `now >= gc_eligible_at`
+  时，artifact 才允许进入 GC。
+
+### Batch 终态语义
+
+第一版把以下情况都视为 batch 终态：
+
+- CLI adapter 报告该 batch 已成功送达
+- operator / user 显式关闭或取消该 batch
+- redelivery window 结束且不再继续自动重投
+
+这意味着：
+
+- `closed` 不是“用户一定已经消费”的证明
+- 它只是“`cbth` 不再自动重投该 batch”的 durable 决策点
 
 ## 第一版稳定外部接口
 
@@ -337,6 +456,7 @@ cbth job query
 - `cbth desktop ...` 预留给 Desktop bootstrap / helper。
 - `cbth job ...` 是第一版对外稳定的任务提交与状态回报面。
 - 更细的 queue / batch / inbox 控制面先视为内部实现，不在第一版对外冻结。
+- Desktop 使用的 snapshot / artifact 路径目前只算候选内部 contract，不算第一版对外稳定接口。
 
 ## 第一版脚本协议
 
@@ -394,8 +514,10 @@ cbth job query <job_id> --json
 ## Desktop 只读快照约束
 
 - 第一版不要求 Desktop heartbeat turn 在关键路径上执行本地 CLI。
-- bridge heartbeat 只读 `ready-threads.json`。
-- caller heartbeat 只读自己的 per-thread inbox snapshot 与 artifact 路径。
+- 当前候选路径是：
+  - bridge heartbeat 只读 `ready-threads.json`
+  - caller heartbeat 只读自己的 per-thread inbox snapshot 与 artifact 路径
+- 这条路径在“Desktop heartbeat 可无审批读取 `~/.cbth` 路径”得到实证前，仍按候选主路径处理。
 - 是否存在后台无审批写回能力，先不当作架构前提。
 
 ## 为什么第一版只做 CLI 脚本
@@ -428,4 +550,5 @@ cbth job query <job_id> --json
 - 不做公开 socket API。
 - 不做动态插件加载框架。
 - 不把 `turn/steer` 当成必需能力。
+- 第一版默认不打开 `turn/steer`。
 - 不把 Desktop heartbeat 的本地 CLI 执行能力当成关键前提。

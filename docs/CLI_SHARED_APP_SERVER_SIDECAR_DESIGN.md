@@ -74,6 +74,7 @@ capabilities.experimentalApi = true
 - 如果缺少 `thread/resume` 或 `turn/start`，CLI adapter 必须 fail-closed。
 - 如果缺少 `turn/steer`，CLI adapter 仍可工作，但只能在 caller idle 时投递。
 - 不能把 PoC 中碰巧可用的实验 RPC 直接当成长期稳定契约。
+- 第一版 shipping 配置默认关闭 `turn/steer`，直到 active-turn 分类与安全门槛被实证支持。
 
 ## 已实证支持的关键能力
 
@@ -218,6 +219,7 @@ thread/resume + turn/start
 ### `turn/steer` 的策略
 
 - `turn/steer` 是可选优化，不是默认主路径。
+- 第一版默认 shipping 配置中应当关闭。
 - 只有在以下条件同时满足时才允许使用：
   - capability probe 明确支持
   - 当前 caller turn 仍处于 active regular turn
@@ -264,7 +266,7 @@ cbth cli run
 5. sidecar 从共享核心读取 per-thread `delivery batch`
 6. 任务 ready 后：
    - 默认只在 caller thread idle 时：`thread/resume + turn/start`
-   - 如果 `turn/steer` 能力存在且满足只读/低风险策略：允许 steer
+   - 只有显式打开 steer feature flag，且 `turn/steer` 能力存在并满足只读/低风险策略时：允许 steer
 7. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
 8. 前台 TUI 通过已有线程订阅自然感知新 turn
 

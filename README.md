@@ -4,10 +4,10 @@ Reference experiments and companion tooling for making long-running background w
 
 ## Status
 
-Two directions are now validated:
+Validated foundations plus the current first-version direction:
 
-- Desktop: keep the long-running work in an external sidecar, expose state through read-only inbox snapshots, use a dedicated heartbeat bridge thread, and arm a caller-thread heartbeat only when a delivery batch is ready.
-- CLI: use a thin CLI entrypoint that starts a shared `codex app-server`, runs the foreground TUI with `codex --remote`, and attaches one or more sidecar clients to the same live thread, with capability probing around the experimental RPC surface.
+- Desktop foundation validated: automation-based bridge/retargeting works. The current first-version delivery contract uses read-only inbox snapshots and managed artifacts, but the “heartbeat can read those files without approval” assumption is still pending validation.
+- CLI foundation validated: the shared `app-server` route works and foreground TUI visibility is proven. The current first-version contract depends on capability probing around the experimental RPC surface, and keeps `turn/steer` as a gated optimization instead of a default path.
 
 The shared architecture is converging on one Rust binary with thin integration entrypoints:
 

@@ -26,8 +26,17 @@
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
 - [ ] 为 Desktop bridge 设计基于只读快照的共享状态面，不把后台 heartbeat 的本地 CLI 执行能力当成前提。
 - [ ] 为共享核心设计 thread-scoped FIFO 队列、batch 合并规则和最小连续发送间隔。
-- [ ] 为共享核心定义“同一 thread 同时最多一个 in-flight delivery attempt”的仲裁契约。
+- [ ] 实现 durable delivery-attempt 合约：
+  - `batch_id`
+  - `attempt_id`
+  - `generation`
+  - `automation_id`
+  - stale wake no-op 规则
 - [ ] 用 Rust 实现 managed artifact store，并把 `cbth job complete --result-file <path>` 定义成 ingest/copy 语义。
+- [ ] 实现 artifact retention / GC contract：
+  - `min_artifact_ttl = 24h`
+  - `post_close_ttl = 72h`
+  - GC 仅在 batch 终态后触发
 - [ ] 用 Rust 实现 sidecar supervisor 的最小骨架，负责长任务状态写入与结果交接。
 - [x] 验证 CLI 在 shared `app-server` 模式下，第二个 sidecar client 能否对同一个 thread 执行 `thread/resume + turn/start`，并让前台 client 收到 live 通知。
 - [x] 验证真实前台 `codex --remote` TUI 在 PTY 中是否会把 sidecar 触发的新 turn 展示给用户。
@@ -35,4 +44,4 @@
 - [ ] 为 CLI 设计最小 `cbth cli run` 进程模型：shared `app-server`、前台 `codex --remote`、sidecar、以及清理策略。
 - [x] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为，且不会导致当前 turn 提前结束。
 - [ ] 为 CLI adapter 明确定义实验 RPC 的最小能力集、capability probe 和 fail-closed 策略。
-- [ ] 把 `turn/steer` 收口为只读、低风险场景下的可选优化，并明确不满足条件时的 idle-only fallback。
+- [ ] 把 `turn/steer` 维持为默认关闭的 gated optimization，并明确不满足条件时的 idle-only fallback。
