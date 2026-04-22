@@ -7,6 +7,10 @@
 - 让后台 sidecar 能在长任务完成后，对同一个 CLI thread 继续执行，而不是依赖当前 turn 长时间挂起。
 - 让前台 TUI 能感知 sidecar 触发的新 turn。
 
+共通核心部分见：
+
+- `docs/SHARED_CORE_ARCHITECTURE.md`
+
 ## 已敲定的约束
 
 - 当前 CLI TUI 不能直接复用 Desktop 的 heartbeat / automation bridge 方案。
@@ -18,7 +22,8 @@
 ### 组件
 
 1. `shared app-server`
-   - 由 wrapper 启动，例如：
+   - 由 CLI 入口启动；在第一版共享架构里，这个入口是主 binary 的一个子命令，而不是独立产品。
+   - 例如可表现为：
 
 ```text
 codex app-server --listen ws://127.0.0.1:<port>
@@ -36,7 +41,7 @@ codex --remote ws://127.0.0.1:<port>
    - 负责等待 CI、等待 reviewer、等待外部系统结果、以及在结果 ready 后恢复 caller thread。
 
 4. `optional shared job state`
-   - 如果 sidecar 需要脱离当前进程继续工作，可以再配一个本地 store / helper CLI。
+   - 如果 sidecar 需要脱离当前进程继续工作，可以直接复用共享核心里的 store 与 `cbth job ...` CLI 子命令。
    - 但就“第二个 client 能否续跑同一 live thread”这一核心能力而言，不需要 heartbeat 或 Desktop 那套 bridge 结构。
 
 ## 已实证支持的关键能力
@@ -159,7 +164,7 @@ PoC 流程：
 CLI 的可行产品化路线是：
 
 ```text
-wrapper
+cbth cli run
   -> spawn shared codex app-server
   -> spawn foreground codex --remote
   -> spawn sidecar client(s)
@@ -179,13 +184,13 @@ wrapper
 
 - 默认 embedded `codex`
   - 默认 `codex` / `codex resume` 走的是 embedded `app-server`，没有可被外部 sidecar attach 的公共 transport。
-  - 因此必须由 wrapper 接管启动方式。
+  - 因此必须由 CLI 入口接管启动方式。
 
 ## 第一版实现建议
 
-1. wrapper 启动共享 `codex app-server`
-2. wrapper 启动前台 `codex --remote`
-3. wrapper 为当前会话保存 `thread_id`
+1. `cbth cli run` 启动共享 `codex app-server`
+2. `cbth cli run` 启动前台 `codex --remote`
+3. CLI 入口为当前会话保存 `thread_id`
 4. sidecar 监听外部任务状态
 5. 任务 ready 后：
    - 如果 caller thread idle：`thread/resume + turn/start`
@@ -194,6 +199,6 @@ wrapper
 
 ## 仍待补的边界
 
-- wrapper 的进程生命周期和清理策略
+- CLI 入口的进程生命周期和清理策略
 - sidecar 长时间运行时的状态持久化与 resume 策略
 - 多个 background jobs 同时命中同一 caller thread 时的串行化策略

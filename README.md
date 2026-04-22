@@ -7,10 +7,17 @@ Reference experiments and companion tooling for making long-running background w
 Two directions are now validated:
 
 - Desktop: keep the long-running work in an external sidecar, expose state through a small local interface, use a dedicated heartbeat bridge thread, and arm a caller-thread heartbeat only when a job is ready.
-- CLI: use a wrapper that starts a shared `codex app-server`, run the foreground TUI with `codex --remote`, and attach one or more sidecar clients to the same live thread.
+- CLI: use a thin CLI entrypoint that starts a shared `codex app-server`, runs the foreground TUI with `codex --remote`, and attaches one or more sidecar clients to the same live thread.
+
+The shared architecture is converging on one Rust binary with thin integration entrypoints:
+
+- a CLI entrypoint that launches the shared `app-server` path
+- a Desktop-facing helper/bridge entrypoint
+- a shared local daemon, store, and job-control CLI surface underneath
 
 Design docs:
 
+- [docs/SHARED_CORE_ARCHITECTURE.md](docs/SHARED_CORE_ARCHITECTURE.md)
 - [docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md)
 - [docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md](docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md)
 
@@ -47,10 +54,11 @@ The current CLI active-turn steering PoC is [scripts/cli_turn_steer_poc.mjs](scr
 
 ## Planned Implementation Direction
 
-This repo is expected to grow in two layers:
+This repo is expected to grow around one shared Rust core with thin per-surface entrypoints:
 
-1. Rust sidecar and helper CLI for low-overhead, portable background-task orchestration.
-2. Small Python reference probes for one-off Desktop or protocol experiments.
+1. A Rust daemon/store/job-control core with a stable CLI surface.
+2. Thin CLI and Desktop integration entrypoints on top of that core.
+3. Small reference probes for one-off Desktop or protocol experiments.
 
 Rust is the preferred implementation language for the real sidecar because it keeps resource usage low and is a better fit for cross-platform deployment anywhere Codex itself can run.
 

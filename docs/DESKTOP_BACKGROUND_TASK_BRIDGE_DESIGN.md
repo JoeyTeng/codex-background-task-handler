@@ -8,6 +8,10 @@
 - 允许大约 1 分钟级别的延迟。
 - 不要求在 Desktop app 退出后继续工作。
 
+共通核心部分见：
+
+- `docs/SHARED_CORE_ARCHITECTURE.md`
+
 ## 已敲定的约束
 
 - 外部进程不能可靠地把消息直接推入 Desktop 当前已加载的 live thread。
@@ -27,10 +31,8 @@
 
 2. `shared job state`
    - 由 sidecar 暴露给 Codex thread 读取的共享状态面。
-   - 推荐优先级：
-     1. 本地 helper CLI
-     2. 本地 JSON / SQLite store
-     3. 本地 socket
+   - 第一版优先通过主 binary 的 CLI 子命令暴露，而不是单独再做一个 helper binary。
+   - 底层仍可用本地 SQLite / socket，但这属于内部实现细节。
    - 明确不依赖直接改 Codex 自己的 automation DB。
 
 3. `bridge heartbeat thread`
@@ -79,7 +81,7 @@ bridge heartbeat 每分钟醒一次：
 1. 调用本地 helper，例如：
 
 ```text
-background-taskctl list-ready --json
+cbth job list-ready --json
 ```
 
 2. 如果没有 ready job，本次 turn 直接结束。
@@ -96,7 +98,7 @@ caller thread heartbeat 在下一次调度中醒来：
 1. 根据 prompt 中的 `job_id` 调用 helper，例如：
 
 ```text
-background-taskctl claim-ready <job_id> --json
+cbth job claim-ready <job_id> --json
 ```
 
 2. 如果 claim 失败，说明结果已被消费或重复武装，本次 turn 直接结束并清理 heartbeat。
@@ -135,22 +137,22 @@ claimed -> ready
 
 ## 共享状态面的推荐接口
 
-优先建议做一个很小的本地 CLI，避免让 Codex thread 自己解析复杂文件格式。
+优先建议直接复用主 binary 的 CLI 子命令，避免让 Codex thread 自己解析复杂文件格式，也避免把入口再拆成第二个工具。
 
 ### Bridge 侧
 
 ```text
-background-taskctl list-ready --json
-background-taskctl mark-armed <job_id> <automation_id>
-background-taskctl requeue <job_id>
+cbth job list-ready --json
+cbth job mark-armed <job_id> <automation_id>
+cbth job requeue <job_id>
 ```
 
 ### Caller 侧
 
 ```text
-background-taskctl claim-ready <job_id> --json
-background-taskctl mark-consumed <job_id>
-background-taskctl mark-failed <job_id> --reason <text>
+cbth job claim-ready <job_id> --json
+cbth job mark-consumed <job_id>
+cbth job fail --job-id <job_id> --reason <text> --json
 ```
 
 这样 bridge prompt 和 caller prompt 都可以很短，而且不需要知道底层 store 是文件、SQLite 还是 socket。
@@ -231,7 +233,7 @@ background-taskctl mark-failed <job_id> --reason <text>
 ## 第一版实现建议
 
 1. 固定一个 bridge heartbeat thread。
-2. 实现 `background-taskctl` 最小 CLI。
+2. 实现共享主 binary 的 `cbth job ...` 最小 CLI 面。
 3. 让 sidecar 只负责写 job 状态。
 4. 让 bridge thread 每分钟查询 `list-ready --json`。
 5. bridge 发现 ready job 后，为对应 caller thread arm 一次 heartbeat。

@@ -4,6 +4,20 @@
 
 验证一套纯外围方案，分别覆盖 Codex Desktop 与 CLI 两条交互路径，让长时间后台任务可以在不修改上游 `codex` 仓库的前提下恢复或继续 caller thread。
 
+## 当前架构收敛
+
+- 双端方案现在共享一套更清晰的核心抽象：
+  - 一个共享的本地 daemon
+  - 一个共享的 job store / 状态机
+  - 一个共享的 CLI 控制面
+  - 两个薄的 Codex integration adapters：CLI 与 Desktop
+- 第一版不做系统级常驻服务；改为按需启动的本地 daemon。
+- 该 daemon 生命周期独立于单个 Codex 前台实例，但在没有 active jobs 且没有活跃接入端时会自动退出。
+- 第一版稳定外部接口只做 CLI，不承诺公开 socket / Web / plugin 协议。
+- 因此，之前设计里提到的 `background-taskctl` helper，应收敛成主 binary 的 `cbth job ...` 子命令，而不是第二个长期维护的独立工具。
+- 这套共通核心设计已单独沉淀在：
+  - `docs/SHARED_CORE_ARCHITECTURE.md`
+
 ## 已确认事实
 
 - 普通 `codex` / `codex resume` 使用嵌入式 `app-server`，默认没有对外 attach surface。
