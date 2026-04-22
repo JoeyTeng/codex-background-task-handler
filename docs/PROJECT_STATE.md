@@ -1,0 +1,116 @@
+# Project State
+
+## 当前目标
+
+验证一个纯外围方案是否能对 Codex Desktop 已创建、且当前桌面端私有 `app-server` 正在持有的 thread 做外部注入，而不修改上游 `codex` 仓库。
+
+## 已确认事实
+
+- 普通 `codex` / `codex resume` 使用嵌入式 `app-server`，默认没有对外 attach surface。
+- `codex --remote` 可以连接共享 `app-server`，适合 wrapper + sidecar 方案。
+- Codex Desktop 会启动自己的私有 `codex app-server` 子进程。
+- 测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 的 rollout 文件当前被桌面端私有 `app-server` 打开，说明它处于已加载状态。
+
+## 当前实验
+
+在本仓库实现一个最小 PoC 脚本：
+
+```text
+external process
+  -> spawn standalone `codex app-server --listen stdio://`
+  -> initialize
+  -> thread/read
+  -> thread/resume
+  -> thread/inject_items
+  -> verify rollout persistence
+```
+
+当前脚本位于：
+
+```text
+scripts/desktop_thread_inject_poc.py
+```
+
+## 当前结果
+
+- PoC 已在测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 上跑通两次。
+- 两次运行都能成功 `thread/read` + `thread/resume` + `thread/inject_items`。
+- rollout 行数从 `13 -> 14 -> 15`，每次只新增一条外部注入的 `response_item`。
+- 注入时，桌面端私有 `app-server` 仍然持有该 rollout 文件的打开句柄。
+- `thread/read(includeTurns=true)` 不会把这种“未附着到某个 turn 的原始 injected item”直接回显出来，因此它不能作为注入成功与否的判断标准；落盘结果才是关键证据。
+- 用户随后在 Codex Desktop 的该 thread 窗口内直接询问历史，可见 assistant 消息仍只有最初那一条“你好，有什么需要我处理的？”，并明确回答看不到两条外部插入 marker。
+- 第二个 PoC 已通过外部独立 `app-server` 对同一 thread 发起一次完整 `turn/start`。
+- 该 turn 在 `2026-04-22T10:05:45Z` 完成，assistant 最终消息为 `EXTERNAL_TURN_START_MARKER_20260422`。
+- 这次不只是 rollout 落盘；`thread/read(includeTurns=true)` 也能在返回 JSON 中看到该 marker，说明完整新 turn 被 thread 结构化吸收了。
+- 随后用户在同一 desktop thread 中再次发起本地 turn，请求“逐字列出当前可见的最近 2 条 assistant 消息”。
+- 该本地 turn 的 assistant 回复仍然只列出早先的两条本地 assistant 文本，完全没有把 `EXTERNAL_TURN_START_MARKER_20260422` 作为可见历史的一部分。
+- 这说明问题不只是“UI 不热刷新”，而是 desktop 当前 loaded thread 的后续推理上下文也没有并入外部完整 turn。
+- 之后又测试了 `codex exec resume 019db49a-de4e-7d61-93ab-5d70a8905cc3 ...`。
+- `exec resume` 明确复用了同一个 thread id，并成功在 `2026-04-22T10:12:10Z` 追加了一次正常 turn，assistant 最终消息为 `EXEC_RESUME_MARKER_20260422`。
+- rollout 行数从 `46 -> 56`，说明 `exec resume` 对 desktop-originated thread 的效果，本质上仍是“从另一个进程往同一 persisted thread 追加 turn”。
+- 又跑了一次独立 `codex exec --ephemeral --json` 的 agent 通信 PoC。该会话成功调用 `spawn_agent`，新建了 worker agent `019db4ae-49df-75e2-b41f-51f23b562858`。
+- 但当前实际暴露给该 `exec` 会话的工具面中，没有模型可调用的 `followup_task` / `send_message` 投递工具，因此无法在运行时直接复现你记忆中的 mailbox 风格跨 agent 发消息。
+- 代码层面仍能看到 `send_message` / `followup_task` 与 `InterAgentCommunication` 的实现，但它们通过当前进程内的 `agent_control.send_inter_agent_communication(...)` 路由，目标 thread 必须是同一个 live thread manager 能处理的 agent。
+
+## 关键判断标准
+
+- 如果外部进程可以 `resume` 并 `inject_items`，说明 desktop-originated thread 的持久化历史可被外围流程改写。
+- 如果消息能稳定落盘，但桌面端不即时反映，则说明“改历史”与“推送进当前交互 session”仍是两回事。
+
+## 当前判断
+
+- “外部独立进程改写 desktop-originated thread 的持久化历史”已经被实证支持。
+- “外部独立进程直接向 desktop 当前 live in-process session 推送一条会被 UI/交互环立即消费的消息”目前有了反证迹象。
+- 目前更像是：外部流程可以追加 thread history，但没有证据表明 desktop 私有 `app-server` 暴露了一个可被外部直接 attach 的公共 transport。
+- 更具体地说，当前最符合证据的模型是：desktop 已加载 thread 的内存态不会热合并外部对 rollout 的追加写入，至少不会把这类 `thread/inject_items` 写入即时映射到当前窗口可见历史。
+- 但完整 `turn/start` 与裸 `thread/inject_items` 并不等价。前者已经被 thread/read 吸收为正常 turn，因此下一步需要用户直接观察 desktop 窗口，判断 UI 是否会对“外部完整新 turn”做热更新或至少在下一次刷新时显示。
+- 现在这一步已经有结论：即使是外部完整 `turn/start`，desktop 当前已加载 session 也不会在后续本地 turn 中把它并入自己的活动上下文。
+- 因此，对于 desktop，外围进程最多只能改写同一个持久化 thread 文件；它不能可靠地“给当前 live session 发消息”。
+- `codex exec resume` 不是例外路径。它能成功向同一个 thread 追加 turn，但没有证据表明它绕过了 desktop 当前 loaded session 的内存隔离。
+- 你记忆中的 agent mailbox 能力在代码里确实存在，但更像“同一 live process 内父子/协作 agent 线程间通信”，不是一个稳定的跨进程、跨现有 desktop session 的公开注入面。
+
+## Heartbeat / Automation 补充判断
+
+- Desktop 的 heartbeat / automation 与“当前 thread 里的 agent 正在长时间等待”不是一回事。
+- 本地状态里存在独立的 `automations` / `automation_runs` / `inbox_items` 持久化表，并且 `automations` 直接记录 `next_run_at` 与 `last_run_at`。
+- 这说明 heartbeat 至少在建模上是独立调度的后台任务，而不是依赖当前 thread 在一个活跃 turn 内持续轮询。
+- 官方公开材料也把 Automations 描述为“按计划在后台运行”并在完成后把结果投递到 review queue。
+- 因此，如果目标只是避免“agent 在当前 turn 里短间隔轮询、轮几次后自己放弃”，heartbeat 路线比把等待留在当前 turn 内更稳。
+- 但目前还没有直接实证证明：当 Desktop app 被完全退出后，heartbeat 仍会准时触发；现有证据只能支持“它不依赖当前主 thread 持续活着轮询”，不能支持“它等价于一个系统级常驻 daemon”。
+- 进一步检查发现：`~/.codex/sqlite/codex-dev.db` 中的 `automations` 表由 Desktop 主进程持有打开句柄，而私有 `codex app-server` 并未直接打开该 DB。
+- 同时，App bundle 字符串中存在 heartbeat 线程选择、目标 thread、next run、pause/resume、以及 `run now` 等 UI 文案，说明 Desktop 内部确实存在面向 thread heartbeat 的调度与立即运行语义。
+- 这使得一个新的外围思路变得可疑似可行：预先为 caller thread 建一个 heartbeat automation，并在外部 sidecar 完成时通过外部写入 automation 持久化状态，把该 heartbeat 重新武装到“马上运行”，从而尽量避免固定频率 wake 痕迹。
+- 但这条路径目前仍是推断，不是已实证能力；尚未验证 Desktop 是否会对运行中 app 外部改写的 automation 调度状态做及时热感知。
+- 进一步从 App bundle 的前端代码字符串里看到了更强的信号：heartbeat automation 在内部对象上直接带有 `targetThreadId`，并且 UI 逻辑会按 `targetThreadId === conversationId` 关联 heartbeat 与具体 thread。
+- 同一处还可以看到 heartbeat automation 的目标 chat 选择、`run now`、以及“直接向所选 chat 发送消息而不是在项目/worktree 中运行”的文案，说明“thread-targeted heartbeat automation”是 Desktop 的一等概念，而不是文档层面的抽象。
+- 基于这些证据，一个更干净的 Desktop 外围架构浮现出来：不让外部 sidecar 直接改 Codex 的 automation DB；改由一个固定的 bridge automation thread 周期性检查外部长任务状态，再用 `automation_update` 为 caller thread 创建、更新、暂停或删除 heartbeat automation。
+- 这条 bridge 架构的关键优点是：caller thread 不需要固定频率 wake，只在 bridge 判定任务 ready 后才被重新武装；周期性检查痕迹被集中在 bridge thread，而不是污染所有 caller thread。
+- 仍需注意：即使不外改 Codex DB，bridge thread 与外部 sidecar 之间依然需要一个共享状态面，例如本地文件、socket、CLI helper，或 sidecar 自己的 store；这里只是避免去碰 Codex 自己的 automation 持久化层。
+
+## Bridge-thread PoC 结论
+
+- 通过 `automation_update` 可以直接在一个 thread 中创建 heartbeat automation，并把 `target_thread_id` 指向另一个现有 thread。
+- 实测创建 `poc-foreign-heartbeat` 时，即使请求 `status = "PAUSED"`，实际落盘仍为 `ACTIVE`；这说明 tool / app 在 heartbeat 创建时可能会强制激活，后续设计需要把这一点当成实现细节风险。
+- 用户提供的 thread `019db5e6-ba6a-7b80-95d2-a6867163281a` 确认使用 `gpt-5.3-codex-spark-preview` + `low`，并成功作为 bridge heartbeat thread 运行。
+- 第一轮 bridge PoC `poc-bridge-armer` 证明：heartbeat turn 内部确实可以调用 `automation_update` 和 `automation_delete`。该 turn 把当前 automation 自身重写成指向 caller thread 的 heartbeat，再把自己删除，最终回复 `BRIDGE_ARMED`。
+- 第二轮 bridge PoC `poc-bridge-retarget` 证明了完整闭环：
+  - bridge thread 在 heartbeat turn 中调用 `automation_update`
+  - 将当前 automation 的 `target_thread_id` 从 bridge thread 改写为 caller thread `019db49a-de4e-7d61-93ab-5d70a8905cc3`
+  - 同时更新名称和 prompt
+  - 下一分钟 caller thread 的 rollout 中出现新的 heartbeat turn，assistant 最终回复 `HEARTBEAT_POC_RETARGETED`
+- 这说明“固定 bridge automation thread 监控状态，再用内建 `automation_update` 去 schedule caller thread heartbeat”在 Desktop 上是可行架构，不需要外部直接改 Codex automation DB。
+
+## 当前方案收敛
+
+- Desktop 方向的技术方案已经收敛为：
+  - 外部 `sidecar supervisor` 跑长任务
+  - 共享 `job state` 作为 bridge / caller 读取面
+  - 固定 `bridge heartbeat thread` 负责轮询 ready job
+  - bridge 通过内建 `automation_update` 为 caller thread 创建、激活、更新或重定向 heartbeat
+  - caller thread 被唤醒后消费结果、继续原任务，并清理自己的 heartbeat
+- 该方案不依赖：
+  - 外部 live push 当前 Desktop thread
+  - 外部直接改 Codex automation DB
+  - notification thread
+- 独立设计文档已记录在：
+  - `docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md`
