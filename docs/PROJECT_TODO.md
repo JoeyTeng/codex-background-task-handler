@@ -24,6 +24,13 @@
   - 无需要在当前 idle timeout 内继续本地观察的近端 delivery work
   - open 但长窗口的 batch / attempt 不单独阻止退出；由下次启动时的 overdue sweep 收口
   - 唯一例外是 CLI accepted attempt 的 `delivery_observation_deadline`，它在 deadline 到期前必须常驻观察
+- [ ] 实现 `cbth` daemon IPC 的 same-user-only 合同：
+  - macOS / Linux 使用 `~/.cbth/run/cbth.sock` 或等价用户私有 Unix domain socket
+  - parent directories 必须当前 uid owned 且不宽于 `0700`
+  - socket 必须当前 uid owned 且不宽于 `0600`
+  - daemon accept 后必须校验 peer uid
+  - 无法提供 same-user proof 时，mutating / recovery CLI 命令 fail closed
+  - v1 不退回 unauthenticated TCP daemon IPC；纯 Windows IPC 暂不支持
 - [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 bridge-side 所需的只读 inbox snapshot，且不会卡审批：
   - `current-snapshot.json`
   - `ready-threads.json`
@@ -45,6 +52,7 @@
   - `source_thread_id`
   - `caller_automation_id`
   - `armed_generation`
+  - `armed_generation_quiesced_at`
   - `pause_not_before`
   - `pause_deadline`
   - `read_transport` (mirrors the installation-wide chosen transport)
@@ -166,9 +174,11 @@
 - [ ] 把 caller heartbeat 的 one-shot cleanup 合同落进实现：
   - daemon exit 条件必须覆盖 `arm_pending_deadline`
   - arm 后写入 `pause_not_before` 与 `pause_deadline`
+  - `note-arm` 写入新 `armed_generation` 时必须清空 `armed_generation_quiesced_at`
   - 在 `pause_not_before` 之前不得因为普通 cleanup 提前 pause 当前 generation
   - daemon exit 条件也必须覆盖 `pause_deadline`
   - bridge 每轮先 pause/reconcile 已到期 generation
+  - 同一 binding 只有在上一代 `armed_generation` 已被证明 quiesced 并设置 `armed_generation_quiesced_at` 后，才允许 fresh-arm 下一批
   - pause 连续失败时 binding 进入 `degraded`
 - [ ] 按已定稿合同实现 `note-boundary-crossed` 的 compare-and-swap / 幂等语义：
   - `note-boundary-crossed` 只允许唯一一次 `not_crossed -> crossed_unacknowledged`

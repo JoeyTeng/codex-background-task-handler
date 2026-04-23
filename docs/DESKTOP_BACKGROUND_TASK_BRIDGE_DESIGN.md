@@ -101,6 +101,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
      - `source_thread_id`
      - `caller_automation_id`
      - `armed_generation` (optional)
+     - `armed_generation_quiesced_at` (optional)
      - `pause_not_before` (optional)
      - `pause_deadline` (optional)
      - `read_transport`
@@ -203,6 +204,9 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
      - bridge arm 成功并 `note-arm` durable 后，才允许把 `armed_generation` 推进到当前 generation
      - bridge 后续做 pause/reconcile 时，也必须比较自己正在清理的 generation 是否仍等于 `armed_generation`
      - 只要 binding 上的 `armed_generation` 已经变成更新 generation，旧 generation 的 cleanup/pause 就必须 no-op
+     - `note-arm` 更新 `armed_generation` 时必须清空 `armed_generation_quiesced_at`
+     - 只有 bridge 已验证该 generation 对应的 caller heartbeat 已 `PAUSED` / deleted / otherwise quiesced，才允许设置 `armed_generation_quiesced_at`
+     - 在 `armed_generation_quiesced_at` 仍为空时，同一 binding 不得 fresh-arm 下一批；`handoff_recorded` 释放 FIFO 只表示 batch 不再阻塞队列，不表示该长期复用 heartbeat 已安全回收
    - 每次成功 arm 还必须同时设置 `pause_not_before` 与 `pause_deadline`：
      - 这次 caller wake 只能被视为 one-shot wake window，而不是长期保持 `ACTIVE`
      - `pause_not_before` 是 bridge 最早允许尝试 pause 当前 generation 的时间
@@ -299,6 +303,7 @@ cbth desktop bridge-preflight --bridge-thread-id <thread_id> --json
      - `claim-next-ready` pure peek 返回的也必须是这个 fair order 的当前第一项
      - fair order 只包含当前 eligible ready thread：
        - 同 thread unresolved reconcile item 必须先把该 thread 排除在 eligible 集合外
+       - binding 上有未 quiesced 的 `armed_generation` 时，也必须先排除
        - degraded / capability-invalid binding 也不得继续占据 ready 首位
      - daemon 必须用 durable `ready_cursor` / `eligible_after` 等等价机制避免同一个 pre-accept 失败 candidate 在每轮里永久霸占第一项
    - 所有仍处于 `arm_pending` 的 attempt 都必须比新 arm 更优先被处理
@@ -311,7 +316,7 @@ fallback:  cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 ```
 
    - 所有到达 `pause_deadline` 的 binding 都必须优先处理
-   - 只有在 bridge 确认这些 one-shot wake 已被 pause 或进入 `degraded` 后，才允许继续 arm 新 batch
+   - 只有在 bridge 确认这些 one-shot wake 已被 pause / otherwise quiesced 并写入 `armed_generation_quiesced_at`，或 binding 已进入 `degraded` 后，才允许同一 binding 继续 fresh-arm 新 batch
    - overdue binding 的读取面必须是：
 
 ```text

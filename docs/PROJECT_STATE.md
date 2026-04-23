@@ -130,6 +130,8 @@
 - caller heartbeat lifecycle 也已收口：
   - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
   - `armed_generation` 作为这个长期复用 heartbeat 的 generation 栅栏
+  - `armed_generation_quiesced_at` 记录上一代 one-shot wake 已经被 bridge 证明 `PAUSED` / deleted / otherwise quiesced
+  - 同一 binding 在 `armed_generation_quiesced_at` 为空时不得 fresh-arm 下一批；`handoff_recorded` 释放 FIFO 不等于 heartbeat 已 quiesced
   - `arm_pending_deadline` 是当前 head attempt 的 reconcile 截止点，不属于 binding 自身的 durable 字段
   - `pause_not_before` / `pause_deadline` 才是 binding / armed generation 级的一次性 wake cleanup 窗口
   - 其中 `pause_not_before` 明确保证 bridge 至少给 caller 一次完整 heartbeat 触发机会，再允许回收这次 wake
@@ -233,6 +235,11 @@
   - daemon-owned ephemeral port
   - unauthenticated local control plane
   - 仅在 dedicated single-user deployment assumption 下支持
+- 这里的 unauthenticated loopback 只指上游 Codex shared `app-server` 的当前可用 surface；`cbth` 自己的 daemon IPC v1 已收紧为 same-user-only Unix domain socket：
+  - socket 位于 `~/.cbth/run` 这类 `0700` 用户私有目录
+  - socket / parent ownership 与权限必须校验
+  - daemon 接入后必须校验 peer uid
+  - 无法提供 same-user proof 时，mutating / recovery CLI 命令 fail closed，不退回 unauthenticated TCP
 - `--remote-auth-token-env` 仍是上游已存在的 surface，但在当前 loopback 合同下不再被当成第一版既有依赖。
 - `~/.cbth` 的 Desktop 侧文件路径也新增了权限合同：
   - directory `0700`

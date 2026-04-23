@@ -264,6 +264,15 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 
 - 这是内部实现细节，不是对外承诺的稳定公共 API。
 - 对外只承诺 CLI 子命令行为，不承诺 socket 协议长期兼容。
+- 但它仍是安全边界的一部分：稳定 CLI 子命令可以提交 job、关闭 batch、repair binding、读取 recovery envelope，因此 daemon IPC v1 必须是 same-user-only。
+- macOS / Linux 第一版只支持 Unix domain socket：
+  - socket path 位于 `~/.cbth/run/cbth.sock` 或等价 `0700` 用户私有目录
+  - parent directories 必须由当前 uid 拥有且 mode 不宽于 `0700`
+  - socket 文件必须由当前 uid 拥有且 mode 不宽于 `0600`
+  - daemon 接受连接后必须校验 peer uid 等于 daemon owner uid
+  - macOS 使用 `getpeereid`，Linux 使用 `SO_PEERCRED` 或等价机制
+- 如果平台或运行环境无法提供 same-user peer proof，相关 mutating / recovery CLI 命令必须 fail closed，不得退回 unauthenticated loopback TCP。
+- 纯 Windows IPC 不属于 v1 支持范围；未来若支持，必须先定义 named-pipe owner / ACL 等价合同。
 
 ### 6. `job orchestrator`
 
@@ -322,6 +331,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - `degraded`
 - `caller_automation_id`
 - `armed_generation` (optional)
+- `armed_generation_quiesced_at` (optional)
 - `pause_not_before` (optional)
 - `pause_deadline` (optional)
 - `bridge_thread_id`
@@ -404,6 +414,9 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - bridge arm 成功并 `note-arm` durable 后，才允许把它更新为当前 generation
   - 后续 bridge 想把该 heartbeat 切回 `PAUSED` 时，也必须带着期望 generation 比较 `armed_generation`
   - 只要 binding 上的 `armed_generation` 已经变成更新 generation，任何旧 generation 的 cleanup/pause 都必须 no-op
+  - `note-arm` 更新 `armed_generation` 时必须清空 `armed_generation_quiesced_at`
+  - 只有 bridge 已验证该 generation 对应的 caller heartbeat 已经 `PAUSED` / deleted / otherwise quiesced，才允许设置 `armed_generation_quiesced_at`
+  - 同一 binding 在 `armed_generation_quiesced_at` 为空时不得 fresh-arm 下一批；`handoff_recorded` 释放 FIFO 不等于 caller heartbeat 已 quiesced
 - 每次成功 arm 还必须同时设置 `pause_not_before` 与 `pause_deadline`：
   - `pause_not_before` 表示 bridge 最早允许尝试把这次 one-shot wake 对应的 caller heartbeat 切回 `PAUSED` 的时间
   - `pause_deadline` 表示 bridge 最迟必须完成这次 pause/reconcile 的时间
@@ -608,9 +621,14 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
     - 当前 head batch 仍 open 且 `replay_policy=automatic`
     - 当前 thread 没有 unresolved 的同 thread safety item
       - 例如 `arm_pending`
+      - 例如 binding 上仍有未 quiesced 的 `armed_generation`
       - 例如 overdue `pause_deadline`
       - 例如 binding `degraded`
       - 例如 `eligible_after > now`
+    - 对 Desktop binding 来说，fresh arm 还要求上一代 `armed_generation` 已被证明 quiesced：
+      - 没有 active `armed_generation`
+      - 或当前 `armed_generation` 已设置 `armed_generation_quiesced_at`
+      - 或 binding 已转入 `degraded` / `unbound` 并因此不再属于 eligible ready set
   - 在 eligible 集合内，daemon 必须按 durable `ready_cursor` 做 round-robin：
     - `ready_cursor` 至少按 target-kind / bridge 作用域维护
     - tie-break 至少稳定到 `ready_at` / `source_thread_id`
