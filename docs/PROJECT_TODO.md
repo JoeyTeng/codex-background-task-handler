@@ -36,10 +36,11 @@
   - `caller_automation_id`
   - `armed_generation`
   - `pause_deadline`
-  - `read_transport`
+  - `read_transport` (mirrors the installation-wide chosen transport)
   - `read_transport_capability`
   - `writeback_capability`
   - paused 状态读回校验
+  - v1 明确不支持 mixed Desktop `read_transport` bindings
 - [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
   - `ready-threads.json`
   - `arm-pending-bindings.json`
@@ -115,7 +116,8 @@
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
 - [ ] 把 caller heartbeat 的 one-shot cleanup 合同落进实现：
   - daemon exit 条件必须覆盖 `arm_pending_deadline`
-  - arm 后写入 `pause_deadline`
+  - arm 后写入 `pause_not_before` 与 `pause_deadline`
+  - 在 `pause_not_before` 之前不得因为普通 cleanup 提前 pause 当前 generation
   - daemon exit 条件也必须覆盖 `pause_deadline`
   - bridge 每轮先 pause/reconcile 已到期 generation
   - pause 连续失败时 binding 进入 `degraded`
@@ -158,7 +160,7 @@
   - `delivery_turn_id` (CLI)
   - optional `automation_id`
   - stale wake no-op 规则
-- [ ] 明确 Desktop 第一版的 `close_reason` / redelivery window contract，保证 `closed` 只表示停止自动重投，而不是隐含“caller 已消费”。
+- [ ] 按已定稿合同实现 Desktop 第一版的 `close_reason` / redelivery window contract，保证 `closed` 只表示停止自动重投，而不是隐含“caller 已消费”。
 - [ ] 把 `max_attempts_exhausted` 的自动关闭条件落进 durable schema 和实现：
   - `delivery_attempt_count >= max_delivery_attempts`
   - 自动转为 `close_reason=max_attempts_exhausted`
@@ -192,7 +194,7 @@
   - 前台退出但 active jobs 未结束时继续保活
   - 后续重连 / resume contract
   - 如果上游未来支持 loopback auth，再补对应 auth contract validation
-- [ ] 定死 CLI managed session 的 fixed-thread contract：
+- [ ] 按已定稿合同实现 CLI managed session 的 fixed-thread contract：
   - durable `managed_session_id + bound_thread_id`
   - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
   - 第一版不做前台 thread-switch 的自动观测或自动 retarget
@@ -200,8 +202,8 @@
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
   - accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
   - 如果 `delivery_turn_id` 的观察连续性丢失，则当前 head batch 进入 `manual_resolution_only`
-  - 明确 `session_epoch` 的生成、递增与 continuity 判定规则
-  - 为 continuity-loss 场景定死 `inspect-head -> close-head(reason=...)` 的 operator-resolution flow
+  - 落地 `session_epoch` 的生成、递增与 continuity 判定规则
+  - 按当前合同实现 continuity-loss 场景的 `inspect-head -> close-head(reason=...)` operator-resolution flow
 - [ ] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
   - 基于 `turn/started` / `turn/completed` / `thread/status/changed`
   - `turn/start` race 失败后回到等待下一个 idle

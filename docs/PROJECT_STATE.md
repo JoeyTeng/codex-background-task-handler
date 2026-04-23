@@ -22,6 +22,9 @@
     - `helper_cli_read`
   - 其中 `direct_file_read` 仍是候选优先路径，`helper_cli_read` 只是条件性 fallback
   - 同时又补了一层 explicit desktop binding：bridge 运行期只更新已知 caller automation，不做 blind create/discovery
+  - Desktop 的 `read_transport` 也已收口为 installation-wide 选择：
+    - binding 里只 durable 镜像当前安装选定 transport
+    - v1 不支持 mixed Desktop `read_transport` bindings
   - Desktop 顶部文案也已改成更保守的口径：`note-arm-pending` / `note-arm` / `note-boundary-crossed` 是 v1 规划中的窄写回依赖；`note-delivered` 已降级为未来 post-output ack 扩展点，但后台 heartbeat 能否无审批执行前者仍待实证
   - 而且 Desktop 自动续跑现在被明确成双门槛：
     - batch 本身必须是只读 / 低风险
@@ -44,6 +47,9 @@
   - 引入最小连续发送间隔
   - 同一 thread 同时最多一个 in-flight delivery attempt
   - 并进一步补上了 durable `attempt_id + generation` 合约，以及 optional `automation_id` 协调字段
+  - 其中 `generation` 现在明确只作用在 batch 内 attempt 级 redelivery：
+    - 新 generation 只会 supersede 旧 attempt
+    - 不会自动把整个 batch 关闭为 `close_reason=superseded`
 - Desktop 第一版的送达语义也已收口：
   - 目标是 `at-least-once wakeup scheduling`
   - `closed` 只表示 `cbth` 停止自动重投，不表示 caller 一定已消费
@@ -92,14 +98,18 @@
 - 第一版自动续跑总门槛也已统一：
   - 只处理 `delivery_read_only=true`
   - 且不需要 approval/network/write access 的 batch
-  - Desktop 还必须满足 `read_transport_capability=validated`
+  - Desktop 还必须满足安装级 `read_transport_capability=validated`
   - Desktop 还必须满足 `writeback_capability=validated`
   - 非只读 batch 一律不自动续跑，留给 operator/manual follow-up
 - caller heartbeat lifecycle 也已收口：
   - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
   - `armed_generation` 作为这个长期复用 heartbeat 的 generation 栅栏
   - `arm_pending_deadline` 是当前 head attempt 的 reconcile 截止点，不属于 binding 自身的 durable 字段
-  - `pause_deadline` 才是 binding / armed generation 级的一次性 wake cleanup 截止点
+  - `pause_not_before` / `pause_deadline` 才是 binding / armed generation 级的一次性 wake cleanup 窗口
+  - 其中 `pause_not_before` 明确保证 bridge 至少给 caller 一次完整 heartbeat 触发机会，再允许回收这次 wake
+  - bridge 的 ready entry 也已收口：
+    - 只要求返回 prompt token
+    - `caller_automation_id` 一律由 bridge 通过 `source_thread_id -> binding` lookup 解析
   - daemon 自动退出条件也必须覆盖这两个 deadline
   - bridge 还需要一个专门的 overdue-binding 输入面：
     - `~/.cbth/inbox/arm-pending-bindings.json`

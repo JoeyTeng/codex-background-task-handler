@@ -244,7 +244,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 
 - 把某个 Desktop source thread 绑定到一个稳定的 caller heartbeat automation。
 - 让 bridge 在运行期只做“更新已知 automation”，而不是 blind create / discover。
-- 为每个 source thread 选择允许的 delivery-envelope 读取传输。
+- 记录当前 Desktop 安装已选定的 delivery-envelope 读取传输快照。
 
 关键字段：
 
@@ -256,6 +256,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - `degraded`
 - `caller_automation_id`
 - `armed_generation` (optional)
+- `pause_not_before` (optional)
 - `pause_deadline` (optional)
 - `bridge_thread_id`
 - `read_transport`
@@ -279,6 +280,10 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - `binding_state=bound`
   - `read_transport_capability=validated`
   - `writeback_capability=validated`
+- Desktop v1 不支持同一安装里 mixed `read_transport` bindings：
+  - 同一 Desktop 安装只允许一个 installation-wide `read_transport`
+  - binding 上的 `read_transport` 只是这个安装当前选定 transport 的 durable 镜像，用于 bootstrap 校验、诊断和 stale-binding 检测
+  - 如果 binding 记录的 `read_transport` 与安装当前 transport 不一致，该 binding 必须进入 `degraded` 或重新 bootstrap
 - `unbound` thread 可以继续提交 job，但 bridge 不得尝试自动 arm caller heartbeat。
 - 运行期 bridge 不负责发现新的 caller automation id；第一版要求这个 id 通过 bootstrap 预先 durable 绑定。
 - `degraded` 表示该 thread 暂时失去自动续跑能力：
@@ -289,8 +294,14 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - bridge arm 成功并 `note-arm` durable 后，才允许把它更新为当前 generation
   - 后续 bridge 想把该 heartbeat 切回 `PAUSED` 时，也必须带着期望 generation 比较 `armed_generation`
   - 只要 binding 上的 `armed_generation` 已经变成更新 generation，任何旧 generation 的 cleanup/pause 都必须 no-op
-- 每次成功 arm 还必须设置一个 `pause_deadline`：
-  - 代表 bridge 最迟应在何时把这次 one-shot wake 对应的 caller heartbeat 切回 `PAUSED`
+- 每次成功 arm 还必须同时设置 `pause_not_before` 与 `pause_deadline`：
+  - `pause_not_before` 表示 bridge 最早允许尝试把这次 one-shot wake 对应的 caller heartbeat 切回 `PAUSED` 的时间
+  - `pause_deadline` 表示 bridge 最迟必须完成这次 pause/reconcile 的时间
+  - `pause_not_before` 必须至少覆盖“一次完整 caller heartbeat 周期 + scheduler jitter budget”
+  - 在 Desktop v1 固定 `FREQ=MINUTELY;INTERVAL=1` 的合同下，推荐：
+    - `pause_not_before >= last_delivery_attempt_at + 90s`
+    - `pause_deadline >= pause_not_before + 90s`
+  - 在 `pause_not_before` 之前，bridge 不得因为普通 cleanup 直接把当前 generation 切回 `PAUSED`
   - bridge 的下一轮 reconciliation 必须优先处理所有已到 `pause_deadline` 的 binding
   - 如果 pause 在限定的 bridge 重试窗口内仍无法被验证，binding 必须进入 `degraded`
 - 如果某次 `automation_update` 已被 Codex 接受，但后续 `note-arm` 没能 durable 成功：
@@ -413,6 +424,10 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - 递增该 thread 的 `generation`
   - 物化新 snapshot
   - 把当前 head attempt 指向新的 `attempt_id`
+- 这里的 `generation` 是 batch 内 attempt 级序号：
+  - 同一 `batch_id` 上创建新的 redelivery attempt 时可以递增
+  - 这只会 supersede 旧 attempt，不会自动把当前 batch 关闭为 `close_reason=superseded`
+  - `close_reason=superseded` 只保留给整个 batch 被新的 `batch_id` / compaction result / operator decision 取代的 batch 级终态
 - 对 Desktop target 来说，新 attempt 只有在存在 `binding_state=bound` 的 desktop binding 时才允许进入可投递状态。
 - 同一 `source_thread_id` 任何时刻最多只能有一个非终态 attempt：
   - `prepared`
@@ -426,7 +441,10 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - `snapshot_path`
 - bridge 获取这组 token 的来源合同必须是二选一：
   - `direct_file_read` 路径：`ready-threads.json` 的每个 ready entry 必须直接携带这整组 prompt token
-  - `helper_cli_read` 路径：`cbth desktop claim-next-ready ...` 必须一次性返回这整组 prompt token 与 `caller_automation_id`
+  - `helper_cli_read` 路径：`cbth desktop claim-next-ready ...` 必须一次性返回这整组 prompt token
+- `caller_automation_id` 不要求由 ready entry 直接携带：
+  - bridge 必须始终根据 `source_thread_id` 查询 desktop binding 来解析它
+  - 如果 binding 缺失、不是 `bound`、或其 `read_transport` 与当前安装已选定 transport 不一致，则 bridge 不得继续 arm
 - `cbth desktop claim-next-ready ...` 虽然名字里带 `claim`，但第一版语义必须是：
   - 纯读取 / peek helper
   - 不得创建 reservation
@@ -447,6 +465,9 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - `cbth desktop note-arm-pending ...` 先把当前 head attempt durable 推到 `arm_pending`
   - 之后 `automation_update` 被 Codex 接受
   - 随后的 `cbth desktop note-arm ...` 再把 attempt 推到 `cooldown`
+- `note-arm` 在把 attempt 推到 `cooldown` 时，还必须同时写下：
+  - `pause_not_before`
+  - `pause_deadline`
 - 因此，即使 bridge 在 `claim-next-ready` 返回后崩溃，head batch 也必须仍然保持可见、可重读。
 - 但只要某个 attempt 已经进入 `arm_pending`，bridge 就不得再对同一 `attempt_id + generation` 重新 arm，直到该 attempt 被明确收口为：
   - `cooldown`
@@ -497,7 +518,8 @@ cooldown -> superseded
 
 - `closed` 表示 `cbth` 不会再自动重投该 attempt 绑定的 batch。
 - `abandoned` 表示本次投递尝试失败，需要调度器决定是否生成新 attempt。
-- `superseded` 表示同一 thread 上出现了更新 generation 的 attempt，旧 attempt 必须彻底失效。
+- `superseded` 表示同一 batch 上出现了更新 generation 的 attempt，旧 attempt 必须彻底失效。
+- 这不等于 batch 自己进入 `close_reason=superseded`；batch 级 supersede 必须来自新的 `batch_id` / compaction result / operator decision。
 - 第一版 durable 状态里不再保留单独的 `armed`。
 - 一次 wakeup arm 一旦被 delivery channel 接受并被 `note-arm` durable 记录，attempt 就直接进入 `cooldown`。
 - `cooldown` 表示 `cbth` 正在等待这次 wakeup 的最短观察窗口结束；窗口结束后，如果 batch 仍是 head 且仍允许自动重投，就会生成新 attempt，而不是直接把旧 attempt 视为成功关闭。
@@ -642,7 +664,8 @@ cooldown -> superseded
   - 可信 delivery channel 已被观察到完成并允许自动关闭
   - 例如 CLI 在同一 `managed_session_id + session_epoch` 上观察到可信的 `turn/completed`
 - `superseded`
-  - 当前 head batch 被更新 generation 或更新 head batch 取代
+  - 当前 batch 被新的 `batch_id` / compaction result / operator decision 取代
+  - 同一 batch 内生成新 redelivery attempt 不属于 batch 级 `superseded`
 - `operator_confirmed_delivery`
   - operator 基于 durable 证据与外部可见证据确认该 batch 已经送达/生效后人工关闭
 - `operator_closed_unconfirmed`
@@ -749,6 +772,7 @@ cooldown -> superseded
 - 可信 delivery channel 报告该 batch 已送达，对应 `close_reason=delivered`
 - operator / user 显式关闭或取消该 batch，对应 `operator_confirmed_delivery`、`operator_closed_unconfirmed` 或 `cancelled`
 - redelivery window 结束且不再继续自动重投，对应 `redelivery_window_exhausted` 或 `manual_resolution_expired`
+- batch 被显式 supersede 或达到尝试上限，对应 `superseded` 或 `max_attempts_exhausted`
 
 这意味着：
 
@@ -962,7 +986,7 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
   - `generation`
   - `snapshot_revision`
   - `snapshot_path`
-  - `caller_automation_id`
+- bridge 必须再根据 `source_thread_id` 查询 binding，解析当前唯一允许更新的 `caller_automation_id`
 - 当前首选路径是：
   - bridge heartbeat 只读 `ready-threads.json`
   - caller heartbeat 通过 `direct_file_read` 读取自己的 per-thread envelope 与 artifact

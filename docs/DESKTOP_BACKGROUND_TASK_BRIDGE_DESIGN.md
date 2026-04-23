@@ -79,11 +79,16 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
      - `source_thread_id`
      - `caller_automation_id`
      - `armed_generation` (optional)
+     - `pause_not_before` (optional)
      - `pause_deadline` (optional)
      - `read_transport`
      - `read_transport_capability`
      - `writeback_capability`
    - bridge 在运行期只允许更新这个已知 `caller_automation_id`，不做 blind create / discovery。
+   - Desktop v1 不支持同一安装里 mixed `read_transport` bindings：
+     - 同一安装只允许一个 installation-wide `read_transport`
+     - binding 上的 `read_transport` 只是这个安装当前选定 transport 的 durable 镜像
+     - 如果 binding 记录与安装当前 transport 不一致，该 binding 必须进入 `degraded` 或重新 bootstrap
    - 只有当以下条件同时满足时，这个 binding 才允许进入真正可自动续跑的 `bound` 状态：
      - `read_transport_capability=validated`
      - `writeback_capability=validated`
@@ -128,8 +133,15 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
      - bridge arm 成功并 `note-arm` durable 后，才允许把 `armed_generation` 推进到当前 generation
      - bridge 后续做 pause/reconcile 时，也必须比较自己正在清理的 generation 是否仍等于 `armed_generation`
      - 只要 binding 上的 `armed_generation` 已经变成更新 generation，旧 generation 的 cleanup/pause 就必须 no-op
-   - 每次成功 arm 还必须设置一个 `pause_deadline`：
+   - 每次成功 arm 还必须同时设置 `pause_not_before` 与 `pause_deadline`：
      - 这次 caller wake 只能被视为 one-shot wake window，而不是长期保持 `ACTIVE`
+     - `pause_not_before` 是 bridge 最早允许尝试 pause 当前 generation 的时间
+     - `pause_deadline` 是 bridge 最迟必须完成 pause/reconcile 的时间
+     - `pause_not_before` 必须至少覆盖“一次完整 caller heartbeat 周期 + scheduler jitter budget”
+     - 在 Desktop v1 固定 `FREQ=MINUTELY;INTERVAL=1` 的合同下，推荐：
+       - `pause_not_before >= last_delivery_attempt_at + 90s`
+       - `pause_deadline >= pause_not_before + 90s`
+     - 在 `pause_not_before` 之前，bridge 不得因为普通 cleanup 直接把当前 generation 切回 `PAUSED`
      - bridge 必须在最迟到达 `pause_deadline` 的 reconciliation 中把该 generation 切回 `PAUSED`
      - 如果 pause 在限定重试窗口内仍无法验证成功，则 binding 必须进入 `degraded`
 
@@ -146,7 +158,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - `delivery_requires_network=false`
   - `delivery_requires_write_access=false`
 - 但这还不是充分条件；Desktop 自动续跑还必须额外满足：
-  - 当前 binding 的 `read_transport_capability=validated`
+  - 当前安装选定 `read_transport` 已验证可无审批执行
   - 当前 binding 的 `writeback_capability=validated`
   - 也就是 `note-arm-pending` / `note-arm` / `note-boundary-crossed` 这组窄 helper 已经被证明可在 heartbeat 中无审批执行
 - 不满足这些条件的 batch 不得由 bridge 自动 arm caller heartbeat；它们保留为 manual/operator follow-up。
@@ -197,7 +209,7 @@ preferred: ~/.cbth/inbox/pause-due-bindings.json
 fallback:  cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 ```
 
-2. 读取 bridge 侧的 ready 来源：
+2. 按当前安装选定的 `read_transport` 读取 bridge 侧的 ready 来源：
 
 ```text
 preferred: ~/.cbth/inbox/ready-threads.json
@@ -219,11 +231,11 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
      - `generation`
      - `snapshot_revision`
      - `snapshot_path`
-     - `caller_automation_id`
    - 该 thread 必须已经存在 `binding_state=bound` 的 desktop binding
    - 且该 binding 必须同时满足：
      - `read_transport_capability=validated`
      - `writeback_capability=validated`
+   - bridge 必须再根据 `source_thread_id` 查询 binding，解析当前唯一允许更新的 `caller_automation_id`
    - 用 `automation_update` 更新这个已知 caller heartbeat
    - heartbeat prompt 中带上：
      - `batch_id`
@@ -259,6 +271,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
      - `last_delivery_attempt_at`
      - `delivery_attempt_count`
      - `armed_generation`
+     - `pause_not_before`
      - `pause_deadline`
    - `note-arm` 的实现合同必须是：
      - compare-and-swap：只允许当前 `arm_pending` 的 head attempt 成功推进一次
@@ -484,8 +497,9 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 - caller 不直接 pause 当前 heartbeat；任务完成后的 pause/reconcile 由 bridge 在后续 heartbeat 中处理。
 - 旧 generation 的 prompt 只允许 no-op，不允许“顺手处理当前 head batch”。
 - 读取传输由 binding 预先决定：
-  - `direct_file_read`
-  - 或 `helper_cli_read`
+  - v1 中它实际是 installation-wide 选择，再被 durable 镜像到 binding：
+    - `direct_file_read`
+    - 或 `helper_cli_read`
 
 ## Delivery 关闭语义
 
@@ -509,6 +523,8 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 - 其中：
   - `delivered` 是共享核心的 canonical 枚举值，供 CLI 等可信自动送达路径使用
   - Desktop v1 自动路径默认只会产出其余几类 `close_reason`，不会在 post-boundary 阶段自动写出 `delivered`
+  - `superseded` 只用于整个 batch 被新的 `batch_id` / compaction result / operator decision 取代
+  - 同一 batch 内创建新 redelivery attempt 不属于 batch 级 `superseded`
 - 也就是说，Desktop 第一版的自动续跑语义是：
   - `at-least-once wakeup scheduling`
   - not `exactly-once consumption`
