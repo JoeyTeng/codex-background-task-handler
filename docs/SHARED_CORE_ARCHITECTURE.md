@@ -299,6 +299,14 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - 这个 installation state 的 source of truth 必须由 `cbth` durable 持有：
   - bootstrap / repair 是唯一允许更新它的路径
   - bridge 运行期必须优先读取它，再检查 binding 上的镜像字段是否一致
+  - installation-wide capability 结论只允许由 installation state 自己写入；binding repair 只能消费它，不能覆盖它
+  - 这些 capability 结论始终绑定在当前 `read_transport_generation` 上：
+    - 只要 `read_transport_generation` 递增
+    - daemon 就必须原子地把 `read_transport_capability`
+    - `artifact_read_capability`
+    - `writeback_capability`
+    - 全部重置为 `unknown`
+    - 并清空 `validated_at`
   - 推荐暴露面：
     - preferred: `~/.cbth/inbox/desktop-installation-state.json`
     - fallback: `cbth desktop installation-state --json`
@@ -343,7 +351,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - 一旦 caller 已成功写入 `cbth desktop note-boundary-crossed ...`，当前 batch 就必须保持 `manual_resolution_only`；第一版不再提供 post-boundary 自动成功收口。
 - 为了避免 FIFO 队列永久卡死，第一版必须给 operator 至少两条显式恢复路径：
   - `cbth desktop binding repair --source-thread-id ... --caller-automation-id ... --json`
-  - `cbth desktop installation-state repair --read-transport ... --json`
+  - `cbth desktop installation-state repair --read-transport ... [--read-transport-capability ...] [--artifact-read-capability ...] [--writeback-capability ...] --json`
   - `cbth batch close-head --source-thread-id ... --reason operator_closed_unconfirmed --json`
   - `cbth batch close-head --source-thread-id ... --reason operator_confirmed_delivery --json`
 
@@ -491,11 +499,16 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - `bridge_arm_lease`
   - 以 `(source_thread_id, attempt_id, generation)` 为 key
   - 只用于串行化 bridge 自己的 arm 流程
-  - 它的 acquire/carry-forward 入口就是 `cbth desktop note-arm-pending ...`
+  - 它的 acquire/carry-forward 入口就是 `cbth desktop note-arm-pending ... --bridge-request-id <request_id>`
   - `note-arm-pending` 必须返回：
     - `bridge_arm_lease_id`
     - `bridge_arm_lease_deadline`
-  - bridge 之后调用 `note-arm` 时，必须回传这个 `bridge_arm_lease_id`
+  - `bridge_request_id` 是每次 bridge wake / reconcile 流水线自己的唯一 owner token：
+    - 同一个 `bridge_request_id` 的重试才允许 carry-forward 同一 lease
+    - 不同 `bridge_request_id` 在 lease 仍有效时必须收到 `lease-held` / `busy`，不得拿到现有 lease
+  - bridge 之后调用 `note-arm` 时，必须同时回传：
+    - `bridge_request_id`
+    - `bridge_arm_lease_id`
   - 不得改变 head batch 的外部可见性
 - Desktop 第一版里，bridge 侧真正允许推进 durable 状态的动作有两步：
   - `cbth desktop note-arm-pending ...` 先把当前 head attempt durable 推到 `arm_pending`
@@ -740,23 +753,29 @@ cooldown -> superseded
   - CLI benign race 不得递增 `delivery_attempt_count`
   - 只有真正进入 delivery channel 的尝试才会逼近 `max_delivery_attempts`
 - `cbth desktop note-arm ...` 的合同必须再补两条：
-  - `cbth desktop note-arm-pending ...` 先提供一个 compare-and-swap durable barrier：
+  - `cbth desktop note-arm-pending ... --bridge-request-id <request_id>` 先提供一个 compare-and-swap durable barrier：
     - 只有当 `(source_thread_id, attempt_id, generation)` 仍指向当前 head attempt
     - 且当前 durable 状态仍是 `prepared`
     - 才允许执行唯一一次 `prepared -> arm_pending`
     - 并记录：
+      - `bridge_request_id`
       - `bridge_arm_lease_id`
       - `bridge_arm_lease_deadline`
       - `arm_pending_since`
       - `arm_pending_deadline`
-    - 如果同一 attempt 已经是 `arm_pending`，重复调用只能返回 already-pending / idempotent success
+    - 如果同一 attempt 已经是 `arm_pending`：
+      - 只有当前 durable `bridge_request_id` 与调用方相同，才允许返回 already-pending / idempotent success
+      - 且必须返回同一个 `bridge_arm_lease_id`
+      - 如果 durable `bridge_request_id` 不同，则必须返回 `lease-held` / `busy`，不得泄露现有 lease
     - 如果 attempt 已过期、已 superseded 或已离开 head，则必须 stale/no-op
-    - 重复调用如果当前 lease 仍有效，必须返回同一个 `bridge_arm_lease_id`，而不是重新发新 lease
   - compare-and-swap：
     - 只有当 `(source_thread_id, attempt_id, generation)` 仍指向当前 head attempt
     - 且当前 durable 状态仍是 `arm_pending`
     - 才允许执行唯一一次 `arm_pending -> cooldown`
-    - 且调用方显式回传的 `bridge_arm_lease_id` 与 durable 记录一致
+    - 且调用方显式回传的：
+      - `bridge_request_id`
+      - `bridge_arm_lease_id`
+      - 都与 durable 记录一致
   - idempotent retry：
     - 如果同一 attempt 之前已经成功进入 `cooldown`
     - 重复 `note-arm` 必须返回 idempotent success / already-armed
@@ -875,11 +894,12 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
     - 只有当当前 head batch 仍匹配 `(source_thread_id, attempt_id, generation)`
     - 且当前 attempt 已经 durable 进入 `cooldown`
     - 且 binding 上的 `armed_generation` 仍等于当前 `generation`
-    - 且 `continuation_boundary_state=not_crossed`
     - 且 batch 仍然 open
-    - 才允许唯一一次把状态推进到 `crossed_unacknowledged`
-    - 如果同一 attempt/generation 已经进入 `crossed_unacknowledged` 或 `acknowledged`
-    - 重复调用必须返回 already-crossed / stale-no-op，而不是再次授权 caller 继续
+    - 且满足以下二选一：
+      - `continuation_boundary_state=not_crossed`，允许 fresh transition
+      - `continuation_boundary_state=crossed_unacknowledged`，且 durable 记录仍属于同一 `(attempt_id, generation, snapshot_revision)`，允许 replay-safe reissue
+    - fresh transition 只允许唯一一次把状态推进到 `crossed_unacknowledged`
+    - replay-safe reissue 不得再次推进状态，但必须允许 caller 重新取回 continuation access
   - 它一旦成功，当前 head batch 必须 durable 进入：
     - `continuation_boundary_state=crossed_unacknowledged`
     - `replay_policy=manual_resolution_only`
@@ -890,9 +910,18 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
   - 对大 artifact，`note-boundary-crossed` success 返回必须至少提供：
     - `artifact_id`
     - opaque `artifact_read_lease_id`
+    - `artifact_read_lease_deadline`
   - `cbth desktop read-artifact ...` 必须要求这个 `artifact_read_lease_id`：
     - 单独持有 `artifact_id` 不足以继续读取
     - lease 必须至少绑定 `(source_thread_id, attempt_id, generation, snapshot_revision)`
+    - lease 还必须满足：
+      - 只对当前 `crossed_unacknowledged` 的 head attempt 有效
+      - 在以下任一时刻立即失效：
+        - `artifact_read_lease_deadline` 到期
+        - batch 关闭
+        - 当前 attempt 被 `superseded` / `abandoned`
+        - operator close / unbind / repair 把该 batch 收口或移出当前 continuation
+        - 同一 `(attempt_id, generation, snapshot_revision)` 的 replay-safe `note-boundary-crossed` 重新签发了更新的 lease
     - stale wake 或其他本地调用方即使拿到旧 `artifact_id`，也不得绕过 continuation boundary 继续读大 artifact
   - 这样即使 caller 在之后崩溃，`cbth` 也不会再自动 redelivery 这个可能已产生副作用的 batch
 - 第一版不再尝试在 continuation boundary 之后自动把 batch 收口到 “已送达”：
@@ -901,8 +930,11 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
   - 当前 head batch 就保持 `crossed_unacknowledged + replay_policy=manual_resolution_only`
   - 后续只能等待 operator close，或在 `redelivery_window_ends_at` 到期时自动关闭
 - 在 v1 自动 caller path 里，caller 不得在 `note-boundary-crossed` 之前直接读取 per-thread envelope / artifact payload。
-- 如果 `note-boundary-crossed` 返回 error / stale-no-op / already-crossed：
+- 如果 `note-boundary-crossed` 返回 error / stale-no-op：
   - caller 必须立即停止，不得继续输出或产生工具副作用
+- 如果 `note-boundary-crossed` 对同一 `(attempt_id, generation, snapshot_revision)` 返回 replay-safe success：
+  - caller 允许继续
+  - 但必须使用 helper 当前返回的 payload / access token，而不是假设旧 response 仍然有效
 - 如果 caller 已经越过 continuation boundary 但还没成功得到 `note-boundary-crossed` 的 success 返回：
   - 这属于违背第一版安全合同的实现错误
   - 正确实现必须保证“先 `note-boundary-crossed` 成功返回，再继续”
@@ -955,7 +987,14 @@ cbth desktop binding unbind
 - `cbth desktop ...` 预留给 Desktop bootstrap / helper。
 - `cbth desktop installation-state repair ...` 是 installation-wide Desktop transport / capability state 的稳定 operator 面：
   - 它才允许切换 `read_transport`
+  - 也是唯一允许写 installation-wide capability 结论的路径
   - 成功时必须原子更新 installation state，并递增 `read_transport_generation`
+  - 如果 `read_transport` 发生变化而 capability 状态没有由同一次 repair 显式提供：
+    - 必须把 `read_transport_capability`
+    - `artifact_read_capability`
+    - `writeback_capability`
+    - 全部原子重置为 `unknown`
+    - 并清空 `validated_at`
   - 同时把所有镜像不再匹配的 bindings 推到 `degraded`
 - `cbth job ...` 是第一版对外稳定的任务提交与状态回报面。
 - `cbth batch close-head` / `inspect-head` 与 `cbth desktop binding repair` / `unbind` 也必须作为第一版稳定的 operator recovery 面存在。
@@ -963,6 +1002,7 @@ cbth desktop binding unbind
   - `read_transport_capability`
   - `artifact_read_capability`
   - `writeback_capability`
+  - 这些字段只是 installation state 的当前镜像，不得由 binding repair 单独写入
 - 其他更细的 queue / batch / inbox 控制面先视为内部实现，不在第一版对外冻结。
 - Desktop 使用的 snapshot / artifact 路径目前只算候选内部 contract，不算第一版对外稳定接口。
 
@@ -1059,7 +1099,7 @@ cbth job query <job_id> --json
 
 ```text
 cbth desktop binding repair --source-thread-id <thread_id> --caller-automation-id <automation_id> --json
-cbth desktop installation-state repair --read-transport <transport> --json
+cbth desktop installation-state repair --read-transport <transport> [--read-transport-capability <state>] [--artifact-read-capability <state>] [--writeback-capability <state>] --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_unconfirmed --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_delivery --json
 cbth batch inspect-head --source-thread-id <thread_id> --json

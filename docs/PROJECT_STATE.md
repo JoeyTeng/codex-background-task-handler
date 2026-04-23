@@ -27,6 +27,9 @@
     - 权威来源是 daemon-managed `desktop_installation_state`
     - v1 不支持 mixed Desktop `read_transport` bindings
     - `~/.cbth` 文件权限与稳定 helper CLI 只是在降低意外暴露面；Desktop helper / snapshot 路线同样只支持 dedicated single-user deployment assumption
+    - installation-wide capability 结论也已收回到 `desktop_installation_state`：
+      - transport generation 变化时，capability 必须原子重置为 `unknown`
+      - binding repair 不得单独覆盖 installation-wide capability
   - Desktop 顶部文案也已改成更保守的口径：`note-arm-pending` / `note-arm` / `note-boundary-crossed` 是 v1 规划中的窄写回依赖；`note-delivered` 已降级为未来 post-output ack 扩展点，但后台 heartbeat 能否无审批执行前者仍待实证
   - 而且 Desktop 自动续跑现在被明确成双门槛：
     - batch 本身必须是只读 / 低风险
@@ -91,6 +94,7 @@
   - `arm_pending` attempt 不再是新的 ready head；bridge 必须先 reconcile 它，不能重复 arm 同一 generation
   - `note-boundary-crossed` 现在不只是断点写回，而是 gated continuation helper：
     - caller 必须先拿到它的 success 返回，才允许看到 payload / artifact access
+    - 对同一 `(attempt_id, generation, snapshot_revision)` 的重试还必须 replay-safe，避免“已 crossed 但 response 丢失”把 batch 永久楔死
   - 如果 `note-boundary-crossed` 尚未 success，caller 不得真正跨过 continuation boundary
   - `note-boundary-crossed` 需要 compare-and-swap / stale-no-op 语义，避免重复 wake 或 supersede 后重复记账
   - 一旦 `note-boundary-crossed` 成功，当前 head batch 就必须保持 `crossed_unacknowledged + replay_policy=manual_resolution_only`
@@ -136,6 +140,8 @@
   - 只有明确 operator `binding unbind` 才允许删除
 - CLI 侧 reviewer 指出的 idle/race 缺口也已收口：
   - idle 必须来自 app-server live event stream
+  - attach/recovery / continuity-loss 之后必须先回到 `activity_state=unknown`
+  - 只有重新拿到 current-state sync 或新的本地 turn lifecycle 证据后，才允许重新判定 `idle`
   - `turn/start` 失败要被当成 benign race，回到等待下一个 idle，而不是视为成功送达
 - CLI managed session contract 也已补硬：
   - shared `app-server` 由 daemon 持有

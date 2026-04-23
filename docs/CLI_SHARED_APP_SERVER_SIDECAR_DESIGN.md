@@ -363,6 +363,20 @@ thread/resume + turn/start
   - 前台 / sidecar 重连到同一个仍存活的 app-server 实例时不变
   - app-server 进程被重建，或 daemon 恢复后无法证明 continuity 时必须递增
 - 只有在后续仍能证明自己附着在同一个 `managed_session_id + session_epoch` 的事件流上时，CLI adapter 才允许继续等待那个 `delivery_turn_id` 的 `turn/completed`。
+- 对每个 managed session，CLI adapter 还必须维护一个独立的 thread activity state：
+  - `unknown`
+  - `active`
+  - `idle`
+- 在以下任一时刻，`activity_state` 都必须强制回到 `unknown`，并暂停自动 delivery：
+  - daemon / sidecar 首次 attach 到该 managed session
+  - `session_epoch` 递增
+  - websocket continuity 丢失后重新附着
+  - daemon 无法证明自己仍看到同一条连续 event stream
+- `unknown` 只能通过权威 current-state sync 或新的本地观测收敛：
+  - 如果 adapter 能从 app-server 当前状态同步出“存在 active regular turn”，则转为 `active`
+  - 如果 adapter 能从权威状态同步出“当前没有 active regular turn”，则转为 `idle`
+  - 如果当前实现拿不到这种权威 current-state sync，v1 必须 fail-closed 保持 `unknown`，直到重新观察到一轮本地 regular turn 生命周期并确认其完成
+- 只要 `activity_state != idle`，就不得自动发 `thread/resume + turn/start`
 
 ### Idle 判定与 race contract
 
@@ -372,6 +386,7 @@ thread/resume + turn/start
   - `turn/completed`
   - `thread/status/changed`（如果可用）
 - 一个 thread 只有在以下条件同时满足时，才允许被本地视图判为 idle：
+  - 当前 `activity_state` 已经不是 `unknown`
   - 最近一次已观察到的 regular turn 已完成/中断
   - 且在那之后没有新的 `turn/started`
 - `turn/start` 本身必须被视为最后一道 compare-and-swap：

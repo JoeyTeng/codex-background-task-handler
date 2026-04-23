@@ -70,14 +70,17 @@
   - 不推进 attempt / batch durable 状态
 - [ ] 把 Desktop `bridge_arm_lease` 合同收口成 `note-arm-pending` 的可执行 acquire/carry-forward 语义：
   - key 为 `(source_thread_id, attempt_id, generation)`
+  - `note-arm-pending` 必须带 `bridge_request_id`
+  - 只有同一 `bridge_request_id` 才允许 carry-forward 同一 lease
+  - 不同 `bridge_request_id` 在 lease 仍有效时必须收到 `lease-held` / `busy`
   - `note-arm-pending` 返回稳定的 `bridge_arm_lease_id`
-  - `note-arm` 必须显式回传该 `bridge_arm_lease_id`
+  - `note-arm` 必须显式回传 `bridge_request_id + bridge_arm_lease_id`
   - 不改变 head batch 的外部可见性
   - `note-arm` unknown 时先 reconcile，再决定是否 degraded/manual
 - [ ] 设计并实现 Desktop bridge 的窄写回 helper：
-  - `cbth desktop note-arm-pending --source-thread-id ... --attempt-id ... --generation ... --json`
+  - `cbth desktop note-arm-pending --source-thread-id ... --attempt-id ... --generation ... --bridge-request-id ... --json`
   - compare-and-swap 只允许唯一一次 `prepared -> arm_pending`
-  - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --bridge-arm-lease-id ... --json`
+  - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --bridge-request-id ... --bridge-arm-lease-id ... --json`
   - compare-and-swap 只允许唯一一次 `arm_pending -> cooldown`
   - idempotent retry 不得重复递增 `delivery_attempt_count`
 - [ ] 按已定稿合同实现 Desktop continuation-boundary 断点 helper：
@@ -91,6 +94,7 @@
   - bridge 读到 ready entry，或 caller 仅拿到 gated payload / artifact access，都不能关闭 batch
   - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
   - 一旦 `note-boundary-crossed` 成功，当前 head batch 必须进入 `crossed_unacknowledged + replay_policy=manual_resolution_only`
+  - 同一 `(attempt_id, generation, snapshot_revision)` 的重试必须 replay-safe 返回 continuation access
   - 第一版不提供 post-boundary 自动 close
   - 如果未来需要支持 post-output ack，再单独设计 observation / response-digest contract
 - [ ] 明确第一版自动续跑的总安全门槛：
@@ -135,7 +139,12 @@
   - pause 连续失败时 binding 进入 `degraded`
 - [ ] 按已定稿合同实现 `note-boundary-crossed` 的 compare-and-swap / 幂等语义：
   - `note-boundary-crossed` 只允许唯一一次 `not_crossed -> crossed_unacknowledged`
-  - 同一 attempt/generation 的重复调用必须返回 already-crossed / stale-no-op
+  - 同一 `(attempt_id, generation, snapshot_revision)` 的重复调用必须 replay-safe 返回 continuation access
+  - stale / mismatch / closed batch 才返回 stale-no-op
+- [ ] 为 Desktop 大 artifact gated read 定死 lease 生命周期：
+  - `note-boundary-crossed` 返回 `artifact_read_lease_id + artifact_read_lease_deadline`
+  - `read-artifact` 只能在持有当前有效 lease 时读取
+  - lease 在 batch close / supersede / abandon / operator repair-or-close / deadline 到期 / lease rotation 后必须失效
 - [ ] 如果未来需要 post-output ack，再单独设计 `note-delivered` 合同：
   - 不进入 v1 自动续跑主路径
   - 必须建立 post-output / post-side-effect observation contract
@@ -144,8 +153,15 @@
   - `cbth batch inspect-head ...`
   - `cbth batch close-head ...`
   - `cbth desktop binding repair ...`
-  - `cbth desktop installation-state repair ...`
+  - `cbth desktop installation-state repair --read-transport ... [--read-transport-capability ...] [--artifact-read-capability ...] [--writeback-capability ...] ...`
   - `cbth desktop binding unbind ...`
+- [ ] 把 installation-wide capability authority 收口到 `desktop_installation_state`：
+  - transport generation 一旦变化，installation-wide capability 必须原子重置为 `unknown`
+  - 只有 installation-state repair 才允许再次写入 validated 结论
+  - binding repair 只能消费 installation state，不能单独覆盖 capability 结论
+- [ ] 把 CLI attach/recovery 的 `activity_state=unknown -> current-state sync -> active/idle` 合同落进实现：
+  - 未完成 current-state sync 前不得自动把 thread 判成 idle
+  - continuity-loss 后只能 fail-closed，直到恢复到权威 current-state 或新的本地 regular turn lifecycle
 - [ ] 定死 caller heartbeat 的长期生命周期合同：
   - 预绑定 `caller_automation_id`
   - 正常路径只 `pause` / `update` / `reuse`

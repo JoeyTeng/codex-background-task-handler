@@ -64,12 +64,13 @@
    - `helper_cli_read` 建议提供一组窄 helper：
 
 ```text
-cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
+cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --json
 cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
 cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
+cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --bridge-arm-lease-id <lease_id> --json
 ```
 
    - 底层仍可用 SQLite / 普通文件 / `mmap`，但这属于内部实现细节。
@@ -107,6 +108,13 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
      - preferred: `~/.cbth/inbox/desktop-installation-state.json`
      - fallback: `cbth desktop installation-state --json`
    - bootstrap / repair 是唯一允许更新 installation state 的路径；bridge 运行期必须先读 installation state，再核对 binding 镜像
+   - installation-wide capability 结论必须永远跟随当前 `read_transport_generation`：
+     - transport generation 一旦变化
+     - `read_transport_capability`
+     - `artifact_read_capability`
+     - `writeback_capability`
+     - 都必须被原子重置为 `unknown`
+     - 直到 installation-state repair 明确再次写入新的 validated 结论
    - 只有当以下条件同时满足时，这个 binding 才允许进入真正可自动续跑的 `bound` 状态：
      - `read_transport_capability=validated`
      - `writeback_capability=validated`
@@ -278,24 +286,27 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
    - 在真正调用 `automation_update` 前，bridge 必须先调用一个窄 helper，把当前 attempt durable 推到 `arm_pending`，同时 acquire 当前 generation 的 `bridge_arm_lease`：
 
 ```text
-cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
+cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --json
 ```
 
    - `note-arm-pending` 的实现合同必须是：
      - compare-and-swap：只允许当前 `prepared` 的 head attempt 唯一一次推进到 `arm_pending`
      - 这一步必须写下：
+       - `bridge_request_id`
        - `bridge_arm_lease_id`
        - `bridge_arm_lease_deadline`
        - `arm_pending_since`
        - `arm_pending_deadline`
-     - 如果同一 attempt 已经是 `arm_pending`，重复调用只能返回 already-pending / idempotent success
+     - 如果同一 attempt 已经是 `arm_pending`：
+       - 只有当前 durable `bridge_request_id` 与调用方相同，才允许返回 already-pending / idempotent success
        - 且必须返回同一个 `bridge_arm_lease_id`
+       - 如果 durable `bridge_request_id` 不同，则必须返回 `lease-held` / `busy`，不得暴露现有 lease
      - stale/no-op：如果 `attempt_id` / `generation` 已经过期，就必须拒绝推进，也不能写新 deadline
    - 只有 `note-arm-pending` 成功并返回 `bridge_arm_lease_id` 后，bridge 才允许真正调用 `automation_update`
    - `automation_update` 成功后，bridge 调用一个窄 helper：
 
 ```text
-cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-arm-lease-id <lease_id> --json
+cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --bridge-arm-lease-id <lease_id> --json
 ```
 
    - 这一步负责把 attempt durable 从 `arm_pending` 推进到 `cooldown`，并更新：
@@ -307,7 +318,10 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
      - `pause_deadline`
    - `note-arm` 的实现合同必须是：
      - compare-and-swap：只允许当前 `arm_pending` 的 head attempt 成功推进一次
-     - 且调用方回传的 `bridge_arm_lease_id` 必须与当前 durable lease 一致
+     - 且调用方回传的：
+       - `bridge_request_id`
+       - `bridge_arm_lease_id`
+       - 都必须与当前 durable lease owner 一致
      - idempotent retry：如果同一 attempt 已经是 `cooldown`，重复调用只能返回 already-armed / idempotent success，不能重复计数
      - stale/no-op：如果 `attempt_id` / `generation` 已经过期，就必须拒绝推进，也不能递增计数
    - 如果 `automation_update` 已被接受，但 `note-arm` 不可用或返回 unknown：
@@ -334,20 +348,25 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 ```
 
 3. 这个 helper 必须一次性完成：
-   - fresh compare-and-swap 校验
+   - fresh compare-and-swap 校验，或同一 tuple 的 replay-safe reissue
    - attempt 已经 durable 处于 `cooldown`
    - binding 上的 `armed_generation` 仍等于当前 `generation`
-   - `continuation_boundary_state=not_crossed -> crossed_unacknowledged`
-   - `replay_policy=automatic -> manual_resolution_only`
+   - fresh 路径下：
+     - `continuation_boundary_state=not_crossed -> crossed_unacknowledged`
+     - `replay_policy=automatic -> manual_resolution_only`
+   - replay-safe 路径下：
+     - 不再次推进状态
+     - 但必须重新返回 continuation access
    - 返回 caller 继续消费当前 batch 所需的 payload / artifact access
-4. 只有 `note-boundary-crossed` fresh success 后，caller 才允许继续后续工作。
+4. 只有 `note-boundary-crossed` fresh success 或 replay-safe success 后，caller 才允许继续后续工作。
 5. `note-boundary-crossed` 的调用时机必须是：
    - caller 还没有看到当前 batch 的 payload / artifact 内容
    - 即将跨过 continuation boundary
    - 但还没有真正开始产生后续输出 / 工具副作用
    - 如果 caller 醒来时 `note-arm` 尚未 durable 成功，`note-boundary-crossed` 必须返回 not-armed-yet / stale-no-op，caller 直接退出
    - helper 在同一次 success 返回中完成 boundary crossing durable write，并返回 payload / artifact access
-   - 如果返回 already-crossed / stale-no-op / error，caller 必须立即停止并退出，不得继续
+   - 如果同一 `(attempt_id, generation, snapshot_revision)` 之前已经成功 crossed，但 caller 丢失了 response，重复调用必须返回 replay-safe success，而不是把 batch 永久楔死
+   - 只有返回 stale-no-op / error 时，caller 才必须立即停止并退出，不得继续
 6. 对大结果，caller 只允许在 `note-boundary-crossed` success 之后，再调用：
 
 ```text
@@ -440,17 +459,18 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
 ```text
 cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
-cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
+cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
 cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
-cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-arm-lease-id <lease_id> --json
+cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --bridge-arm-lease-id <lease_id> --json
 ```
 
 `read-artifact` 的第一版返回合同至少包括：
 
 - `artifact_id`
 - `artifact_read_lease_id`
+- `artifact_read_lease_deadline`
 - `content_type`
 - `size_bytes`
 - `offset`
@@ -460,6 +480,11 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 - `eof`
 
 也就是说，大 artifact 的后续读取不能只靠 `artifact_id`；必须同时带上 `note-boundary-crossed` success 返回的 `artifact_read_lease_id`。
+这个 lease 还必须是短寿命 continuation lease，而不是长期 artifact bearer token：
+
+- 它只对当前 `crossed_unacknowledged` 的同一 `(attempt_id, generation, snapshot_revision)` 有效
+- 一旦 batch 被 close、attempt 被 supersede / abandon、operator repair / unbind 收口，旧 lease 必须立即失效
+- 如果同一 attempt 发生 replay-safe `note-boundary-crossed` 重试，daemon 可以重发新的 lease，但必须让旧 lease 失效
 
 也就是说，`helper_cli_read` 对大 artifact 的 fallback 不是返回一个路径，而是返回一个显式 chunked payload 协议。
 
@@ -623,7 +648,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 
 ```text
 cbth desktop binding repair --source-thread-id <thread_id> --caller-automation-id <automation_id> --json
-cbth desktop installation-state repair --read-transport <transport> --json
+cbth desktop installation-state repair --read-transport <transport> [--read-transport-capability <state>] [--artifact-read-capability <state>] [--writeback-capability <state>] --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_unconfirmed --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_delivery --json
 cbth batch inspect-head --source-thread-id <thread_id> --json
@@ -632,19 +657,30 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
 
   - 推荐语义：
   - `binding repair`：
-    - 重新验证 paused status / 当前 installation state / `read-artifact` capability / narrow helpers
+    - 重新验证 binding-scoped 条件：
+      - paused status
+      - `caller_automation_id` 是否仍指向当前 `source_thread_id`
+      - 当前 binding 镜像是否匹配 installation state
     - 不得直接切换 installation-wide `read_transport`
+    - 不得直接写入 installation-wide capability 结论
     - 如果 operator 提供新的 `caller_automation_id`：
       - 必须证明该 automation 仍然 `target_thread_id == source_thread_id`
       - 必须证明它当前没有被别的 binding 占用
     - 成功返回的 binding snapshot 必须回显 `artifact_read_capability`
-    - 成功后把 binding 从 `degraded` 恢复到 `bound`
+    - 只有 installation state 当前已经满足所需 capability 时，才允许把 binding 从 `degraded` 恢复到 `bound`
     - 只对“尚未成功写入 `note-boundary-crossed`”的失败允许把当前 head batch 重新放回可投递状态
     - 如果 degraded 的来源是 `note-arm` outcome unknown 这类 post-boundary / post-arm 歧义场景，`binding repair` 不得自动重投当前 head batch
     - 它恢复的是当前 caller heartbeat 与后续调度能力；但在当前 head batch 被显式关闭或超时自动关闭前，FIFO 仍会被这个 head batch 挡住
   - `installation-state repair`：
     - 是唯一允许切换 installation-wide `read_transport` 的 operator 路径
+    - 也是唯一允许写 installation-wide capability 结论的路径
     - 成功时必须原子更新 installation state，并递增 `read_transport_generation`
+    - 如果 `read_transport` 发生变化而 capability 参数未显式提供：
+      - 必须把 `read_transport_capability`
+      - `artifact_read_capability`
+      - `writeback_capability`
+      - 全部原子重置为 `unknown`
+      - 清空 `validated_at`
     - 同时把所有镜像不再匹配的 bindings 推到 `degraded`
   - `batch close-head`：
     - 显式关闭当前 head batch
