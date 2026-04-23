@@ -27,14 +27,14 @@
     - `cbth desktop note-arm ...`
     - `cbth desktop note-boundary-crossed ...`
 - 其中窄写回 helper 是否能在后台 heartbeat 中无审批执行，当前仍待实证；在这一步没验证前，不应把 Desktop 自动续跑表述成已实现能力。
-- `claim-next-ready` / `read-envelope` / `read-artifact` 这组 read helper 目前只是条件性 fallback，不应被表述成第一版必需面。
+- `claim-next-ready` / `read-artifact` 这组 read helper 目前只是条件性 fallback，不应被表述成第一版必需面。
 - 这组 helper 目前只能算条件性 fallback：
   - 它仍要求 heartbeat turn 能无审批执行窄本地命令
   - 在这个前提被实证前，不应把它表述成已验证主路径
 - 因此，Desktop 上最可靠的方案不是“外部 sidecar 直接推送 caller thread”，而是“由 app 内部 automation scheduler 去唤醒 caller thread”。
 - 运行期对 bound caller heartbeat 的 automation mutation 也必须收口：
   - bridge / operator 是唯一允许 `pause` / `update` / `reuse` 它的一方
-  - caller prompt 本身只读 envelope 并调用窄 helper，不直接修改这个长期复用的 automation
+  - caller prompt 本身不直接读取 per-thread envelope；它只通过 gated helper 请求 continuation access，并且不直接修改这个长期复用的 automation
 
 ## 核心设计
 
@@ -53,9 +53,9 @@
      - `~/.cbth/inbox/ready-threads.json`
      - `~/.cbth/inbox/arm-pending-bindings.json`
      - `~/.cbth/inbox/pause-due-bindings.json`
-     - `~/.cbth/inbox/by-thread/<thread_id>.json`
-     - `~/.cbth/artifacts/<artifact_id>/manifest.json`
-     - `~/.cbth/artifacts/<artifact_id>/payload`
+     - `~/.cbth/inbox/by-thread/<thread_id>.json` (diagnostic / future path)
+     - `~/.cbth/artifacts/<artifact_id>/manifest.json` (diagnostic / future path)
+     - `~/.cbth/artifacts/<artifact_id>/payload` (diagnostic / future path)
    - `helper_cli_read` 建议提供一组窄 helper：
 
 ```text
@@ -63,13 +63,13 @@ cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attem
 cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
-cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
+cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
 cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
 ```
 
    - 底层仍可用 SQLite / 普通文件 / `mmap`，但这属于内部实现细节。
    - 明确不依赖直接改 Codex 自己的 automation DB。
-   - `direct_file_read` 目前仍是候选主路径，待“heartbeat 无审批读取”实证后再升级为已验证主路径。
+   - `direct_file_read` 目前仍是 bridge 侧候选主路径，待“heartbeat 无审批读取”实证后再升级为已验证主路径。
    - `helper_cli_read` 目前只是条件性 fallback，待“heartbeat 无审批执行窄 helper”实证后才能升级为正式路径。
    - 如果 `direct_file_read` 在目标安装上不可行，Desktop 第一版只能退回“已单独验证过的 `helper_cli_read`”，而不是继续把任意本地 helper 执行当作既定前提。
 
@@ -107,18 +107,22 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
    - 不是常驻轮询器。
    - 第一版按“预绑定、运行期只更新”来建模。
    - 也就是：bootstrap 时创建并绑定；运行期只做激活、暂停和 prompt 更新，不再重定向到别的 thread。
-   - 被唤醒后，在原 caller thread 中读取自己的 delivery envelope，并继续原任务。
+   - 被唤醒后，在原 caller thread 中先通过 gated helper 开启 continuation，再继续原任务。
    - 第一版不要求它在关键路径上执行通用 `cbth job ...` CLI。
-   - caller 真正开始 continuation 之前，必须先 durable 记录一个 boundary 断点：
+   - caller 真正开始 continuation 之前，必须先调用一个 gated helper：
      - `cbth desktop note-boundary-crossed ...`
-   - `note-boundary-crossed` 必须发生在真正跨过 continuation boundary 之前：
+   - `note-boundary-crossed` 的 success 返回必须同时代表：
+     - boundary crossing 已 durable 记录
+     - 当前 batch 已切到 `crossed_unacknowledged + replay_policy=manual_resolution_only`
+     - caller 已获得继续消费当前 batch 所需的 payload / artifact access
+   - 它必须发生在真正跨过 continuation boundary 之前：
      - 例如真正开始产出后续 assistant 文本
      - 或真正开始发起下一个基于该 batch 的工具 / 行动步骤
-   - 只有 `note-boundary-crossed` 成功后，caller 才允许继续执行后续 continuation。
+   - 只有 `note-boundary-crossed` 成功返回后，caller 才允许继续执行后续 continuation。
    - 但这不等于外围系统替 caller 后续动作兜底成“低风险”：
      - 如果 caller 之后决定发起 approval / network / write 工具
      - 仍然完全受 Codex 自己的审批与沙箱规则约束
-   - 如果 caller 在读完 envelope 后、真正跨过 continuation boundary 前崩溃，batch 仍可 redelivery。
+   - 如果 caller 在 `note-boundary-crossed` 成功返回前崩溃，batch 仍可 redelivery。
    - 如果 caller 已经成功写入 `note-boundary-crossed` 后再崩溃，batch 必须保持 `manual_resolution_only`，不得自动 redelivery。
    - 因此，`note-boundary-crossed` 就是 v1 的最后一个自动 durable 断点：
      - crossing 之后不再尝试自动把 batch 收口成 “已送达”
@@ -284,60 +288,45 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
        - 如果 attempt 已进入 `cooldown` 且 `armed_generation` 已等于当前 generation，则按成功处理
        - 如果当前 generation 对应的 heartbeat 已能被证明重新 `PAUSED`，则当前 attempt 收敛到 `abandoned`，head batch 保持 `replay_policy=automatic`
      - 只有在仍无法证明“已成功 arm”或“已成功 pause”时，才允许把当前 head batch 打到 `manual_resolution_only` 并把 binding 置为 `degraded`
+   - `arm_pending_deadline` 到期时，这个 reconcile 必须强制完成收敛，禁止无限停留在 `arm_pending`：
+     - 能证明 attempt 已进入 `cooldown`：按成功 arm 处理
+     - 能证明这次 arm 从未真正生效、且当前 generation 对应 heartbeat 仍保持 `PAUSED`：attempt -> `abandoned`，head batch 保持 `replay_policy=automatic`
+     - 两者都无法证明：attempt -> `abandoned`，head batch -> `manual_resolution_only`，binding -> `degraded`
 
 ### 3. caller thread 被唤醒
 
 caller thread heartbeat 在下一次调度中醒来：
 
-1. 根据 prompt 读取自己的 delivery envelope：
+1. caller 不得先直接读取 per-thread envelope / artifact payload。
+2. caller 必须先调用一个 gated helper：
 
 ```text
-preferred: ~/.cbth/inbox/by-thread/<thread_id>.json
-fallback:  cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
+cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
 ```
 
-2. 如果 envelope 不存在、当前 batch 已被撤回，或只包含旧内容，本次 turn 直接结束。
-3. 如果 envelope 存在并指向一个可消费 batch：
-   - 先比较 envelope header 中的：
-     - `batch_id`
-     - `attempt_id`
-     - `generation`
-     - `snapshot_revision`
-     与 prompt 中的期望值是否一致
-   - 任一不一致都视为 stale wake，立即退出
-   - 即使全部匹配，也只有在以下条件同时满足时才允许继续：
-     - `replay_policy=automatic`
-     - `continuation_boundary_state=not_crossed`
-     - 对应 binding 仍是 `bound`
-   - 否则本次 wake 必须只做 no-op 并退出
-   - 读取 batch 摘要
-   - 对小结果可直接读取 inline payload
-   - 对大结果：
-     - `direct_file_read` 路径下读取 `cbth` 管理的 artifact 路径
-     - `helper_cli_read` 路径下调用：
+3. 这个 helper 必须一次性完成：
+   - fresh compare-and-swap 校验
+   - `continuation_boundary_state=not_crossed -> crossed_unacknowledged`
+   - `replay_policy=automatic -> manual_resolution_only`
+   - 返回 caller 继续消费当前 batch 所需的 payload / artifact access
+4. 只有 `note-boundary-crossed` fresh success 后，caller 才允许继续后续工作。
+5. `note-boundary-crossed` 的调用时机必须是：
+   - caller 还没有看到当前 batch 的 payload / artifact 内容
+   - 即将跨过 continuation boundary
+   - 但还没有真正开始产生后续输出 / 工具副作用
+   - helper 在同一次 success 返回中完成 boundary crossing durable write，并返回 payload / artifact access
+   - 如果返回 already-crossed / stale-no-op / error，caller 必须立即停止并退出，不得继续
+6. 对大结果，caller 只允许在 `note-boundary-crossed` success 之后，再调用：
 
 ```text
 cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
 ```
 
-   - 在真正跨过 continuation boundary 前，必须先调用一个窄 helper：
-
-```text
-cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
-```
-
-4. 只有 `note-boundary-crossed` 成功后，caller 才允许继续后续工作。
-5. `note-boundary-crossed` 的调用时机必须是：
-   - caller 已成功读取当前 envelope / artifact
-   - 即将跨过 continuation boundary
-   - 但还没有真正开始产生后续输出 / 工具副作用
-   - 只有 fresh compare-and-swap success 才允许继续后续工作
-   - 如果返回 already-crossed / stale-no-op，caller 必须立即停止并退出，不得继续
-6. 第一版不再提供自动 `note-delivered` 收口：
+7. 第一版不再提供自动 `note-delivered` 收口：
    - 无论后续是纯文本回复，还是工具 / 行动步骤
    - 只要已经跨过 continuation boundary，batch 都保持 `manual_resolution_only`
    - 后续只能由 operator close，或等待 `redelivery_window_ends_at` 超时关闭
-7. 如果 caller 在被唤醒后决定继续走 approval / network / write 工具：
+8. 如果 caller 在被唤醒后决定继续走 approval / network / write 工具：
    - 这一步仍按 Codex 自己的审批与沙箱规则执行
    - 不被本文档前面的“只读 / 低风险 batch”门槛自动豁免
 
@@ -408,9 +397,9 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 ### Caller 侧
 
 ```text
-~/.cbth/inbox/by-thread/<thread_id>.json
-~/.cbth/artifacts/<artifact_id>/manifest.json
-~/.cbth/artifacts/<artifact_id>/payload
+~/.cbth/inbox/by-thread/<thread_id>.json   # diagnostic / future caller path
+~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / future caller path
+~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / future caller path
 ```
 
 ### Helper fallback
@@ -420,10 +409,9 @@ cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
-cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
+cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
 cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
 cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-arm-lease-id <lease_id> --json
-cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
 ```
 
 `read-artifact` 的第一版返回合同至少包括：
@@ -484,12 +472,11 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 
 ### Caller prompt 要求
 
-- 先读取自己的 per-thread delivery envelope。
-- 只处理当前 envelope 指向的 head batch。
-- 对小结果可以直接读取 inline payload；对大结果通过当前 transport 读取 artifact 内容。
+- 先通过 `cbth desktop note-boundary-crossed ...` 请求开启当前 batch 的 continuation。
+- 只处理当前 helper success 返回所指向的 head batch。
+- 对小结果可以直接消费 helper 返回的 inline payload；对大结果只允许在 helper success 之后继续读取 artifact 内容。
 - 即使 prompt token 全匹配，也只有当 `replay_policy=automatic`、`continuation_boundary_state=not_crossed`、binding 仍是 `bound` 时才允许继续。
-- 成功读取当前 envelope 后，不得立刻关闭 batch。
-- 在真正跨过 continuation boundary 前，必须先调用 `cbth desktop note-boundary-crossed ...`。
+- 在 `note-boundary-crossed` success 之前，caller 不得直接读取 per-thread envelope / artifact payload，也不得开始输出或起工具。
 - 一旦成功记录 `note-boundary-crossed`，当前 batch 就进入 `manual_resolution_only`：
   - 不再自动 redelivery
   - 不再尝试自动关闭为 “已送达”
@@ -547,6 +534,10 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
   - 如果失败发生在 `note-arm-pending` 之后、`automation_update` 之前：
     - 当前 attempt 先保持 `arm_pending`
     - bridge 下一轮必须先 reconcile 这个 `arm_pending` attempt，而不是直接重 arm
+    - 一旦 `arm_pending_deadline` 到期，reconcile 必须把它收敛到：
+      - `cooldown`
+      - 或 `abandoned + replay_policy=automatic`
+      - 或 `abandoned + replay_policy=manual_resolution_only + binding_state=degraded`
 - 下一次 bridge heartbeat 只能基于新的 head attempt 再试
 - 如果 `automation_update` 已被接受，但 `note-arm` 没能 durable 成功：
   - bridge 不得立刻把它视为歧义失败
@@ -576,10 +567,10 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 - `cbth` 通过保留 batch、cooldown 与 redelivery timeout 决定是否再次 arm。
 - 如果 `cooldown_until` 到期后，该 batch 仍然是当前 head batch，且 `replay_policy=automatic`、`close_reason` 仍为空、`now < redelivery_window_ends_at`、并且 `delivery_attempt_count < max_delivery_attempts`，就应该创建新 attempt 并再次 arm，而不是把旧 attempt 直接视为成功送达。
 
-### Caller 已读到 envelope，但 `note-boundary-crossed` 失败
+### Caller 请求开启 continuation，但 `note-boundary-crossed` 失败
 
-- 如果 caller 还没成功写入 `note-boundary-crossed`，就不得真正跨过 continuation boundary。
-- 因此，如果 caller 已成功读取 envelope，但 `cbth desktop note-boundary-crossed ...` 失败：
+- 如果 caller 还没成功得到 `note-boundary-crossed` 的 success 返回，就不得真正跨过 continuation boundary。
+- 因此，如果 caller 在请求开启 continuation 时，`cbth desktop note-boundary-crossed ...` 失败：
   - caller 必须立即停止，不得继续产出后续输出或工具副作用
   - 当前 head batch 保持可自动 redelivery
   - 如果失败原因表明 helper / binding 已失效，则 binding 可以进入 `degraded`

@@ -27,7 +27,6 @@
   - `list-arm-pending`
   - `list-pause-due`
   - `claim-next-ready`
-  - `read-envelope`
   - `read-artifact`
   - `note-arm`
   - `note-boundary-crossed`
@@ -53,7 +52,6 @@
   - regular files `0600`
 - [ ] 设计并实现 `helper_cli_read` fallback：
   - `cbth desktop claim-next-ready --bridge-thread-id ... --json`
-  - `cbth desktop read-envelope --source-thread-id ... --expected-attempt-id ... --expected-generation ... --expected-snapshot-revision ... --json`
   - `cbth desktop read-artifact --artifact-id ... --offset ... --max-bytes ... --json`
   - chunked payload return contract
 - [ ] 把 `claim-next-ready` 的语义定死并在实现里保持为纯 read/peek：
@@ -77,8 +75,9 @@
   - 必须先于真正的 continuation boundary durable 成功
   - 成功后当前 head batch 转为 `continuation_boundary_state=crossed_unacknowledged`
   - 同时切到 `replay_policy=manual_resolution_only`
+  - success 返回同时提供 gated payload / artifact access
 - [ ] 为 Desktop 定死 continuation-boundary contract：
-  - 仅读完 envelope / artifact 不能关闭 batch
+  - bridge 读到 ready entry，或 caller 仅拿到 gated payload / artifact access，都不能关闭 batch
   - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
   - 一旦 `note-boundary-crossed` 成功，当前 head batch 必须进入 `crossed_unacknowledged + replay_policy=manual_resolution_only`
   - 第一版不提供 post-boundary 自动 close
@@ -147,6 +146,10 @@
   - `delivery_requires_write_access`
   - `inline_payload_bytes`
   - `steer_candidate`
+  - `job submit` 的输入合同要同步落地：
+    - submit flags / metadata-file.delivery_policy
+    - 缺失时 fail-closed 默认值
+    - `inline_payload_bytes` / `steer_candidate` 由 core / adapter 派生
 - [ ] 为 CLI active-turn steer 落地可机判的 turn-risk 字段，至少包括：
   - `active_turn_kind`
   - `active_turn_requires_approval`

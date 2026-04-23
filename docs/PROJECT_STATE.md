@@ -67,7 +67,6 @@
   - `cbth desktop list-arm-pending ...`
   - `cbth desktop list-pause-due ...`
   - `cbth desktop claim-next-ready ...`
-  - `cbth desktop read-envelope ...`
   - `cbth desktop read-artifact ...`
   - `cbth desktop note-arm ...`
   - `cbth desktop note-boundary-crossed ...`
@@ -84,8 +83,9 @@
 - Desktop 的送达语义也进一步收紧：
   - `claim-next-ready` 虽然名字里带 `claim`，但第一版必须是纯 read/peek helper，不能 reservation 或隐藏 head batch
   - `arm_pending` attempt 不再是新的 ready head；bridge 必须先 reconcile 它，不能重复 arm 同一 generation
-  - `note-boundary-crossed` 必须先于真正的 continuation boundary durable 成功
-  - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
+  - `note-boundary-crossed` 现在不只是断点写回，而是 gated continuation helper：
+    - caller 必须先拿到它的 success 返回，才允许看到 payload / artifact access
+  - 如果 `note-boundary-crossed` 尚未 success，caller 不得真正跨过 continuation boundary
   - `note-boundary-crossed` 需要 compare-and-swap / stale-no-op 语义，避免重复 wake 或 supersede 后重复记账
   - 一旦 `note-boundary-crossed` 成功，当前 head batch 就必须保持 `crossed_unacknowledged + replay_policy=manual_resolution_only`
   - 第一版不再尝试把纯文本回复或后续工具动作自动收口成 “已送达”
@@ -101,6 +101,10 @@
   - Desktop 还必须满足安装级 `read_transport_capability=validated`
   - Desktop 还必须满足 `writeback_capability=validated`
   - 非只读 batch 一律不自动续跑，留给 operator/manual follow-up
+  - 这些字段的输入合同也已收口为：
+    - submitter 显式提供 delivery policy
+    - 若缺失则 core fail-closed 写入保守默认值
+    - `inline_payload_bytes` / `steer_candidate` 由 core 或 adapter 派生，不由 submitter 直填
 - caller heartbeat lifecycle 也已收口：
   - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
   - `armed_generation` 作为这个长期复用 heartbeat 的 generation 栅栏
@@ -270,7 +274,7 @@ scripts/desktop_thread_inject_poc.py
   - 固定 `bridge heartbeat thread` 负责轮询可投递 thread / batch
   - bootstrap 预绑定 `caller_automation_id`
   - bridge 运行期只更新这个已知 heartbeat，不做 blind create / retarget
-  - caller thread 被唤醒后读取只读 inbox snapshot，在真正跨过 continuation boundary 前先 durable 写入 `note-boundary-crossed`，再继续原任务
+  - bridge 侧优先读取只读 inbox snapshot；caller thread 被唤醒后必须先通过 `note-boundary-crossed` 成功跨过 gated continuation boundary，拿到 payload / artifact access 后才能继续原任务
 - 该方案不依赖：
   - 外部 live push 当前 Desktop thread
   - 外部直接改 Codex automation DB

@@ -55,8 +55,15 @@ codex --remote ws://127.0.0.1:<port>
    - 第一版一个 managed CLI session 只承诺一个固定的 caller thread。
    - daemon 必须 durable 维护：
      - `managed_session_id`
+     - `binding_state`
+       - `awaiting_thread`
+       - `bound`
      - `bound_thread_id`
-   - `bound_thread_id` 一旦建立，就代表这条 managed session 的自动续跑目标 thread。
+   - managed session 初始必须处于 `binding_state=awaiting_thread`，此时：
+     - `bound_thread_id=null`
+     - daemon 不得自动投递任何 ready batch
+   - `bound_thread_id` 只有在 daemon 能从该 managed session 的前台事件流里，可归因地观察到“前台用户已进入某个 caller thread 并在其上发起了第一个 foreground turn”后，才允许 durable 建立。
+   - 一旦 durable 建立，`bound_thread_id` 就代表这条 managed session 的自动续跑目标 thread。
    - 第一版不承诺在同一 managed session 里自动追踪前台 TUI 的 thread 切换，也不承诺自动把 delivery retarget 到别的 thread。
    - 如果用户想把自动续跑目标换到另一个 thread，必须：
      - 显式启动一个新的 managed session
@@ -66,6 +73,10 @@ codex --remote ws://127.0.0.1:<port>
      - daemon 仍只会把 ready batch 投递回 `bound_thread_id`
      - 该 managed session 的 live-visibility 保证也只覆盖“前台停留在 `bound_thread_id` 上”的情形
      - 是否恰好在另一个 thread 里看到 sidecar delivery，不属于第一版合同
+   - 如果前台连接在 durable 建立 `bound_thread_id` 之前就退出，或 daemon 无法再证明这一绑定来自同一个前台事件流：
+     - 当前 managed session 必须保持/回到 `awaiting_thread`
+     - 直到用户重新进入某个 caller thread 并重新完成 bind
+     - 在此期间自动续跑必须 fail-closed
    - 一旦某个 `bound_thread_id` 上的 attempt 已经 accepted，并 durable 记录了 `delivery_turn_id`：
      - 它仍允许等待自己匹配的 `turn/completed` 并正常 close
      - 不需要因为前台 UI 临时切到别的 thread 就强行中止或重开这次已 accepted 的投递
@@ -453,13 +464,14 @@ cbth cli run
    - 不依赖 loopback websocket auth
 3. 启动时对实验 RPC 做 capability probe
 4. `cbth cli run` 连接该 managed session，并启动前台 `codex --remote ...`
-5. CLI 入口为当前 managed session durable 建立 `bound_thread_id`
-6. sidecar 从共享核心读取 per-thread `delivery batch`
-7. 任务 ready 后：
+5. managed session 初始保持 `awaiting_thread`
+6. 只有当 daemon 从前台事件流里观察到第一个 foreground caller thread 与其首个 foreground turn 后，才 durable 建立 `bound_thread_id`
+7. sidecar 从共享核心读取 per-thread `delivery batch`
+8. 任务 ready 后：
    - 默认只在 caller thread idle 时：`thread/resume + turn/start`
    - 只有显式打开 steer feature flag，且 `turn/steer` 能力存在并满足只读/低风险策略时：允许 steer
-8. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
-9. 只要前台仍停留在 `bound_thread_id`，TUI 就通过该 thread 的已有订阅自然感知新 turn
+9. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
+10. 只要前台仍停留在 `bound_thread_id`，TUI 就通过该 thread 的已有订阅自然感知新 turn
 
 ## 仍待补的边界
 
