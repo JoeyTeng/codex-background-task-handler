@@ -270,7 +270,10 @@
   - accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
   - accepted attempt 必须 durable 记录 `delivery_observation_deadline`
   - detached auto-delivery 只允许在 session-scoped risk profile 三项都为 `false` 时开启
-  - `delivery_observation_deadline` 到期仍未看到可信 `turn/completed` 时，必须 fail-closed 到 `manual_resolution_only`
+  - `delivery_observation_deadline` 到期仍未看到可信 `turn/completed` 时：
+    - 当前 attempt -> `abandoned`
+    - `delivery_observation_state=expired`
+    - 当前 head batch -> `replay_policy=manual_resolution_only`
   - 如果 `delivery_turn_id` 的观察连续性丢失，则当前 head batch 进入 `manual_resolution_only`
   - 落地 `session_epoch` 的生成、递增与 continuity 判定规则
   - 按当前合同实现 continuity-loss 场景的 `inspect-head -> close-head(reason=...)` operator-resolution flow

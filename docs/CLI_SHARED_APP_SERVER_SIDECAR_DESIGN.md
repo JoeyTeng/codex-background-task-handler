@@ -173,7 +173,9 @@ codex --remote ws://127.0.0.1:<port>
   - 没有 active jobs
   - 没有连接中的 foreground client
   - 没有需要继续投递的 sidecar client
-  - 没有挂起的 ready/materialized/cooldown batch
+  - 没有任何仍绑定到这个 `bound_thread_id` 的 unresolved delivery work
+    - 包括 ready / materialized / cooldown batch
+    - 包括 `replay_policy=manual_resolution_only`、仍等待 operator close 或 `manual_resolution_expired` 的 head batch
   - 没有仍在 `delivery_observation_deadline` 之内等待匹配 `turn/completed` 的 `delivery_turn_id`
 
 ## 实验 RPC 依赖面
@@ -392,7 +394,11 @@ thread/resume + turn/start
   - 由 `accepted_at + max_turn_observation_window` 推导
   - `max_turn_observation_window` 必须显式大于 daemon 的 `idle timeout`
   - deadline 未到时，这个 attempt 属于 daemon 必须继续保活的近端 observation work
-  - deadline 到期仍未看到可信 `turn/completed` 时，attempt 必须 fail-closed 到 `manual_resolution_only`，而不是继续无限常驻或静默退出
+  - deadline 到期仍未看到可信 `turn/completed` 时：
+    - 当前 attempt 必须收敛到 `abandoned`
+    - `delivery_observation_state=expired`
+    - 当前 head batch 必须进入 `replay_policy=manual_resolution_only`
+    - 之后 daemon 才允许退出，而不是继续无限常驻或静默退出
 - 对每个 managed session，CLI adapter 还必须维护一个独立的 thread activity state：
   - `unknown`
   - `active`

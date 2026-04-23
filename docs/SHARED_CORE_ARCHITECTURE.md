@@ -33,7 +33,10 @@
 - 核心进程采用按需启动的本地 daemon 模式：
   - 有命令调用时，如 daemon 不存在则自动拉起。
   - 有 active jobs 时，即使前台 CLI / Desktop 实例退出，daemon 也可继续活着。
-  - v1 不要求 daemon 为长时间窗口持续驻留；它只需要把截止时间 durable 落盘，并在下一次启动时先做 overdue sweep。
+  - v1 不要求 daemon 为大多数长时间窗口持续驻留；它只需要把 deadline durable 落盘，并在下一次启动时先做 overdue sweep。
+  - 唯一例外是 CLI accepted attempt 的 `delivery_observation_deadline`：
+    - 这是 live-observation window，而不是“允许下次启动再 sweep”的普通长窗口 deadline
+    - 只要它还没到期，daemon 就必须持续保活并观察同一条 event stream
   - 当且仅当以下条件同时满足时，daemon 才允许在 idle timeout 后自动退出：
     - 没有 active jobs
     - 没有活跃接入端
@@ -42,6 +45,7 @@
     - daemon 可以退出
     - 但下次任何入口拉起 daemon 时，必须先执行一次 deterministic overdue sweep
     - 把已到期的 deadline / GC / auto-close / reconcile 全部补做完，再处理新请求
+  - 上面这条“允许退出并 sweep”的规则不适用于 `delivery_observation_deadline`。
   - 换句话说，Desktop v1 的 `manual_resolution_only` batch 不能因为等待 operator close 就强迫 daemon 无限常驻；可靠性来自 durable deadline + next-start sweep，而不是常驻进程。
 
 ### 3. 第一版公共接口只做 CLI
@@ -474,6 +478,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - `delivery_observation_state` (CLI optional)
   - `tracking`
   - `lost`
+  - `expired`
 - `delivery_observation_deadline` (CLI optional)
 - `binding_id` (optional)
 - `automation_id` (optional)
@@ -701,6 +706,7 @@ cooldown -> superseded
   - 只要 deadline 未到，未收口的 `delivery_turn_id` 就属于“近端 observation work”，会阻止 daemon 退出
 - 如果在 `delivery_observation_deadline` 到期前仍未观察到可信的 `turn/completed`，则不得静默退出：
   - 当前 attempt 必须收敛到 `abandoned`
+  - `delivery_observation_state=expired`
   - 当前 head batch durable 进入 `replay_policy=manual_resolution_only`
   - 之后 daemon 才允许按正常 idle 规则退出
 - 只要 `managed_session_id` 或 `session_epoch` 的连续性无法再证明，当前 head batch 就不得自动 replay：

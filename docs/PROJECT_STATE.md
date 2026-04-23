@@ -15,6 +15,7 @@
 - 该 daemon 生命周期独立于单个 Codex 前台实例，但第一版不要求它为长窗口持续常驻：
   - 近端 delivery work / timers 可以阻止当前实例退出
   - 更长的 deadline 则改为 durable 落盘，并在下次启动时先做 overdue sweep / auto-close / reconcile
+  - 唯一例外是 CLI accepted attempt 的 `delivery_observation_deadline`：在 deadline 到期前它仍属于必须常驻观察的 live-observation window
 - 第一版稳定外部接口只做 CLI，不承诺公开 socket / Web / plugin 协议。
 - 因此，之前设计里提到的 `background-taskctl` helper，应收敛成主 binary 的 `cbth job ...` 子命令，而不是第二个长期维护的独立工具。
 - 经过 reviewer 复核后，Desktop 关键路径又做了一个更保守的收口：
@@ -168,7 +169,10 @@
   - `managed_session_id` 是逻辑会话 id；`session_epoch` 是该会话当前可证明连续的 app-server 事件流代号
   - accepted attempt 还必须带 `delivery_observation_deadline`
   - 只有在这个 deadline 之内，未收口 `delivery_turn_id` 才阻止 daemon 退出
-  - deadline 到期仍未观察到可信 `turn/completed` 时，当前 head batch 必须 fail-closed 到 `manual_resolution_only`
+  - deadline 到期仍未观察到可信 `turn/completed` 时：
+    - 当前 attempt 收敛到 `abandoned`
+    - `delivery_observation_state=expired`
+    - 当前 head batch 必须 fail-closed 到 `manual_resolution_only`
   - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍是当前 head delivery 时，batch 才允许关闭
   - 如果某次 accepted attempt 已经带有 `delivery_turn_id`，即使前台 UI 临时切到别的 thread，它也仍可等待匹配的 `turn/completed` 正常收口
   - 因此 daemon 退出条件只需要在 `delivery_observation_deadline` 窗口内覆盖这些未收口的 `delivery_turn_id` 观察
