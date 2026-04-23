@@ -62,7 +62,13 @@ codex --remote ws://127.0.0.1:<port>
    - managed session 初始必须处于 `binding_state=awaiting_thread`，此时：
      - `bound_thread_id=null`
      - daemon 不得自动投递任何 ready batch
-   - `bound_thread_id` 只有在 daemon 能从该 managed session 的前台事件流里，可归因地观察到“前台用户已进入某个 caller thread 并在其上发起了第一个 foreground turn”后，才允许 durable 建立。
+   - 第一版不再尝试从 shared `app-server` 的事件流里自动归因“哪个 turn 来自前台 TUI”：
+     - 当前上游 surface 没有 per-client identity / source attribution
+     - 因此 daemon 不能可靠地靠被动观察事件流来推断 `bound_thread_id`
+   - `bound_thread_id` 只能通过显式 bootstrap 建立：
+     - 启动时由 `cbth cli run --bind-thread-id <thread_id>` 提供
+     - 或后续由显式命令如 `cbth cli bind --managed-session-id <id> --thread-id <thread_id>` 提供
+   - 只要没有显式 bind，managed session 就必须保持 `awaiting_thread`，并 fail-closed 地禁止自动投递。
    - 一旦 durable 建立，`bound_thread_id` 就代表这条 managed session 的自动续跑目标 thread。
    - 第一版不承诺在同一 managed session 里自动追踪前台 TUI 的 thread 切换，也不承诺自动把 delivery retarget 到别的 thread。
    - 如果用户想把自动续跑目标换到另一个 thread，必须：
@@ -73,9 +79,9 @@ codex --remote ws://127.0.0.1:<port>
      - daemon 仍只会把 ready batch 投递回 `bound_thread_id`
      - 该 managed session 的 live-visibility 保证也只覆盖“前台停留在 `bound_thread_id` 上”的情形
      - 是否恰好在另一个 thread 里看到 sidecar delivery，不属于第一版合同
-   - 如果前台连接在 durable 建立 `bound_thread_id` 之前就退出，或 daemon 无法再证明这一绑定来自同一个前台事件流：
+   - 如果前台连接在显式 bind 建立 `bound_thread_id` 之前就退出，或用户一直没有显式 bind：
      - 当前 managed session 必须保持/回到 `awaiting_thread`
-     - 直到用户重新进入某个 caller thread 并重新完成 bind
+     - 直到用户显式提供某个 caller thread 并完成 bind
      - 在此期间自动续跑必须 fail-closed
    - 一旦某个 `bound_thread_id` 上的 attempt 已经 accepted，并 durable 记录了 `delivery_turn_id`：
      - 它仍允许等待自己匹配的 `turn/completed` 并正常 close
@@ -465,13 +471,14 @@ cbth cli run
 3. 启动时对实验 RPC 做 capability probe
 4. `cbth cli run` 连接该 managed session，并启动前台 `codex --remote ...`
 5. managed session 初始保持 `awaiting_thread`
-6. 只有当 daemon 从前台事件流里观察到第一个 foreground caller thread 与其首个 foreground turn 后，才 durable 建立 `bound_thread_id`
-7. sidecar 从共享核心读取 per-thread `delivery batch`
-8. 任务 ready 后：
+6. 如果用户已经知道 caller thread，则通过 `cbth cli run --bind-thread-id <thread_id>` 在启动时显式建立 `bound_thread_id`
+7. 否则保持 `awaiting_thread`，直到用户后续显式执行 `cbth cli bind --managed-session-id <id> --thread-id <thread_id>`
+8. sidecar 从共享核心读取 per-thread `delivery batch`
+9. 任务 ready 后：
    - 默认只在 caller thread idle 时：`thread/resume + turn/start`
    - 只有显式打开 steer feature flag，且 `turn/steer` 能力存在并满足只读/低风险策略时：允许 steer
-9. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
-10. 只要前台仍停留在 `bound_thread_id`，TUI 就通过该 thread 的已有订阅自然感知新 turn
+10. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
+11. 只要前台仍停留在 `bound_thread_id`，TUI 就通过该 thread 的已有订阅自然感知新 turn
 
 ## 仍待补的边界
 

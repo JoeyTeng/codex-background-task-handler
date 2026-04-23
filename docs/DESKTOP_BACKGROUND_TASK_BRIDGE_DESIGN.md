@@ -20,16 +20,21 @@
 - `automation_update` 可以创建或更新指向其他 thread 的 heartbeat automation。
 - heartbeat 触发出来的 turn 本身也可以继续调用 `automation_update`。
 - 第一版不把“heartbeat turn 稳定执行通用 `cbth job ...` CLI”当作既定前提。
-- 但 Desktop adapter 当前只把两类能力当作规划中的关键路径：
+- 但 Desktop adapter 当前只把三类能力当作规划中的关键路径：
   - 优先的只读文件路径：`direct_file_read`
   - 窄写回 helper：
     - `cbth desktop note-arm-pending ...`
     - `cbth desktop note-arm ...`
     - `cbth desktop note-boundary-crossed ...`
-- 其中窄写回 helper 是否能在后台 heartbeat 中无审批执行，当前仍待实证；在这一步没验证前，不应把 Desktop 自动续跑表述成已实现能力。
-- `claim-next-ready` / `read-artifact` 这组 read helper 目前只是条件性 fallback，不应被表述成第一版必需面。
-- 这组 helper 目前只能算条件性 fallback：
-  - 它仍要求 heartbeat turn 能无审批执行窄本地命令
+  - caller 侧大 artifact 的后续 chunked helper：
+    - `cbth desktop read-artifact ...`
+- 其中窄写回 helper，以及大 artifact 场景下的 `read-artifact` capability，是否能在后台 heartbeat 中无审批执行，当前仍待实证；在这一步没验证前，不应把 Desktop 自动续跑表述成已实现能力。
+- bridge 侧的 `claim-next-ready` 目前只是条件性 fallback，不应被表述成第一版必需面。
+- `read-artifact` 不再算 bridge-side fallback：
+  - 它是 caller 侧在大 artifact 场景下的必需 chunked access surface
+  - 但仍然要求 heartbeat turn 能无审批执行对应窄 helper
+- bridge-side fallback 当前只能算条件性方案：
+  - 它仍要求 bridge heartbeat turn 能无审批执行窄本地命令
   - 在这个前提被实证前，不应把它表述成已验证主路径
 - 因此，Desktop 上最可靠的方案不是“外部 sidecar 直接推送 caller thread”，而是“由 app 内部 automation scheduler 去唤醒 caller thread”。
 - 运行期对 bound caller heartbeat 的 automation mutation 也必须收口：
@@ -224,7 +229,7 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
      - 不得 reservation
      - 不得移动 head batch
      - 不得递增 attempt / batch 计数
-     - 真正的 durable 推进只能发生在后续 `note-arm`
+     - 真正的 durable 推进只能从后续 `note-arm-pending` 开始；`note-arm` 只负责 `arm_pending -> cooldown`
 
 3. 如果没有可投递 thread，本次 turn 直接结束。
 4. 如果有可投递 thread：
@@ -376,7 +381,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - `cooldown_until`
 - bridge arm caller heartbeat 前，必须先原子创建/更新 attempt，并在真正调用 `automation_update` 前先把它 durable 推到 `arm_pending`。
 - caller prompt 中必须显式携带 `batch_id + attempt_id + generation + snapshot_revision`。
-- caller 读取 envelope 后，必须先比较这四者；只要 mismatch 就立即 no-op。
+- `note-boundary-crossed` 的 success 返回也必须回显这四者；caller 必须先比较 helper 返回值与 prompt 期望值是否一致，只要 mismatch 就立即 no-op。
 - 同一 thread 上出现新的 generation 后，所有旧 heartbeat prompt 都只能看到 mismatch，不得重复消费当前 head batch。
 - 第一版不要求 `cbth` 在关键路径上同步拿到 `automation_id`。
 - 对第一版来说：
@@ -671,10 +676,10 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
 1. 固定一个 bridge heartbeat thread。
 2. 让 sidecar 只负责写 job 状态与完成结果。
 3. 由 `cbth` 自己把结果 ingest 到 managed artifact store。
-4. 由 `cbth` 物化 `ready-threads.json` 与 per-thread inbox snapshot。
+4. 由 `cbth` 物化 `ready-threads.json` 与 bridge-side inbox snapshot。
 5. 让 bridge thread 每分钟读取 `ready-threads.json`。
 6. bridge 发现可投递 batch 后，为对应 caller thread arm 一次 heartbeat。
-7. caller thread 醒来后读取自己的 inbox snapshot，继续任务。
+7. caller thread 醒来后先调用 `note-boundary-crossed`，拿到 gated payload / artifact access 后继续任务。
 
 这套方案的关键优点是：
 

@@ -490,12 +490,12 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - Desktop 第一版里，运行期对 bound caller heartbeat 的 automation mutation 必须只允许 bridge / operator 发起：
   - caller prompt 自己不得直接 `pause` / `update` / `delete` 这个长期复用的 automation
   - stale wake、不可读、caller 成功或 degraded 之后的 pause/reconcile 都必须由 bridge 在后续 heartbeat 中完成
-- caller 读取 envelope 后，必须先比较：
-  - `snapshot.batch_id`
-  - `snapshot.attempt_id`
-  - `snapshot.generation`
-  - `snapshot.snapshot_revision`
-  与 prompt 中的期望值是否完全一致；任一不一致都视为 stale wake，立即退出。
+- `note-boundary-crossed` 的 success 返回也必须回显：
+  - `batch_id`
+  - `attempt_id`
+  - `generation`
+  - `snapshot_revision`
+- caller 必须先比较 helper 返回值与 prompt 中的期望值是否完全一致；任一不一致都视为 stale wake，立即退出。
 - 即使 token 全部匹配，caller 也只有在以下条件同时满足时才允许继续：
   - 当前 head batch 仍是 `replay_policy=automatic`
   - `continuation_boundary_state=not_crossed`
@@ -1006,13 +1006,15 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
 ## Desktop 只读快照约束
 
 - 第一版不要求 Desktop heartbeat turn 在关键路径上执行通用 `cbth job ...` CLI。
-- 但 Desktop adapter 可以依赖两类窄接口：
-  - bridge 侧 `helper_cli_read`：只读 ready/reconcile helper
+- 但 Desktop adapter 可以依赖三类窄接口：
+  - bridge 侧 `helper_cli_read`：只读 ready/reconcile fallback helper
   - narrow helper writeback：
     - `cbth desktop note-arm-pending ...`
     - `cbth desktop note-arm ...`
     - `cbth desktop note-boundary-crossed ...`
-- 第一版如果 bridge 侧不用 `direct_file_read`，则 helper 链路必须是完整可用的：
+  - caller 侧 post-boundary artifact helper：
+    - `cbth desktop read-artifact ...`
+- 第一版如果 bridge 侧不用 `direct_file_read`，则 bridge-side fallback helper 链路必须是完整可用的：
   - `cbth desktop note-arm-pending ...`
   - `cbth desktop list-arm-pending ...`
   - `cbth desktop list-pause-due ...`
@@ -1022,9 +1024,12 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
 - caller 侧 automatic continuation 不通过 `direct_file_read` 直接拿 payload：
   - 必须先通过 `cbth desktop note-boundary-crossed ...` 成功返回 gated payload / artifact access
   - 只有在这个 helper success 之后，才允许继续调用 `cbth desktop read-artifact ...`
-- 但这条 helper 链路目前只能算条件性 fallback：
+- 但 bridge-side helper fallback 目前只能算条件性方案：
   - 它仍然要求 heartbeat turn 能无审批执行窄 `cbth desktop ...` 命令
   - 在这个前提被实证前，不应把它表述成已验证的默认主路径
+- 而 `cbth desktop read-artifact ...` 不是 bridge-side fallback：
+  - 它是大 artifact continuation 的 caller-side 必需接口
+  - 因此只要 v1 支持大 artifact，就必须把它纳入 Desktop 自动路径的能力验证范围
 - 其中 `cbth desktop read-artifact ...` 必须提供 chunked payload 协议，而不是返回一个需要再次 file-read 的路径。
 - 其中 bridge 的 overdue-binding cleanup 也必须有对应只读输入面：
   - `~/.cbth/inbox/pause-due-bindings.json`

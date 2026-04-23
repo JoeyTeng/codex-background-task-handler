@@ -38,6 +38,7 @@
   - 更强本地 auth 边界留待上游支持 loopback auth 后再补
   - shared `app-server` 由 daemon 持有，而不是前台 wrapper 临时持有
   - 一个 managed CLI session 在 v1 里只绑定一个 `bound_thread_id`
+  - 这个 `bound_thread_id` 在 v1 必须通过显式 bind bootstrap 建立，而不是靠前台事件流自动归因
   - 前台 thread-switch 的自动观测/自动 retarget 不属于 v1 合同
   - 默认仅在 idle 时 `turn/start`
   - `turn/steer` 只作为只读、低风险场景下的受限优化
@@ -131,6 +132,7 @@
 - CLI managed session contract 也已补硬：
   - shared `app-server` 由 daemon 持有
   - 一个 managed session 在 v1 里只承诺一个固定的 `bound_thread_id`
+  - `bound_thread_id` 只能通过显式 bind bootstrap 建立；当前上游 surface 不提供可依赖的前台来源归因
   - daemon 必须 durable 跟踪 `managed_session_id + bound_thread_id`
   - 如果用户想把自动续跑目标换到另一个 thread，必须显式开新 session 或等待未来的 rebind contract
 - CLI 的 delivery completion contract 也继续收口：

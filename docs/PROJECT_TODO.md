@@ -200,6 +200,7 @@
 - [ ] 按已定稿合同实现 CLI managed session 的 fixed-thread contract：
   - durable `managed_session_id + bound_thread_id`
   - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
+  - 通过显式 bind bootstrap 建立 `bound_thread_id`，而不是靠前台事件流自动归因
   - 第一版不做前台 thread-switch 的自动观测或自动 retarget
   - 如需把自动续跑目标换到别的 thread，必须显式开新 session 或等待未来 rebind contract
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
