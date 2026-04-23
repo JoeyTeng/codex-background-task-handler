@@ -75,9 +75,12 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
      - `armed_generation` (optional)
      - `pause_deadline` (optional)
      - `read_transport`
+     - `read_transport_capability`
      - `writeback_capability`
    - bridge 在运行期只允许更新这个已知 `caller_automation_id`，不做 blind create / discovery。
-   - 只有当 `writeback_capability=validated` 时，这个 binding 才允许进入真正可自动续跑的 `bound` 状态。
+   - 只有当以下条件同时满足时，这个 binding 才允许进入真正可自动续跑的 `bound` 状态：
+     - `read_transport_capability=validated`
+     - `writeback_capability=validated`
    - 未完成 binding 的 thread 可以提交 job，但不会被 bridge 自动续跑。
 
 4. `bridge heartbeat thread`
@@ -102,6 +105,9 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
      - 例如真正开始产出后续 assistant 文本
      - 或真正开始发起下一个基于该 batch 的工具 / 行动步骤
    - 只有 `note-boundary-crossed` 成功后，caller 才允许继续执行后续 continuation。
+   - 但这不等于外围系统替 caller 后续动作兜底成“低风险”：
+     - 如果 caller 之后决定发起 approval / network / write 工具
+     - 仍然完全受 Codex 自己的审批与沙箱规则约束
    - `note-delivered` 则只负责在 caller 已经完成 continuation preparation 后收口 batch：
      - 例如已经构造好即将发送的 assistant 输出
      - 或已经决定并准备发起下一个基于该 batch 的工具 / 行动步骤
@@ -136,9 +142,12 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - `delivery_requires_network=false`
   - `delivery_requires_write_access=false`
 - 但这还不是充分条件；Desktop 自动续跑还必须额外满足：
+  - 当前 binding 的 `read_transport_capability=validated`
   - 当前 binding 的 `writeback_capability=validated`
   - 也就是 `note-arm` / `note-boundary-crossed` / `note-delivered` 这组窄 helper 已经被证明可在 heartbeat 中无审批执行
 - 不满足这些条件的 batch 不得由 bridge 自动 arm caller heartbeat；它们保留为 manual/operator follow-up。
+- 这里的“只读 / 低风险”只描述 bridge 自动投递与断点写回这条外围机制本身。
+- caller 被唤醒之后如果决定发起 approval / network / write 工具，那仍然受 Codex 自己的审批与沙箱约束；这不属于本项目 v1 自动续跑门槛已经替你兜底的范围。
 - 运行期 bridge 不得 blind create caller heartbeat；它只能更新已绑定 automation。
 - 旧 heartbeat prompt 必须能够通过 attempt token / generation 检测自己已经过期，并立即 no-op。
 - 旧 heartbeat prompt 即使被延迟唤醒，也不得直接 `pause` 当前这个长期复用的 caller heartbeat；否则会把新 generation 的合法 wake 一起关掉。
@@ -193,7 +202,9 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
      - `snapshot_path`
      - `caller_automation_id`
    - 该 thread 必须已经存在 `binding_state=bound` 的 desktop binding
-   - 且该 binding 必须满足 `writeback_capability=validated`
+   - 且该 binding 必须同时满足：
+     - `read_transport_capability=validated`
+     - `writeback_capability=validated`
    - 用 `automation_update` 更新这个已知 caller heartbeat
    - heartbeat prompt 中带上：
      - `batch_id`
@@ -286,7 +297,10 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
    - 如果 caller 的后续动作只是“发送一条最终 assistant 文本然后结束”
    - 则这条路径不允许使用 `note-delivered`
    - 因为当前 Desktop 没有安全的 post-output ack 面
-9. 这一步负责把当前 batch durable 关闭到：
+9. 如果 caller 在被唤醒后决定继续走 approval / network / write 工具：
+   - 这一步仍按 Codex 自己的审批与沙箱规则执行
+   - 不被本文档前面的“只读 / 低风险 batch”门槛自动豁免
+10. 这一步负责把当前 batch durable 关闭到：
    - `close_reason=caller_acknowledged`
    - 并停止该 head batch 的自动重投
 
@@ -542,6 +556,8 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 ```text
 cbth desktop binding repair --source-thread-id <thread_id> --caller-automation-id <automation_id> --read-transport <transport> --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_closed --json
+cbth batch inspect-head --source-thread-id <thread_id> --json
+cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <true|false> --json
 ```
 
 - 推荐语义：
@@ -582,7 +598,7 @@ cbth batch close-head --source-thread-id <thread_id> --reason operator_closed --
   - 正常送达后：bridge 在后续 reconciliation 中、且只在目标 generation 仍等于 `armed_generation` 时，把它切回 `PAUSED`
   - stale wake / snapshot 不可读：caller turn 只 no-op；后续由 bridge 在 generation 仍匹配时切回 `PAUSED`
   - degraded：bridge 或 operator 在 generation 仍匹配时切回 `PAUSED`，等待 repair
-  - 只有 operator 明确执行 unbind/destroy，才允许删除
+  - 只有 operator 明确执行 `cbth desktop binding unbind ...`，才允许删除
 - 换句话说，第一版 caller heartbeat 必须被当成“长期复用的 one-shot wake carrier”：
   - 每次 arm 只授权一个有限的 wake window
   - 不能无限期停留在 `ACTIVE`

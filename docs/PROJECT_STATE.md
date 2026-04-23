@@ -25,6 +25,7 @@
   - Desktop 顶部文案也已改成更保守的口径：`note-arm` / `note-delivered` 仍是规划中的窄写回依赖，但后台 heartbeat 能否无审批执行它们还待实证
   - 而且 Desktop 自动续跑现在被明确成双门槛：
     - batch 本身必须是只读 / 低风险
+    - 目标安装上的读路径也必须已验证可无审批执行
     - 目标安装上的 `note-*` 写 helper 也必须已验证可无审批执行
 - 同时，CLI 关键路径也收口为：
   - 明确依赖实验 RPC
@@ -59,6 +60,7 @@
   - `cbth desktop read-envelope ...`
   - `cbth desktop read-artifact ...`
   - `cbth desktop note-arm ...`
+  - `cbth desktop note-boundary-crossed ...`
   - `cbth desktop note-delivered ...`
 - 但这条 helper fallback 也被重新降级成“条件性 fallback”：
   - 它仍要求 heartbeat turn 无审批执行窄 `cbth desktop ...` 命令
@@ -92,7 +94,7 @@
   - caller prompt 自己不直接 pause 这个长期复用 automation
   - stale wake、snapshot 不可读、成功送达、degraded 都先 no-op / helper writeback，再由 bridge 后续切回 `PAUSED`
   - 正常投递路径不做 `delete`
-  - 只有明确 operator unbind / destroy 才允许删除
+  - 只有明确 operator `binding unbind` 才允许删除
 - CLI 侧 reviewer 指出的 idle/race 缺口也已收口：
   - idle 必须来自 app-server live event stream
   - `turn/start` 失败要被当成 benign race，回到等待下一个 idle，而不是视为成功送达
@@ -112,6 +114,7 @@
   - 如果某次旧 thread attempt 已经 accepted 并带有 `delivery_turn_id`，后续即使 `current_thread_id` 改变，它仍可等待匹配的 `turn/completed` 正常收口
   - 因此 daemon 退出条件也必须覆盖这些未收口的 ready/materialized/cooldown batch 与 `delivery_turn_id` 观察
   - 但只要 `managed_session_id + session_epoch` 的观察连续性丢失，就不得自动 replay；当前 head batch 必须进入 `manual_resolution_only`
+  - continuity-loss 后的最小人工收口路径也已收口为：`batch inspect-head` 看 durable 证据，再用 `batch close-head` 带明确 reason 收口
 - 同时又补了一个和 TUI 当前实现一致的判断：
   - active-turn steer 语义更接近现有 TUI 的 `pending_steers` / queued-follow-up 行为
   - non-steerable turn 必须回落到排队，而不是被算作成功送达

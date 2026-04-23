@@ -35,6 +35,7 @@
   - `armed_generation`
   - `pause_deadline`
   - `read_transport`
+  - `read_transport_capability`
   - `writeback_capability`
   - paused 状态读回校验
 - [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
@@ -95,6 +96,11 @@
   - arm 后写入 `pause_deadline`
   - bridge 每轮先 pause/reconcile 已到期 generation
   - pause 连续失败时 binding 进入 `degraded`
+- [ ] 把 Desktop operator recovery / cleanup 命令面定死并实现：
+  - `cbth batch inspect-head ...`
+  - `cbth batch close-head ...`
+  - `cbth desktop binding repair ...`
+  - `cbth desktop binding unbind ...`
 - [ ] 定死 caller heartbeat 的长期生命周期合同：
   - 预绑定 `caller_automation_id`
   - 正常路径只 `pause` / `update` / `reuse`
@@ -166,6 +172,7 @@
   - accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
   - 如果 `delivery_turn_id` 的观察连续性丢失，则当前 head batch 进入 `manual_resolution_only`
   - 明确 `session_epoch` 的生成、递增与 continuity 判定规则
+  - 为 continuity-loss 场景定死 `inspect-head -> close-head(reason=...)` 的 operator-resolution flow
 - [ ] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
   - 基于 `turn/started` / `turn/completed` / `thread/status/changed`
   - `turn/start` race 失败后回到等待下一个 idle

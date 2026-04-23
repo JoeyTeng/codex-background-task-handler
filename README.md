@@ -6,7 +6,7 @@ Reference experiments and companion tooling for making long-running background w
 
 Validated foundations plus the current first-version direction:
 
-- Desktop enabling experiments validated: automation-based bridge/retargeting experiments work. The current first-version delivery contract is built around a bound caller-heartbeat plus a delivery-envelope abstraction, with `direct_file_read` as the preferred path and a narrow helper fallback when approval-free file reads are not available. The full automatic path still depends on installation-local validation of approval-free heartbeat reads plus the narrow `note-*` writeback helpers.
+- Desktop enabling experiments validated: automation-based bridge/retargeting experiments work. The current first-version delivery contract is built around a bound caller-heartbeat plus a delivery-envelope abstraction, with `direct_file_read` as the preferred path and a narrow helper fallback when approval-free file reads are not available. The full automatic path still depends on installation-local validation of both the chosen read transport and the narrow `note-*` writeback helpers.
 - CLI foundation validated: the shared `app-server` route works and foreground TUI visibility is proven. The current first-version contract depends on capability probing around the experimental RPC surface, uses a loopback-only daemon-owned control plane, and keeps `turn/steer` as a gated optimization instead of a default path. Stronger local auth is deferred until upstream loopback auth support exists.
 
 The shared architecture is converging on one Rust binary with thin integration entrypoints:

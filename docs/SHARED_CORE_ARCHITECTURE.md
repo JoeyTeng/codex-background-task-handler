@@ -64,6 +64,8 @@
 - 因此，Desktop 第一版的自动续跑门槛不是“batch 只读”单条件，而是两层同时成立：
   - batch 自身满足只读 / 低风险 delivery policy
   - 当前安装上的 Desktop writeback helpers 已被验证可在 heartbeat 中无审批执行
+- 这里的“只读 / 低风险”只约束自动投递与断点写回这条外围机制本身。
+- caller 被唤醒后的后续推理与工具选择仍受 Codex 自身的 sandbox / approval policy 约束；本项目不把这些后续动作一并宣称成“已被外围系统降成低风险”。
 - Desktop 的关键投递路径优先依赖只读状态面：
   - 只读 inbox snapshot 文件
   - 只读 artifact manifest / artifact 文件
@@ -249,6 +251,10 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 - `read_transport`
   - `direct_file_read`
   - `helper_cli_read`
+- `read_transport_capability`
+  - `unknown`
+  - `validated`
+  - `unavailable`
 - `writeback_capability`
   - `unknown`
   - `validated`
@@ -261,6 +267,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 
 - Desktop 自动续跑只对同时满足以下条件的 thread 生效：
   - `binding_state=bound`
+  - `read_transport_capability=validated`
   - `writeback_capability=validated`
 - `unbound` thread 可以继续提交 job，但 bridge 不得尝试自动 arm caller heartbeat。
 - 运行期 bridge 不负责发现新的 caller automation id；第一版要求这个 id 通过 bootstrap 预先 durable 绑定。
@@ -781,6 +788,10 @@ cbth job complete
 cbth job fail
 cbth job cancel
 cbth job query
+cbth batch close-head
+cbth batch inspect-head
+cbth desktop binding repair
+cbth desktop binding unbind
 ```
 
 说明：
@@ -788,7 +799,8 @@ cbth job query
 - `cbth cli run` 是 CLI 集成入口。
 - `cbth desktop ...` 预留给 Desktop bootstrap / helper。
 - `cbth job ...` 是第一版对外稳定的任务提交与状态回报面。
-- 更细的 queue / batch / inbox 控制面先视为内部实现，不在第一版对外冻结。
+- `cbth batch close-head` / `inspect-head` 与 `cbth desktop binding repair` / `unbind` 也必须作为第一版稳定的 operator recovery 面存在。
+- 其他更细的 queue / batch / inbox 控制面先视为内部实现，不在第一版对外冻结。
 - Desktop 使用的 snapshot / artifact 路径目前只算候选内部 contract，不算第一版对外稳定接口。
 
 ## 第一版脚本协议
@@ -851,6 +863,8 @@ cbth job query <job_id> --json
 ```text
 cbth desktop binding repair --source-thread-id <thread_id> --caller-automation-id <automation_id> --read-transport <transport> --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_closed --json
+cbth batch inspect-head --source-thread-id <thread_id> --json
+cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <true|false> --json
 ```
 
 ## Desktop 只读快照约束

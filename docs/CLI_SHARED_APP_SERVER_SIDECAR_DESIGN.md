@@ -373,6 +373,27 @@ thread/resume + turn/start
   - 当前 attempt 必须切到 `delivery_observation_state=lost`
   - 当前 head batch 必须进入 `replay_policy=manual_resolution_only`
   - 第一版不得靠“重投一次看看”来猜原 turn 是否已经产生副作用
+- continuity-loss 之后的最小 operator-resolution flow 必须是：
+  - 先运行：
+
+```text
+cbth batch inspect-head --source-thread-id <thread_id> --json
+```
+
+  - 读取 durable 证据：
+    - `delivery_turn_id`
+    - `managed_session_id`
+    - `session_epoch`
+    - acceptance timestamp
+    - last observed turn event
+  - 再结合外部可见证据（例如 thread history / rollout /人工确认）做二选一收口：
+
+```text
+cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_cli_delivery --json
+cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_unconfirmed --json
+```
+
+  - 第一版不提供 continuity-loss 后的自动 replay。
 
 ### `turn/steer` 的策略
 
