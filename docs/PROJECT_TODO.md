@@ -337,6 +337,8 @@
   - `turn/start` / `turn/steer` 前必须先进入 `accept_pending`
   - `accept_pending` 必须 durable 记录 `delivery_rpc_request_id + delivery_rpc_correlation_marker`
   - response 丢失后只能通过同一连续 event/current-state 面正向证明 marker 已接入 exactly one caller turn；否则 fail-closed，不得自动重发
+  - proven-before-accept benign reject 才允许 `accept_pending -> prepared`
+  - `accept_pending -> prepared` 必须写入 `delivery_rpc_state=rejected_before_accept`，且不得递增 `delivery_attempt_count`
   - accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
   - accepted attempt 必须 durable 记录 `delivery_accepted_at`
   - accepted attempt 必须 durable 记录 `last_observed_turn_event + last_observed_turn_event_at`

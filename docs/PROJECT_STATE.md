@@ -187,6 +187,7 @@
     - `delivery_rpc_correlation_marker`
   - response 丢失时，只有同一 `managed_session_id + session_epoch` 的连续 event/current-state 面能正向证明 marker 已接入 exactly one caller turn，才允许补写 `delivery_turn_id`
   - 如果既不能证明 accepted，也不能证明未 accepted，当前 head batch 必须 fail-closed 到 `manual_resolution_only`，不得重新发送同一 batch
+  - 如果能在同一连续会话里正向证明 RPC rejected before accept，才允许 `accept_pending -> prepared`，写入 `delivery_rpc_state=rejected_before_accept`，且不递增 `delivery_attempt_count`
   - `turn/start` / `turn/steer` 被接受，只表示 batch 已接入某个 caller turn 的 pending input
   - 每次 accepted attempt 都必须 durable 记录 `delivery_turn_id`
   - accepted attempt 还必须 durable 绑定 `managed_session_id + session_epoch`

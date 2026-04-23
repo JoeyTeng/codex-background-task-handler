@@ -427,6 +427,11 @@ thread/resume + turn/start
   - adapter 不得因为 daemon 崩溃、websocket 断开、或 response 丢失而直接重新发送同一个 batch
   - 下一次 sweep 必须先做 accepted/unknown reconciliation
 - 如果 RPC 在同一进程、同一 `managed_session_id + session_epoch` 内明确返回“未被接受”的 benign reject，例如 idle race 或 non-steerable active turn，才允许把该 attempt 恢复为 retry-on-idle 或重新排队。
+  - 具体状态迁移是 `accept_pending -> prepared`
+  - 必须先 durable 写入 `delivery_rpc_state=rejected_before_accept`
+  - `delivery_turn_id` 必须保持为空
+  - `delivery_attempt_count` 不得递增
+  - 下一次重试必须使用新的 `delivery_rpc_request_id + delivery_rpc_correlation_marker`
 - 如果 RPC response 丢失，但 daemon 能在同一连续 event/current-state 面里正向证明同一个 `delivery_rpc_correlation_marker` 已经被接入且只接入一个具体 caller turn，则必须补写 `delivery_turn_id` 并按 accepted attempt 继续观察。
 - 如果无法正向证明 accepted，也无法正向证明未 accepted，当前 attempt 必须收敛到 `abandoned`，当前 head batch 必须进入 `replay_policy=manual_resolution_only`，不得 automatic retry。
 - 对 CLI 来说，accepted delivery 的第一层语义是：
@@ -507,7 +512,7 @@ thread/resume + turn/start
 - benign race 的处理规则：
   - 不得关闭 batch
   - 不得创建第二个并发 attempt
-  - 当前 attempt 保持在 `prepared`，不得推进到 `cooldown`
+  - 当前 attempt 如果已经进入 `accept_pending`，只能在证明 RPC 未被接受后回到 `prepared`，不得推进到 `cooldown`
   - `last_delivery_attempt_at` 不得因为这次 race 被当成成功投递而更新
   - `delivery_attempt_count` 不得递增
   - 必须清除本地 idle 视图

@@ -725,6 +725,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 ```text
 prepared -> arm_pending -> cooldown -> closed
 prepared -> accept_pending -> cooldown -> closed
+accept_pending -> prepared
 prepared -> abandoned
 prepared -> superseded
 accept_pending -> abandoned
@@ -748,7 +749,9 @@ cooldown -> superseded
   - 进入 `accept_pending` 时必须写入 `delivery_rpc_request_id + delivery_rpc_kind + delivery_rpc_started_at + delivery_rpc_state=pending_acceptance + delivery_rpc_correlation_marker`
   - 只要 attempt 仍处于 `accept_pending`，该 batch 不得 automatic redelivery
   - 如果同一连续 event/current-state 面能证明 marker 被接入 exactly one caller turn，则补写 `delivery_turn_id` 并进入 `cooldown`
-  - 如果同一连续 event/current-state 面能证明 RPC 未被接受，则允许回到 retry-on-idle / benign-race path
+  - 如果同一连续 event/current-state 面能证明 RPC 未被接受，则设置 `delivery_rpc_state=rejected_before_accept`，清空 active acceptance 观察，回到 `prepared`
+  - `accept_pending -> prepared` 只允许用于这类 proven-before-accept benign reject；它不得递增 `delivery_attempt_count`，也不得更新 `last_delivery_attempt_at` 为成功投递时间
+  - 下一次 retry 必须生成新的 `delivery_rpc_request_id + delivery_rpc_correlation_marker`；旧 rejected request 只能作为 audit evidence 保留
   - 如果 acceptance 结果无法证明，attempt 必须进入 `abandoned`，head batch 必须进入 `manual_resolution_only`
 - `arm_pending` 表示 bridge 已经 durable 记录“准备为该 attempt arm caller heartbeat”，但这次 arm 还没有被 `note-arm` 最终确认。
   - 只要 attempt 仍处于 `arm_pending`，它就不再是新的 ready head

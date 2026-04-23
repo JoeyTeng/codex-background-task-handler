@@ -593,7 +593,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
   - `cbth batch inspect --batch-id ...` 返回 operator-only `artifact_recovery_lease_id + artifact_recovery_lease_deadline`（或等价 re-lease surface）
   - 这样人工/operator 才能继续调用 `cbth desktop read-artifact ...` 完成收口
 
-也就是说，`helper_cli_read` 对大 artifact 的 fallback 不是返回一个路径，而是返回一个显式 chunked payload 协议。
+也就是说，operator/manual `read-artifact` recovery 对大 artifact 不是返回一个裸路径，而是返回一个显式 chunked payload 协议；它不属于 bridge-side `helper_cli_read` fallback，也不属于 v1 automatic caller path。
 
 这样 bridge prompt 和 caller prompt 都可以很短，而且不需要知道底层 store 是 SQLite、普通文件还是 `mmap`。
 
