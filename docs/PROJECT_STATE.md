@@ -26,7 +26,8 @@
 - 同时，CLI 关键路径也收口为：
   - 明确依赖实验 RPC
   - 启动时 capability probe
-  - 默认使用 loopback-only shared `app-server` + per-session bearer-token auth
+  - 设计目标是 loopback-only shared `app-server` + per-session bearer-token auth
+  - 但 bearer-token 端到端路径目前仍待实证
   - shared `app-server` 由 daemon 持有，而不是前台 wrapper 临时持有
   - 默认仅在 idle 时 `turn/start`
   - `turn/steer` 只作为只读、低风险场景下的受限优化
@@ -66,9 +67,11 @@
   - 若 `delivery_attempt_count >= max_delivery_attempts`，batch 必须自动关闭到 `close_reason=max_attempts_exhausted`
 - Desktop 的送达语义也进一步收紧：
   - `claim-next-ready` 虽然名字里带 `claim`，但第一版必须是纯 read/peek helper，不能 reservation 或隐藏 head batch
+  - `note-boundary-crossed` 必须先于真正的 continuation boundary durable 成功
   - `note-delivered` 不能在“刚读完 envelope”时就执行
   - caller 只有在当前 turn 中完成 continuation preparation、且 helper 仍可调用时，才允许用 `note-delivered` 关闭 batch
-  - 如果 `note-delivered` 在 post-continuation-boundary 场景下失败，batch 进入人工判定语义，`binding repair` 不得自动重投它
+  - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
+  - 如果 `note-delivered` 在 post-boundary 场景下失败，batch 进入人工判定语义，`binding repair` 不得自动重投它
   - `note-arm` 也新增了 CAS/幂等合同，避免 bridge 重试导致重复计数
   - 这类歧义 batch 的 durable 表达应落成 `replay_policy=manual_resolution_only`
   - 默认只允许 operator close；若长期无人处理，则在 `redelivery_window_ends_at` 到期时自动 close 释放 FIFO/GC
@@ -78,8 +81,10 @@
   - 非只读 batch 一律不自动续跑，留给 operator/manual follow-up
 - caller heartbeat lifecycle 也已收口：
   - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
-  - 正常路径只 `pause` / `update` / `reuse`
-  - stale wake、snapshot 不可读、成功送达、degraded 都优先回到 `PAUSED`
+  - `armed_generation` 作为这个长期复用 heartbeat 的 generation 栅栏
+  - 正常路径只由 bridge / operator `pause` / `update` / `reuse`
+  - caller prompt 自己不直接 pause 这个长期复用 automation
+  - stale wake、snapshot 不可读、成功送达、degraded 都先 no-op / helper writeback，再由 bridge 后续切回 `PAUSED`
   - 正常投递路径不做 `delete`
   - 只有明确 operator unbind / destroy 才允许删除
 - CLI 侧 reviewer 指出的 idle/race 缺口也已收口：
@@ -94,13 +99,16 @@
 - CLI 的 delivery completion contract 也继续收口：
   - `turn/start` / `turn/steer` 被接受，只表示 batch 已接入某个 caller turn 的 pending input
   - 每次 accepted attempt 都必须 durable 记录 `delivery_turn_id`
+  - accepted attempt 还必须 durable 绑定 `managed_session_id + session_epoch`
   - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍是当前 head delivery 时，batch 才允许关闭
   - 非当前 thread 的 backlog 可以挂起，但仍受 batch 自己的 deadline / redelivery window 约束，不能无限阻塞 FIFO/GC
   - 如果某次旧 thread attempt 已经 accepted 并带有 `delivery_turn_id`，后续即使 `current_thread_id` 改变，它仍可等待匹配的 `turn/completed` 正常收口
   - 因此 daemon 退出条件也必须覆盖这些未收口的 ready/materialized/cooldown batch 与 `delivery_turn_id` 观察
+  - 但只要 `managed_session_id + session_epoch` 的观察连续性丢失，就不得自动 replay；当前 head batch 必须进入 `manual_resolution_only`
 - 同时又补了一个和 TUI 当前实现一致的判断：
   - active-turn steer 语义更接近现有 TUI 的 `pending_steers` / queued-follow-up 行为
   - non-steerable turn 必须回落到排队，而不是被算作成功送达
+  - steer 的 gating 不能只看 batch 自己；还必须证明当前 active turn 本身也是 `read_only_low_risk`
 - 结果保留责任也已收敛：
   - `cbth job complete --result-file <path>` 的语义改为 ingest/copy 到 `cbth` 自己管理的 artifact store
   - 原始外部文件不再承担长期保留责任
@@ -201,7 +209,7 @@ scripts/desktop_thread_inject_poc.py
 - 但这条路径目前仍是推断，不是已实证能力；尚未验证 Desktop 是否会对运行中 app 外部改写的 automation 调度状态做及时热感知。
 - 进一步从 App bundle 的前端代码字符串里看到了更强的信号：heartbeat automation 在内部对象上直接带有 `targetThreadId`，并且 UI 逻辑会按 `targetThreadId === conversationId` 关联 heartbeat 与具体 thread。
 - 同一处还可以看到 heartbeat automation 的目标 chat 选择、`run now`、以及“直接向所选 chat 发送消息而不是在项目/worktree 中运行”的文案，说明“thread-targeted heartbeat automation”是 Desktop 的一等概念，而不是文档层面的抽象。
-- 基于这些证据，一个更干净的 Desktop 外围架构浮现出来：不让外部 sidecar 直接改 Codex 的 automation DB；改由一个固定的 bridge automation thread 周期性检查外部长任务状态，再用 `automation_update` 为 caller thread 创建、更新、暂停或删除 heartbeat automation。
+- 基于这些证据，一个更干净的 Desktop 外围架构浮现出来：不让外部 sidecar 直接改 Codex 的 automation DB；改由一个固定的 bridge automation thread 周期性检查外部长任务状态，再用 `automation_update` 管理 caller thread 的 heartbeat。
 - 这条 bridge 架构的关键优点是：caller thread 不需要固定频率 wake，只在 bridge 判定任务 ready 后才被重新武装；周期性检查痕迹被集中在 bridge thread，而不是污染所有 caller thread。
 - 仍需注意：即使不外改 Codex DB，bridge thread 与外部 sidecar 之间依然需要一个共享状态面，例如本地文件、socket、CLI helper，或 sidecar 自己的 store；这里只是避免去碰 Codex 自己的 automation 持久化层。
 
@@ -217,6 +225,7 @@ scripts/desktop_thread_inject_poc.py
   - 同时更新名称和 prompt
   - 下一分钟 caller thread 的 rollout 中出现新的 heartbeat turn，assistant 最终回复 `HEARTBEAT_POC_RETARGETED`
 - 这说明“固定 bridge automation thread 监控状态，再用内建 `automation_update` 去 schedule caller thread heartbeat”在 Desktop 上是可行架构，不需要外部直接改 Codex automation DB。
+- 但这些 PoC 主要证明的是 Desktop 内置 automation 能力与 thread-targeted heartbeat 可行；当前第一版运行期合同已经进一步收窄为“预绑定 caller heartbeat + bridge 只更新已知 automation”，不再把 runtime retarget/create 当成默认路径。
 
 ## 当前方案收敛
 
@@ -224,12 +233,13 @@ scripts/desktop_thread_inject_poc.py
   - 外部 `sidecar supervisor` 跑长任务
   - 共享 `job state` 作为 bridge / caller 读取面
   - 固定 `bridge heartbeat thread` 负责轮询可投递 thread / batch
-  - bridge 通过内建 `automation_update` 为 caller thread 创建、激活、更新或重定向 heartbeat
-  - caller thread 被唤醒后读取只读 inbox snapshot、消费结果、继续原任务
+  - bootstrap 预绑定 `caller_automation_id`
+  - bridge 运行期只更新这个已知 heartbeat，不做 blind create / retarget
+  - caller thread 被唤醒后读取只读 inbox snapshot，在真正跨过 continuation boundary 前先 durable 写入 `note-boundary-crossed`，再继续原任务
 - 该方案不依赖：
   - 外部 live push 当前 Desktop thread
   - 外部直接改 Codex automation DB
-  - 后台 heartbeat 稳定执行本地 CLI
+  - 后台 heartbeat 稳定执行通用本地 CLI
   - notification thread
 - 独立设计文档已记录在：
   - `docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md`

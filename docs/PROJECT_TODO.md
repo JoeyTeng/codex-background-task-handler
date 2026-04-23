@@ -27,10 +27,12 @@
   - `read-envelope`
   - `read-artifact`
   - `note-arm`
+  - `note-boundary-crossed`
   - `note-delivered`
 - [ ] 为 Desktop bootstrap 设计并实现 `desktop binding` 流程，至少 durable 记录：
   - `source_thread_id`
   - `caller_automation_id`
+  - `armed_generation`
   - `read_transport`
   - paused 状态读回校验
 - [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
@@ -53,11 +55,17 @@
   - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --json`
   - compare-and-swap 只允许唯一一次 `prepared -> cooldown`
   - idempotent retry 不得重复递增 `delivery_attempt_count`
+- [ ] 设计并实现 Desktop continuation-boundary 断点 helper：
+  - `cbth desktop note-boundary-crossed --source-thread-id ... --attempt-id ... --generation ... --json`
+  - 必须先于真正的 continuation boundary durable 成功
+  - 成功后当前 head batch 转为 `continuation_boundary_state=crossed_unacknowledged`
+  - 同时切到 `replay_policy=manual_resolution_only`
 - [ ] 设计并实现 caller 成功关闭当前 head batch 的窄 helper：
   - `cbth desktop note-delivered --source-thread-id ... --attempt-id ... --generation ... --json`
 - [ ] 为 Desktop 定死 continuation-boundary contract：
   - 仅读完 envelope / artifact 不能关闭 batch
-  - 只有 caller 已经完成 continuation preparation、且 helper 仍可调用时，才允许 `note-delivered`
+  - 只有 `note-boundary-crossed` 已成功、且 caller 已经完成 continuation preparation、helper 仍可调用时，才允许 `note-delivered`
+  - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
   - 纯文本成功路径也必须能走到 `caller_acknowledged`
 - [ ] 明确第一版自动续跑的总安全门槛：
   - 仅限 `delivery_read_only=true`
@@ -69,6 +77,10 @@
   - `replay_policy=manual_resolution_only`
   - `redelivery_window_ends_at` 到期时自动 `manual_resolution_expired`
   - 如需 replay，后续单独设计 operator override
+- [ ] 为 “`automation_update` 已接受但 `note-arm` 未 durable 成功” 的 Desktop ghost-wake 场景定死收敛合同：
+  - head batch 进入 `manual_resolution_only`
+  - binding 进入 `degraded`
+  - repair / re-arm 前必须先验证 bound heartbeat 已被 `PAUSED`
 - [ ] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
 - [ ] 定死 caller heartbeat 的长期生命周期合同：
@@ -85,6 +97,12 @@
   - `delivery_requires_write_access`
   - `inline_payload_bytes`
   - `steer_candidate`
+- [ ] 为 CLI active-turn steer 落地可机判的 turn-risk 字段，至少包括：
+  - `active_turn_kind`
+  - `active_turn_requires_approval`
+  - `active_turn_requires_network`
+  - `active_turn_requires_write_access`
+  - `active_turn_risk_class`
 - [ ] 实现 durable delivery-attempt 合约：
   - `batch_id`
   - `attempt_id`
@@ -126,6 +144,7 @@
   - shared `app-server` 归 daemon 持有
   - 前台退出但 active jobs 未结束时继续保活
   - 后续重连 / resume contract
+  - 端到端 bearer-token auth contract validation
 - [ ] 定死 CLI managed session 的 thread-routing contract：
   - durable `session_id + current_thread_id`
   - 前台切换 thread 时更新 `current_thread_id`
@@ -133,6 +152,8 @@
   - 非当前 thread 的 backlog 保持挂起，不自动迁移、不静默丢弃
   - backlog 仍受 batch 自己的 `redelivery_window_ends_at` / `delivery_deadline` 约束，不能无限挂起
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 thread 完成事件
+  - accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
+  - 如果 `delivery_turn_id` 的观察连续性丢失，则当前 head batch 进入 `manual_resolution_only`
 - [ ] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
   - 基于 `turn/started` / `turn/completed` / `thread/status/changed`
   - `turn/start` race 失败后回到等待下一个 idle

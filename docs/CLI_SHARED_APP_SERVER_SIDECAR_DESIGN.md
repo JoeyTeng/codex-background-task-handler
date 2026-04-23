@@ -90,6 +90,7 @@ codex --remote-auth-token-env CBTH_REMOTE_AUTH_TOKEN --remote ws://127.0.0.1:<po
 - 上游 `codex --remote` 也支持：
   - `--remote-auth-token-env <ENV_VAR>`
 - 因此，第一版不应把“本机 loopback 默认可信”当成唯一安全前提。
+- 但这里目前仍是“已发现可用 auth surface”的设计合同，不是已经做过端到端 PoC 的已验证事实。
 - 第一版推荐的最小安全边界是：
   - shared `app-server` 只监听 `127.0.0.1` / `localhost`
   - daemon 为每次 managed session 生成一枚新的 bearer token
@@ -226,6 +227,7 @@ TUI_SIDECAR_MARKER_20260422
 - `thread_id = 019db614-1fb7-70a3-956f-7a96c48f0226`
 
 这一步把结论从“协议层前台 client 能收到通知”进一步推进到了“真实前台 TUI 会把 sidecar 触发的新 turn 展示给用户”。
+- 但这次 PTY 级别实测走的是无认证 loopback 路径；它还不等价于“per-session bearer-token auth 的端到端实现已验证”。
 
 ### 3. Active turn 可以被 `turn/steer`，且不会提前结束
 
@@ -317,6 +319,11 @@ thread/resume + turn/start
   - steer 路径下来自当前 active regular turn id
 - accepted 之后，attempt 进入 `cooldown`；是否真正关闭 batch，要看后续同一个 `delivery_turn_id` 的 turn 结果。
 - 因此，`delivery_turn_id` 也必须落进共享核心的 durable attempt schema，而不是只存在于 CLI adapter 的内存里。
+- accepted attempt 还必须 durable 绑定：
+  - `managed_session_id`
+  - `session_epoch`
+  - `delivery_observation_state=tracking`
+- 只有在后续仍能证明自己附着在同一个 `managed_session_id + session_epoch` 的事件流上时，CLI adapter 才允许继续等待那个 `delivery_turn_id` 的 `turn/completed`。
 
 ### Idle 判定与 race contract
 
@@ -348,6 +355,11 @@ thread/resume + turn/start
   - `turn/start` 被接受时：只记录 `delivery_turn_id`，attempt 进入 `cooldown`
   - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍然是当前 generation/head delivery 时，batch 才允许关闭为 CLI-delivered
   - 如果该 turn 在完成前失败、被替换、或 batch 已被 supersede，则不得因为早先的 `turn/start` 接受而关闭 batch
+- 如果 websocket / daemon / app-server continuity 在 accepted 之后丢失：
+  - 且无法再证明自己回到了同一个 `managed_session_id + session_epoch`
+  - 当前 attempt 必须切到 `delivery_observation_state=lost`
+  - 当前 head batch 必须进入 `replay_policy=manual_resolution_only`
+  - 第一版不得靠“重投一次看看”来猜原 turn 是否已经产生副作用
 
 ### `turn/steer` 的策略
 
@@ -356,6 +368,11 @@ thread/resume + turn/start
 - 只有在以下条件同时满足时才允许使用：
   - capability probe 明确支持
   - 当前 caller turn 仍处于 active regular turn
+  - 当前 active turn 的风险视图明确是 `read_only_low_risk`
+  - 当前 active turn 的：
+    - `active_turn_requires_approval=false`
+    - `active_turn_requires_network=false`
+    - `active_turn_requires_write_access=false`
   - 当前 batch 的 `delivery_read_only=true`
   - 当前 batch 的 `delivery_requires_approval=false`
   - 当前 batch 的 `delivery_requires_network=false`
@@ -369,6 +386,7 @@ thread/resume + turn/start
   - accepted steer 表示新输入被并入当前 active regular turn 的 pending input
   - non-steerable turn 不算成功送达，而是必须像 TUI 一样回落到 queued-follow-up 语义
   - race / expected-turn mismatch 只能重试或回退，不能直接 close batch
+- 如果当前 active turn 自己的风险分类无法确定，或其 delivery profile 不是 `read_only_low_risk`，则即使 batch 本身是只读，也不得 steer。
 - 因此，steer 路径的 batch close 语义必须是：
   - `turn/steer` 被接受时：只记录当前 `delivery_turn_id = active_turn_id`，attempt 进入 `cooldown`
   - 只有当同一个 `delivery_turn_id` 之后出现 `turn/completed`，且该 attempt 仍是当前 head delivery 时，batch 才允许关闭
@@ -422,5 +440,7 @@ cbth cli run
 
 - CLI 入口的进程生命周期和清理策略
 - sidecar 长时间运行时的状态持久化与 resume 策略
+- per-session bearer-token auth 的端到端实证
 - capability probe 的具体实现与版本策略
 - 多个 background jobs 同时命中同一 caller thread 时的 batch 合并参数
+- accepted `delivery_turn_id` 在 daemon / websocket / app-server continuity 丢失后的 operator-resolution 流程
