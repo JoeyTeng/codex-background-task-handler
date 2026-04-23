@@ -23,6 +23,7 @@
   - 无 active clients
   - 无需要在当前 idle timeout 内继续本地观察的近端 delivery work
   - open 但长窗口的 batch / attempt 不单独阻止退出；由下次启动时的 overdue sweep 收口
+  - 唯一例外是 CLI accepted attempt 的 `delivery_observation_deadline`，它在 deadline 到期前必须常驻观察
 - [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 bridge-side 所需的只读 inbox snapshot，且不会卡审批：
   - `ready-threads.json`
   - `arm-pending-bindings.json`
@@ -184,7 +185,8 @@
   - 缺少 `thread/read` 或等价 current-state 面时，v1 不支持 detached managed-session auto-continuation
   - 这个 sync 至少必须对 `bound_thread_id` 返回 `has_active_regular_turn` 与可选 `active_turn_id`
 - [ ] 为 daemon 的 overdue sweep / next-start reconcile 落地稳定合同：
-  - daemon 不需要为长窗口 `manual_resolution_only` / deadline 持续常驻
+  - daemon 不需要为大多数长窗口 `manual_resolution_only` / deadline 持续常驻
+  - 但 `delivery_observation_deadline` 是必须常驻观察的唯一例外
   - 但下次任何入口启动前都必须先补做 overdue close / reconcile / artifact GC
 - [ ] 定死 caller heartbeat 的长期生命周期合同：
   - 预绑定 `caller_automation_id`

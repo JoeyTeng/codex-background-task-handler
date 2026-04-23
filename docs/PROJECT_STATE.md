@@ -173,6 +173,7 @@
     - 当前 attempt 收敛到 `abandoned`
     - `delivery_observation_state=expired`
     - 当前 head batch 必须 fail-closed 到 `manual_resolution_only`
+  - 这之后任何迟到的 `turn/completed` 都只能保留为 operator/debug 证据，不得再自动 close 为 `delivered`
   - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍是当前 head delivery 时，batch 才允许关闭
   - 如果某次 accepted attempt 已经带有 `delivery_turn_id`，即使前台 UI 临时切到别的 thread，它也仍可等待匹配的 `turn/completed` 正常收口
   - 因此 daemon 退出条件只需要在 `delivery_observation_deadline` 窗口内覆盖这些未收口的 `delivery_turn_id` 观察

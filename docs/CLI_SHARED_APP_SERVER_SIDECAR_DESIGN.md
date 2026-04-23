@@ -175,7 +175,7 @@ codex --remote ws://127.0.0.1:<port>
   - 没有需要继续投递的 sidecar client
   - 没有任何仍绑定到这个 `bound_thread_id` 的 unresolved delivery work
     - 包括 ready / materialized / cooldown batch
-    - 包括 `replay_policy=manual_resolution_only`、仍等待 operator close 或 `manual_resolution_expired` 的 head batch
+    - 包括 `replay_policy=manual_resolution_only`、且尚未被 operator close 或 `manual_resolution_expired` auto-close 的 head batch
   - 没有仍在 `delivery_observation_deadline` 之内等待匹配 `turn/completed` 的 `delivery_turn_id`
 
 ## 实验 RPC 依赖面
@@ -444,7 +444,14 @@ thread/resume + turn/start
   - `turn/start` 失败时的 retry-on-next-idle 约束
 - idle 路径的 batch close 语义必须是：
   - `turn/start` 被接受时：只记录 `delivery_turn_id`，attempt 进入 `cooldown`
-  - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍然是当前 generation/head delivery 时，batch 才允许关闭为 `close_reason=delivered`
+  - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且以下条件同时满足时，batch 才允许关闭为 `close_reason=delivered`
+    - 该 attempt 仍然是当前 generation/head delivery
+    - `delivery_observation_state=tracking`
+    - `replay_policy=automatic`
+    - `now <= delivery_observation_deadline`
+  - 一旦 attempt 已 `abandoned`、`delivery_observation_state != tracking`、或 batch 已进入 `replay_policy=manual_resolution_only`：
+    - 迟到的 `turn/completed` 只能记录为 operator/debug 证据
+    - 不得再自动关闭为 `delivered`
   - 如果该 turn 在被接受之后又失败、中断、被替换，或 batch 已被 supersede，则不得因为早先的 `turn/start` 接受而关闭 batch
   - 对这类“accepted 后又变得不可信”的 turn，第一版不得自动 replay；当前 attempt 必须收敛到 `abandoned`，当前 head batch 必须进入 `replay_policy=manual_resolution_only`
 - 如果 websocket / daemon / app-server continuity 在 accepted 之后丢失：
@@ -463,6 +470,8 @@ cbth batch inspect-head --source-thread-id <thread_id> --json
     - `delivery_turn_id`
     - `managed_session_id`
     - `session_epoch`
+    - `delivery_observation_state`
+    - `delivery_observation_deadline`
     - acceptance timestamp
     - last observed turn event
   - 再结合外部可见证据（例如 thread history / rollout /人工确认）做二选一收口：
@@ -502,7 +511,14 @@ cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_un
 - 如果当前 active turn 自己的风险分类无法确定，或其 delivery profile 不是 `read_only_low_risk`，则即使 batch 本身是只读，也不得 steer。
 - 因此，steer 路径的 batch close 语义必须是：
   - `turn/steer` 被接受时：只记录当前 `delivery_turn_id = active_turn_id`，attempt 进入 `cooldown`
-  - 只有当同一个 `delivery_turn_id` 之后出现 `turn/completed`，且该 attempt 仍是当前 head delivery 时，batch 才允许关闭
+  - 只有当同一个 `delivery_turn_id` 之后出现 `turn/completed`，且以下条件同时满足时，batch 才允许关闭
+    - 该 attempt 仍是当前 head delivery
+    - `delivery_observation_state=tracking`
+    - `replay_policy=automatic`
+    - `now <= delivery_observation_deadline`
+  - 一旦 attempt 已 `abandoned`、`delivery_observation_state != tracking`、或 batch 已进入 `replay_policy=manual_resolution_only`：
+    - 迟到的 `turn/completed` 只能记录为 operator/debug 证据
+    - 不得再自动关闭为 `delivered`
   - 如果 steer 在被接受之前就被拒绝为 non-steerable，batch 不得关闭，必须继续走 queued / retry-on-idle 流程
   - 如果 steer 已被接受，但当前 turn 之后失败、中断、被替换，或观察连续性丢失，则 batch 同样不得关闭，且必须 fail-closed 到 `replay_policy=manual_resolution_only`
 

@@ -709,6 +709,14 @@ cooldown -> superseded
   - `delivery_observation_state=expired`
   - 当前 head batch durable 进入 `replay_policy=manual_resolution_only`
   - 之后 daemon 才允许按正常 idle 规则退出
+- 因此，CLI 自动 close `close_reason=delivered` 还必须额外满足：
+  - 当前 attempt 仍是 head delivery
+  - `delivery_observation_state=tracking`
+  - `replay_policy=automatic`
+  - `now <= delivery_observation_deadline`
+- 一旦 attempt 已 `abandoned`、`delivery_observation_state != tracking`、或 batch 已进入 `replay_policy=manual_resolution_only`：
+  - 迟到的 `turn/completed` 只能作为 operator/debug 证据保留
+  - 不得再自动把 batch 关闭成 `close_reason=delivered`
 - 只要 `managed_session_id` 或 `session_epoch` 的连续性无法再证明，当前 head batch 就不得自动 replay：
   - 当前 attempt 收敛到 `abandoned`
   - 当前 head batch durable 进入 `replay_policy=manual_resolution_only`
@@ -1123,6 +1131,14 @@ cbth desktop binding unbind
   - 同时把所有镜像不再匹配的 bindings 推到 `degraded`
 - `cbth job ...` 是第一版对外稳定的任务提交与状态回报面。
 - `cbth batch close-head` / `inspect-head` 与 `cbth desktop binding repair` / `unbind` 也必须作为第一版稳定的 operator recovery 面存在。
+- 对 CLI fail-closed 路径，`cbth batch inspect-head ...` 的最小可观测面还必须至少包含：
+  - `delivery_turn_id`
+  - `managed_session_id`
+  - `session_epoch`
+  - `delivery_observation_state`
+  - `delivery_observation_deadline`
+  - acceptance timestamp
+  - last observed turn event
 - `cbth batch inspect-head ...` 在 head batch 已 `crossed_unacknowledged` 时，必须回显：
   - `boundary_recovery_envelope`
   - 对大 artifact 则再回显 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
