@@ -22,13 +22,15 @@
 - 第一版不把“heartbeat turn 稳定执行通用 `cbth job ...` CLI”当作既定前提。
 - 但 Desktop adapter 当前只把三类能力当作规划中的关键路径：
   - 优先的只读文件路径：`direct_file_read`
+  - 每轮 bridge wake 的 mandatory helper：
+    - `cbth desktop bridge-preflight ...`
   - 窄写回 helper：
     - `cbth desktop note-arm-pending ...`
     - `cbth desktop note-arm ...`
     - `cbth desktop note-boundary-crossed ...`
   - operator / future-expansion 用的大 artifact helper：
     - `cbth desktop read-artifact ...`
-- 其中窄写回 helper 是否能在后台 heartbeat 中无审批执行，当前仍待实证；在这一步没验证前，不应把 Desktop 自动续跑表述成已实现能力。
+- 其中 mandatory / 窄写回 helper 是否能在后台 heartbeat 中无审批执行，当前仍待实证；在这一步没验证前，不应把 Desktop 自动续跑表述成已实现能力。
 - bridge 侧的 `claim-next-ready` 目前只是条件性 fallback，不应被表述成第一版必需面。
 - `read-artifact` 不再算 bridge-side fallback：
   - 它保留给 operator/manual recovery，或 future-expansion 的大 artifact continuation
@@ -65,6 +67,7 @@
    - `helper_cli_read` 建议提供一组窄 helper：
 
 ```text
+cbth desktop bridge-preflight --bridge-thread-id <thread_id> --json
 cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --json
 cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
@@ -74,6 +77,11 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
 cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --bridge-arm-lease-id <lease_id> --json
 ```
 
+   - `bridge-preflight` 是每轮 bridge wake 的必经 helper，不是 `helper_cli_read` fallback：
+     - 它负责按需拉起 daemon
+     - 执行 deterministic overdue sweep / auto-close / artifact GC / binding reconcile
+     - 原子刷新本轮 `direct_file_read` 或 fallback helper 要读取的 snapshot
+   - `direct_file_read` 只表示 bridge 读取 preflight 之后的 refreshed snapshot 不再需要额外读 helper。
    - 底层仍可用 SQLite / 普通文件 / `mmap`，但这属于内部实现细节。
    - 明确不依赖直接改 Codex 自己的 automation DB。
    - `direct_file_read` 目前仍是 bridge 侧候选主路径，待“heartbeat 无审批读取”实证后再升级为已验证主路径。
@@ -93,6 +101,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
      - `read_transport_capability`
      - `artifact_read_capability`
      - `writeback_capability`
+     - `validation_fingerprint`
    - bridge 在运行期只允许更新这个已知 `caller_automation_id`，不做 blind create / discovery。
    - Desktop v1 不支持同一安装里 mixed `read_transport` bindings：
      - 同一安装只允许一个 installation-wide `read_transport`
@@ -123,6 +132,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
    - 只有当以下条件同时满足时，这个 binding 才允许进入真正可自动续跑的 `bound` 状态：
      - `read_transport_capability=validated`
      - `writeback_capability=validated`
+     - binding 镜像的 `validation_fingerprint` 等于当前 installation state 的 `validation_fingerprint`
   - `artifact_read_capability=validated` 不再进入 v1 automatic caller path 的 gate：
     - 它保留给 operator/manual recovery
     - 或 future-expansion 的大 artifact automatic continuation
@@ -153,6 +163,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
    - `note-boundary-crossed` 的 success 返回必须同时代表：
      - boundary crossing 已 durable 记录
      - 当前 batch 已切到 `crossed_unacknowledged + replay_policy=manual_resolution_only`
+     - 当前 batch 已用 `close_reason=handoff_recorded` 关闭并释放 FIFO
      - caller 已获得当前 v1 supported handoff 所需的 inline continuation payload / summary
      - 同时 durable 保存一份 operator-only `boundary_recovery_envelope`
    - 它必须发生在真正跨过 continuation boundary 之前：
@@ -165,12 +176,12 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
      - 大 artifact / 需要后续工具的 continuation 留给 operator/manual follow-up
    - 也就是说，v1 不再把“系统层面阻止 post-boundary 普通工具”当成架构保证：
      - 如果 caller 偏离这条 supported path，属于 unsupported implementation drift
-     - 核心 delivery state machine 只保证 batch 已切到 `manual_resolution_only`，而不再保证后续动作可自动重放或自动收口
+     - 核心 delivery state machine 只保证 batch 已 durable 记录 handoff 并释放 FIFO，而不再保证后续动作可自动重放或证明可见
    - 如果 caller 在 `note-boundary-crossed` 成功返回前崩溃，batch 仍可 redelivery。
-   - 如果 caller 已经成功写入 `note-boundary-crossed` 后再崩溃，batch 必须保持 `manual_resolution_only`，不得自动 redelivery。
+   - 如果 caller 已经成功写入 `note-boundary-crossed` 后再崩溃，batch 已经 `handoff_recorded`，不得自动 redelivery。
    - 因此，`note-boundary-crossed` 就是 v1 的最后一个自动 durable 断点：
      - crossing 之后不再尝试自动把 batch 收口成 “已送达”
-     - 后续只允许 operator close，或等待 `redelivery_window_ends_at` 超时关闭
+     - 后续如需恢复，只能通过 operator recovery 读取 `boundary_recovery_envelope`
    - 这个已绑定 automation 的生命周期合同是：
      - 正常路径下只由 bridge / operator `pause` / `update` / `reuse`
      - caller 自己不直接 `pause` / `delete`
@@ -208,7 +219,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 - 但这还不是充分条件；Desktop 自动续跑还必须额外满足：
   - 当前安装选定 `read_transport` 已验证可无审批执行
   - 当前 binding 的 `writeback_capability=validated`
-  - 也就是 `note-arm-pending` / `note-arm` / `note-boundary-crossed` 这组窄 helper 已经被证明可在 heartbeat 中无审批执行
+  - 也就是 `bridge-preflight` / `note-arm-pending` / `note-arm` / `note-boundary-crossed` 这组窄 helper 已经被证明可在 heartbeat 中无审批执行
 - 不满足这些条件的 batch 不得由 bridge 自动 arm caller heartbeat；它们保留为 manual/operator follow-up。
 - 对 `requires_artifact_read=true` 的 batch：
   - v1 不再把它纳入 Desktop automatic caller path
@@ -216,8 +227,8 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 - 这里的“只读 / 低风险”只描述 bridge 自动投递与断点写回这条外围机制本身。
 - caller 被唤醒之后如果决定发起 approval / network / write 工具：
   - 这不再属于 v1 supported automatic path
-  - 当前 batch 必须已经是 `manual_resolution_only`
-  - 后续只能依赖 operator/manual 收口，而不是外围系统的自动重投保证
+  - 当前 batch 必须已经是 `closed + close_reason=handoff_recorded + replay_policy=manual_resolution_only`
+  - 后续只能依赖 operator/manual recovery，而不是外围系统的自动重投保证
 - 运行期 bridge 不得 blind create caller heartbeat；它只能更新已绑定 automation。
 - 旧 heartbeat prompt 必须能够通过 attempt token / generation 检测自己已经过期，并立即 no-op。
 - 旧 heartbeat prompt 即使被延迟唤醒，也不得直接 `pause` 当前这个长期复用的 caller heartbeat；否则会把新 generation 的合法 wake 一起关掉。
@@ -243,6 +254,19 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 ### 2. bridge thread 轮询
 
 bridge heartbeat 每分钟醒一次：
+
+0. 先执行 mandatory daemon preflight：
+
+```text
+cbth desktop bridge-preflight --bridge-thread-id <thread_id> --json
+```
+
+   - 这个 helper 必须按需拉起 daemon。
+   - 它必须先完成 deterministic overdue sweep / auto-close / artifact GC / binding reconcile。
+   - 它必须原子刷新本轮要读取的 `ready-threads.json` / `arm-pending-bindings.json` / `pause-due-bindings.json`。
+   - 它必须返回本轮 snapshot revision / generation。
+   - 如果 preflight 失败，bridge 本轮不得继续读取旧 snapshot，也不得 arm caller heartbeat。
+   - 因此 `direct_file_read` 只是 refreshed snapshot 的读取传输，不是 daemon liveness / sweep 机制。
 
 1. 先做上一轮已 arm generation 的 pause / reconcile：
    - 每轮 wake 必须遵守 bounded work budget：
@@ -313,6 +337,7 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
    - bridge 必须再根据 `source_thread_id` 查询 binding，解析当前唯一允许更新的 `caller_automation_id`
    - 用 `automation_update` 更新这个已知 caller heartbeat
    - heartbeat prompt 中带上：
+     - `source_thread_id`
      - `batch_id`
      - `attempt_id`
      - `generation`
@@ -365,7 +390,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
      - bridge 不能立刻把这次 wake 视为歧义失败
      - 它必须先做一次 durable reconciliation：
        - 如果 attempt 已进入 `cooldown` 且 `armed_generation` 已等于当前 generation，则按成功处理
-       - 如果同一 attempt 已经成功 `note-boundary-crossed`，则当前 head batch 必须保持 `manual_resolution_only`
+       - 如果同一 attempt 已经成功 `note-boundary-crossed`，则该 batch 必须保持 `closed + close_reason=handoff_recorded`
        - 如果当前 generation 对应的 heartbeat 已能被证明重新 `PAUSED`，则当前 attempt 收敛到 `abandoned`，head batch 保持 `replay_policy=automatic`
      - 只有在仍无法证明“已成功 arm”或“已成功 pause”时，才允许把当前 head batch 打到 `manual_resolution_only` 并把 binding 置为 `degraded`
    - `arm_pending_deadline` 到期时，这个 reconcile 必须强制完成收敛，禁止无限停留在 `arm_pending`：
@@ -396,6 +421,8 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
      - `writeback_capability=validated`
    - `continuation_boundary_state=not_crossed -> crossed_unacknowledged`
    - `replay_policy=automatic -> manual_resolution_only`
+   - `closed_at=<now>`
+   - `close_reason=handoff_recorded`
    - durable 保存 operator-only `boundary_recovery_envelope`
    - 返回 caller 当前 v1 supported handoff 所需的 inline continuation payload / summary
 4. 只有 `note-boundary-crossed` fresh success 后，caller 才允许进入 post-boundary handoff phase。
@@ -412,8 +439,9 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
    - 需要大 artifact 或后续工具的 batch 不进入 automatic caller path
 7. 第一版不再提供自动 `note-delivered` 收口：
    - 无论后续是纯文本回复，还是工具 / 行动步骤
-   - 只要已经跨过 continuation boundary，batch 都保持 `manual_resolution_only`
-   - 后续只能由 operator close，或等待 `redelivery_window_ends_at` 超时关闭
+   - 只要 `note-boundary-crossed` fresh success，batch 就以 `close_reason=handoff_recorded` 关闭
+   - 这个 close reason 只表示 inline handoff payload / recovery envelope 已 durable 记录
+   - 它释放 FIFO，但不证明 caller assistant 文本已经展示给用户
 8. 如果 caller 在被唤醒后决定继续走 approval / network / write 工具：
    - 这一步仍按 Codex 自己的审批与沙箱规则执行
    - 不被本文档前面的“只读 / 低风险 batch”门槛自动豁免
@@ -463,9 +491,9 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
   - `arm_pending_deadline`
   - `cooldown_until`
 - bridge arm caller heartbeat 前，必须先原子创建/更新 attempt，并在真正调用 `automation_update` 前先把它 durable 推到 `arm_pending`。
-- caller prompt 中必须显式携带 `batch_id + attempt_id + generation + snapshot_revision`。
+- caller prompt 中必须显式携带 `source_thread_id + batch_id + attempt_id + generation + snapshot_revision`。
 - `snapshot_path` 只用于 bridge 侧直接读取 / 核对 envelope，不属于 caller prompt token。
-- `note-boundary-crossed` 的 success 返回也必须回显这四者；caller 必须先比较 helper 返回值与 prompt 期望值是否一致，只要 mismatch 就立即 no-op。
+- `note-boundary-crossed` 的 success 返回也必须回显这五者；caller 必须先比较 helper 返回值与 prompt 期望值是否一致，只要 mismatch 就立即 no-op。
 - 同一 thread 上出现新的 generation 后，所有旧 heartbeat prompt 都只能看到 mismatch，不得重复消费当前 head batch。
 - 第一版不要求 `cbth` 在关键路径上同步拿到 `automation_id`。
 - 对第一版来说：
@@ -498,6 +526,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 ### Helper fallback
 
 ```text
+cbth desktop bridge-preflight --bridge-thread-id <thread_id> --json
 cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --json
@@ -507,7 +536,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
 cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --bridge-arm-lease-id <lease_id> --json
 ```
 
-`read-artifact` 保留给 operator/manual recovery，或 future-expansion；它不再属于 v1 automatic caller path。若未来重新启用，它的返回合同至少包括：
+`bridge-preflight` 是每轮 bridge wake 的 mandatory helper；它成功后，`direct_file_read` 才能读取 freshly generated snapshots。`read-artifact` 保留给 operator/manual recovery，或 future-expansion；它不再属于 v1 automatic caller path。若未来重新启用，它的返回合同至少包括：
 
 - `artifact_id`
 - `artifact_read_lease_id`
@@ -520,14 +549,16 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 - `next_offset`
 - `eof`
 
-也就是说，大 artifact 的后续读取不能只靠 `artifact_id`；必须同时带上 `note-boundary-crossed` success 返回的 `artifact_read_lease_id`。
-这个 lease 还必须是短寿命 continuation lease，而不是长期 artifact bearer token：
+也就是说，大 artifact 的后续读取不能只靠 `artifact_id`；必须同时带上 operator recovery 路径新签发的 `artifact_recovery_lease_id`。
+这个 lease 还必须是短寿命 recovery lease，而不是长期 artifact bearer token：
 
-- 它只对当前 `crossed_unacknowledged` 的同一 `(attempt_id, generation, snapshot_revision)` 有效
-- 一旦 batch 被 close、attempt 被 supersede / abandon、operator repair / unbind 收口，旧 lease 必须立即失效
+- 它只对当前 operator recovery session 和指定 `batch_id` 有效
+- `note-boundary-crossed` fresh success 会关闭 batch，但不得删除 `boundary_recovery_envelope`
+- `boundary_recovery_envelope` 必须至少保留到 batch/artifact retention contract 允许 GC
+- 短寿命 `artifact_recovery_lease_id` 必须在 deadline 到期、lease rotation、artifact GC、或 operator 明确 revoke 后失效
 - 如果 caller 没拿到第一次 `note-boundary-crossed` success 的返回值，自动 caller path 不得重新申请新的 artifact lease；只能通过 operator recovery 读取 durable `boundary_recovery_envelope` / manifest 做人工收口
 - 对大 artifact，这个 operator recovery 还必须闭环成：
-  - `cbth batch inspect-head ...` 返回 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
+  - `cbth batch inspect --batch-id ...` 返回 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
   - 这样人工/operator 才能继续调用 `cbth desktop read-artifact ...` 完成收口
 
 也就是说，`helper_cli_read` 对大 artifact 的 fallback 不是返回一个路径，而是返回一个显式 chunked payload 协议。
@@ -583,7 +614,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 ### Caller prompt 要求
 
 - 先通过 `cbth desktop note-boundary-crossed ...` 请求开启当前 batch 的 continuation。
-- 只处理当前 helper success 返回所指向的 head batch。
+- 只处理当前 helper fresh success 返回所指向的 batch。
 - 对小结果，caller 只允许消费 helper fresh success 返回的 inline continuation payload / summary。
 - `replay_policy=automatic`、`continuation_boundary_state=not_crossed`、binding 仍是 `bound` 这些条件，只用于 fresh `note-boundary-crossed` 的前置校验。
 - 一旦 helper fresh success，后续允许继续的条件就切换为：
@@ -591,10 +622,11 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
   - 不再重新检查 `replay_policy=automatic` / `continuation_boundary_state=not_crossed`
   - 不把普通 Codex 工具纳入 supported automatic path
 - 在 `note-boundary-crossed` success 之前，caller 不得直接读取 per-thread envelope / artifact payload，也不得开始输出或起工具。
-- 一旦成功记录 `note-boundary-crossed`，当前 batch 就进入 `manual_resolution_only`：
+- 一旦成功记录 `note-boundary-crossed`，当前 batch 就进入 `closed + close_reason=handoff_recorded`：
   - 不再自动 redelivery
   - 不再尝试自动关闭为 “已送达”
-  - 后续只能等待 operator close 或超时关闭
+  - FIFO 立即释放
+  - lost post-boundary response 只能通过 operator recovery 读取 `boundary_recovery_envelope`
 - caller 不直接 pause 当前 heartbeat；任务完成后的 pause/reconcile 由 bridge 在后续 heartbeat 中处理。
 - 旧 generation 的 prompt 只允许 no-op，不允许“顺手处理当前 head batch”。
 - 读取传输由 binding 预先决定：
@@ -614,6 +646,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
   - caller 一定完成了后续工作
 - 第一版推荐的 `close_reason` 至少包括：
   - `delivered`
+  - `handoff_recorded`
   - `superseded`
   - `operator_confirmed_delivery`
   - `operator_closed_unconfirmed`
@@ -623,6 +656,10 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
   - `max_attempts_exhausted`
 - 其中：
   - `delivered` 是共享核心的 canonical 枚举值，供 CLI 等可信自动送达路径使用
+  - `handoff_recorded` 是 Desktop v1 的正常自动成功 reason：
+    - 它表示 `note-boundary-crossed` fresh success 已 durable 记录 inline handoff payload / recovery envelope
+    - 它释放 FIFO
+    - 它不证明 caller assistant 文本已被用户看到
   - Desktop v1 自动路径默认只会产出其余几类 `close_reason`，不会在 post-boundary 阶段自动写出 `delivered`
   - `superseded` 只用于整个 batch 被新的 `batch_id` / compaction result / operator decision 取代
   - 同一 batch 内创建新 redelivery attempt 不属于 batch 级 `superseded`
@@ -705,6 +742,7 @@ cbth desktop installation-state repair --read-transport <transport> [--read-tran
 cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_unconfirmed --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_delivery --json
 cbth batch inspect-head --source-thread-id <thread_id> --json
+cbth batch inspect --batch-id <batch_id> --json
 cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <true|false> --json
 ```
 
@@ -726,8 +764,8 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
     - 但凡 repair 过程中更换了 `caller_automation_id`，或旧 automation 的 quiesce 无法被证明：
       - 不得复用当前 head batch 的旧 attempt / generation
       - 必须先强制切换到新的 fresh attempt / generation，再允许后续自动 arm
-    - 如果 degraded 的来源是 `note-arm` outcome unknown 这类 post-boundary / post-arm 歧义场景，`binding repair` 不得自动重投当前 head batch
-    - 它恢复的是当前 caller heartbeat 与后续调度能力；但在当前 head batch 被显式关闭或超时自动关闭前，FIFO 仍会被这个 head batch 挡住
+    - 如果 degraded 的来源是 `note-arm` outcome unknown 这类 post-arm 歧义场景，`binding repair` 不得自动重投当前 head batch
+    - 它恢复的是当前 caller heartbeat 与后续调度能力；未关闭的 manual head batch 仍会阻塞 FIFO，但已 `handoff_recorded` 的 batch 不再阻塞后续 batch
   - `installation-state repair`：
     - 是唯一允许切换 installation-wide `read_transport` 的 operator 路径
     - 也是唯一允许写 installation-wide capability 结论的路径
@@ -744,9 +782,10 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
     - 显式关闭当前 head batch
     - 让后续 FIFO 队列继续前进
 - 第一版安全默认值是：
-  - post-continuation-boundary 的歧义 batch 只能人工 close
+  - `note-boundary-crossed` fresh success 后的 batch 自动关闭为 `handoff_recorded`，以释放 FIFO
+  - pre-boundary 歧义 batch 仍只能人工 close 或等待 `manual_resolution_expired`
+  - post-boundary lost response 只能通过 `cbth batch inspect --batch-id ...` 恢复 handoff 记录
   - 不提供自动 replay
-  - 但如果 operator 长时间不处理，仍在 `redelivery_window_ends_at` 到期时自动关闭为 `manual_resolution_expired`，以释放 FIFO/GC
   - 未来如果要支持人工 replay，必须单独引入明确的 operator override contract，而不是复用普通 `binding repair`
 
 ## Bootstrap 约束

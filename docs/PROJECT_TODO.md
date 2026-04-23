@@ -31,6 +31,7 @@
   - 大 artifact 的正式自动路径不再依赖直接读 `artifacts/<artifact_id>/payload`
 - [ ] 如果未来要把大 artifact 纳入 automatic caller path，再单独验证 `cbth desktop read-artifact ...` 在 heartbeat / caller 路径中的无审批能力，并把结果写回 `artifact_read_capability`。
 - [ ] 单独验证 Desktop heartbeat 在后台运行时，是否能无审批执行窄 `cbth desktop ...` helper：
+  - `bridge-preflight`
   - `note-arm-pending`
   - `list-arm-pending`
   - `list-pause-due`
@@ -47,6 +48,7 @@
   - `read_transport_capability`
   - `artifact_read_capability`
   - `writeback_capability`
+  - `validation_fingerprint`
   - paused 状态读回校验
   - v1 明确不支持 mixed Desktop `read_transport` bindings
 - [ ] 按已定稿合同实现 Desktop installation-wide `read_transport` 权威来源：
@@ -72,10 +74,12 @@
 - [ ] 落实 `~/.cbth` 的权限合同：
   - directories `0700`
   - regular files `0600`
-- [ ] 设计并实现 `helper_cli_read` fallback：
+- [ ] 设计并实现 Desktop bridge preflight 与 `helper_cli_read` fallback：
+  - `cbth desktop bridge-preflight --bridge-thread-id ... --json`
   - `cbth desktop claim-next-ready --bridge-thread-id ... --json`
-  - `cbth desktop read-artifact --artifact-id ... --artifact-read-lease-id ... --offset ... --max-bytes ... --json`
-  - chunked payload return contract
+  - `bridge-preflight` 是每轮 bridge wake 的 mandatory helper；`direct_file_read` 也必须先通过它刷新 snapshots
+  - `cbth desktop read-artifact --artifact-id ... --artifact-read-lease-id ... --offset ... --max-bytes ... --json` 只属于 operator/manual recovery 或 future-expansion；v1 里传入的 lease 必须来自 operator recovery 签发的 `artifact_recovery_lease_id`
+  - chunked payload return contract 只用于 recovery / future-expansion，不属于 v1 automatic caller path
 - [ ] 按已定稿合同实现 `claim-next-ready` 的纯 read/peek 语义：
   - 不 reservation
   - 不隐藏 head batch
@@ -107,14 +111,16 @@
     - `writeback_capability=validated`
   - 成功后当前 head batch 转为 `continuation_boundary_state=crossed_unacknowledged`
   - 同时切到 `replay_policy=manual_resolution_only`
+  - 同时关闭为 `close_reason=handoff_recorded`
+  - 同时 durable 保存 `boundary_recovery_envelope`
   - success 返回同时提供 gated inline continuation payload / summary
 - [ ] 按已定稿 continuation-boundary contract 实现并验证：
   - bridge 读到 ready entry，或 caller 仅拿到 gated inline continuation payload / summary，都不能关闭 batch
   - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
-  - 一旦 `note-boundary-crossed` 成功，当前 head batch 必须进入 `crossed_unacknowledged + replay_policy=manual_resolution_only`
+  - 一旦 `note-boundary-crossed` 成功，当前 batch 必须进入 `closed + close_reason=handoff_recorded + replay_policy=manual_resolution_only`
   - post-boundary 只允许进入一次性 inline text handoff phase；普通 Codex 工具不属于 supported automatic path
   - 自动 caller path 不提供 replay-safe continuation；response 丢失后改走 operator recovery
-  - 第一版不提供 post-boundary 自动 close
+  - 第一版不提供 post-boundary `delivered` 自动 close；`handoff_recorded` 只是 durable handoff 记录
   - 如果未来需要支持 post-output ack，再单独设计 observation / response-digest contract
 - [ ] 明确第一版自动续跑的总安全门槛：
   - 仅限 `delivery_read_only=true`
@@ -125,14 +131,14 @@
   - 非只读 batch 只走 manual/operator follow-up
 - [ ] 为 post-continuation-boundary 的 operator-resolution contract 定死收口规则：
   - `binding repair` 不得自动 replay 当前 head batch
-  - 第一版默认只允许人工 `batch close-head`
-  - `replay_policy=manual_resolution_only`
-  - `redelivery_window_ends_at` 到期时自动 `manual_resolution_expired`
+  - `note-boundary-crossed` fresh success 后 batch 已经 `closed + close_reason=handoff_recorded`
+  - lost response recovery 必须通过 `cbth batch inspect --batch-id ...`，不能依赖 `inspect-head`
+  - pre-boundary `replay_policy=manual_resolution_only` batch 仍只能人工 `batch close-head` 或等待 `manual_resolution_expired`
   - 如需 post-output ack / replay，后续单独设计 operator override
 - [ ] 按已定稿合同实现 Desktop ghost-wake reconciliation：
   - 先 reconcile，而不是立刻视为歧义失败
   - 如果能证明 attempt 已进入 `cooldown` 且 `armed_generation` 匹配，则按成功 arm 处理
-  - 如果能证明同一 attempt 已成功 `note-boundary-crossed`，则 head batch 必须保持 `manual_resolution_only`
+  - 如果能证明同一 attempt 已成功 `note-boundary-crossed`，则 batch 必须保持 `closed + close_reason=handoff_recorded`
   - 如果能证明当前 generation 对应的 heartbeat 已重新 `PAUSED`，则当前 attempt 收敛到 `abandoned`，head batch 保持 `replay_policy=automatic`
   - 只有在既无法证明 arm 成功、也无法证明 pause 成功时，head batch 才进入 `manual_resolution_only`，binding 才进入 `degraded`
 - [ ] 为 Desktop arm flow 增补 durable `arm_pending` barrier：
@@ -159,20 +165,22 @@
 - [ ] 按已定稿合同实现 `note-boundary-crossed` 的 compare-and-swap / 幂等语义：
   - `note-boundary-crossed` 只允许唯一一次 `not_crossed -> crossed_unacknowledged`
   - 自动 caller path 的重复调用必须返回 `already-crossed` / stale-no-op
-  - `batch inspect-head` 必须提供 operator-only `boundary_recovery_envelope`
+  - `batch inspect --batch-id ...` 必须提供 operator-only `boundary_recovery_envelope`
   - stale / mismatch / closed batch 才返回 stale-no-op
 - [ ] 为 Desktop operator/manual 大 artifact recovery 定死 lease 生命周期：
   - automatic caller path 不再依赖 `artifact_read_lease`
   - operator recovery 需要单独的 `artifact_recovery_lease_id + artifact_read_lease_deadline`
   - `read-artifact` 只能在持有当前有效 lease 时读取
-  - lease 在 batch close / supersede / abandon / operator repair-or-close / deadline 到期 / lease rotation 后必须失效
-  - `batch inspect-head` 还必须能返回 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
+  - `note-boundary-crossed` fresh success 关闭 batch 后，`boundary_recovery_envelope` 仍必须按 retention contract 保留
+  - 短寿命 recovery lease 在 deadline 到期 / lease rotation / artifact GC / operator revoke 后必须失效
+  - `batch inspect --batch-id ...` 还必须能返回 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
 - [ ] 如果未来需要 post-output ack，再单独设计 `note-delivered` 合同：
   - 不进入 v1 自动续跑主路径
   - 必须建立 post-output / post-side-effect observation contract
   - 不能靠“continuation preparation 已完成”来自动关闭 batch
 - [ ] 把 Desktop operator recovery / cleanup 命令面定死并实现：
   - `cbth batch inspect-head ...`
+  - `cbth batch inspect --batch-id ...`
   - `cbth batch close-head ...`
   - `cbth desktop binding repair ...`
   - `cbth desktop installation-state repair --read-transport ... [--read-transport-capability ...] [--artifact-read-capability ...] [--writeback-capability ...] ...`

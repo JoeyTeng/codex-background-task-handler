@@ -24,6 +24,7 @@
     - `direct_file_read`
     - `helper_cli_read`
   - 其中 `direct_file_read` 仍是候选优先路径，`helper_cli_read` 只是条件性 fallback
+  - 但 `direct_file_read` 不是 daemon liveness 机制：每轮 bridge wake 仍必须先执行窄 helper `cbth desktop bridge-preflight ...`，按需拉起 daemon、补做 overdue sweep / GC / auto-close / reconcile，并原子刷新 ready/reconcile snapshots
   - 同时又补了一层 explicit desktop binding：bridge 运行期只更新已知 caller automation，不做 blind create/discovery
   - Desktop 的 `read_transport` 也已收口为 installation-wide 选择：
     - binding 里只 durable 镜像当前安装选定 transport 与其 generation
@@ -34,7 +35,7 @@
       - transport generation 变化时，capability 必须原子重置为 `unknown`
       - capability 还必须绑定 installation-wide `validation_fingerprint`
       - binding repair 不得单独覆盖 installation-wide capability
-  - Desktop 顶部文案也已改成更保守的口径：`note-arm-pending` / `note-arm` / `note-boundary-crossed` 是 v1 规划中的窄写回依赖；`note-delivered` 已降级为未来 post-output ack 扩展点，但后台 heartbeat 能否无审批执行前者仍待实证
+  - Desktop 顶部文案也已改成更保守的口径：`bridge-preflight` / `note-arm-pending` / `note-arm` / `note-boundary-crossed` 是 v1 规划中的窄 helper 依赖；`note-delivered` 已降级为未来 post-output ack 扩展点，但后台 heartbeat 能否无审批执行前者仍待实证
   - 而且 Desktop 自动续跑现在被明确成双门槛：
     - batch 本身必须是只读 / 低风险
     - 目标安装上的读路径也必须已验证可无审批执行
@@ -81,7 +82,8 @@
   - 用于在 bridge 真正调用 `automation_update` 前，把当前 head attempt durable 推到 `arm_pending`
   - `cbth desktop note-arm ...`
   - 用于在 bridge 成功 `automation_update` 后，把 attempt durable 推进到 `cooldown`
-- Desktop helper fallback 也进一步补成完整链路：
+- Desktop helper/control 链路也进一步补完整：
+  - `cbth desktop bridge-preflight ...`
   - `cbth desktop note-arm-pending ...`
   - `cbth desktop list-arm-pending ...`
   - `cbth desktop list-pause-due ...`
@@ -89,10 +91,10 @@
   - `cbth desktop read-artifact ...`（operator/manual recovery 或 future-expansion）
   - `cbth desktop note-arm ...`
   - `cbth desktop note-boundary-crossed ...`
-- 但这条 helper fallback 也被重新降级成“条件性 fallback”：
+- 但除了 mandatory `bridge-preflight` 外，额外 helper read fallback 仍被重新降级成“条件性 fallback”：
   - 它仍要求 heartbeat turn 无审批执行窄 `cbth desktop ...` 命令
-  - 在这个前提被实证前，不能把它当作已验证主路径
-  - 当前真正优先候选仍是 `direct_file_read`
+  - 在这个前提被实证前，不能把额外 helper read fallback 当作已验证主路径
+  - 当前真正优先候选仍是 `bridge-preflight + direct_file_read`
 - Desktop 的 delivery state machine 也继续收紧：
   - attempt 不再保留单独的 durable `armed`
   - bridge 在真正调用 `automation_update` 前，先把 attempt durable 推到 `arm_pending`
@@ -107,14 +109,12 @@
     - 这一步在 v1 是单次 crossing，不再提供自动 replay-safe continuation；response 丢失后改走 operator recovery
   - 如果 `note-boundary-crossed` 尚未 success，caller 不得真正跨过 continuation boundary
   - `note-boundary-crossed` 需要 compare-and-swap / stale-no-op 语义，避免重复 wake 或 supersede 后重复记账
-  - 一旦 `note-boundary-crossed` 成功，当前 head batch 就必须保持 `crossed_unacknowledged + replay_policy=manual_resolution_only`
+  - 一旦 `note-boundary-crossed` 成功，当前 batch 就必须进入 `closed + close_reason=handoff_recorded + replay_policy=manual_resolution_only`
   - post-boundary 只允许进入一次性 inline text handoff phase，不把普通 Codex 工具纳入 supported automatic path
-  - 第一版不再尝试把纯文本回复或后续工具动作自动收口成 “已送达”
-  - 因此 post-boundary 阶段的默认收口方式只剩：
-    - operator 显式 close
-    - 或 `redelivery_window_ends_at` 到期后的自动 close
+  - 第一版不再尝试把纯文本回复或后续工具动作自动收口成 “已送达”；`handoff_recorded` 只表示 inline handoff payload / recovery envelope 已 durable 记录，释放 FIFO，但不证明 caller assistant 文本可见
+  - post-boundary lost response 只能通过 `cbth batch inspect --batch-id ...` 读取 `boundary_recovery_envelope` 做 operator recovery
   - `note-arm` 也新增了 CAS/幂等合同，避免 bridge 重试导致重复计数
-  - 这类歧义 batch 的 durable 表达应落成 `replay_policy=manual_resolution_only`
+  - pre-boundary 歧义 batch 的 durable 表达应落成 `replay_policy=manual_resolution_only`
   - 默认只允许 operator close；若长期无人处理，则在 `redelivery_window_ends_at` 到期时自动 close 释放 FIFO/GC
 - 第一版自动续跑总门槛也已统一：
   - 只处理 `delivery_read_only=true`
@@ -136,6 +136,7 @@
   - 其中 `pause_not_before` 明确保证 bridge 至少给 caller 一次完整 heartbeat 触发机会，再允许回收这次 wake
   - bridge 的 ready entry 也已收口：
     - 只要求返回 prompt token
+    - caller prompt token 必须包含 `source_thread_id + batch_id + attempt_id + generation + snapshot_revision`
     - `snapshot_path` 只保留在 bridge-side locator，不进入 caller prompt
     - `caller_automation_id` 一律由 bridge 通过 `source_thread_id -> binding` lookup 解析
   - daemon 自动退出条件也必须覆盖这两个 deadline
