@@ -438,7 +438,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <ba
    - 但还没有真正开始产生后续输出
    - 如果 caller 醒来时 `note-arm` 尚未 durable 成功，`note-boundary-crossed` 必须返回 not-armed-yet / stale-no-op，caller 直接退出
    - helper 在同一次 success 返回中完成 boundary crossing durable write，并返回 inline continuation payload / summary
-   - 如果同一 `(attempt_id, generation, snapshot_revision)` 之前已经成功 crossed，但 caller 丢失了 response，自动 caller path 不得继续；只能转入 operator recovery
+   - 如果同一 `source_thread_id + batch_id + attempt_id + generation + snapshot_revision` 之前已经成功 crossed，但 caller 丢失了 response，自动 caller path 不得继续；只能转入 operator recovery
    - 只有返回 fresh success 时 caller 才允许继续；返回 `already-crossed` / stale-no-op / error 时都必须立即停止并退出，不得继续
 6. v1 automatic caller path 不再支持 post-boundary artifact 读取或普通工具步骤：
    - `cbth desktop read-artifact ...` 留给 operator/manual recovery

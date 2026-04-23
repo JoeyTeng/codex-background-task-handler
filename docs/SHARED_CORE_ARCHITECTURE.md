@@ -227,7 +227,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - 但这些文件权限和稳定 `cbth desktop ...` CLI 面都不是 per-invocation 授权机制：
   - 它们只能降低意外暴露面
   - 不能防御“同一本机用户下的其他本地进程调用 helper / 恢复 prompt token”
-  - 因此 `(batch_id, attempt_id, generation, snapshot_revision)` 在 v1 里只是 correctness fencing，不是对抗同用户本地进程的身份认证
+  - 因此 `source_thread_id + batch_id + attempt_id + generation + snapshot_revision` 在 v1 里只是 correctness fencing，不是对抗同用户本地进程的身份认证
   - 因此 Desktop helper / snapshot 路线同样只支持 dedicated single-user deployment assumption
 
 ### 5. `local IPC`
