@@ -148,8 +148,8 @@
 ~/.cbth/inbox/ready-threads.json
 ~/.cbth/inbox/arm-pending-bindings.json
 ~/.cbth/inbox/pause-due-bindings.json
-~/.cbth/inbox/by-thread/<thread_id>.json   # diagnostic / future caller path
-~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / future caller path
+~/.cbth/inbox/by-thread/<thread_id>.json   # optional diagnostic export, disabled by default
+~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / operator path only
 ~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / operator path
 ```
 
@@ -181,8 +181,8 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 ~/.cbth/inbox/ready-threads.json
 ~/.cbth/inbox/arm-pending-bindings.json
 ~/.cbth/inbox/pause-due-bindings.json
-~/.cbth/inbox/by-thread/<thread_id>.json   # diagnostic / future caller path
-~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / future caller path
+~/.cbth/inbox/by-thread/<thread_id>.json   # optional diagnostic export, disabled by default
+~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / operator path only
 ~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / operator path
 ```
 
@@ -492,12 +492,12 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - `attempt_id`
   - `generation`
   - `snapshot_revision`
-- `snapshot_path` 只属于 bridge-side read locator，不得在 v1 caller prompt 中暴露。
+- `snapshot_path` 只属于 bridge-side internal locator，不得在 v1 caller prompt 中暴露，也不应被当成稳定的自动 caller 文件接口。
 - `requires_artifact_read` 是 bridge-side gating metadata，不是 caller stale-wake token 的一部分。
 - bridge 获取 ready entry 的来源合同必须是二选一：
   - `direct_file_read` 路径：`ready-threads.json` 的每个 ready entry 必须携带：
     - caller prompt token：`batch_id + attempt_id + generation + snapshot_revision`
-    - bridge-side locator：`snapshot_path`
+    - bridge-side internal locator：`snapshot_path`
     - gating metadata：`requires_artifact_read`
   - `helper_cli_read` 路径：`cbth desktop claim-next-ready ...` 必须一次性返回同样三类信息
 - `caller_automation_id` 不要求由 ready entry 直接携带：
@@ -928,6 +928,9 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
     - `artifact_id`
     - opaque `artifact_read_lease_id`
     - `artifact_read_lease_deadline`
+  - `boundary_recovery_envelope` 也必须足以支持 operator recovery：
+    - 小 payload：直接 durable 保存可恢复的 inline payload / summary
+    - 大 artifact：至少 durable 保存 manifest，并在 `cbth batch inspect-head ...` 中返回一条 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
   - `cbth desktop read-artifact ...` 必须要求这个 `artifact_read_lease_id`：
     - 单独持有 `artifact_id` 不足以继续读取
     - lease 必须至少绑定 `(source_thread_id, attempt_id, generation, snapshot_revision)`
@@ -953,6 +956,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
   - 后续只能走 operator recovery：
     - `cbth batch inspect-head ...` 必须暴露 `boundary_recovery_envelope`
     - 以及必要的 artifact manifest / diagnostic refs
+    - 对大 artifact 还必须返回 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
   - v1 选择 safety over liveness：不允许靠下一次 heartbeat 自动重放同一 delivery
 - 如果 caller 已经越过 continuation boundary 但还没成功得到 `note-boundary-crossed` 的 success 返回：
   - 这属于违背第一版安全合同的实现错误
@@ -1020,6 +1024,10 @@ cbth desktop binding unbind
   - 同时把所有镜像不再匹配的 bindings 推到 `degraded`
 - `cbth job ...` 是第一版对外稳定的任务提交与状态回报面。
 - `cbth batch close-head` / `inspect-head` 与 `cbth desktop binding repair` / `unbind` 也必须作为第一版稳定的 operator recovery 面存在。
+- `cbth batch inspect-head ...` 在 head batch 已 `crossed_unacknowledged` 时，必须回显：
+  - `boundary_recovery_envelope`
+  - 对大 artifact 则再回显 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
+  - 这些 recovery surface 只用于人工/operator 收口，不重新开启自动 caller continuation
 - `cbth desktop binding repair ...` 的成功输出必须至少回显：
   - `read_transport_capability`
   - `artifact_read_capability`

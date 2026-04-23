@@ -58,8 +58,8 @@
      - `~/.cbth/inbox/ready-threads.json`
      - `~/.cbth/inbox/arm-pending-bindings.json`
      - `~/.cbth/inbox/pause-due-bindings.json`
-     - `~/.cbth/inbox/by-thread/<thread_id>.json` (diagnostic / future path)
-     - `~/.cbth/artifacts/<artifact_id>/manifest.json` (diagnostic / future path)
+     - `~/.cbth/inbox/by-thread/<thread_id>.json` (optional diagnostic export, disabled by default)
+     - `~/.cbth/artifacts/<artifact_id>/manifest.json` (diagnostic / operator path only)
      - `~/.cbth/artifacts/<artifact_id>/payload` (diagnostic / operator path)
    - `helper_cli_read` 建议提供一组窄 helper：
 
@@ -286,7 +286,7 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
      - `attempt_id`
      - `generation`
      - `snapshot_revision`
-   - 其中 `snapshot_path` 只属于 bridge 侧 ready-source locator：
+   - 其中 `snapshot_path` 只属于 bridge 侧 internal ready-source locator：
      - 可用于 bridge 自己读取/核对 envelope
      - 不得写入 caller heartbeat prompt
    - 在真正调用 `automation_update` 前，bridge 必须先调用一个窄 helper，把当前 attempt durable 推到 `arm_pending`，同时 acquire 当前 generation 的 `bridge_arm_lease`：
@@ -452,8 +452,8 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
 ### Caller 侧
 
 ```text
-~/.cbth/inbox/by-thread/<thread_id>.json   # diagnostic / future caller path
-~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / future caller path
+~/.cbth/inbox/by-thread/<thread_id>.json   # optional diagnostic export, disabled by default
+~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / operator path only
 ~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / operator path
 ```
 
@@ -488,6 +488,9 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 - 它只对当前 `crossed_unacknowledged` 的同一 `(attempt_id, generation, snapshot_revision)` 有效
 - 一旦 batch 被 close、attempt 被 supersede / abandon、operator repair / unbind 收口，旧 lease 必须立即失效
 - 如果 caller 没拿到第一次 `note-boundary-crossed` success 的返回值，自动 caller path 不得重新申请新的 artifact lease；只能通过 operator recovery 读取 durable `boundary_recovery_envelope` / manifest 做人工收口
+- 对大 artifact，这个 operator recovery 还必须闭环成：
+  - `cbth batch inspect-head ...` 返回 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
+  - 这样人工/operator 才能继续调用 `cbth desktop read-artifact ...` 完成收口
 
 也就是说，`helper_cli_read` 对大 artifact 的 fallback 不是返回一个路径，而是返回一个显式 chunked payload 协议。
 

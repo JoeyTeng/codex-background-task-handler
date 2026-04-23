@@ -194,6 +194,10 @@ capabilities.experimentalApi = true
 - 如果缺少权威 current-state sync 面（例如 `thread/read` 或等价 surface），CLI adapter 也必须 fail-closed：
   - 没有这个能力时，v1 不支持 detached managed-session auto-continuation
   - 最多只允许用户手工跑一个 foreground `codex --remote` 会话，而不进入 daemon-owned managed-session 合同
+  - 这个 current-state sync 至少必须能对 `bound_thread_id` 返回：
+    - 是否存在 active regular turn
+    - 若存在则返回 `active_turn_id`
+    - 足以把 `activity_state=unknown` 收敛到 `active` 或 `idle` 的权威状态
 - 如果缺少 `turn/steer`，CLI adapter 仍可工作，但只能在 caller idle 时投递。
 - 不能把 PoC 中碰巧可用的实验 RPC 直接当成长期稳定契约。
 - 第一版 shipping 配置默认关闭 `turn/steer`，直到 active-turn 分类与安全门槛被实证支持。
@@ -338,6 +342,11 @@ CLI adapter 不直接按单 job 投递，而是消费共享核心为每个 threa
   - `delivery_requires_approval=false`
   - `delivery_requires_network=false`
   - `delivery_requires_write_access=false`
+- 除了 batch 本身，managed session 自身也必须满足 detached auto-continuation profile：
+  - `session_allows_approval=false`
+  - `session_allows_network=false`
+  - `session_allows_write_access=false`
+  - 如果 session profile 本身允许 write / network / approval，v1 不得自动 `turn/start` / `turn/steer`，只能转入 manual/operator path
 - 不满足这些条件的 batch 不得自动 `turn/start`；它们保留为 operator/manual 路径。
 - 默认只在 caller thread idle 时使用：
 
@@ -378,6 +387,7 @@ thread/resume + turn/start
 - `unknown` 只能通过权威 current-state sync 或新的本地观测收敛：
   - 如果 adapter 能从 app-server 当前状态同步出“存在 active regular turn”，则转为 `active`
   - 如果 adapter 能从权威状态同步出“当前没有 active regular turn”，则转为 `idle`
+  - 这里的 current-state sync 必须是 `bound_thread_id` 级证明，而不是模糊的 session 级“最近没活动”
   - 如果当前实现拿不到这种权威 current-state sync，v1 必须 fail-closed 保持 `unknown`，直到重新观察到一轮本地 regular turn 生命周期并确认其完成
 - 只要 `activity_state != idle`，就不得自动发 `thread/resume + turn/start`
 

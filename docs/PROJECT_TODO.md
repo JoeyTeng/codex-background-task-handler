@@ -60,7 +60,7 @@
   - `ready-threads.json`
   - `arm-pending-bindings.json`
   - `pause-due-bindings.json`
-  - `by-thread/<thread_id>.json`
+  - `by-thread/<thread_id>.json` (optional diagnostic export, disabled by default)
   - `artifacts/<artifact_id>/manifest.json` (diagnostic / operator path)
   - `artifacts/<artifact_id>/payload` (diagnostic / operator path; not the automatic continuation path)
 - [ ] 落实 `~/.cbth` 的权限合同：
@@ -152,6 +152,7 @@
   - `note-boundary-crossed` 返回 `artifact_read_lease_id + artifact_read_lease_deadline`
   - `read-artifact` 只能在持有当前有效 lease 时读取
   - lease 在 batch close / supersede / abandon / operator repair-or-close / deadline 到期 / lease rotation 后必须失效
+  - `batch inspect-head` 还必须能返回 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
 - [ ] 如果未来需要 post-output ack，再单独设计 `note-delivered` 合同：
   - 不进入 v1 自动续跑主路径
   - 必须建立 post-output / post-side-effect observation contract
@@ -175,6 +176,7 @@
   - continuity-loss 后只能 fail-closed，直到恢复到权威 current-state 或新的本地 regular turn lifecycle
 - [ ] 把 CLI current-state sync 升成最小 capability probe 的正式要求：
   - 缺少 `thread/read` 或等价 current-state 面时，v1 不支持 detached managed-session auto-continuation
+  - 这个 sync 至少必须对 `bound_thread_id` 返回 `has_active_regular_turn` 与可选 `active_turn_id`
 - [ ] 为 daemon 的 overdue sweep / next-start reconcile 落地稳定合同：
   - daemon 不需要为长窗口 `manual_resolution_only` / deadline 持续常驻
   - 但下次任何入口启动前都必须先补做 overdue close / reconcile / artifact GC

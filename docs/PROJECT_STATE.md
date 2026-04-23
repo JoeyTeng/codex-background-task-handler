@@ -52,6 +52,7 @@
   - 同一个 `bound_thread_id` 在 v1 最多只允许一个 non-retired managed session；`cbth cli run --bind-thread-id` 必须是 attach-or-create，而不是 blind create
   - 前台 thread-switch 的自动观测/自动 retarget 不属于 v1 合同
   - 默认仅在 idle 时 `turn/start`
+  - detached 自动投递还要求 managed session 自身是 no-approval / no-network / no-write profile
   - `turn/steer` 只作为只读、低风险场景下的受限优化
 - 共享核心也补上了 reviewer 指出的 thread 级缺口：
   - 引入 thread-scoped FIFO 队列
