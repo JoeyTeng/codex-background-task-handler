@@ -160,7 +160,8 @@
   - session state 现在必须允许 `parked`：
     - live app-server 已结束
     - 但 unresolved manual batch 仍在 durable 等待 operator 收口
-  - 这组 profile 对 non-retired session 是 immutable 的；attach 遇到 drift 时只能 fail-closed 或 retire-and-recreate
+    - 这个 manual batch 可以来自 accepted attempt fail-closed，也可以来自 pre-accept manual/operator path
+  - 这组 profile 对 non-retired session 是 immutable 的；attach-or-create 必须先比较 requested profile 与 durable profile，drift 时只能 fail-closed 或 retire-and-recreate
   - 同一个 `bound_thread_id` 最多只允许一个 non-retired managed session；不可安全复用时必须 fail-closed，而不是并发创建第二个 session
   - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点
   - v1 不提供 late-bind / external discovery surface；如需换目标 thread，必须新开 session
@@ -174,6 +175,12 @@
     - `delivery_accepted_at`
     - `last_observed_turn_event`
     - `last_observed_turn_event_at`
+  - `last_observed_turn_event` 的 v1 canonical enum 已固定为：
+    - `turn_started`
+    - `turn_completed`
+    - `turn_failed`
+    - `turn_interrupted`
+    - `turn_replaced`
   - accepted attempt 还必须带 `delivery_observation_deadline`
   - 只有在这个 deadline 之内，未收口 `delivery_turn_id` 才阻止 daemon 退出
   - deadline 到期仍未观察到可信 `turn/completed` 时：
@@ -190,7 +197,8 @@
   - 因此 daemon 退出条件只需要在 `delivery_observation_deadline` 窗口内覆盖这些未收口的 `delivery_turn_id` 观察
   - 但只要 `managed_session_id + session_epoch` 的观察连续性丢失，就不得自动 replay；当前 head batch 必须进入 `manual_resolution_only`
   - 同样地，只要 accepted 的 `delivery_turn_id` 后续出现失败/中断/替换等不可信终局，也必须 fail-closed 到 `manual_resolution_only`
-  - accepted attempt fail-closed 到 `manual_resolution_only` 后，managed session 的 live 部分可以结束，但 durable session 要先转成 `parked`，等 manual batch 终态后再允许 replace
+  - CLI 的最小 capability set 现在不只包括 `thread/resume` / `turn/start` / current-state sync；还必须能观察 accepted turn 的负终态事件，否则 detached auto-continuation 必须 fail-closed
+  - accepted attempt fail-closed 到 `manual_resolution_only` 后，managed session 的 live 部分可以结束，但 durable session 要先转成 `parked`；同样的 `parked` 语义也覆盖 pre-accept manual/operator path，等 manual batch 终态后再允许 replace
   - continuity-loss 后的最小人工收口路径也已收口为：`batch inspect-head` 看 durable 证据，再用 `batch close-head` 带明确 reason 收口
 - 同时又补了一个和 TUI 当前实现一致的判断：
   - active-turn steer 语义更接近现有 TUI 的 `pending_steers` / queued-follow-up 行为

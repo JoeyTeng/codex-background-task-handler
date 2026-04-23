@@ -724,12 +724,17 @@ cooldown -> superseded
   - 只记录当前 `delivery_turn_id` 上真实观察到的事件
   - accepted 时初始化为 `null`
   - 后续只能由同一 `delivery_turn_id` 的观察更新
-  - 推荐最小枚举至少包括：
+  - v1 fixed canonical enum 为：
     - `turn_started`
     - `turn_completed`
     - `turn_failed`
     - `turn_interrupted`
     - `turn_replaced`
+  - CLI minimum capability probe 还必须证明：
+    - 能观察 `turn_started`
+    - 能观察 `turn_completed`
+    - 能观察 accepted-turn 的负终态：`turn_failed` / `turn_interrupted` / `turn_replaced`
+  - 缺少这组观察面时，CLI detached auto-continuation 必须 fail-closed
 - 只要 `managed_session_id` 或 `session_epoch` 的连续性无法再证明，当前 head batch 就不得自动 replay：
   - 当前 attempt 收敛到 `abandoned`
   - 当前 head batch durable 进入 `replay_policy=manual_resolution_only`
@@ -755,6 +760,14 @@ cooldown -> superseded
 - `attach-or-create` 发现 requested profile 与 durable profile 不一致时，不得原地改写：
   - 如果旧 session 仍有 active foreground client、未收口 accepted attempt、或其他未解决 delivery work，则必须 fail-closed 为 `session_profile_mismatch`
   - 只有在旧 session 已满足 retirement 条件后，daemon 才允许把它标为 `retired`，并创建一个带新 profile 的新 `managed_session_id`
+- `parked` 是 managed session 的统一非 live 停放态，不是 accepted-path 专属状态：
+  - live part 已结束
+  - 不再要求 automatic delivery 或 accepted-turn live observation
+  - 但仍有 unresolved manual batch 等待 operator close / `manual_resolution_expired` auto-close
+  - 这个 manual batch 可以来自 accepted attempt fail-closed，也可以来自 pre-accept manual/operator path
+- 只要 session 仍处于 `parked` 且 unresolved manual batch 未终态：
+  - attach/reuse 必须 fail-closed 为 `session_pending_manual_resolution`
+  - daemon 不得创建第二个指向同一 `bound_thread_id` 的 non-retired replacement session
 - 任一字段为 `true` 或 `unknown` 时：
   - batch 即使本身是 `delivery_read_only=true`
   - 也必须回落到 manual/operator path

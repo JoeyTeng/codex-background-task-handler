@@ -184,6 +184,15 @@
 - [ ] 把 CLI current-state sync 升成最小 capability probe 的正式要求：
   - 缺少 `thread/read` 或等价 current-state 面时，v1 不支持 detached managed-session auto-continuation
   - 这个 sync 至少必须对 `bound_thread_id` 返回 `has_active_regular_turn` 与可选 `active_turn_id`
+- [ ] 把 accepted-turn 负终态观察面升成最小 capability probe 的正式要求：
+  - 最小 capability set 不只包括 `turn/completed`
+  - 还必须能对当前 `delivery_turn_id` 观察并 durable 区分：
+    - `turn_started`
+    - `turn_completed`
+    - `turn_failed`
+    - `turn_interrupted`
+    - `turn_replaced`
+  - 缺少这组观察面时，CLI detached auto-continuation 必须 fail-closed
 - [ ] 为 daemon 的 overdue sweep / next-start reconcile 落地稳定合同：
   - daemon 不需要为大多数长窗口 `manual_resolution_only` / deadline 持续常驻
   - 但 `delivery_observation_deadline` 是必须常驻观察的唯一例外

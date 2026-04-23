@@ -167,9 +167,18 @@ codex --remote ws://127.0.0.1:<port>
       - 任何 accepted `delivery_turn_id` 的后续观察连续性无法再证明
 - `cbth cli run --bind-thread-id <thread_id>` 的 v1 合同必须是：
   - 先按 `bound_thread_id` 查询是否已经存在 non-retired managed session
-  - 如果存在可复用的 `live` / `detached` session：attach/reuse
+  - 如果存在 `live` / `detached` session：
+    - 先比较 requested session profile 与 durable `session_allows_*` profile
+    - 只有 profile 完全一致时，才允许 attach/reuse
+    - 只要存在 profile drift，且旧 session 尚未满足 retirement 条件，就必须 fail-closed 为 `session_profile_mismatch`
+    - 只有旧 session 已满足 retirement 条件时，daemon 才允许 retire 它，并创建一个新 profile 的 replacement session
   - 如果存在 `parked` session：
-    - 且其 unresolved manual batch 仍未 operator close / `manual_resolution_expired` auto-close：必须 fail-closed 为 `session_pending_manual_resolution`
+    - `parked` 的统一语义是：
+      - 当前 managed session 的 live part 已结束
+      - 不再要求 live observation 或自动 delivery
+      - 但仍有 unresolved manual batch 等待 operator close / `manual_resolution_expired` auto-close
+      - 这个 manual batch 可以来自 accepted attempt fail-closed，也可以来自 pre-accept manual/operator path
+    - 且其 unresolved manual batch 仍未终态时：必须 fail-closed 为 `session_pending_manual_resolution`
     - 只有在这些 manual batch 已终态后，daemon 才允许先 retire 这个 `parked` session，再创建新的 managed session
   - 如果存在 `stale` session：只有在它已满足 retirement 条件后才允许替换
   - 如果存在不可安全替换的 `stale` / conflicting session：直接 fail-closed，不得并发创建第二个 session
@@ -228,6 +237,15 @@ capabilities.experimentalApi = true
     - 是否存在 active regular turn
     - 若存在则返回 `active_turn_id`
     - 足以把 `activity_state=unknown` 收敛到 `active` 或 `idle` 的权威状态
+- 如果缺少 accepted-turn 观察面，CLI adapter 也必须 fail-closed：
+  - 最小能力集不只包括 `turn/completed`
+  - 还必须能对当前 `delivery_turn_id` 观察并 durable 区分以下 canonical 事件：
+    - `turn_started`
+    - `turn_completed`
+    - `turn_failed`
+    - `turn_interrupted`
+    - `turn_replaced`
+  - 缺少这些负终态观察面时，v1 不得宣称自己能安全收口 accepted delivery
 - 如果缺少 `turn/steer`，CLI adapter 仍可工作，但只能在 caller idle 时投递。
 - 不能把 PoC 中碰巧可用的实验 RPC 直接当成长期稳定契约。
 - 第一版 shipping 配置默认关闭 `turn/steer`，直到 active-turn 分类与安全门槛被实证支持。
@@ -422,12 +440,13 @@ thread/resume + turn/start
   - 只记录当前 `delivery_turn_id` 上真实观察到的事件
   - accepted 时初始化为 `null`
   - 后续只允许由同一 `delivery_turn_id` 的观察更新
-  - 推荐最小枚举至少包括：
+  - canonical enum 在 v1 固定为：
     - `turn_started`
     - `turn_completed`
     - `turn_failed`
     - `turn_interrupted`
     - `turn_replaced`
+  - capability probe 必须证明这些终局观察面可用；否则 detached auto-continuation 必须 fail-closed
 - 对每个 managed session，CLI adapter 还必须维护一个独立的 thread activity state：
   - `unknown`
   - `active`
@@ -588,8 +607,9 @@ cbth cli run
    - 不依赖 loopback websocket auth
 3. 启动时对实验 RPC 做 capability probe
 4. `cbth cli run --bind-thread-id <thread_id>` 先执行 attach-or-create：
-   - 同一 `bound_thread_id` 有可复用的 `live` / `detached` session 时 attach/reuse
-   - 同一 `bound_thread_id` 有 `parked` session 且 manual batch 尚未终态时：fail-closed 为 `session_pending_manual_resolution`
+   - 同一 `bound_thread_id` 有 `live` / `detached` session 时，先比较 requested profile 与 durable profile；只有完全一致才允许 attach/reuse
+   - 如果 profile drift 且旧 session 仍未满足 retirement 条件：fail-closed 为 `session_profile_mismatch`
+   - 同一 `bound_thread_id` 有 `parked` session 且 unresolved manual batch 尚未终态时：fail-closed 为 `session_pending_manual_resolution`
    - 同一 `bound_thread_id` 有不可安全替换的 stale/conflicting session 时 fail-closed
    - 只有在没有 non-retired session，或旧 `parked/stale` session 已满足 retirement 条件时，才创建新的 managed session
 5. attach/create 成功后再启动前台 `codex --remote ...`
