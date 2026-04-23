@@ -645,11 +645,11 @@ v1 范围外：
 - 通过 `managed_session_id` 外部发现/回填一个尚未 fixed-thread bootstrap 的 session
 - 在同一 managed session 里自动重绑定到新的 caller thread
 
-## 仍待补的边界
+## 仍待实现的边界
 
 - CLI 入口的进程生命周期和清理策略
 - sidecar 长时间运行时的状态持久化与 resume 策略
 - 如果未来上游允许 loopback websocket auth，则补一轮更强本地安全边界设计与实证
 - capability probe 的具体实现与版本策略
 - 多个 background jobs 同时命中同一 caller thread 时的 batch 合并参数
-- accepted `delivery_turn_id` 在 daemon / websocket / app-server continuity 丢失后的 operator-resolution 流程
+- accepted `delivery_turn_id` 在 daemon / websocket / app-server continuity 丢失后的 operator-resolution 实现细节；设计合同已收口为 `inspect-head -> close-head(reason=...)`

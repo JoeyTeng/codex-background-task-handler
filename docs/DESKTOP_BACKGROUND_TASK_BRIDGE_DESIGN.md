@@ -504,7 +504,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <ba
 - 同一 thread 上出现新的 generation 后，所有旧 heartbeat prompt 都只能看到 mismatch，不得重复消费当前 head batch。
 - 第一版不要求 `cbth` 在关键路径上同步拿到 `automation_id`。
 - 对第一版来说：
-  - `attempt_id + generation + snapshot_revision + envelope header` 才是防止 stale wake 的硬约束
+  - `source_thread_id + batch_id + attempt_id + generation + snapshot_revision` 才是防止 stale wake 的硬约束
   - `caller_automation_id` 来自 binding，而不是运行期 discovery
   - `automation_id` 只是 bridge 侧可选的协调/诊断信息
 
@@ -755,7 +755,9 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
   - `unknown_after_helper_failure`：
     - caller 仍必须 no-op
     - bridge/daemon 必须先 reconcile durable state
-    - 如果 durable state 显示已 crossed，则按 `handoff_recorded` 处理；否则按对应 pre-boundary state 收敛
+    - 如果 durable state 显示已 crossed，则按 `handoff_recorded` 处理
+    - 如果 durable state 能正向证明没有发生 crossing，才允许重新分类成 `transient_not_ready`
+    - 如果无法正向证明未 crossing，必须 fail closed 到 `manual_resolution_only` / operator recovery，不得 automatic redelivery
 
 ### Binding degraded
 

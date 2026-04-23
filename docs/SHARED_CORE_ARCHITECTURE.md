@@ -648,6 +648,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - 如果没有 fresh success，当前 wake 也必须只做 no-op / 诊断退出，不能继续消费这个 batch。
 - 第一版 Desktop 路线的 head-batch 安全性不建立在 `automation_id` 必定可同步回填这一前提上。
 - 第一版真正的安全锚点是：
+  - `source_thread_id`
   - `batch_id`
   - `attempt_id`
   - `generation`
@@ -1168,6 +1169,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <ba
   - 只有 `transient_not_ready` 且 batch 仍 open、`replay_policy=automatic`、未过 redelivery window 时，bridge 后续才允许 automatic redelivery
   - `already_crossed_or_handoff_recorded` 必须导向 `cbth batch inspect --batch-id ...` operator recovery，不得自动重放 continuation
   - `binding_or_capability_invalid` 必须 fail closed 到 degraded/manual operator path，直到 repair 产生 fresh attempt / generation
+  - `unknown_after_helper_failure` 必须先做 durable reconciliation；只有正向证明没有发生 crossing 后才允许重新分类成 `transient_not_ready`，否则必须 fail closed 到 manual/operator path
 - 如果 `note-boundary-crossed` 已经成功过一次，而 caller 没拿到那次 response：
   - 自动 caller path 不得再次 continuation
   - 后续只能走 operator recovery：
