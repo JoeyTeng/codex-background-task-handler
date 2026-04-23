@@ -191,6 +191,9 @@ capabilities.experimentalApi = true
 
 - 启动时必须做 capability probe。
 - 如果缺少 `thread/resume` 或 `turn/start`，CLI adapter 必须 fail-closed。
+- 如果缺少权威 current-state sync 面（例如 `thread/read` 或等价 surface），CLI adapter 也必须 fail-closed：
+  - 没有这个能力时，v1 不支持 detached managed-session auto-continuation
+  - 最多只允许用户手工跑一个 foreground `codex --remote` 会话，而不进入 daemon-owned managed-session 合同
 - 如果缺少 `turn/steer`，CLI adapter 仍可工作，但只能在 caller idle 时投递。
 - 不能把 PoC 中碰巧可用的实验 RPC 直接当成长期稳定契约。
 - 第一版 shipping 配置默认关闭 `turn/steer`，直到 active-turn 分类与安全门槛被实证支持。

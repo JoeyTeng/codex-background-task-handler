@@ -103,6 +103,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
      - `read_transport_capability`
      - `artifact_read_capability`
      - `writeback_capability`
+     - `validation_fingerprint`
      - `validated_at`
    - 推荐暴露面：
      - preferred: `~/.cbth/inbox/desktop-installation-state.json`
@@ -115,6 +116,9 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
      - `writeback_capability`
      - 都必须被原子重置为 `unknown`
      - 直到 installation-state repair 明确再次写入新的 validated 结论
+   - installation state 的 capability 结论还必须绑定一个 installation-wide `validation_fingerprint`：
+     - 至少覆盖当前 Codex Desktop build / helper binary revision / 与无审批执行相关的本地环境形状
+     - 只要 fingerprint 变化，bridge 就必须把这套 capability 视为失效，直到 installation-state repair 重新确认
    - 只有当以下条件同时满足时，这个 binding 才允许进入真正可自动续跑的 `bound` 状态：
      - `read_transport_capability=validated`
      - `writeback_capability=validated`
@@ -666,15 +670,20 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
     - 如果 operator 提供新的 `caller_automation_id`：
       - 必须证明该 automation 仍然 `target_thread_id == source_thread_id`
       - 必须证明它当前没有被别的 binding 占用
+      - 必须优先证明旧 `caller_automation_id` 已 quiesced / deleted；如果做不到，也只能在强制轮换新的 fresh attempt / generation 之后恢复自动续跑
     - 成功返回的 binding snapshot 必须回显 `artifact_read_capability`
     - 只有 installation state 当前已经满足所需 capability 时，才允许把 binding 从 `degraded` 恢复到 `bound`
     - 只对“尚未成功写入 `note-boundary-crossed`”的失败允许把当前 head batch 重新放回可投递状态
+    - 但凡 repair 过程中更换了 `caller_automation_id`，或旧 automation 的 quiesce 无法被证明：
+      - 不得复用当前 head batch 的旧 attempt / generation
+      - 必须先强制切换到新的 fresh attempt / generation，再允许后续自动 arm
     - 如果 degraded 的来源是 `note-arm` outcome unknown 这类 post-boundary / post-arm 歧义场景，`binding repair` 不得自动重投当前 head batch
     - 它恢复的是当前 caller heartbeat 与后续调度能力；但在当前 head batch 被显式关闭或超时自动关闭前，FIFO 仍会被这个 head batch 挡住
   - `installation-state repair`：
     - 是唯一允许切换 installation-wide `read_transport` 的 operator 路径
     - 也是唯一允许写 installation-wide capability 结论的路径
     - 成功时必须原子更新 installation state，并递增 `read_transport_generation`
+    - capability 结论必须和当前 `validation_fingerprint` 一起写入；fingerprint 变化会让旧 validated 结论失效
     - 如果 `read_transport` 发生变化而 capability 参数未显式提供：
       - 必须把 `read_transport_capability`
       - `artifact_read_capability`

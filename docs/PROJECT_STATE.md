@@ -12,7 +12,9 @@
   - 一个共享的 CLI 控制面
   - 两个薄的 Codex integration adapters：CLI 与 Desktop
 - 第一版不做系统级常驻服务；改为按需启动的本地 daemon。
-- 该 daemon 生命周期独立于单个 Codex 前台实例，但只有在没有 active jobs、没有活跃接入端、且没有未收口的 delivery work / timers 时才会自动退出。
+- 该 daemon 生命周期独立于单个 Codex 前台实例，但第一版不要求它为长窗口持续常驻：
+  - 近端 delivery work / timers 可以阻止当前实例退出
+  - 更长的 deadline 则改为 durable 落盘，并在下次启动时先做 overdue sweep / auto-close / reconcile
 - 第一版稳定外部接口只做 CLI，不承诺公开 socket / Web / plugin 协议。
 - 因此，之前设计里提到的 `background-taskctl` helper，应收敛成主 binary 的 `cbth job ...` 子命令，而不是第二个长期维护的独立工具。
 - 经过 reviewer 复核后，Desktop 关键路径又做了一个更保守的收口：
@@ -29,6 +31,7 @@
     - `~/.cbth` 文件权限与稳定 helper CLI 只是在降低意外暴露面；Desktop helper / snapshot 路线同样只支持 dedicated single-user deployment assumption
     - installation-wide capability 结论也已收回到 `desktop_installation_state`：
       - transport generation 变化时，capability 必须原子重置为 `unknown`
+      - capability 还必须绑定 installation-wide `validation_fingerprint`
       - binding repair 不得单独覆盖 installation-wide capability
   - Desktop 顶部文案也已改成更保守的口径：`note-arm-pending` / `note-arm` / `note-boundary-crossed` 是 v1 规划中的窄写回依赖；`note-delivered` 已降级为未来 post-output ack 扩展点，但后台 heartbeat 能否无审批执行前者仍待实证
   - 而且 Desktop 自动续跑现在被明确成双门槛：

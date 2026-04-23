@@ -50,6 +50,8 @@
   - preferred `~/.cbth/inbox/desktop-installation-state.json`
   - fallback `cbth desktop installation-state --json`
   - bootstrap / repair 是唯一写入路径
+  - capability 结论必须绑定 `validation_fingerprint`
+  - transport generation 或 fingerprint 变化都必须让旧 validated 结论失效
 - [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
   - `ready-threads.json`
   - `arm-pending-bindings.json`
@@ -159,9 +161,18 @@
   - transport generation 一旦变化，installation-wide capability 必须原子重置为 `unknown`
   - 只有 installation-state repair 才允许再次写入 validated 结论
   - binding repair 只能消费 installation state，不能单独覆盖 capability 结论
+- [ ] 把 Desktop rebind / binding repair 的硬失效合同落进实现：
+  - 如果更换 `caller_automation_id`，必须优先证明旧 automation 已 quiesced / deleted
+  - 如果旧 automation 无法被证明 quiesced，则不得复用当前 attempt / generation
+  - 必须先强制切到新的 fresh attempt / generation，再允许恢复自动 delivery
 - [ ] 把 CLI attach/recovery 的 `activity_state=unknown -> current-state sync -> active/idle` 合同落进实现：
   - 未完成 current-state sync 前不得自动把 thread 判成 idle
   - continuity-loss 后只能 fail-closed，直到恢复到权威 current-state 或新的本地 regular turn lifecycle
+- [ ] 把 CLI current-state sync 升成最小 capability probe 的正式要求：
+  - 缺少 `thread/read` 或等价 current-state 面时，v1 不支持 detached managed-session auto-continuation
+- [ ] 为 daemon 的 overdue sweep / next-start reconcile 落地稳定合同：
+  - daemon 不需要为长窗口 `manual_resolution_only` / deadline 持续常驻
+  - 但下次任何入口启动前都必须先补做 overdue close / reconcile / artifact GC
 - [ ] 定死 caller heartbeat 的长期生命周期合同：
   - 预绑定 `caller_automation_id`
   - 正常路径只 `pause` / `update` / `reuse`

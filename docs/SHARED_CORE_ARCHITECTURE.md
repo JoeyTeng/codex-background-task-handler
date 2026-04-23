@@ -33,11 +33,16 @@
 - 核心进程采用按需启动的本地 daemon 模式：
   - 有命令调用时，如 daemon 不存在则自动拉起。
   - 有 active jobs 时，即使前台 CLI / Desktop 实例退出，daemon 也可继续活着。
+  - v1 不要求 daemon 为长时间窗口持续驻留；它只需要把截止时间 durable 落盘，并在下一次启动时先做 overdue sweep。
   - 当且仅当以下条件同时满足时，daemon 才允许在 idle timeout 后自动退出：
     - 没有 active jobs
     - 没有活跃接入端
-    - 没有未收口的 delivery batches / attempts
-    - 没有等待中的 `arm_pending_deadline` / `pause_deadline` / `cooldown_until` / `redelivery_window_ends_at` / `delivery_turn_id` 完成观察
+    - 没有“需要在 idle timeout 内继续本地观察”的近端 delivery work
+  - 对超出当前 idle timeout 的 `arm_pending_deadline` / `pause_deadline` / `redelivery_window_ends_at` / artifact GC deadline：
+    - daemon 可以退出
+    - 但下次任何入口拉起 daemon 时，必须先执行一次 deterministic overdue sweep
+    - 把已到期的 deadline / GC / auto-close / reconcile 全部补做完，再处理新请求
+  - 换句话说，Desktop v1 的 `manual_resolution_only` batch 不能因为等待 operator close 就强迫 daemon 无限常驻；可靠性来自 durable deadline + next-start sweep，而不是常驻进程。
 
 ### 3. 第一版公共接口只做 CLI
 
@@ -294,12 +299,20 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - `read_transport_capability`
   - `artifact_read_capability`
   - `writeback_capability`
+  - `validation_fingerprint`
   - `validated_at`
   - `updated_by_bootstrap_or_repair`
 - 这个 installation state 的 source of truth 必须由 `cbth` durable 持有：
   - bootstrap / repair 是唯一允许更新它的路径
   - bridge 运行期必须优先读取它，再检查 binding 上的镜像字段是否一致
   - installation-wide capability 结论只允许由 installation state 自己写入；binding repair 只能消费它，不能覆盖它
+  - `validation_fingerprint` 至少必须覆盖：
+    - 当前 Codex Desktop / helper binary 版本或 build identity
+    - 当前 `cbth` helper surface / compatibility revision
+    - 与无审批读取 / 写回能力直接相关的本地权限与执行环境形状
+  - 只要当前观测到的 fingerprint 与 installation state 里 durable 的 `validation_fingerprint` 不一致：
+    - installation-wide capability 结论就必须被视为失效
+    - bridge 不得继续把该安装当成 `validated`
   - 这些 capability 结论始终绑定在当前 `read_transport_generation` 上：
     - 只要 `read_transport_generation` 递增
     - daemon 就必须原子地把 `read_transport_capability`
@@ -560,6 +573,10 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - 因此，Desktop 第一版的重 arm / supersede / stale-wake 安全性不得依赖 `automation_id` 是否已知。
 - 任何旧 generation 的 heartbeat，即使被延迟触发，也只能看到 mismatch 并 no-op，不得再次消费 head batch。
 - 旧 generation 的 heartbeat 即使醒来，也不得直接去 pause 这个共享 caller heartbeat；否则会把新 generation 的合法 wake 一起关掉。
+- 如果 binding repair / rebind 替换了 `caller_automation_id`，或无法证明旧 automation 已经 quiesced：
+  - 后续自动续跑绝不能复用当前 attempt / generation
+  - 必须先把当前 head batch 的自动 delivery 恢复路径切换到新的 fresh attempt / generation
+  - 这样旧 automation 即使迟到，也只会命中旧 generation 并 stale-no-op
 
 #### Attempt 迁移
 
@@ -989,6 +1006,9 @@ cbth desktop binding unbind
   - 它才允许切换 `read_transport`
   - 也是唯一允许写 installation-wide capability 结论的路径
   - 成功时必须原子更新 installation state，并递增 `read_transport_generation`
+  - 成功输出还必须至少回显：
+    - `validation_fingerprint`
+    - `validated_at`
   - 如果 `read_transport` 发生变化而 capability 状态没有由同一次 repair 显式提供：
     - 必须把 `read_transport_capability`
     - `artifact_read_capability`
@@ -1003,6 +1023,9 @@ cbth desktop binding unbind
   - `artifact_read_capability`
   - `writeback_capability`
   - 这些字段只是 installation state 的当前镜像，不得由 binding repair 单独写入
+  - 如果 repair 替换了 `caller_automation_id`，还必须明确回显：
+    - 旧 automation 是否已证明 quiesced / deleted
+    - 是否已强制当前自动 delivery 切换到新的 fresh attempt / generation
 - 其他更细的 queue / batch / inbox 控制面先视为内部实现，不在第一版对外冻结。
 - Desktop 使用的 snapshot / artifact 路径目前只算候选内部 contract，不算第一版对外稳定接口。
 
