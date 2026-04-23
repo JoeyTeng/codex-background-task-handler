@@ -23,11 +23,15 @@
   - 其中 `direct_file_read` 仍是候选优先路径，`helper_cli_read` 只是条件性 fallback
   - 同时又补了一层 explicit desktop binding：bridge 运行期只更新已知 caller automation，不做 blind create/discovery
   - Desktop 顶部文案也已改成更保守的口径：`note-arm` / `note-delivered` 仍是规划中的窄写回依赖，但后台 heartbeat 能否无审批执行它们还待实证
+  - 而且 Desktop 自动续跑现在被明确成双门槛：
+    - batch 本身必须是只读 / 低风险
+    - 目标安装上的 `note-*` 写 helper 也必须已验证可无审批执行
 - 同时，CLI 关键路径也收口为：
   - 明确依赖实验 RPC
   - 启动时 capability probe
-  - 设计目标是 loopback-only shared `app-server` + per-session bearer-token auth
-  - 但 bearer-token 端到端路径目前仍待实证
+  - 基于本机 `codex-cli 0.123.0` 的当前上游能力，第一版实际合同收口为 loopback-only shared `app-server`
+  - `--ws-auth` 目前仍只适用于 non-loopback listeners，因此不再把 per-session bearer-token auth 当成 v1 既有能力
+  - 更强本地 auth 边界留待上游支持 loopback auth 后再补
   - shared `app-server` 由 daemon 持有，而不是前台 wrapper 临时持有
   - 默认仅在 idle 时 `turn/start`
   - `turn/steer` 只作为只读、低风险场景下的受限优化
@@ -49,7 +53,7 @@
   - 用于在 bridge 成功 `automation_update` 后，把 attempt durable 推进到 `cooldown`
 - 同时又补上了 caller 成功分支：
   - `cbth desktop note-delivered ...`
-  - 只允许在 caller 已读取 envelope 且跨过 continuation boundary 后，把 head batch 自动关闭到 `caller_acknowledged`
+  - 只允许在 caller 已读取 envelope、已成功写入 `note-boundary-crossed`、且不是纯文本最终回复路径时，把 head batch 自动关闭到 `caller_acknowledged`
 - Desktop helper fallback 也进一步补成完整链路：
   - `cbth desktop claim-next-ready ...`
   - `cbth desktop read-envelope ...`
@@ -71,6 +75,7 @@
   - `note-delivered` 不能在“刚读完 envelope”时就执行
   - caller 只有在当前 turn 中完成 continuation preparation、且 helper 仍可调用时，才允许用 `note-delivered` 关闭 batch
   - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
+  - 纯文本最终回复路径不属于第一版 `caller_acknowledged` 的自动关闭范围
   - 如果 `note-delivered` 在 post-boundary 场景下失败，batch 进入人工判定语义，`binding repair` 不得自动重投它
   - `note-arm` 也新增了 CAS/幂等合同，避免 bridge 重试导致重复计数
   - 这类歧义 batch 的 durable 表达应落成 `replay_policy=manual_resolution_only`
@@ -82,6 +87,7 @@
 - caller heartbeat lifecycle 也已收口：
   - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
   - `armed_generation` 作为这个长期复用 heartbeat 的 generation 栅栏
+  - `pause_deadline` 作为 one-shot wake 的 cleanup 截止点
   - 正常路径只由 bridge / operator `pause` / `update` / `reuse`
   - caller prompt 自己不直接 pause 这个长期复用 automation
   - stale wake、snapshot 不可读、成功送达、degraded 都先 no-op / helper writeback，再由 bridge 后续切回 `PAUSED`
@@ -100,6 +106,7 @@
   - `turn/start` / `turn/steer` 被接受，只表示 batch 已接入某个 caller turn 的 pending input
   - 每次 accepted attempt 都必须 durable 记录 `delivery_turn_id`
   - accepted attempt 还必须 durable 绑定 `managed_session_id + session_epoch`
+  - `managed_session_id` 是逻辑会话 id；`session_epoch` 是该会话当前可证明连续的 app-server 事件流代号
   - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍是当前 head delivery 时，batch 才允许关闭
   - 非当前 thread 的 backlog 可以挂起，但仍受 batch 自己的 deadline / redelivery window 约束，不能无限阻塞 FIFO/GC
   - 如果某次旧 thread attempt 已经 accepted 并带有 `delivery_turn_id`，后续即使 `current_thread_id` 改变，它仍可等待匹配的 `turn/completed` 正常收口
@@ -114,12 +121,12 @@
   - 原始外部文件不再承担长期保留责任
   - artifact GC 也被绑定到 batch 终态与最小保留窗口，而不是外部临时文件生命周期
 - 但 reviewer 第二轮指出，设计还没有完全闭环；当前剩余的是 contract 细化和实证，不再是路线选择问题。
-- 上游 CLI/shared app-server 侧也确认存在现成的 websocket auth 能力与 `--remote-auth-token-env` 接口，因此 CLI 第一版不需要把“本机 loopback 默认可信”当成唯一安全前提。
-- CLI token 合同也已收口：
-  - per-session token
-  - `0600` token file
-  - session 结束即作废
-  - 当前前台 Codex session 自己启动的命令仍视为同一 trust domain
+- 进一步用本机 `codex-cli 0.123.0` 复核后，`codex app-server --help` 仍把 `--ws-auth` 标成仅适用于 non-loopback listeners。
+- 因此 CLI 第一版现在改成更现实的安全边界：
+  - loopback-only listener
+  - daemon-owned ephemeral port
+  - 单机 / 单用户 / 同一 OS-user trust domain
+- `--remote-auth-token-env` 仍是上游已存在的 surface，但在当前 loopback 合同下不再被当成第一版既有依赖。
 - `~/.cbth` 的 Desktop 侧文件路径也新增了权限合同：
   - directory `0700`
   - file `0600`

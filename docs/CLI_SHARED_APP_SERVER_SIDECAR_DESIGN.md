@@ -28,19 +28,19 @@
    - 例如可表现为：
 
 ```text
-codex app-server --listen ws://127.0.0.1:<port> --ws-auth capability-token --ws-token-file <token-file>
+codex app-server --listen ws://127.0.0.1:<port>
 ```
 
 第一版安全边界必须再加两条：
 
 - 只绑定 loopback 地址，不允许监听非本机可达地址。
-- 默认启用 websocket bearer-token auth，而不是把本地 loopback 当成唯一控制面。
+- shared `app-server` 进程必须由 daemon 持有，且只暴露一个随机本地端口。
 
 2. `foreground TUI`
    - 使用原生 Codex TUI，通过 `--remote` 连接共享 `app-server`：
 
 ```text
-codex --remote-auth-token-env CBTH_REMOTE_AUTH_TOKEN --remote ws://127.0.0.1:<port>
+codex --remote ws://127.0.0.1:<port>
 ```
 
 3. `sidecar client`
@@ -89,27 +89,22 @@ codex --remote-auth-token-env CBTH_REMOTE_AUTH_TOKEN --remote ws://127.0.0.1:<po
   - `--ws-auth signed-bearer-token --ws-shared-secret-file <path>`
 - 上游 `codex --remote` 也支持：
   - `--remote-auth-token-env <ENV_VAR>`
-- 因此，第一版不应把“本机 loopback 默认可信”当成唯一安全前提。
-- 但这里目前仍是“已发现可用 auth surface”的设计合同，不是已经做过端到端 PoC 的已验证事实。
-- 第一版推荐的最小安全边界是：
+- 但截至本机 `codex-cli 0.123.0`，`codex app-server --help` 仍把 `--ws-auth` 明确标成“for non-loopback listeners”。
+- 这意味着第一版在 `127.0.0.1` / `localhost` 上的 shared `app-server` 目前不能把 bearer-token auth 当成既有能力来依赖。
+- 因此，第一版的最小安全边界必须改成：
   - shared `app-server` 只监听 `127.0.0.1` / `localhost`
-  - daemon 为每次 managed session 生成一枚新的 bearer token
-  - token 必须落在 session-scoped token file，权限至少 `0600`
-  - app-server 以 websocket auth 模式启动
-  - 前台 `codex --remote` 通过 `--remote-auth-token-env` 读取同一 token
-  - sidecar client 也使用同一 token
-- token 生命周期合同：
-  - 每个 managed CLI session 一枚独立 token
-  - session 结束后立即作废
-  - wrapper 自己的环境不长期保留 token
-  - 不把 token 写入持久日志或 thread 历史
-- 信任边界合同：
-  - bearer token 主要防护“无关的本地进程/旧会话”误连 shared `app-server`
-  - 由当前前台 Codex session 自己启动的命令，如果继承了同一进程环境，则视为同一 trust domain，而不是额外隔离边界
-- 如果当前运行环境无法同时满足：
-  - loopback-only 监听
-  - bearer token 注入
-  则第一版实现应 fail-closed，而不是退化成长期开放的本地 websocket 控制面。
+  - daemon 为每个 managed session 选择随机高位本地端口
+  - shared `app-server` 只在该 managed session 生命周期内存在
+  - 前台 `codex --remote` 与 sidecar 都被视为同一 OS-user trust domain 下的本地 client
+- 第一版明确不承诺防御“同一用户下的其他本地进程误连 loopback app-server”。
+- 更强的 auth 边界有两条未来路径：
+  - 上游将 websocket auth 扩展到 loopback listeners
+  - 或本项目改成不同的本地 transport / wrapper 形状
+- 在那之前，第一版只能把 CLI shared `app-server` 视为：
+  - 单机
+  - 单用户
+  - loopback-only
+  - daemon-owned ephemeral control plane
 
 ## Shared App-Server 所有权
 
@@ -124,6 +119,18 @@ codex --remote-auth-token-env CBTH_REMOTE_AUTH_TOKEN --remote ws://127.0.0.1:<po
   - shared `app-server`
   - sidecar session metadata
   - 当前 thread 的 live continuation 能力
+- `managed_session_id` 与 `session_epoch` 的合同必须是：
+  - `managed_session_id`：
+    - daemon 为一条逻辑 managed session 创建的稳定 durable id
+    - 前台 / sidecar 重新附着到同一个仍存活的 shared `app-server` 时不变
+  - `session_epoch`：
+    - daemon 为该 managed session 当前可证明连续的 app-server event stream 分配的单调递增序号
+    - 当 daemon 首次拉起该 shared `app-server` 时初始化为 `1`
+    - 只要 daemon 还能证明自己仍连接到同一个未重建的 shared `app-server` 实例，短暂 websocket 重连不递增
+    - 只要发生以下任一情况，就必须递增：
+      - shared `app-server` 进程被重启或重建
+      - daemon 自己重启后无法证明已恢复到同一个连续 event stream
+      - 任何 accepted `delivery_turn_id` 的后续观察连续性无法再证明
 - 当同时满足以下条件时，daemon 才允许清理该 managed session：
   - 没有 active jobs
   - 没有连接中的 foreground client
@@ -227,7 +234,7 @@ TUI_SIDECAR_MARKER_20260422
 - `thread_id = 019db614-1fb7-70a3-956f-7a96c48f0226`
 
 这一步把结论从“协议层前台 client 能收到通知”进一步推进到了“真实前台 TUI 会把 sidecar 触发的新 turn 展示给用户”。
-- 但这次 PTY 级别实测走的是无认证 loopback 路径；它还不等价于“per-session bearer-token auth 的端到端实现已验证”。
+- 但这次 PTY 级别实测走的是无认证 loopback 路径；而这也正是当前本机 `codex-cli 0.123.0` 在 loopback listener 上真实可用的上游能力边界。
 
 ### 3. Active turn 可以被 `turn/steer`，且不会提前结束
 
@@ -323,6 +330,12 @@ thread/resume + turn/start
   - `managed_session_id`
   - `session_epoch`
   - `delivery_observation_state=tracking`
+- 其中：
+  - `managed_session_id` 是 daemon 为该逻辑 CLI 会话分配的稳定 id
+  - `session_epoch` 是这个 managed session 当前“可证明连续的 shared app-server event stream”的单调递增代号
+  - app-server 首次启动时从 `1` 开始
+  - 前台 / sidecar 重连到同一个仍存活的 app-server 实例时不变
+  - app-server 进程被重建，或 daemon 恢复后无法证明 continuity 时必须递增
 - 只有在后续仍能证明自己附着在同一个 `managed_session_id + session_epoch` 的事件流上时，CLI adapter 才允许继续等待那个 `delivery_turn_id` 的 `turn/completed`。
 
 ### Idle 判定与 race contract
@@ -425,9 +438,9 @@ cbth cli run
 1. daemon 创建或恢复一个 managed CLI session
 2. daemon 为该 session 启动共享 `codex app-server`
    - 监听 loopback
-   - 启用 websocket bearer-token auth
+   - 不依赖 loopback websocket auth
 3. 启动时对实验 RPC 做 capability probe
-4. `cbth cli run` 连接该 managed session，并启动前台 `codex --remote --remote-auth-token-env ...`
+4. `cbth cli run` 连接该 managed session，并启动前台 `codex --remote ...`
 5. CLI 入口为当前会话保存 `thread_id`
 6. sidecar 从共享核心读取 per-thread `delivery batch`
 7. 任务 ready 后：
@@ -440,7 +453,7 @@ cbth cli run
 
 - CLI 入口的进程生命周期和清理策略
 - sidecar 长时间运行时的状态持久化与 resume 策略
-- per-session bearer-token auth 的端到端实证
+- 如果未来上游允许 loopback websocket auth，则补一轮更强本地安全边界设计与实证
 - capability probe 的具体实现与版本策略
 - 多个 background jobs 同时命中同一 caller thread 时的 batch 合并参数
 - accepted `delivery_turn_id` 在 daemon / websocket / app-server continuity 丢失后的 operator-resolution 流程

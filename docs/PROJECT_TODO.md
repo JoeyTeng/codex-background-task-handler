@@ -33,7 +33,9 @@
   - `source_thread_id`
   - `caller_automation_id`
   - `armed_generation`
+  - `pause_deadline`
   - `read_transport`
+  - `writeback_capability`
   - paused 状态读回校验
 - [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
   - `ready-threads.json`
@@ -51,6 +53,10 @@
   - 不 reservation
   - 不隐藏 head batch
   - 不推进 attempt / batch durable 状态
+- [ ] 为 Desktop bridge 落地内部 `bridge_arm_lease` 串行化合同：
+  - key 为 `(source_thread_id, attempt_id, generation)`
+  - 不改变 head batch 的外部可见性
+  - `note-arm` unknown 时先 reconcile，再决定是否 degraded/manual
 - [ ] 设计并实现 Desktop bridge 的窄写回 helper：
   - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --json`
   - compare-and-swap 只允许唯一一次 `prepared -> cooldown`
@@ -66,10 +72,12 @@
   - 仅读完 envelope / artifact 不能关闭 batch
   - 只有 `note-boundary-crossed` 已成功、且 caller 已经完成 continuation preparation、helper 仍可调用时，才允许 `note-delivered`
   - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
-  - 纯文本成功路径也必须能走到 `caller_acknowledged`
+  - 第一版明确不支持纯文本最终回复自动走到 `caller_acknowledged`
+  - 如果未来需要支持，单独设计 output-observation / response-digest contract
 - [ ] 明确第一版自动续跑的总安全门槛：
   - 仅限 `delivery_read_only=true`
   - 且 `delivery_requires_approval/network/write_access=false`
+  - Desktop 还必须额外满足 `writeback_capability=validated`
   - 非只读 batch 只走 manual/operator follow-up
 - [ ] 为 post-continuation-boundary 的 `note-delivered` 失败场景定死 operator-resolution contract：
   - `binding repair` 不得自动 replay 当前 head batch
@@ -83,6 +91,10 @@
   - repair / re-arm 前必须先验证 bound heartbeat 已被 `PAUSED`
 - [ ] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
+- [ ] 把 caller heartbeat 的 one-shot cleanup 合同落进实现：
+  - arm 后写入 `pause_deadline`
+  - bridge 每轮先 pause/reconcile 已到期 generation
+  - pause 连续失败时 binding 进入 `degraded`
 - [ ] 定死 caller heartbeat 的长期生命周期合同：
   - 预绑定 `caller_automation_id`
   - 正常路径只 `pause` / `update` / `reuse`
@@ -136,15 +148,14 @@
 - [ ] 为 CLI 设计最小 `cbth cli run` 进程模型：shared `app-server`、前台 `codex --remote`、sidecar、以及清理策略。
 - [ ] 把 CLI 第一版的 shared `app-server` 安全边界定死为：
   - loopback-only listener
-  - per-session bearer token
-  - `--remote-auth-token-env` 注入前台 TUI
-  - `0600` token file
-  - session-end revocation
+  - daemon-owned random local port
+  - 单机 / 单用户 trust-domain 假设
+  - 如上游未来支持 loopback auth，再单独补更强本地 auth 设计
 - [ ] 为 CLI 的 daemon-owned managed session 设计并实现：
   - shared `app-server` 归 daemon 持有
   - 前台退出但 active jobs 未结束时继续保活
   - 后续重连 / resume contract
-  - 端到端 bearer-token auth contract validation
+  - 如果上游未来支持 loopback auth，再补对应 auth contract validation
 - [ ] 定死 CLI managed session 的 thread-routing contract：
   - durable `session_id + current_thread_id`
   - 前台切换 thread 时更新 `current_thread_id`
@@ -154,6 +165,7 @@
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 thread 完成事件
   - accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
   - 如果 `delivery_turn_id` 的观察连续性丢失，则当前 head batch 进入 `manual_resolution_only`
+  - 明确 `session_epoch` 的生成、递增与 continuity 判定规则
 - [ ] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
   - 基于 `turn/started` / `turn/completed` / `thread/status/changed`
   - `turn/start` race 失败后回到等待下一个 idle

@@ -73,8 +73,11 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
      - `source_thread_id`
      - `caller_automation_id`
      - `armed_generation` (optional)
+     - `pause_deadline` (optional)
      - `read_transport`
+     - `writeback_capability`
    - bridge 在运行期只允许更新这个已知 `caller_automation_id`，不做 blind create / discovery。
+   - 只有当 `writeback_capability=validated` 时，这个 binding 才允许进入真正可自动续跑的 `bound` 状态。
    - 未完成 binding 的 thread 可以提交 job，但不会被 bridge 自动续跑。
 
 4. `bridge heartbeat thread`
@@ -115,6 +118,10 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
      - bridge arm 成功并 `note-arm` durable 后，才允许把 `armed_generation` 推进到当前 generation
      - bridge 后续做 pause/reconcile 时，也必须比较自己正在清理的 generation 是否仍等于 `armed_generation`
      - 只要 binding 上的 `armed_generation` 已经变成更新 generation，旧 generation 的 cleanup/pause 就必须 no-op
+   - 每次成功 arm 还必须设置一个 `pause_deadline`：
+     - 这次 caller wake 只能被视为 one-shot wake window，而不是长期保持 `ACTIVE`
+     - bridge 必须在最迟到达 `pause_deadline` 的 reconciliation 中把该 generation 切回 `PAUSED`
+     - 如果 pause 在限定重试窗口内仍无法验证成功，则 binding 必须进入 `degraded`
 
 ## 设计原则
 
@@ -128,6 +135,9 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - `delivery_requires_approval=false`
   - `delivery_requires_network=false`
   - `delivery_requires_write_access=false`
+- 但这还不是充分条件；Desktop 自动续跑还必须额外满足：
+  - 当前 binding 的 `writeback_capability=validated`
+  - 也就是 `note-arm` / `note-boundary-crossed` / `note-delivered` 这组窄 helper 已经被证明可在 heartbeat 中无审批执行
 - 不满足这些条件的 batch 不得由 bridge 自动 arm caller heartbeat；它们保留为 manual/operator follow-up。
 - 运行期 bridge 不得 blind create caller heartbeat；它只能更新已绑定 automation。
 - 旧 heartbeat prompt 必须能够通过 attempt token / generation 检测自己已经过期，并立即 no-op。
@@ -155,7 +165,11 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 
 bridge heartbeat 每分钟醒一次：
 
-1. 读取 bridge 侧的 ready 来源：
+1. 先做上一轮已 arm generation 的 pause / reconcile：
+   - 所有到达 `pause_deadline` 的 binding 都必须优先处理
+   - 只有在 bridge 确认这些 one-shot wake 已被 pause 或进入 `degraded` 后，才允许继续 arm 新 batch
+
+2. 读取 bridge 侧的 ready 来源：
 
 ```text
 preferred: ~/.cbth/inbox/ready-threads.json
@@ -168,8 +182,8 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
      - 不得递增 attempt / batch 计数
      - 真正的 durable 推进只能发生在后续 `note-arm`
 
-2. 如果没有可投递 thread，本次 turn 直接结束。
-3. 如果有可投递 thread：
+3. 如果没有可投递 thread，本次 turn 直接结束。
+4. 如果有可投递 thread：
    - 无论来自 `ready-threads.json` 还是 `claim-next-ready` helper，都必须直接拿到一个 ready entry：
      - `source_thread_id`
      - `batch_id`
@@ -179,6 +193,7 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
      - `snapshot_path`
      - `caller_automation_id`
    - 该 thread 必须已经存在 `binding_state=bound` 的 desktop binding
+   - 且该 binding 必须满足 `writeback_capability=validated`
    - 用 `automation_update` 更新这个已知 caller heartbeat
    - heartbeat prompt 中带上：
      - `batch_id`
@@ -186,6 +201,7 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
      - `generation`
      - `snapshot_revision`
      - `snapshot_path`
+   - 在真正调用 `automation_update` 前，bridge 必须先获取当前 `(source_thread_id, attempt_id, generation)` 的内部 `bridge_arm_lease`
    - `automation_update` 成功后，bridge 调用一个窄 helper：
 
 ```text
@@ -197,15 +213,17 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
      - `last_delivery_attempt_at`
      - `delivery_attempt_count`
      - `armed_generation`
+     - `pause_deadline`
    - `note-arm` 的实现合同必须是：
      - compare-and-swap：只允许当前 `prepared` 的 head attempt 成功推进一次
      - idempotent retry：如果同一 attempt 已经是 `cooldown`，重复调用只能返回 already-armed / idempotent success，不能重复计数
      - stale/no-op：如果 `attempt_id` / `generation` 已经过期，就必须拒绝推进，也不能递增计数
    - 如果 `automation_update` 已被接受，但 `note-arm` 不可用或返回 unknown：
-     - 不得继续把这个 head batch 当成可自动重投
-     - 当前 head batch 必须 durable 进入 `replay_policy=manual_resolution_only`
-     - 当前 binding 必须进入 `degraded`
-     - 后续任何 repair / re-arm 前，都必须先确认已绑定 heartbeat 被重新 `PAUSED`
+     - bridge 不能立刻把这次 wake 视为歧义失败
+     - 它必须先做一次 durable reconciliation：
+       - 如果 attempt 已进入 `cooldown` 且 `armed_generation` 已等于当前 generation，则按成功处理
+       - 否则再尝试验证当前 heartbeat 是否已被 pause
+     - 只有在仍无法证明“已成功 arm”或“已成功 pause”时，才允许把当前 head batch 打到 `manual_resolution_only` 并把 binding 置为 `degraded`
 
 ### 3. caller thread 被唤醒
 
@@ -260,11 +278,15 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
    - 即将跨过 continuation boundary
    - 但还没有真正开始产生后续输出 / 工具副作用
 7. `note-delivered` 的调用时机必须是：
-   - caller 已成功写入 `note-boundary-crossed`
-   - 并且已经在当前 turn 中完成 continuation preparation
-   - 此时 turn 仍然活着，helper 仍可调用
-   - 仅读到数据本身还不够
-8. 这一步负责把当前 batch durable 关闭到：
+  - caller 已成功写入 `note-boundary-crossed`
+  - 并且已经在当前 turn 中完成 continuation preparation
+  - 此时 turn 仍然活着，helper 仍可调用
+  - 仅读到数据本身还不够
+8. 但第一版再收紧一条：
+   - 如果 caller 的后续动作只是“发送一条最终 assistant 文本然后结束”
+   - 则这条路径不允许使用 `note-delivered`
+   - 因为当前 Desktop 没有安全的 post-output ack 面
+9. 这一步负责把当前 batch durable 关闭到：
    - `close_reason=caller_acknowledged`
    - 并停止该 head batch 的自动重投
 
@@ -390,6 +412,7 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 ### Bridge prompt 要求
 
 - 每次醒来只做一次状态检查。
+- 每次醒来先做 pause / reconcile，再决定是否 arm 新 batch。
 - 只读取 ready index，不依赖通用 `cbth job ...` CLI。
 - 没有 ready thread 就立即结束。
 - 有 ready thread 时，只更新对应 caller thread 的已绑定 heartbeat，不直接展开主任务。
@@ -402,6 +425,7 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
   - snapshot 已物化
   - 当前 generation 的 caller heartbeat arm 请求已被 Codex 接受
   - `cbth desktop note-arm ...` 已成功执行
+  - 并写下当前 generation 的 `pause_deadline`
 
 ### Caller prompt 要求
 
@@ -412,6 +436,7 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 - 成功读取当前 envelope 后，不得立刻关闭 batch。
 - 在真正跨过 continuation boundary 前，必须先调用 `cbth desktop note-boundary-crossed ...`。
 - 只有在已经成功记录 `note-boundary-crossed`、且完成 continuation preparation 后，才允许调用 `cbth desktop note-delivered ...`，把当前 batch durable 关闭为 `caller_acknowledged`，从而停止自动 redelivery。
+- 纯文本最终回复路径不适用 `note-delivered`；这类路径在第一版里只能停留在 `manual_resolution_only`，等待 operator close 或超时关闭。
 - caller 不直接 pause 当前 heartbeat；任务完成后的 pause/reconcile 由 bridge 在后续 heartbeat 中处理。
 - 旧 generation 的 prompt 只允许 no-op，不允许“顺手处理当前 head batch”。
 - 读取传输由 binding 预先决定：
@@ -441,6 +466,7 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 - 但一旦 caller 已成功执行 `cbth desktop note-delivered ...`，该 head batch 就必须自动进入：
   - `close_reason=caller_acknowledged`
   - 不再继续 redelivery
+- 纯文本最终回复不属于这条成功关闭路径；第一版不会把这类路径自动 close 成 `caller_acknowledged`。
 - 如果 `delivery_attempt_count >= max_delivery_attempts`，该 head batch 也必须自动进入：
   - `close_reason=max_attempts_exhausted`
   - `closed`
@@ -557,6 +583,9 @@ cbth batch close-head --source-thread-id <thread_id> --reason operator_closed --
   - stale wake / snapshot 不可读：caller turn 只 no-op；后续由 bridge 在 generation 仍匹配时切回 `PAUSED`
   - degraded：bridge 或 operator 在 generation 仍匹配时切回 `PAUSED`，等待 repair
   - 只有 operator 明确执行 unbind/destroy，才允许删除
+- 换句话说，第一版 caller heartbeat 必须被当成“长期复用的 one-shot wake carrier”：
+  - 每次 arm 只授权一个有限的 wake window
+  - 不能无限期停留在 `ACTIVE`
 - 未完成 bootstrap 的 thread 仍可提交 job，但只允许：
   - sidecar 继续跑任务
   - `cbth` 保留结果

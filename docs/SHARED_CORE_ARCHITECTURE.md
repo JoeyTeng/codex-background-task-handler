@@ -61,6 +61,9 @@
   - `cbth desktop note-arm ...`
   - `cbth desktop note-boundary-crossed ...`
   - `cbth desktop note-delivered ...`
+- 因此，Desktop 第一版的自动续跑门槛不是“batch 只读”单条件，而是两层同时成立：
+  - batch 自身满足只读 / 低风险 delivery policy
+  - 当前安装上的 Desktop writeback helpers 已被验证可在 heartbeat 中无审批执行
 - Desktop 的关键投递路径优先依赖只读状态面：
   - 只读 inbox snapshot 文件
   - 只读 artifact manifest / artifact 文件
@@ -241,17 +244,24 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - `degraded`
 - `caller_automation_id`
 - `armed_generation` (optional)
+- `pause_deadline` (optional)
 - `bridge_thread_id`
 - `read_transport`
   - `direct_file_read`
   - `helper_cli_read`
+- `writeback_capability`
+  - `unknown`
+  - `validated`
+  - `unavailable`
 - `created_at`
 - `updated_at`
 - `last_verified_at`
 
 约束：
 
-- Desktop 自动续跑只对 `binding_state=bound` 的 thread 生效。
+- Desktop 自动续跑只对同时满足以下条件的 thread 生效：
+  - `binding_state=bound`
+  - `writeback_capability=validated`
 - `unbound` thread 可以继续提交 job，但 bridge 不得尝试自动 arm caller heartbeat。
 - 运行期 bridge 不负责发现新的 caller automation id；第一版要求这个 id 通过 bootstrap 预先 durable 绑定。
 - `degraded` 表示该 thread 暂时失去自动续跑能力：
@@ -262,6 +272,10 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - bridge arm 成功并 `note-arm` durable 后，才允许把它更新为当前 generation
   - 后续 bridge 想把该 heartbeat 切回 `PAUSED` 时，也必须带着期望 generation 比较 `armed_generation`
   - 只要 binding 上的 `armed_generation` 已经变成更新 generation，任何旧 generation 的 cleanup/pause 都必须 no-op
+- 每次成功 arm 还必须设置一个 `pause_deadline`：
+  - 代表 bridge 最迟应在何时把这次 one-shot wake 对应的 caller heartbeat 切回 `PAUSED`
+  - bridge 的下一轮 reconciliation 必须优先处理所有已到 `pause_deadline` 的 binding
+  - 如果 pause 在限定的 bridge 重试窗口内仍无法被验证，binding 必须进入 `degraded`
 - 如果某次 `automation_update` 已被 Codex 接受，但后续 `note-arm` 没能 durable 成功：
   - 当前 head batch 必须立即切到 `replay_policy=manual_resolution_only`
   - 当前 binding 必须进入 `degraded`
@@ -341,6 +355,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 - `batch_id`
 - `generation`
 - `state`
+- `bridge_arm_lease_id` (Desktop optional)
 - `delivery_turn_id` (optional)
 - `managed_session_id` (CLI optional)
 - `session_epoch` (CLI optional)
@@ -394,6 +409,11 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - 不得移动 head batch
   - 不得递增 `delivery_attempt_count`
   - 不得改变当前 attempt / batch 的 durable 状态
+- `claim-next-ready` 保持纯 peek 的同时，daemon 仍必须在 bridge 运行期内部提供一条不对外暴露的短租约：
+  - `bridge_arm_lease`
+  - 以 `(source_thread_id, attempt_id, generation)` 为 key
+  - 只用于串行化 bridge 自己的 arm 流程
+  - 不得改变 head batch 的外部可见性
 - Desktop 第一版里，bridge 侧真正允许推进 durable 状态的动作只有：
   - `automation_update` 被 Codex 接受
   - 随后的 `cbth desktop note-arm ...` 成功
@@ -474,6 +494,12 @@ cooldown -> superseded
   - `managed_session_id`
   - `session_epoch`
   - `delivery_turn_id`
+- 其中：
+  - `managed_session_id` 是 daemon 为一条逻辑 managed CLI session 分配的稳定 durable id
+  - `session_epoch` 是该 managed session 当前“可证明连续的 shared app-server event stream”的单调递增序号
+  - `session_epoch` 在 daemon 首次拉起该 shared `app-server` 时初始化为 `1`
+  - 只要 daemon 还能证明自己仍附着在同一个未重建的 shared `app-server` 实例上，短暂 websocket 重连不递增
+  - 只要 app-server 进程重启、managed session 被重建，或 daemon 恢复后无法证明事件流连续性，就必须递增
 - 如果 daemon 只是 websocket 短暂断开、但能够重新附着到同一个 `managed_session_id + session_epoch`，则允许继续等待对应的 `turn/completed`。
 - 只要 `managed_session_id` 或 `session_epoch` 的连续性无法再证明，当前 head batch 就不得自动 replay：
   - 当前 attempt 收敛到 `abandoned`
@@ -582,6 +608,7 @@ cooldown -> superseded
     - 只有当 `(source_thread_id, attempt_id, generation)` 仍指向当前 head attempt
     - 且当前 durable 状态仍是 `prepared`
     - 才允许执行唯一一次 `prepared -> cooldown`
+    - 且当前 `bridge_arm_lease_id` 仍由本次 bridge 流程持有
   - idempotent retry：
     - 如果同一 attempt 之前已经成功进入 `cooldown`
     - 重复 `note-arm` 必须返回 idempotent success / already-armed
@@ -589,10 +616,12 @@ cooldown -> superseded
     - 也不得再次推进任何状态
 - 如果 `attempt_id` / `generation` 已失配，或该 attempt 已经 `superseded/abandoned/closed`，`note-arm` 必须返回 stale/no-op，而不是重复记账。
 - 如果 `automation_update` 已被接受，但 `note-arm` 返回 unknown / failed，则：
-  - 不得把这次 accepted wake 当成可安全重试
-  - 必须把当前 head batch durable 推到 `replay_policy=manual_resolution_only`
-  - 必须把 binding durable 推到 `degraded`
-  - 必须要求 bridge / operator 在任何后续 repair 前先验证 bound caller heartbeat 已被 pause
+  - bridge 不得立刻把这次 wake 视为歧义失败
+  - 它必须先做一次 durable reconciliation：
+    - 如果当前 attempt 已经是 `cooldown`
+    - 且 binding 的 `armed_generation` 已等于该 generation
+    - 则把这次 unknown 当作“已成功 arm，但响应丢失”
+  - 只有在既无法证明 arm 成功、也无法证明 bound heartbeat 已经被重新 pause 时，才允许把当前 head batch durable 推到 `replay_policy=manual_resolution_only` 并把 binding 推到 `degraded`
 
 ### Artifact 关键字段
 
@@ -699,6 +728,10 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
   - 第一版的 continuation preparation 至少意味着 caller 已经：
     - 构造好了将要发送的 assistant 输出
     - 或确定并准备发起下一个基于该 batch 的工具 / 行动步骤
+- 但第一版必须进一步收紧：
+  - `note-delivered` 不适用于“纯文本最终回复后立即结束 turn”的路径
+  - 因为当前 Desktop surface 没有一个安全的 post-output ack 点
+  - 因此，第一版 `caller_acknowledged` 只覆盖仍能在输出前安全完成 helper 写回的 continuation 形状
 - 仅读到 envelope / artifact 本身，不足以调用 `note-boundary-crossed` 或 `note-delivered`。
 - 如果 caller 在读完 envelope 后、真正跨过 continuation boundary 前崩溃：
   - `note-boundary-crossed` 不得执行
@@ -720,6 +753,11 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
     - 等待 operator 显式 `batch close-head ...`
     - 或在 `redelivery_window_ends_at` 到期时自动关闭为 `close_reason=manual_resolution_expired`
     - 未来版本如果要支持人工 replay，必须单独引入专门的 operator override contract
+- 如果 caller 选择的是“纯文本最终回复”路径：
+  - caller 不得调用 `note-delivered`
+  - 当前 head batch 保持 `manual_resolution_only`
+  - 后续只能由 operator close，或等待 `redelivery_window_ends_at` 自动关闭
+  - 如果未来需要自动关闭这类路径，必须单独设计 output-observation / response-digest contract
 
 ## 第一版稳定外部接口
 
