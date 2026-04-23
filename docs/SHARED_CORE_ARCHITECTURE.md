@@ -475,11 +475,14 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - `delivery_turn_id` (optional)
 - `managed_session_id` (CLI optional)
 - `session_epoch` (CLI optional)
+- `delivery_accepted_at` (CLI optional)
 - `delivery_observation_state` (CLI optional)
   - `tracking`
   - `lost`
   - `expired`
 - `delivery_observation_deadline` (CLI optional)
+- `last_observed_turn_event` (CLI optional)
+- `last_observed_turn_event_at` (CLI optional)
 - `binding_id` (optional)
 - `automation_id` (optional)
 - `automation_binding_state`
@@ -787,6 +790,7 @@ cooldown -> superseded
 - `session_state`
   - `live`
   - `detached`
+  - `parked`
   - `stale`
   - `retired`
 - `session_allows_approval`
@@ -1137,8 +1141,9 @@ cbth desktop binding unbind
   - `session_epoch`
   - `delivery_observation_state`
   - `delivery_observation_deadline`
-  - acceptance timestamp
-  - last observed turn event
+  - `delivery_accepted_at`
+  - `last_observed_turn_event`
+  - `last_observed_turn_event_at`
 - `cbth batch inspect-head ...` 在 head batch 已 `crossed_unacknowledged` 时，必须回显：
   - `boundary_recovery_envelope`
   - 对大 artifact 则再回显 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）

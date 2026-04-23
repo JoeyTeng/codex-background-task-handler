@@ -157,6 +157,9 @@
     - `session_allows_approval`
     - `session_allows_network`
     - `session_allows_write_access`
+  - session state 现在必须允许 `parked`：
+    - live app-server 已结束
+    - 但 unresolved manual batch 仍在 durable 等待 operator 收口
   - 这组 profile 对 non-retired session 是 immutable 的；attach 遇到 drift 时只能 fail-closed 或 retire-and-recreate
   - 同一个 `bound_thread_id` 最多只允许一个 non-retired managed session；不可安全复用时必须 fail-closed，而不是并发创建第二个 session
   - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点
@@ -167,6 +170,10 @@
   - 每次 accepted attempt 都必须 durable 记录 `delivery_turn_id`
   - accepted attempt 还必须 durable 绑定 `managed_session_id + session_epoch`
   - `managed_session_id` 是逻辑会话 id；`session_epoch` 是该会话当前可证明连续的 app-server 事件流代号
+  - accepted attempt 还必须 durable 记录：
+    - `delivery_accepted_at`
+    - `last_observed_turn_event`
+    - `last_observed_turn_event_at`
   - accepted attempt 还必须带 `delivery_observation_deadline`
   - 只有在这个 deadline 之内，未收口 `delivery_turn_id` 才阻止 daemon 退出
   - deadline 到期仍未观察到可信 `turn/completed` 时：
@@ -174,7 +181,11 @@
     - `delivery_observation_state=expired`
     - 当前 head batch 必须 fail-closed 到 `manual_resolution_only`
   - 这之后任何迟到的 `turn/completed` 都只能保留为 operator/debug 证据，不得再自动 close 为 `delivered`
-  - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍是当前 head delivery 时，batch 才允许关闭
+  - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且以下条件同时满足时，batch 才允许关闭：
+    - 该 attempt 仍是当前 head delivery
+    - `delivery_observation_state=tracking`
+    - `replay_policy=automatic`
+    - `now <= delivery_observation_deadline`
   - 如果某次 accepted attempt 已经带有 `delivery_turn_id`，即使前台 UI 临时切到别的 thread，它也仍可等待匹配的 `turn/completed` 正常收口
   - 因此 daemon 退出条件只需要在 `delivery_observation_deadline` 窗口内覆盖这些未收口的 `delivery_turn_id` 观察
   - 但只要 `managed_session_id + session_epoch` 的观察连续性丢失，就不得自动 replay；当前 head batch 必须进入 `manual_resolution_only`

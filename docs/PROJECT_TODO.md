@@ -258,6 +258,7 @@
   - durable `managed_session_id + bound_thread_id`
   - durable `session_allows_approval + session_allows_network + session_allows_write_access`
   - durable `session_state`
+    - include `parked` for live-part torn down while manual batch still waits operator resolution
   - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
   - 通过 `cbth cli run --bind-thread-id <thread_id>` 在启动时建立 `bound_thread_id`，而不是靠前台事件流自动归因
   - v1 不提供 late-bind 或 `managed_session_id` 外部发现/回填的 stable surface
@@ -270,6 +271,8 @@
   - 如需把自动续跑目标换到别的 thread，必须显式开新 session 或等待未来 rebind contract
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
   - accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
+  - accepted attempt 必须 durable 记录 `delivery_accepted_at`
+  - accepted attempt 必须 durable 记录 `last_observed_turn_event + last_observed_turn_event_at`
   - accepted attempt 必须 durable 记录 `delivery_observation_deadline`
   - detached auto-delivery 只允许在 session-scoped risk profile 三项都为 `false` 时开启
   - `delivery_observation_deadline` 到期仍未看到可信 `turn/completed` 时：

@@ -62,6 +62,7 @@ codex --remote ws://127.0.0.1:<port>
      - `session_state`
        - `live`
        - `detached`
+       - `parked`
        - `stale`
        - `retired`
    - 这三个 `session_allows_*` 字段属于 v1 的 session-scoped risk profile：
@@ -177,6 +178,18 @@ codex --remote ws://127.0.0.1:<port>
     - 包括 ready / materialized / cooldown batch
     - 包括 `replay_policy=manual_resolution_only`、且尚未被 operator close 或 `manual_resolution_expired` auto-close 的 head batch
   - 没有仍在 `delivery_observation_deadline` 之内等待匹配 `turn/completed` 的 `delivery_turn_id`
+- 当 accepted attempt 因 deadline expiry / continuity-loss / untrusted terminal result 而 fail-closed 到 `manual_resolution_only` 后：
+  - daemon 可以结束该 managed session 的 live 部分
+    - 关闭 daemon-owned shared `app-server`
+    - 断开对应 sidecar / foreground attachment
+  - 但 durable session record 不得立刻 `retired`
+  - 它必须先转入 `session_state=parked`
+    - 继续保留 `bound_thread_id`
+    - 保留 manual/operator 收口所需的 durable 证据
+    - 不再允许自动 delivery 或 live observation
+  - 只要仍有 unresolved manual batch，`parked` session 就不得被 attach/reuse 成 live session
+    - 必须 fail-closed 为 `session_pending_manual_resolution`
+  - 只有当这些 manual batch 已被 operator close 或 `manual_resolution_expired` auto-close 后，`parked` session 才允许 retirement / replace
 
 ## 实验 RPC 依赖面
 
@@ -472,8 +485,9 @@ cbth batch inspect-head --source-thread-id <thread_id> --json
     - `session_epoch`
     - `delivery_observation_state`
     - `delivery_observation_deadline`
-    - acceptance timestamp
-    - last observed turn event
+    - `delivery_accepted_at`
+    - `last_observed_turn_event`
+    - `last_observed_turn_event_at`
   - 再结合外部可见证据（例如 thread history / rollout /人工确认）做二选一收口：
 
 ```text
