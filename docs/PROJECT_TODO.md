@@ -20,9 +20,12 @@
   - 无 active jobs
   - 无 active clients
   - 无未收口的 ready/materialized/cooldown batch
-  - 无等待中的 `cooldown_until` / `redelivery_window_ends_at` / `delivery_turn_id`
+  - 无等待中的 `arm_pending_deadline` / `pause_deadline` / `cooldown_until` / `redelivery_window_ends_at` / `delivery_turn_id`
 - [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 `cbth` 物化出的只读 inbox snapshot / artifact 文件，且不会卡审批。
 - [ ] 单独验证 Desktop heartbeat 在后台运行时，是否能无审批执行窄 `cbth desktop ...` helper：
+  - `note-arm-pending`
+  - `list-arm-pending`
+  - `list-pause-due`
   - `claim-next-ready`
   - `read-envelope`
   - `read-artifact`
@@ -33,6 +36,7 @@
   - `source_thread_id`
   - `caller_automation_id`
   - `armed_generation`
+  - `arm_pending_deadline`
   - `pause_deadline`
   - `read_transport`
   - `read_transport_capability`
@@ -59,8 +63,10 @@
   - 不改变 head batch 的外部可见性
   - `note-arm` unknown 时先 reconcile，再决定是否 degraded/manual
 - [ ] 设计并实现 Desktop bridge 的窄写回 helper：
+  - `cbth desktop note-arm-pending --source-thread-id ... --attempt-id ... --generation ... --json`
+  - compare-and-swap 只允许唯一一次 `prepared -> arm_pending`
   - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --json`
-  - compare-and-swap 只允许唯一一次 `prepared -> cooldown`
+  - compare-and-swap 只允许唯一一次 `arm_pending -> cooldown`
   - idempotent retry 不得重复递增 `delivery_attempt_count`
 - [ ] 设计并实现 Desktop continuation-boundary 断点 helper：
   - `cbth desktop note-boundary-crossed --source-thread-id ... --attempt-id ... --generation ... --json`
@@ -78,6 +84,7 @@
 - [ ] 明确第一版自动续跑的总安全门槛：
   - 仅限 `delivery_read_only=true`
   - 且 `delivery_requires_approval/network/write_access=false`
+  - Desktop 还必须额外满足 `read_transport_capability=validated`
   - Desktop 还必须额外满足 `writeback_capability=validated`
   - 非只读 batch 只走 manual/operator follow-up
 - [ ] 为 post-continuation-boundary 的 `note-delivered` 失败场景定死 operator-resolution contract：
@@ -91,6 +98,14 @@
   - 如果能证明 attempt 已进入 `cooldown` 且 `armed_generation` 匹配，则按成功 arm 处理
   - 如果能证明当前 generation 对应的 heartbeat 已重新 `PAUSED`，则当前 attempt 收敛到 `abandoned`，head batch 保持 `replay_policy=automatic`
   - 只有在既无法证明 arm 成功、也无法证明 pause 成功时，head batch 才进入 `manual_resolution_only`，binding 才进入 `degraded`
+- [ ] 为 Desktop arm flow 增补 durable `arm_pending` barrier：
+  - `note-arm-pending` 先把 attempt 从 `prepared` 推到 `arm_pending`
+  - `note-arm` 只允许从 `arm_pending -> cooldown`
+  - 只要 attempt 仍是 `arm_pending`，bridge 就不得对同一 generation 重复 arm
+- [ ] 为 `arm_pending` 增补专门的 reconcile 输入面：
+  - `~/.cbth/inbox/arm-pending-bindings.json`
+  - `cbth desktop list-arm-pending --bridge-thread-id ... --json`
+  - bridge 每轮必须先 reconcile 这些 attempt，再处理 pause-due / ready
 - [ ] 为 bridge overdue-binding cleanup 定义 durable 只读输入面：
   - `~/.cbth/inbox/pause-due-bindings.json`
   - `cbth desktop list-pause-due --bridge-thread-id ... --json`
@@ -98,9 +113,16 @@
 - [ ] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
 - [ ] 把 caller heartbeat 的 one-shot cleanup 合同落进实现：
+  - daemon exit 条件必须覆盖 `arm_pending_deadline`
   - arm 后写入 `pause_deadline`
+  - daemon exit 条件也必须覆盖 `pause_deadline`
   - bridge 每轮先 pause/reconcile 已到期 generation
   - pause 连续失败时 binding 进入 `degraded`
+- [ ] 为 `note-boundary-crossed` / `note-delivered` 定死 compare-and-swap / 幂等合同：
+  - `note-boundary-crossed` 只允许唯一一次 `not_crossed -> crossed_unacknowledged`
+  - 同一 attempt/generation 的重复调用必须返回 already-crossed / stale-no-op
+  - `note-delivered` 只允许唯一一次 `crossed_unacknowledged -> acknowledged`
+  - 已 `acknowledged` 的重复调用只能返回 already-delivered / idempotent success
 - [ ] 把 Desktop operator recovery / cleanup 命令面定死并实现：
   - `cbth batch inspect-head ...`
   - `cbth batch close-head ...`

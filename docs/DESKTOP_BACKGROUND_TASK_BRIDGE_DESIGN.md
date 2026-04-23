@@ -23,6 +23,7 @@
 - 但 Desktop adapter 当前只把两类能力当作规划中的关键路径：
   - 优先的只读文件路径：`direct_file_read`
   - 窄写回 helper：
+    - `cbth desktop note-arm-pending ...`
     - `cbth desktop note-arm ...`
     - `cbth desktop note-boundary-crossed ...`
     - `cbth desktop note-delivered ...`
@@ -57,6 +58,8 @@
    - `helper_cli_read` 建议提供一组窄 helper：
 
 ```text
+cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
+cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
@@ -146,7 +149,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 - 但这还不是充分条件；Desktop 自动续跑还必须额外满足：
   - 当前 binding 的 `read_transport_capability=validated`
   - 当前 binding 的 `writeback_capability=validated`
-  - 也就是 `note-arm` / `note-boundary-crossed` / `note-delivered` 这组窄 helper 已经被证明可在 heartbeat 中无审批执行
+  - 也就是 `note-arm-pending` / `note-arm` / `note-boundary-crossed` / `note-delivered` 这组窄 helper 已经被证明可在 heartbeat 中无审批执行
 - 不满足这些条件的 batch 不得由 bridge 自动 arm caller heartbeat；它们保留为 manual/operator follow-up。
 - 这里的“只读 / 低风险”只描述 bridge 自动投递与断点写回这条外围机制本身。
 - caller 被唤醒之后如果决定发起 approval / network / write 工具，那仍然受 Codex 自己的审批与沙箱约束；这不属于本项目 v1 自动续跑门槛已经替你兜底的范围。
@@ -177,6 +180,15 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 bridge heartbeat 每分钟醒一次：
 
 1. 先做上一轮已 arm generation 的 pause / reconcile：
+   - 所有仍处于 `arm_pending` 的 attempt 都必须比新 arm 更优先被处理
+   - 只要某个 thread 的 head attempt 仍是 `arm_pending`，bridge 就不得对同一 `attempt_id + generation` 重新 arm
+   - arm-pending 的读取面必须是：
+
+```text
+preferred: ~/.cbth/inbox/arm-pending-bindings.json
+fallback:  cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
+```
+
    - 所有到达 `pause_deadline` 的 binding 都必须优先处理
    - 只有在 bridge 确认这些 one-shot wake 已被 pause 或进入 `degraded` 后，才允许继续 arm 新 batch
    - overdue binding 的读取面必须是：
@@ -221,20 +233,34 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
      - `snapshot_revision`
      - `snapshot_path`
    - 在真正调用 `automation_update` 前，bridge 必须先获取当前 `(source_thread_id, attempt_id, generation)` 的内部 `bridge_arm_lease`
+   - 然后必须先调用一个窄 helper，把当前 attempt durable 推到 `arm_pending`：
+
+```text
+cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
+```
+
+   - `note-arm-pending` 的实现合同必须是：
+     - compare-and-swap：只允许当前 `prepared` 的 head attempt 唯一一次推进到 `arm_pending`
+     - 这一步必须写下：
+       - `arm_pending_since`
+       - `arm_pending_deadline`
+     - 如果同一 attempt 已经是 `arm_pending`，重复调用只能返回 already-pending / idempotent success
+     - stale/no-op：如果 `attempt_id` / `generation` 已经过期，就必须拒绝推进，也不能写新 deadline
+   - 只有 `note-arm-pending` 成功后，bridge 才允许真正调用 `automation_update`
    - `automation_update` 成功后，bridge 调用一个窄 helper：
 
 ```text
 cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
 ```
 
-   - 这一步负责把 attempt durable 推进到 `cooldown`，并更新：
+   - 这一步负责把 attempt durable 从 `arm_pending` 推进到 `cooldown`，并更新：
      - `head_attempt_id`
      - `last_delivery_attempt_at`
      - `delivery_attempt_count`
      - `armed_generation`
      - `pause_deadline`
    - `note-arm` 的实现合同必须是：
-     - compare-and-swap：只允许当前 `prepared` 的 head attempt 成功推进一次
+     - compare-and-swap：只允许当前 `arm_pending` 的 head attempt 成功推进一次
      - idempotent retry：如果同一 attempt 已经是 `cooldown`，重复调用只能返回 already-armed / idempotent success，不能重复计数
      - stale/no-op：如果 `attempt_id` / `generation` 已经过期，就必须拒绝推进，也不能递增计数
    - 如果 `automation_update` 已被接受，但 `note-arm` 不可用或返回 unknown：
@@ -296,11 +322,14 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
    - caller 已成功读取当前 envelope / artifact
    - 即将跨过 continuation boundary
    - 但还没有真正开始产生后续输出 / 工具副作用
+   - 只有 fresh compare-and-swap success 才允许继续后续工作
+   - 如果返回 already-crossed / stale-no-op，caller 必须立即停止并退出，不得继续
 7. `note-delivered` 的调用时机必须是：
   - caller 已成功写入 `note-boundary-crossed`
   - 并且已经在当前 turn 中完成 continuation preparation
   - 此时 turn 仍然活着，helper 仍可调用
   - 仅读到数据本身还不够
+  - 如果返回 already-delivered / stale-no-op，caller 同样必须停止，不得把它当成新授权
 8. 但第一版再收紧一条：
    - 如果 caller 的后续动作只是“发送一条最终 assistant 文本然后结束”
    - 则这条路径不允许使用 `note-delivered`
@@ -331,6 +360,7 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 ### Delivery attempt 状态
 
 - `prepared`
+- `arm_pending`
 - `cooldown`
 - `closed`
 - `superseded`
@@ -353,8 +383,9 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
   - `automation_id` (optional)
   - `snapshot_path`
   - `delivery_deadline`
+  - `arm_pending_deadline`
   - `cooldown_until`
-- bridge arm caller heartbeat 前，必须先原子创建/更新 attempt。
+- bridge arm caller heartbeat 前，必须先原子创建/更新 attempt，并在真正调用 `automation_update` 前先把它 durable 推到 `arm_pending`。
 - caller prompt 中必须显式携带 `batch_id + attempt_id + generation + snapshot_revision`。
 - caller 读取 envelope 后，必须先比较这四者；只要 mismatch 就立即 no-op。
 - 同一 thread 上出现新的 generation 后，所有旧 heartbeat prompt 都只能看到 mismatch，不得重复消费当前 head batch。
@@ -502,9 +533,13 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 ### Bridge arm 失败
 
 - 如果失败发生在 `automation_update` 被接受之前：
-  - batch 保持可投递
-  - 当前 attempt 标为 `abandoned` 或保持 `prepared`，由调度器决定是否重建新 attempt
-  - 下一次 bridge heartbeat 只能基于新的 head attempt 再试
+  - 如果失败发生在 `note-arm-pending` 之前：
+    - batch 保持可投递
+    - 当前 attempt 标为 `abandoned` 或保持 `prepared`，由调度器决定是否重建新 attempt
+  - 如果失败发生在 `note-arm-pending` 之后、`automation_update` 之前：
+    - 当前 attempt 先保持 `arm_pending`
+    - bridge 下一轮必须先 reconcile 这个 `arm_pending` attempt，而不是直接重 arm
+- 下一次 bridge heartbeat 只能基于新的 head attempt 再试
 - 如果 `automation_update` 已被接受，但 `note-arm` 没能 durable 成功：
   - bridge 不得立刻把它视为歧义失败
   - 它必须先做 reconciliation：

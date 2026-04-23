@@ -22,7 +22,7 @@
     - `helper_cli_read`
   - 其中 `direct_file_read` 仍是候选优先路径，`helper_cli_read` 只是条件性 fallback
   - 同时又补了一层 explicit desktop binding：bridge 运行期只更新已知 caller automation，不做 blind create/discovery
-  - Desktop 顶部文案也已改成更保守的口径：`note-arm` / `note-delivered` 仍是规划中的窄写回依赖，但后台 heartbeat 能否无审批执行它们还待实证
+  - Desktop 顶部文案也已改成更保守的口径：`note-arm-pending` / `note-arm` / `note-boundary-crossed` / `note-delivered` 仍是规划中的窄写回依赖，但后台 heartbeat 能否无审批执行它们还待实证
   - 而且 Desktop 自动续跑现在被明确成双门槛：
     - batch 本身必须是只读 / 低风险
     - 目标安装上的读路径也必须已验证可无审批执行
@@ -51,13 +51,18 @@
   - `redelivery_window_ends_at`
   - `max_delivery_attempts`
   - `delivery_attempt_count`
-- Desktop 运行期还新增了一条窄控制面：
+- Desktop 运行期还新增了两条窄控制面：
+  - `cbth desktop note-arm-pending ...`
+  - 用于在 bridge 真正调用 `automation_update` 前，把当前 head attempt durable 推到 `arm_pending`
   - `cbth desktop note-arm ...`
   - 用于在 bridge 成功 `automation_update` 后，把 attempt durable 推进到 `cooldown`
 - 同时又补上了 caller 成功分支：
   - `cbth desktop note-delivered ...`
   - 只允许在 caller 已读取 envelope、已成功写入 `note-boundary-crossed`、且不是纯文本最终回复路径时，把 head batch 自动关闭到 `caller_acknowledged`
 - Desktop helper fallback 也进一步补成完整链路：
+  - `cbth desktop note-arm-pending ...`
+  - `cbth desktop list-arm-pending ...`
+  - `cbth desktop list-pause-due ...`
   - `cbth desktop claim-next-ready ...`
   - `cbth desktop read-envelope ...`
   - `cbth desktop read-artifact ...`
@@ -70,15 +75,18 @@
   - 当前真正优先候选仍是 `direct_file_read`
 - Desktop 的 delivery state machine 也继续收紧：
   - attempt 不再保留单独的 durable `armed`
-  - bridge arm 成功并 durable 记录后，attempt 直接进入 `cooldown`
+  - bridge 在真正调用 `automation_update` 前，先把 attempt durable 推到 `arm_pending`
+  - 只有 bridge arm 成功并 `note-arm` durable 记录后，attempt 才进入 `cooldown`
   - `cooldown` 期满后若仍可重投，再创建新 attempt
   - 若 `delivery_attempt_count >= max_delivery_attempts`，batch 必须自动关闭到 `close_reason=max_attempts_exhausted`
 - Desktop 的送达语义也进一步收紧：
   - `claim-next-ready` 虽然名字里带 `claim`，但第一版必须是纯 read/peek helper，不能 reservation 或隐藏 head batch
+  - `arm_pending` attempt 不再是新的 ready head；bridge 必须先 reconcile 它，不能重复 arm 同一 generation
   - `note-boundary-crossed` 必须先于真正的 continuation boundary durable 成功
   - `note-delivered` 不能在“刚读完 envelope”时就执行
   - caller 只有在当前 turn 中完成 continuation preparation、且 helper 仍可调用时，才允许用 `note-delivered` 关闭 batch
   - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
+  - `note-boundary-crossed` / `note-delivered` 也都需要 compare-and-swap / stale-no-op 语义，避免重复 wake 或 supersede 后重复记账
   - 纯文本最终回复路径不属于第一版 `caller_acknowledged` 的自动关闭范围
   - 如果 `note-delivered` 在 post-boundary 场景下失败，batch 进入人工判定语义，`binding repair` 不得自动重投它
   - `note-arm` 也新增了 CAS/幂等合同，避免 bridge 重试导致重复计数
@@ -87,12 +95,18 @@
 - 第一版自动续跑总门槛也已统一：
   - 只处理 `delivery_read_only=true`
   - 且不需要 approval/network/write access 的 batch
+  - Desktop 还必须满足 `read_transport_capability=validated`
+  - Desktop 还必须满足 `writeback_capability=validated`
   - 非只读 batch 一律不自动续跑，留给 operator/manual follow-up
 - caller heartbeat lifecycle 也已收口：
   - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
   - `armed_generation` 作为这个长期复用 heartbeat 的 generation 栅栏
+  - `arm_pending_deadline` 作为 bridge/daemon 在 `automation_update` 与 `note-arm` 之间崩溃时的 reconcile 截止点
   - `pause_deadline` 作为 one-shot wake 的 cleanup 截止点
+  - daemon 自动退出条件也必须覆盖这两个 deadline
   - bridge 还需要一个专门的 overdue-binding 输入面：
+    - `~/.cbth/inbox/arm-pending-bindings.json`
+    - 或 `cbth desktop list-arm-pending ...`
     - `~/.cbth/inbox/pause-due-bindings.json`
     - 或 `cbth desktop list-pause-due ...`
   - 正常路径只由 bridge / operator `pause` / `update` / `reuse`

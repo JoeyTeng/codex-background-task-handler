@@ -37,7 +37,7 @@
     - 没有 active jobs
     - 没有活跃接入端
     - 没有未收口的 delivery batches / attempts
-    - 没有等待中的 `cooldown_until` / `redelivery_window_ends_at` / `delivery_turn_id` 完成观察
+    - 没有等待中的 `arm_pending_deadline` / `pause_deadline` / `cooldown_until` / `redelivery_window_ends_at` / `delivery_turn_id` 完成观察
 
 ### 3. 第一版公共接口只做 CLI
 
@@ -54,10 +54,13 @@
   - 只读 inbox snapshot 文件
   - 只读 artifact manifest / artifact 文件
 - 只有在 `direct_file_read` 不成立、且 helper 执行能力已被单独验证后，才条件性依赖读 helper：
+  - `cbth desktop list-arm-pending ...`
+  - `cbth desktop list-pause-due ...`
   - `cbth desktop claim-next-ready ...`
   - `cbth desktop read-envelope ...`
   - `cbth desktop read-artifact ...`
 - 当前无论读路径怎么选，写回 helper 仍是既定窄依赖：
+  - `cbth desktop note-arm-pending ...`
   - `cbth desktop note-arm ...`
   - `cbth desktop note-boundary-crossed ...`
   - `cbth desktop note-delivered ...`
@@ -134,6 +137,7 @@
 
 ```text
 ~/.cbth/inbox/ready-threads.json
+~/.cbth/inbox/arm-pending-bindings.json
 ~/.cbth/inbox/pause-due-bindings.json
 ~/.cbth/inbox/by-thread/<thread_id>.json
 ~/.cbth/artifacts/<artifact_id>/manifest.json
@@ -143,6 +147,7 @@
 2. `helper_cli_read`
 
 ```text
+cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
@@ -164,6 +169,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 
 ```text
 ~/.cbth/inbox/ready-threads.json
+~/.cbth/inbox/arm-pending-bindings.json
 ~/.cbth/inbox/pause-due-bindings.json
 ~/.cbth/inbox/by-thread/<thread_id>.json
 ~/.cbth/artifacts/<artifact_id>/manifest.json
@@ -229,7 +235,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - caller heartbeat
   - `automation_update` update/pause on a bound caller automation
   - delivery envelope 读取（`direct_file_read` 或 `helper_cli_read`）
-  - narrow helper writeback (`cbth desktop note-arm ...`, `cbth desktop note-boundary-crossed ...`, `cbth desktop note-delivered ...`)
+  - narrow helper writeback (`cbth desktop note-arm-pending ...`, `cbth desktop note-arm ...`, `cbth desktop note-boundary-crossed ...`, `cbth desktop note-delivered ...`)
 
 ### 9. `desktop thread bindings`
 
@@ -367,6 +373,8 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 - `generation`
 - `state`
 - `bridge_arm_lease_id` (Desktop optional)
+- `arm_pending_since` (Desktop optional)
+- `arm_pending_deadline` (Desktop optional)
 - `delivery_turn_id` (optional)
 - `managed_session_id` (CLI optional)
 - `session_epoch` (CLI optional)
@@ -389,6 +397,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 #### Attempt 状态
 
 - `prepared`
+- `arm_pending`
 - `cooldown`
 - `closed`
 - `superseded`
@@ -404,6 +413,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 - 对 Desktop target 来说，新 attempt 只有在存在 `binding_state=bound` 的 desktop binding 时才允许进入可投递状态。
 - 同一 `source_thread_id` 任何时刻最多只能有一个非终态 attempt：
   - `prepared`
+  - `arm_pending`
   - `cooldown`
 - bridge 为 caller arm heartbeat 时，必须把以下值同时写入 caller prompt：
   - `batch_id`
@@ -425,10 +435,15 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - 以 `(source_thread_id, attempt_id, generation)` 为 key
   - 只用于串行化 bridge 自己的 arm 流程
   - 不得改变 head batch 的外部可见性
-- Desktop 第一版里，bridge 侧真正允许推进 durable 状态的动作只有：
-  - `automation_update` 被 Codex 接受
-  - 随后的 `cbth desktop note-arm ...` 成功
-- 因此，即使 bridge 在 `claim-next-ready` 返回后崩溃，head batch 也必须仍然保持可见、可重读、可再次 arm。
+- Desktop 第一版里，bridge 侧真正允许推进 durable 状态的动作有两步：
+  - `cbth desktop note-arm-pending ...` 先把当前 head attempt durable 推到 `arm_pending`
+  - 之后 `automation_update` 被 Codex 接受
+  - 随后的 `cbth desktop note-arm ...` 再把 attempt 推到 `cooldown`
+- 因此，即使 bridge 在 `claim-next-ready` 返回后崩溃，head batch 也必须仍然保持可见、可重读。
+- 但只要某个 attempt 已经进入 `arm_pending`，bridge 就不得再对同一 `attempt_id + generation` 重新 arm，直到该 attempt 被明确收口为：
+  - `cooldown`
+  - `abandoned`
+  - `superseded`
 - Desktop 第一版里，运行期对 bound caller heartbeat 的 automation mutation 必须只允许 bridge / operator 发起：
   - caller prompt 自己不得直接 `pause` / `update` / `delete` 这个长期复用的 automation
   - stale wake、不可读、caller 成功或 degraded 之后的 pause/reconcile 都必须由 bridge 在后续 heartbeat 中完成
@@ -461,9 +476,11 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 #### Attempt 迁移
 
 ```text
-prepared -> cooldown -> closed
+prepared -> arm_pending -> cooldown -> closed
 prepared -> abandoned
 prepared -> superseded
+arm_pending -> abandoned
+arm_pending -> superseded
 cooldown -> abandoned
 cooldown -> superseded
 ```
@@ -476,6 +493,10 @@ cooldown -> superseded
 - 第一版 durable 状态里不再保留单独的 `armed`。
 - 一次 wakeup arm 一旦被 delivery channel 接受并被 `note-arm` durable 记录，attempt 就直接进入 `cooldown`。
 - `cooldown` 表示 `cbth` 正在等待这次 wakeup 的最短观察窗口结束；窗口结束后，如果 batch 仍是 head 且仍允许自动重投，就会生成新 attempt，而不是直接把旧 attempt 视为成功关闭。
+- `arm_pending` 表示 bridge 已经 durable 记录“准备为该 attempt arm caller heartbeat”，但这次 arm 还没有被 `note-arm` 最终确认。
+- 只要 attempt 仍处于 `arm_pending`：
+  - 它就不再是新的 ready head
+  - bridge 必须先做 reconcile，而不是再对同一 `attempt_id + generation` 重新 arm
 - 如果某次 wakeup arm 已被 delivery channel 接受，但 `note-arm` 结果无法 durable 确认，则必须先走 reconcile：
   - 能证明 arm 成功 -> 按成功 arm 处理
   - 能证明 caller heartbeat 已重新 `PAUSED` -> 当前 attempt 收敛到 `abandoned`，head batch 仍可保持 `replay_policy=automatic`
@@ -622,10 +643,20 @@ cooldown -> superseded
   - CLI benign race 不得递增 `delivery_attempt_count`
   - 只有真正进入 delivery channel 的尝试才会逼近 `max_delivery_attempts`
 - `cbth desktop note-arm ...` 的合同必须再补两条：
-  - compare-and-swap：
+  - `cbth desktop note-arm-pending ...` 先提供一个 compare-and-swap durable barrier：
     - 只有当 `(source_thread_id, attempt_id, generation)` 仍指向当前 head attempt
     - 且当前 durable 状态仍是 `prepared`
-    - 才允许执行唯一一次 `prepared -> cooldown`
+    - 且当前 `bridge_arm_lease_id` 仍由本次 bridge 流程持有
+    - 才允许执行唯一一次 `prepared -> arm_pending`
+    - 并记录：
+      - `arm_pending_since`
+      - `arm_pending_deadline`
+    - 如果同一 attempt 已经是 `arm_pending`，重复调用只能返回 already-pending / idempotent success
+    - 如果 attempt 已过期、已 superseded 或已离开 head，则必须 stale/no-op
+  - compare-and-swap：
+    - 只有当 `(source_thread_id, attempt_id, generation)` 仍指向当前 head attempt
+    - 且当前 durable 状态仍是 `arm_pending`
+    - 才允许执行唯一一次 `arm_pending -> cooldown`
     - 且当前 `bridge_arm_lease_id` 仍由本次 bridge 流程持有
   - idempotent retry：
     - 如果同一 attempt 之前已经成功进入 `cooldown`
@@ -738,6 +769,13 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
   - 并且准备跨过 continuation boundary，开始产生后续 assistant 输出或工具 / 行动副作用
   - 这个 helper 必须发生在真正跨过 continuation boundary 之前
   - 只有它成功后，caller 才允许继续执行后续 continuation
+  - 它也必须具备 compare-and-swap / stale-no-op 语义：
+    - 只有当当前 head batch 仍匹配 `(source_thread_id, attempt_id, generation)`
+    - 且 `continuation_boundary_state=not_crossed`
+    - 且 batch 仍然 open
+    - 才允许唯一一次把状态推进到 `crossed_unacknowledged`
+    - 如果同一 attempt/generation 已经进入 `crossed_unacknowledged` 或 `acknowledged`
+    - 重复调用必须返回 already-crossed / stale-no-op，而不是再次授权 caller 继续
   - 它一旦成功，当前 head batch 必须 durable 进入：
     - `continuation_boundary_state=crossed_unacknowledged`
     - `replay_policy=manual_resolution_only`
@@ -748,6 +786,13 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
   - 第一版的 continuation preparation 至少意味着 caller 已经：
     - 构造好了将要发送的 assistant 输出
     - 或确定并准备发起下一个基于该 batch 的工具 / 行动步骤
+  - 它同样必须具备 compare-and-swap / stale-no-op 语义：
+    - 只有当 `continuation_boundary_state=crossed_unacknowledged`
+    - 且 `boundary_attempt_id + boundary_generation` 仍匹配当前调用
+    - 才允许唯一一次把 batch 收口到 `caller_acknowledged`
+    - 如果同一 boundary 已经被 `acknowledged`
+    - 重复调用只能返回 already-delivered / idempotent success
+    - 如果 attempt/generation 已过期、batch 已 superseded 或已被别的原因关闭，则必须 stale/no-op
 - 但第一版必须进一步收紧：
   - `note-delivered` 不适用于“纯文本最终回复后立即结束 turn”的路径
   - 因为当前 Desktop surface 没有一个安全的 post-output ack 点
@@ -885,8 +930,14 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
 - 第一版不要求 Desktop heartbeat turn 在关键路径上执行通用 `cbth job ...` CLI。
 - 但 Desktop adapter 可以依赖两类窄接口：
   - `helper_cli_read`：只读 envelope/helper
-  - `cbth desktop note-arm ...`：bridge 成功 arm 后的窄写回
+  - narrow helper writeback：
+    - `cbth desktop note-arm-pending ...`
+    - `cbth desktop note-arm ...`
+    - `cbth desktop note-boundary-crossed ...`
+    - `cbth desktop note-delivered ...`
 - 第一版如果不用 `direct_file_read`，则 helper 链路必须是完整可用的：
+  - `cbth desktop note-arm-pending ...`
+  - `cbth desktop list-arm-pending ...`
   - `cbth desktop list-pause-due ...`
   - `cbth desktop claim-next-ready ...`
   - `cbth desktop read-envelope ...`
