@@ -87,7 +87,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
    - `bridge-preflight` 是每轮 bridge wake 的必经 helper，不是 `helper_cli_read` fallback：
      - 它负责按需拉起 daemon
      - 执行 deterministic overdue sweep / auto-close / artifact GC / binding reconcile
-     - 原子刷新本轮 `direct_file_read` 或 fallback helper 要读取的 snapshot
+     - 原子发布本轮 `direct_file_read` 或 fallback helper 要读取的 snapshot manifest / revision
    - `direct_file_read` 只表示 bridge 读取 preflight 之后的 refreshed snapshot 不再需要额外读 helper。
    - 底层仍可用 SQLite / 普通文件 / `mmap`，但这属于内部实现细节。
    - 明确不依赖直接改 Codex 自己的 automation DB。
@@ -274,8 +274,9 @@ cbth desktop bridge-preflight --bridge-thread-id <thread_id> --json
 
    - 这个 helper 必须按需拉起 daemon。
    - 它必须先完成 deterministic overdue sweep / auto-close / artifact GC / binding reconcile。
-   - 它必须原子刷新本轮要读取的 `ready-threads.json` / `arm-pending-bindings.json` / `pause-due-bindings.json`。
-   - 它必须返回本轮 snapshot revision / generation。
+   - 它必须原子发布本轮要读取的 snapshot manifest；manifest 内的 `ready-threads.json` / `arm-pending-bindings.json` / `pause-due-bindings.json` 必须全部绑定同一个 `snapshot_revision`。
+   - 它必须返回本轮 `snapshot_manifest_path + snapshot_revision / generation`。
+   - bridge 只允许读取该 manifest 指向的文件；如果任一文件内嵌 revision 与 manifest 不一致，本轮必须 fail closed，不得混读不同 revision。
    - 如果 preflight 失败，bridge 本轮不得继续读取旧 snapshot，也不得 arm caller heartbeat。
    - 因此 `direct_file_read` 只是 refreshed snapshot 的读取传输，不是 daemon liveness / sweep 机制。
 
@@ -522,8 +523,11 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <ba
 ### Bridge 侧
 
 ```text
+~/.cbth/inbox/current-snapshot.json
 ~/.cbth/inbox/ready-threads.json
 ```
+
+`current-snapshot.json` 是 `bridge-preflight` 原子发布的 generation manifest，至少包含本轮 `snapshot_revision` 以及 `ready-threads.json` / `arm-pending-bindings.json` / `pause-due-bindings.json` 的路径或等价 locator。直接暴露传统固定文件名可以保留为兼容视图，但 bridge 必须把 manifest revision 与每个文件内嵌 revision 一起校验；不能只依赖每个文件各自 `rename` 的原子性。
 
 ### Operator / diagnostic exports
 
@@ -557,7 +561,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <ba
 cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
 ```
 
-`bridge-preflight` 是每轮 bridge wake 的 mandatory helper；它成功后，`direct_file_read` 才能读取 freshly generated snapshots。`read-artifact` 保留给 operator/manual recovery，或 future-expansion；它不再属于 v1 automatic caller path。若未来重新启用，它的返回合同至少包括：
+`bridge-preflight` 是每轮 bridge wake 的 mandatory helper；它成功后，`direct_file_read` 才能读取 freshly generated snapshot manifest。`read-artifact` 保留给 operator/manual recovery，或 future-expansion；它不再属于 v1 automatic caller path。若未来重新启用，它的返回合同至少包括：
 
 - `artifact_id`
 - `artifact_read_lease_id`
@@ -570,18 +574,18 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
 - `next_offset`
 - `eof`
 
-命令行参数名 `--artifact-read-lease-id` 是通用读取 lease 槽位；Desktop v1 operator recovery 传入的值必须是 `cbth batch inspect --batch-id ...` 新签发的 `artifact_recovery_lease_id`，不存在 automatic caller continuation lease。
+命令行参数名 `--artifact-read-lease-id` 是通用读取 lease 槽位；`read-artifact` 返回的 `artifact_read_lease_id / artifact_read_lease_deadline` 只是对传入读取 lease 的通用回显。Desktop v1 operator recovery 的外部 schema 必须命名为 `artifact_recovery_lease_id + artifact_recovery_lease_deadline`；传给 `--artifact-read-lease-id` 的值就是 `artifact_recovery_lease_id`，不存在 automatic caller continuation lease。
 
-也就是说，大 artifact 的后续读取不能只靠 `artifact_id`；必须同时带上 operator recovery 路径新签发的 `artifact_recovery_lease_id`。
+也就是说，大 artifact 的后续读取不能只靠 `artifact_id`；operator recovery 必须先拿到新签发的 `artifact_recovery_lease_id + artifact_recovery_lease_deadline`，后续 `read-artifact` 调用使用该 lease id 且必须在 deadline 前完成。
 这个 lease 还必须是短寿命 recovery lease，而不是长期 artifact bearer token：
 
 - 它只对当前 operator recovery session 和指定 `batch_id` 有效
 - `note-boundary-crossed` fresh success 会关闭 batch，但不得删除 `boundary_recovery_envelope`
 - `boundary_recovery_envelope` 必须至少保留到 batch/artifact retention contract 允许 GC
-- 短寿命 `artifact_recovery_lease_id` 必须在 deadline 到期、lease rotation、artifact GC、或 operator 明确 revoke 后失效
+- 短寿命 `artifact_recovery_lease_id` 必须在 `artifact_recovery_lease_deadline` 到期、lease rotation、artifact GC、或 operator 明确 revoke 后失效
 - 如果 caller 没拿到第一次 `note-boundary-crossed` success 的返回值，自动 caller path 不得重新申请新的 artifact lease；只能通过 operator recovery 读取 durable `boundary_recovery_envelope` / manifest 做人工收口
 - 对大 artifact，这个 operator recovery 还必须闭环成：
-  - `cbth batch inspect --batch-id ...` 返回 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
+  - `cbth batch inspect --batch-id ...` 返回 operator-only `artifact_recovery_lease_id + artifact_recovery_lease_deadline`（或等价 re-lease surface）
   - 这样人工/operator 才能继续调用 `cbth desktop read-artifact ...` 完成收口
 
 也就是说，`helper_cli_read` 对大 artifact 的 fallback 不是返回一个路径，而是返回一个显式 chunked payload 协议。
@@ -776,11 +780,15 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
 ### Binding degraded
 
 - `binding_state=degraded` 表示该 thread 暂时失去自动续跑能力，但 job / artifact 仍可继续累积。
-- degraded 之后：
+- degraded 之后，若当前 head batch 仍处于 pre-boundary / 未 `handoff_recorded`：
   - bridge 不得再为该 thread 自动 arm caller heartbeat
   - 当前 in-flight attempt 必须收敛到 `abandoned`
   - 当前 head batch 保持未关闭
   - 调度器只保留结果与元数据，不继续自动 redelivery
+- 如果 degraded 发生时相关 batch 已经 `handoff_recorded`：
+  - batch 已关闭并释放 FIFO
+  - 不得重新打开或重新保持为 head
+  - lost response 只能通过 `cbth batch inspect --batch-id ...` 做 operator recovery
 - operator 必须通过显式 CLI 路径来解开这个状态，至少支持两类动作：
 
 ```text

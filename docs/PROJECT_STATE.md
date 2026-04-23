@@ -24,7 +24,7 @@
     - `direct_file_read`
     - `helper_cli_read`
   - 其中 `direct_file_read` 仍是候选优先路径，`helper_cli_read` 只是条件性 fallback
-  - 但 `direct_file_read` 不是 daemon liveness 机制：每轮 bridge wake 仍必须先执行窄 helper `cbth desktop bridge-preflight ...`，按需拉起 daemon、补做 overdue sweep / GC / auto-close / reconcile，并原子刷新 ready/reconcile snapshots
+  - 但 `direct_file_read` 不是 daemon liveness 机制：每轮 bridge wake 仍必须先执行窄 helper `cbth desktop bridge-preflight ...`，按需拉起 daemon、补做 overdue sweep / GC / auto-close / reconcile，并原子发布同一 `snapshot_revision` 的 ready/reconcile manifest
   - 同时又补了一层 explicit desktop binding：bridge 运行期只更新已知 caller automation，不做 blind create/discovery
   - Desktop 的 `read_transport` 也已收口为 installation-wide 选择：
     - binding 里只 durable 镜像当前安装选定 transport 与其 generation
@@ -177,6 +177,14 @@
   - v1 不提供 late-bind / external discovery surface；如需换目标 thread，必须新开 session
   - 如果用户想把自动续跑目标换到另一个 thread，必须显式开新 session 或等待未来的 rebind contract
 - CLI 的 delivery completion contract 也继续收口：
+  - 在真正调用 `turn/start` / `turn/steer` 前，必须先 durable 写入 `accept_pending` barrier：
+    - `delivery_rpc_request_id`
+    - `delivery_rpc_kind`
+    - `delivery_rpc_started_at`
+    - `delivery_rpc_state=pending_acceptance`
+    - `delivery_rpc_correlation_marker`
+  - response 丢失时，只有同一 `managed_session_id + session_epoch` 的连续 event/current-state 面能正向证明 marker 已接入 exactly one caller turn，才允许补写 `delivery_turn_id`
+  - 如果既不能证明 accepted，也不能证明未 accepted，当前 head batch 必须 fail-closed 到 `manual_resolution_only`，不得重新发送同一 batch
   - `turn/start` / `turn/steer` 被接受，只表示 batch 已接入某个 caller turn 的 pending input
   - 每次 accepted attempt 都必须 durable 记录 `delivery_turn_id`
   - accepted attempt 还必须 durable 绑定 `managed_session_id + session_epoch`

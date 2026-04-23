@@ -160,10 +160,13 @@
 1. `direct_file_read`
 
 ```text
+~/.cbth/inbox/current-snapshot.json
 ~/.cbth/inbox/ready-threads.json
 ~/.cbth/inbox/arm-pending-bindings.json
 ~/.cbth/inbox/pause-due-bindings.json
 ```
+
+`current-snapshot.json` 是 `bridge-preflight` 原子发布的 generation manifest；固定文件名可以作为兼容视图存在，但 bridge 必须按 manifest revision 校验所有读取文件。
 
 附加的 `by-thread/<thread_id>.json` / artifact 文件只允许作为 operator/debug export：
 
@@ -204,7 +207,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
 bridge 侧 `direct_file_read` 与 `helper_cli_read` 必须返回同一个 ready-entry schema。
 caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` success 返回来获得 inline continuation payload / summary。
 
-`bridge-preflight` 是每轮 bridge wake 的 mandatory helper：它按需拉起 daemon，执行 overdue sweep / auto-close / artifact GC / binding reconcile，并原子刷新本轮 snapshot。`helper_cli_read` 的合同要额外收紧：
+`bridge-preflight` 是每轮 bridge wake 的 mandatory helper：它按需拉起 daemon，执行 overdue sweep / auto-close / artifact GC / binding reconcile，并原子发布本轮 snapshot manifest。`helper_cli_read` 的合同要额外收紧：
 
 - 它不是“完全摆脱本地 CLI 执行依赖”的路径。
 - 它只是 Desktop 在 `direct_file_read` 失败时可考虑的窄 helper fallback。
@@ -218,6 +221,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 `direct_file_read` 的第一版自动路径只暴露 bridge-ready / reconcile metadata：
 
 ```text
+~/.cbth/inbox/current-snapshot.json
 ~/.cbth/inbox/ready-threads.json
 ~/.cbth/inbox/arm-pending-bindings.json
 ~/.cbth/inbox/pause-due-bindings.json
@@ -232,8 +236,10 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 
 更新方式：
 
-- 用 `write temp + rename` 原子替换。
-- 外部语义固定为“读快照文件”。
+- daemon 先写入 generationed snapshot files，再发布一个包含 `snapshot_revision` 与各文件 locator 的 `current-snapshot.json` manifest。
+- manifest 用 `write temp + rename` 原子替换；单个数据文件也必须用 temp + rename，但多文件一致性只由 manifest revision 合同保证。
+- bridge 必须先读取 manifest，再读取 manifest 指向的文件，并确认每个文件内嵌 `snapshot_revision` 都等于 manifest revision；任何 mismatch 都必须 fail closed。
+- 外部语义固定为“读同一 generation 的快照 manifest + 文件”。
 - 后续如果内部改成 `mmap` / shared memory，只能在不改变这一语义的前提下做。
 - `direct_file_read` 在 Desktop 无审批读取能力得到实证前，仍视为候选内部 contract，而不是已冻结接口。
 - 如果 `direct_file_read` 无法满足无审批读取约束，Desktop 第一版只能切到“已单独验证过的 `helper_cli_read`”，否则就继续保留为候选方案；不能直接把未验证 helper 执行前提当主链路。
@@ -511,6 +517,17 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - `bridge_arm_lease_deadline` (Desktop optional)
 - `arm_pending_since` (Desktop optional)
 - `arm_pending_deadline` (Desktop optional)
+- `delivery_rpc_request_id` (CLI optional)
+- `delivery_rpc_kind` (CLI optional)
+  - `turn_start`
+  - `turn_steer`
+- `delivery_rpc_started_at` (CLI optional)
+- `delivery_rpc_state` (CLI optional)
+  - `pending_acceptance`
+  - `accepted`
+  - `rejected_before_accept`
+  - `acceptance_unknown`
+- `delivery_rpc_correlation_marker` (CLI optional)
 - `delivery_turn_id` (optional)
 - `managed_session_id` (CLI optional)
 - `session_epoch` (CLI optional)
@@ -538,6 +555,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 #### Attempt 状态
 
 - `prepared`
+- `accept_pending`
 - `arm_pending`
 - `cooldown`
 - `closed`
@@ -688,8 +706,11 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 
 ```text
 prepared -> arm_pending -> cooldown -> closed
+prepared -> accept_pending -> cooldown -> closed
 prepared -> abandoned
 prepared -> superseded
+accept_pending -> abandoned
+accept_pending -> superseded
 arm_pending -> abandoned
 arm_pending -> superseded
 cooldown -> abandoned
@@ -705,9 +726,14 @@ cooldown -> superseded
 - 第一版 durable 状态里不再保留单独的 `armed`。
 - 一次 wakeup arm 一旦被 delivery channel 接受并被 `note-arm` durable 记录，attempt 就直接进入 `cooldown`。
 - `cooldown` 表示 `cbth` 正在等待这次 wakeup 的最短观察窗口结束；窗口结束后，如果 batch 仍是 head 且仍允许自动重投，就会生成新 attempt，而不是直接把旧 attempt 视为成功关闭。
+- `accept_pending` 表示 CLI adapter 已经 durable 记录“准备调用 `turn/start` / `turn/steer`”，但还没有 durable 证明这次 side-effectful RPC 被接受或未被接受。
+  - 进入 `accept_pending` 时必须写入 `delivery_rpc_request_id + delivery_rpc_kind + delivery_rpc_started_at + delivery_rpc_state=pending_acceptance + delivery_rpc_correlation_marker`
+  - 只要 attempt 仍处于 `accept_pending`，该 batch 不得 automatic redelivery
+  - 如果同一连续 event/current-state 面能证明 marker 被接入 exactly one caller turn，则补写 `delivery_turn_id` 并进入 `cooldown`
+  - 如果同一连续 event/current-state 面能证明 RPC 未被接受，则允许回到 retry-on-idle / benign-race path
+  - 如果 acceptance 结果无法证明，attempt 必须进入 `abandoned`，head batch 必须进入 `manual_resolution_only`
 - `arm_pending` 表示 bridge 已经 durable 记录“准备为该 attempt arm caller heartbeat”，但这次 arm 还没有被 `note-arm` 最终确认。
-- 只要 attempt 仍处于 `arm_pending`：
-  - 它就不再是新的 ready head
+  - 只要 attempt 仍处于 `arm_pending`，它就不再是新的 ready head
   - bridge 必须先做 reconcile，而不是再对同一 `attempt_id + generation` 重新 arm
 - 如果某次 wakeup arm 已被 delivery channel 接受，但 `note-arm` 结果无法 durable 确认，则必须先走 reconcile：
   - 能证明 arm 成功 -> 按成功 arm 处理
@@ -736,10 +762,20 @@ cooldown -> superseded
 
 ### CLI `delivery_turn_id` 观察连续性
 
+- 在调用 `turn/start` / `turn/steer` 前，CLI adapter 必须先 durable 写入 `accept_pending` barrier：
+  - `delivery_rpc_request_id`
+  - `delivery_rpc_kind`
+  - `delivery_rpc_started_at`
+  - `delivery_rpc_state=pending_acceptance`
+  - `delivery_rpc_correlation_marker`
+- `delivery_rpc_correlation_marker` 必须随 RPC 一起进入 app-server 可观察输入；协议如果没有 opaque idempotency key，就把短 marker 放进 continuation prompt。
+- 如果 RPC response 丢失，只有在同一 `managed_session_id + session_epoch` 的连续 event/current-state 面能正向证明 marker 被接入 exactly one caller turn 时，adapter 才允许补写 `delivery_turn_id`。
+- 如果无法证明 accepted，也无法证明未 accepted，当前 attempt 必须 fail-closed 到 `abandoned + manual_resolution_only`，不得自动重发。
 - 一旦某个 CLI attempt 已经被 `turn/start` 或 `turn/steer` 接受，并 durable 记录了 `delivery_turn_id`，后续安全收口就建立在“持续观察同一个 managed session / app-server 实例的 turn 事件流”之上。
 - 因此，accepted CLI attempt 还必须 durable 绑定：
   - `managed_session_id`
   - `session_epoch`
+  - `delivery_rpc_request_id`
   - `delivery_turn_id`
   - `delivery_observation_deadline`
 - 其中：
@@ -1163,7 +1199,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <ba
     - 它们在 bridge 侧就必须被留给 manual/operator follow-up
   - `boundary_recovery_envelope` 也必须足以支持 operator recovery：
     - 小 payload：直接 durable 保存可恢复的 inline payload / summary
-    - 大 artifact：至少 durable 保存 manifest，并允许 operator recovery 按需签发短寿命 `artifact_recovery_lease_id`
+    - 大 artifact：至少 durable 保存 manifest，并允许 operator recovery 按需签发短寿命 `artifact_recovery_lease_id + artifact_recovery_lease_deadline`
     - `cbth desktop read-artifact --artifact-read-lease-id ...` 的参数名是通用读取 lease 槽位；Desktop v1 recovery 传入的值就是 `artifact_recovery_lease_id`
     - `note-boundary-crossed` fresh success 会关闭 batch，但不得删除 `boundary_recovery_envelope`
     - `boundary_recovery_envelope` 必须至少保留到 batch/artifact retention contract 允许 GC
@@ -1193,7 +1229,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <ba
   - 后续只能走 operator recovery：
     - `cbth batch inspect --batch-id ...` 必须暴露 `boundary_recovery_envelope`
     - 以及必要的 artifact manifest / diagnostic refs
-    - 对大 artifact 还必须返回 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
+    - 对大 artifact 还必须返回 operator-only `artifact_recovery_lease_id + artifact_recovery_lease_deadline`（或等价 re-lease surface）
   - v1 选择 safety over liveness：不允许靠下一次 heartbeat 自动重放同一 delivery
 - 如果 caller 已经越过 continuation boundary 但还没成功得到 `note-boundary-crossed` 的 success 返回：
   - 这属于违背第一版安全合同的实现错误
@@ -1253,8 +1289,8 @@ cbth desktop binding unbind
 - `cbth desktop bridge-preflight ...` 是 Desktop bridge 每轮 wake 的必经窄 helper：
   - 它按需拉起 daemon
   - 执行 deterministic overdue sweep / GC / auto-close / binding reconcile
-  - 原子刷新 `ready-threads.json` / `arm-pending-bindings.json` / `pause-due-bindings.json`
-  - 返回本轮 snapshot revision / generation
+  - 原子发布本轮 snapshot manifest，并让 `ready-threads.json` / `arm-pending-bindings.json` / `pause-due-bindings.json` 全部绑定同一个 `snapshot_revision`
+  - 返回本轮 `snapshot_manifest_path + snapshot_revision / generation`
   - 如果它失败，本轮 bridge 不得读取旧 snapshot 继续 arm
 - `cbth desktop installation-state repair ...` 是 installation-wide Desktop transport / capability state 的稳定 operator 面：
   - 它才允许切换 `read_transport`
@@ -1286,7 +1322,7 @@ cbth desktop binding unbind
   - 因为 `handoff_recorded` 会立即关闭 batch 并释放 FIFO，当前 head 可能已经是后续 batch
 - `cbth batch inspect --batch-id ...` 必须能对已 `handoff_recorded` 的历史 batch 回显 recovery surface：
   - `boundary_recovery_envelope`
-  - 对大 artifact 则再回显 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
+  - 对大 artifact 则再回显 operator-only `artifact_recovery_lease_id + artifact_recovery_lease_deadline`（或等价 re-lease surface）
   - 这保证 `note-boundary-crossed` fresh success 释放 FIFO 后，lost post-boundary response 仍可人工恢复
 - `cbth desktop binding repair ...` 的成功输出必须至少回显：
   - `read_transport_capability`
@@ -1396,6 +1432,7 @@ cbth desktop installation-state repair --read-transport <transport> [--read-tran
 cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_unconfirmed --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_delivery --json
 cbth batch inspect-head --source-thread-id <thread_id> --json
+cbth batch inspect --batch-id <batch_id> --json
 cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <true|false> --json
 ```
 

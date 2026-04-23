@@ -412,7 +412,23 @@ CLI adapter 不直接按单 job 投递，而是消费共享核心为每个 threa
 thread/resume + turn/start
 ```
 
-- 无论 `turn/start` 还是 `turn/steer`，第一版都必须把“RPC 被 server 接受”与“batch 已成功送达”分开建模。
+- 无论 `turn/start` 还是 `turn/steer`，第一版都必须把“准备发送 side-effectful RPC”、“RPC 被 server 接受”与“batch 已成功送达”分开建模。
+- 在调用 `turn/start` / `turn/steer` 之前，CLI adapter 必须先 durable 写入一个 accept-pending barrier：
+  - `delivery_rpc_request_id`
+  - `delivery_rpc_kind=turn_start|turn_steer`
+  - `delivery_rpc_started_at`
+  - `delivery_rpc_state=pending_acceptance`
+  - `delivery_rpc_correlation_marker`
+- `delivery_rpc_correlation_marker` 必须随 RPC 一起进入 app-server 可观察输入：
+  - 如果上游 RPC 支持 opaque idempotency / metadata，就用协议字段承载
+  - 否则把一个短的 CBTH marker 放进投递给 caller 的 continuation prompt
+  - marker 只用于本地相关性判定，不得携带 artifact payload 或敏感内容
+- 只要 attempt 已经进入 `accept_pending` / `delivery_rpc_state=pending_acceptance`，它就不再是普通 pre-accept retry：
+  - adapter 不得因为 daemon 崩溃、websocket 断开、或 response 丢失而直接重新发送同一个 batch
+  - 下一次 sweep 必须先做 accepted/unknown reconciliation
+- 如果 RPC 在同一进程、同一 `managed_session_id + session_epoch` 内明确返回“未被接受”的 benign reject，例如 idle race 或 non-steerable active turn，才允许把该 attempt 恢复为 retry-on-idle 或重新排队。
+- 如果 RPC response 丢失，但 daemon 能在同一连续 event/current-state 面里正向证明同一个 `delivery_rpc_correlation_marker` 已经被接入且只接入一个具体 caller turn，则必须补写 `delivery_turn_id` 并按 accepted attempt 继续观察。
+- 如果无法正向证明 accepted，也无法正向证明未 accepted，当前 attempt 必须收敛到 `abandoned`，当前 head batch 必须进入 `replay_policy=manual_resolution_only`，不得 automatic retry。
 - 对 CLI 来说，accepted delivery 的第一层语义是：
   - batch 已被接入某个具体 caller turn 的 pending input / input queue
   - 但 batch 还不能因此立刻 `closed`

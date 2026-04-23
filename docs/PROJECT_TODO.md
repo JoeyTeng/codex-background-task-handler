@@ -25,9 +25,12 @@
   - open 但长窗口的 batch / attempt 不单独阻止退出；由下次启动时的 overdue sweep 收口
   - 唯一例外是 CLI accepted attempt 的 `delivery_observation_deadline`，它在 deadline 到期前必须常驻观察
 - [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 bridge-side 所需的只读 inbox snapshot，且不会卡审批：
+  - `current-snapshot.json`
   - `ready-threads.json`
   - `arm-pending-bindings.json`
   - `pause-due-bindings.json`
+  - `bridge-preflight` 必须原子发布同一 `snapshot_revision` 的 manifest
+  - bridge 必须校验 manifest revision 与每个 snapshot 文件内嵌 revision 一致
   - 大 artifact 的正式自动路径不再依赖直接读 `artifacts/<artifact_id>/payload`
 - [ ] 如果未来要把大 artifact 纳入 automatic caller path，再单独验证 `cbth desktop read-artifact ...` 在 heartbeat / caller 路径中的无审批能力，并把结果写回 `artifact_read_capability`。
 - [ ] 单独验证 Desktop heartbeat 在后台运行时，是否能无审批执行窄 `cbth desktop ...` helper：
@@ -81,7 +84,7 @@
   - `cbth desktop list-arm-pending --bridge-thread-id ... --json`
   - `cbth desktop list-pause-due --bridge-thread-id ... --json`
   - `cbth desktop claim-next-ready --bridge-thread-id ... --json`
-  - `bridge-preflight` 是每轮 bridge wake 的 mandatory helper；`direct_file_read` 也必须先通过它刷新 snapshots
+  - `bridge-preflight` 是每轮 bridge wake 的 mandatory helper；`direct_file_read` 也必须先通过它发布 snapshot manifest
   - `cbth desktop read-artifact --artifact-id ... --artifact-read-lease-id ... --offset ... --max-bytes ... --json` 只属于 operator/manual recovery 或 future-expansion；v1 里传入的 lease 必须来自 operator recovery 签发的 `artifact_recovery_lease_id`
   - chunked payload return contract 只用于 recovery / future-expansion，不属于 v1 automatic caller path
 - [ ] 按已定稿合同实现 `claim-next-ready` 的纯 read/peek 语义：
@@ -174,11 +177,11 @@
   - stale / mismatch / closed batch 才返回 stale-no-op
 - [ ] 为 Desktop operator/manual 大 artifact recovery 定死 lease 生命周期：
   - automatic caller path 不再依赖 `artifact_read_lease`
-  - operator recovery 需要单独的 `artifact_recovery_lease_id + artifact_read_lease_deadline`
+  - operator recovery 需要单独的 `artifact_recovery_lease_id + artifact_recovery_lease_deadline`
   - `read-artifact` 只能在持有当前有效 lease 时读取
   - `note-boundary-crossed` fresh success 关闭 batch 后，`boundary_recovery_envelope` 仍必须按 retention contract 保留
   - 短寿命 recovery lease 在 deadline 到期 / lease rotation / artifact GC / operator revoke 后必须失效
-  - `batch inspect --batch-id ...` 还必须能返回 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
+  - `batch inspect --batch-id ...` 还必须能返回 operator-only `artifact_recovery_lease_id + artifact_recovery_lease_deadline`（或等价 re-lease surface）
 - [ ] 如果未来需要 post-output ack，再单独设计 `note-delivered` 合同：
   - 不进入 v1 自动续跑主路径
   - 必须建立 post-output / post-side-effect observation contract
@@ -250,6 +253,11 @@
   - `batch_id`
   - `attempt_id`
   - `generation`
+  - `delivery_rpc_request_id` (CLI)
+  - `delivery_rpc_kind` (CLI)
+  - `delivery_rpc_started_at` (CLI)
+  - `delivery_rpc_state` (CLI)
+  - `delivery_rpc_correlation_marker` (CLI)
   - `delivery_turn_id` (CLI)
   - optional `automation_id`
   - stale wake no-op 规则
@@ -316,6 +324,9 @@
   - 第一版不做前台 thread-switch 的自动观测或自动 retarget
   - 如需把自动续跑目标换到别的 thread，必须显式开新 session 或等待未来 rebind contract
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
+  - `turn/start` / `turn/steer` 前必须先进入 `accept_pending`
+  - `accept_pending` 必须 durable 记录 `delivery_rpc_request_id + delivery_rpc_correlation_marker`
+  - response 丢失后只能通过同一连续 event/current-state 面正向证明 marker 已接入 exactly one caller turn；否则 fail-closed，不得自动重发
   - accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
   - accepted attempt 必须 durable 记录 `delivery_accepted_at`
   - accepted attempt 必须 durable 记录 `last_observed_turn_event + last_observed_turn_event_at`
