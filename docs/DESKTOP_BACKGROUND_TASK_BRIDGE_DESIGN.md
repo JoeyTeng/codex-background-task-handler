@@ -316,7 +316,8 @@ fallback:  cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 ```
 
    - 所有到达 `pause_deadline` 的 binding 都必须优先处理
-   - 只有在 bridge 确认这些 one-shot wake 已被 pause / otherwise quiesced 并写入 `armed_generation_quiesced_at`，或 binding 已进入 `degraded` 后，才允许同一 binding 继续 fresh-arm 新 batch
+   - 只有在 bridge 确认这些 one-shot wake 已被 pause / otherwise quiesced 并写入 `armed_generation_quiesced_at` 后，才允许同一 binding 继续 fresh-arm 新 batch
+   - 如果 binding 已进入 `degraded`，它必须从 eligible fresh-arm set 中移除；只有 operator repair 明确恢复 `bound` 并创建/授权 fresh attempt / generation 后，才能重新自动续跑
    - overdue binding 的读取面必须是：
 
 ```text
