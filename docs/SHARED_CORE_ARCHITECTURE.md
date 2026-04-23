@@ -180,7 +180,7 @@ cbth desktop bridge-preflight --bridge-thread-id <thread_id> --json
 cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
-cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
+cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <batch_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
 cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
 ```
 
@@ -360,6 +360,10 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - `read_transport_capability=validated`
   - `writeback_capability=validated`
   - binding 镜像的 `validation_fingerprint` 等于当前 `desktop_installation_state.validation_fingerprint`
+- Desktop v1 中，`read_transport_capability=validated` 不是单纯“能读文件”的结论；它必须同时证明：
+  - bridge heartbeat 可以无审批执行 mandatory `cbth desktop bridge-preflight ...`
+  - preflight 能按需拉起 daemon、完成 overdue sweep / refresh snapshot
+  - 当前 installation-wide `read_transport` 能无审批读取 preflight 刷新的 ready/reconcile snapshots
 - `requires_artifact_read=true` 的 batch 不进入 v1 automatic caller path
 - Desktop v1 不支持同一安装里 mixed `read_transport` bindings：
   - 同一 Desktop 安装只允许一个 installation-wide `read_transport`
@@ -625,7 +629,15 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - Desktop 第一版里，运行期对 bound caller heartbeat 的 automation mutation 必须只允许 bridge / operator 发起：
   - caller prompt 自己不得直接 `pause` / `update` / `delete` 这个长期复用的 automation
   - stale wake、不可读、caller 成功或 degraded 之后的 pause/reconcile 都必须由 bridge 在后续 heartbeat 中完成
+- `note-boundary-crossed` 的 mutation-side CAS 必须先校验调用方传入的完整 token：
+  - `source_thread_id`
+  - `batch_id`
+  - `attempt_id`
+  - `generation`
+  - `expected_snapshot_revision`
+- 任一 token 与当前 head batch / head attempt / materialized snapshot 不一致时，helper 必须在任何 mutation 前返回 stale/no-op。
 - `note-boundary-crossed` 的 success 返回也必须回显：
+  - `source_thread_id`
   - `batch_id`
   - `attempt_id`
   - `generation`
@@ -861,6 +873,11 @@ cooldown -> superseded
 - `continuation_boundary_crossed_at`
 - `boundary_attempt_id`
 - `boundary_generation`
+- `boundary_snapshot_revision`
+- `boundary_recovery_envelope_ref`
+- `boundary_recovery_envelope_bytes`
+- `boundary_recovery_retention_until`
+- `boundary_recovery_operator_pin_until`
 - `replay_policy`
   - `automatic`
   - `manual_resolution_only`
@@ -1001,6 +1018,37 @@ cooldown -> superseded
   - 且 `now >= gc_eligible_at`
   时，artifact 才允许进入 GC。
 
+## Boundary recovery envelope retention
+
+`boundary_recovery_envelope` 是 Desktop `handoff_recorded` 的恢复证据，不是 caller prompt 的普通 payload 文件。
+
+最小 schema：
+
+- `batch_id`
+- `source_thread_id`
+- `attempt_id`
+- `generation`
+- `snapshot_revision`
+- `closed_at`
+- `close_reason=handoff_recorded`
+- `inline_payload_summary` 或 `inline_payload_ref`
+- `artifact_manifest_refs`
+- `artifact_ids`
+- `created_at`
+- `retention_until`
+
+约束：
+
+- `note-boundary-crossed` fresh success 必须在关闭 batch 前原子写入 `boundary_recovery_envelope_ref`。
+- 小 handoff 可以 inline 保存，但必须受 `max_boundary_recovery_inline_bytes` 限制。
+- 超过 inline 上限时，payload 必须进入 managed artifact / recovery object，envelope 只保存受控引用。
+- `boundary_recovery_retention_until` 至少为以下三者最大值：
+  - `closed_at + post_close_ttl`
+  - 所有关联 artifact 的 `retention_until`
+  - `boundary_recovery_operator_pin_until`
+- 在 `now < boundary_recovery_retention_until` 前，不得 GC envelope 或其引用的 recovery object。
+- `cbth batch inspect --batch-id ...` 是读取该 envelope 的稳定 operator surface。
+
 ### Batch 终态语义
 
 第一版把以下情况都视为 batch 终态：
@@ -1051,7 +1099,7 @@ cooldown -> superseded
 - caller 的“明确 crossing 已发生”在第一版里应实现为一个窄 helper：
 
 ```text
-cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
+cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <batch_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
 ```
 
 - `note-boundary-crossed` 是 Desktop 第一版必需的 gated continuation helper：
@@ -1066,7 +1114,8 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
     - supported automatic path 只覆盖这次 handoff phase 的 inline text continuation
     - 任何偏离这条路径的后续动作都属于 unsupported implementation drift，而不是 core delivery safety contract 的一部分
   - 它也必须具备 compare-and-swap / stale-no-op 语义：
-    - 只有当当前 head batch 仍匹配 `(source_thread_id, attempt_id, generation)`
+    - 只有当当前 head batch 仍匹配 `(source_thread_id, batch_id, attempt_id, generation)`
+    - 且当前 materialized snapshot revision 仍等于 `expected_snapshot_revision`
     - 且当前 attempt 已经 durable 进入 `cooldown`
     - 且 binding 上的 `armed_generation` 仍等于当前 `generation`
     - 且 binding 仍处于 `bound`
@@ -1096,6 +1145,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
   - `boundary_recovery_envelope` 也必须足以支持 operator recovery：
     - 小 payload：直接 durable 保存可恢复的 inline payload / summary
     - 大 artifact：至少 durable 保存 manifest，并允许 operator recovery 按需签发短寿命 `artifact_recovery_lease_id`
+    - `cbth desktop read-artifact --artifact-read-lease-id ...` 的参数名是通用读取 lease 槽位；Desktop v1 recovery 传入的值就是 `artifact_recovery_lease_id`
     - `note-boundary-crossed` fresh success 会关闭 batch，但不得删除 `boundary_recovery_envelope`
     - `boundary_recovery_envelope` 必须至少保留到 batch/artifact retention contract 允许 GC
     - 短寿命 artifact recovery lease 只允许在 deadline 到期、lease rotation、artifact GC、或 operator 明确 revoke 后失效
@@ -1109,6 +1159,15 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 - 在 v1 自动 caller path 里，caller 不得在 `note-boundary-crossed` 之前直接读取 per-thread envelope / artifact payload。
 - 如果 `note-boundary-crossed` 返回 error / stale-no-op：
   - caller 必须立即停止，不得继续输出或产生工具副作用
+  - helper 必须把非 success outcome 至少区分为：
+    - `transient_not_ready`
+    - `stale_or_superseded`
+    - `already_crossed_or_handoff_recorded`
+    - `binding_or_capability_invalid`
+    - `unknown_after_helper_failure`
+  - 只有 `transient_not_ready` 且 batch 仍 open、`replay_policy=automatic`、未过 redelivery window 时，bridge 后续才允许 automatic redelivery
+  - `already_crossed_or_handoff_recorded` 必须导向 `cbth batch inspect --batch-id ...` operator recovery，不得自动重放 continuation
+  - `binding_or_capability_invalid` 必须 fail closed 到 degraded/manual operator path，直到 repair 产生 fresh attempt / generation
 - 如果 `note-boundary-crossed` 已经成功过一次，而 caller 没拿到那次 response：
   - 自动 caller path 不得再次 continuation
   - 后续只能走 operator recovery：
@@ -1202,11 +1261,12 @@ cbth desktop binding unbind
   - `delivery_accepted_at`
   - `last_observed_turn_event`
   - `last_observed_turn_event_at`
-- `cbth batch inspect-head ...` 在当前 head batch 已 `crossed_unacknowledged` 时，必须回显：
+- `cbth batch inspect-head ...` 只用于查看当前仍为 head 的 open/manual batch 或 CLI fail-closed 证据：
+  - 它不得被 Desktop lost post-boundary response recovery 依赖
+  - 因为 `handoff_recorded` 会立即关闭 batch 并释放 FIFO，当前 head 可能已经是后续 batch
+- `cbth batch inspect --batch-id ...` 必须能对已 `handoff_recorded` 的历史 batch 回显 recovery surface：
   - `boundary_recovery_envelope`
   - 对大 artifact 则再回显 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
-  - 这些 recovery surface 只用于人工/operator 收口，不重新开启自动 caller continuation
-- `cbth batch inspect --batch-id ...` 必须能对已 `handoff_recorded` 的历史 batch 回显同样 recovery surface：
   - 这保证 `note-boundary-crossed` fresh success 释放 FIFO 后，lost post-boundary response 仍可人工恢复
 - `cbth desktop binding repair ...` 的成功输出必须至少回显：
   - `read_transport_capability`

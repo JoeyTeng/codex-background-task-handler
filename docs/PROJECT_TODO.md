@@ -42,6 +42,7 @@
   - `source_thread_id`
   - `caller_automation_id`
   - `armed_generation`
+  - `pause_not_before`
   - `pause_deadline`
   - `read_transport` (mirrors the installation-wide chosen transport)
   - `read_transport_generation`
@@ -58,6 +59,7 @@
   - bootstrap / repair 是唯一写入路径
   - capability 结论必须绑定 `validation_fingerprint`
   - transport generation 或 fingerprint 变化都必须让旧 validated 结论失效
+  - `read_transport_capability=validated` 必须同时覆盖 mandatory `bridge-preflight` 无审批执行、daemon sweep/refresh 成功、以及刷新后 snapshot 无审批读取
 - [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
   - `ready-threads.json`
   - `arm-pending-bindings.json`
@@ -100,8 +102,9 @@
   - compare-and-swap 只允许唯一一次 `arm_pending -> cooldown`
   - idempotent retry 不得重复递增 `delivery_attempt_count`
 - [ ] 按已定稿合同实现 Desktop continuation-boundary 断点 helper：
-  - `cbth desktop note-boundary-crossed --source-thread-id ... --attempt-id ... --generation ... --expected-snapshot-revision ... --json`
+  - `cbth desktop note-boundary-crossed --source-thread-id ... --batch-id ... --attempt-id ... --generation ... --expected-snapshot-revision ... --json`
   - 必须先于真正的 continuation boundary durable 成功
+  - mutation 前必须先校验完整 caller prompt token：`source_thread_id + batch_id + attempt_id + generation + expected_snapshot_revision`
   - success 前置条件必须包括：attempt 已 durable `cooldown`，且 `armed_generation` 仍匹配
   - 还必须包括 binding / installation-state 仍有效：
     - `binding_state=bound`
@@ -153,7 +156,7 @@
   - `~/.cbth/inbox/pause-due-bindings.json`
   - `cbth desktop list-pause-due --bridge-thread-id ... --json`
   - bridge 每轮必须先 reconcile 这些 binding，再读取新的 ready batch
-- [ ] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
+- [x] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
 - [ ] 把 caller heartbeat 的 one-shot cleanup 合同落进实现：
   - daemon exit 条件必须覆盖 `arm_pending_deadline`
@@ -221,8 +224,8 @@
   - 正常路径只 `pause` / `update` / `reuse`
   - 不在正常投递路径里 `delete`
   - 只有 operator unbind / destroy 才允许删除
-- [ ] 为 Desktop bridge 设计基于 delivery envelope 的共享状态面，不把后台 heartbeat 对通用 `cbth job ...` CLI 的执行能力当成前提。
-- [ ] 为共享核心设计 thread-scoped FIFO 队列、batch 合并规则和最小连续发送间隔。
+- [x] 为 Desktop bridge 设计基于 delivery envelope 的共享状态面，不把后台 heartbeat 对通用 `cbth job ...` CLI 的执行能力当成前提。
+- [x] 为共享核心设计 thread-scoped FIFO 队列、batch 合并规则和最小连续发送间隔。
 - [ ] 为共享核心落地可机判的 delivery policy 字段，至少包括：
   - `delivery_read_only`
   - `delivery_requires_approval`
@@ -262,6 +265,16 @@
   - `max_delivery_attempts`
   - `delivery_attempt_count`
   - `replay_policy`
+  - `boundary_snapshot_revision`
+  - `boundary_recovery_envelope_ref`
+  - `boundary_recovery_envelope_bytes`
+  - `boundary_recovery_retention_until`
+  - `boundary_recovery_operator_pin_until`
+- [ ] 实现 `boundary_recovery_envelope` retention / GC contract：
+  - 小 inline handoff 受 `max_boundary_recovery_inline_bytes` 限制
+  - 超限 payload 进入 managed artifact / recovery object
+  - `boundary_recovery_retention_until` 至少覆盖 `closed_at + post_close_ttl`、关联 artifact retention、operator pin
+  - `cbth batch inspect --batch-id ...` 是 `handoff_recorded` 历史 batch 的稳定恢复入口
 - [ ] 用 Rust 实现 managed artifact store，并把 `cbth job complete --result-file <path>` 定义成 ingest/copy 语义。
 - [ ] 实现 artifact retention / GC contract：
   - `min_artifact_ttl = 24h`

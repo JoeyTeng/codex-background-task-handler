@@ -106,6 +106,7 @@
   - `arm_pending` attempt 不再是新的 ready head；bridge 必须先 reconcile 它，不能重复 arm 同一 generation
   - `note-boundary-crossed` 现在不只是断点写回，而是 gated continuation helper：
     - caller 必须先拿到它的 fresh success 返回，才允许看到 inline continuation payload / summary
+    - helper mutation 前必须校验完整 caller prompt token：`source_thread_id + batch_id + attempt_id + generation + expected_snapshot_revision`
     - 这一步在 v1 是单次 crossing，不再提供自动 replay-safe continuation；response 丢失后改走 operator recovery
   - 如果 `note-boundary-crossed` 尚未 success，caller 不得真正跨过 continuation boundary
   - `note-boundary-crossed` 需要 compare-and-swap / stale-no-op 语义，避免重复 wake 或 supersede 后重复记账
@@ -114,6 +115,7 @@
   - 第一版不再尝试把纯文本回复或后续工具动作自动收口成 “已送达”；`handoff_recorded` 只表示 inline handoff payload / recovery envelope 已 durable 记录，释放 FIFO，但不证明 caller assistant 文本可见
   - post-boundary lost response 只能通过 `cbth batch inspect --batch-id ...` 读取 `boundary_recovery_envelope` 做 operator recovery
   - `note-arm` 也新增了 CAS/幂等合同，避免 bridge 重试导致重复计数
+  - `note-boundary-crossed` 的非 success outcome 已拆成 transient / stale / already-crossed / capability-invalid / unknown，避免把已 `handoff_recorded` 的 batch 误重投
   - pre-boundary 歧义 batch 的 durable 表达应落成 `replay_policy=manual_resolution_only`
   - 默认只允许 operator close；若长期无人处理，则在 `redelivery_window_ends_at` 到期时自动 close 释放 FIFO/GC
 - 第一版自动续跑总门槛也已统一：
@@ -140,6 +142,7 @@
     - `snapshot_path` 只保留在 bridge-side locator，不进入 caller prompt
     - `caller_automation_id` 一律由 bridge 通过 `source_thread_id -> binding` lookup 解析
   - daemon 自动退出条件也必须覆盖这两个 deadline
+  - `read_transport_capability=validated` 现在明确包括 mandatory `bridge-preflight` 的无审批执行、daemon sweep/refresh 成功，以及刷新后 snapshot 的无审批读取
   - bridge 还需要一个专门的 overdue-binding 输入面：
     - `~/.cbth/inbox/arm-pending-bindings.json`
     - 或 `cbth desktop list-arm-pending ...`
