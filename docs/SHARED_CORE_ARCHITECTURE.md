@@ -70,7 +70,7 @@
   - batch 自身满足只读 / 低风险 delivery policy
   - 当前安装上的 Desktop 读路径已被验证可在 heartbeat 中无审批执行
   - 当前安装上的 Desktop writeback helpers 已被验证可在 heartbeat 中无审批执行
-  - 对大 artifact batch，当前 binding 上的 `artifact_read_capability=validated`
+  - 对 `requires_artifact_read=true` 的 batch，当前 binding 上的 `artifact_read_capability=validated`
 - 这里的“只读 / 低风险”只约束自动投递与断点写回这条外围机制本身。
 - caller 被唤醒后的后续推理与工具选择仍受 Codex 自身的 sandbox / approval policy 约束；本项目不把这些后续动作一并宣称成“已被外围系统降成低风险”。
 - Desktop 的关键投递路径优先依赖只读状态面：
@@ -288,7 +288,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - Desktop 自动续跑只对同时满足以下条件的 thread 生效：
   - `binding_state=bound`
   - `read_transport_capability=validated`
-  - 对大 artifact batch，`artifact_read_capability=validated`
+  - 对 `requires_artifact_read=true` 的 batch，`artifact_read_capability=validated`
   - `writeback_capability=validated`
 - Desktop v1 不支持同一安装里 mixed `read_transport` bindings：
   - 同一 Desktop 安装只允许一个 installation-wide `read_transport`
@@ -669,6 +669,7 @@ cooldown -> superseded
 - `delivery_requires_write_access`
 - `inline_payload_bytes`
 - `artifact_count`
+- `requires_artifact_read`
 - `steer_candidate`
 
 ### Delivery batch 状态
@@ -894,6 +895,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 ```text
 cbth daemon run
 cbth cli run
+cbth cli bind
 cbth desktop ...
 cbth job submit
 cbth job complete
@@ -909,9 +911,16 @@ cbth desktop binding unbind
 说明：
 
 - `cbth cli run` 是 CLI 集成入口。
+- `cbth cli bind` 是 CLI fixed-thread bootstrap 的稳定入口：
+  - 只允许把 `awaiting_thread` session 推进到 `bound`
+  - 如果 session 已经 `bound`，必须返回 `already_bound`
 - `cbth desktop ...` 预留给 Desktop bootstrap / helper。
 - `cbth job ...` 是第一版对外稳定的任务提交与状态回报面。
 - `cbth batch close-head` / `inspect-head` 与 `cbth desktop binding repair` / `unbind` 也必须作为第一版稳定的 operator recovery 面存在。
+- `cbth desktop binding repair ...` 的成功输出必须至少回显：
+  - `read_transport_capability`
+  - `artifact_read_capability`
+  - `writeback_capability`
 - 其他更细的 queue / batch / inbox 控制面先视为内部实现，不在第一版对外冻结。
 - Desktop 使用的 snapshot / artifact 路径目前只算候选内部 contract，不算第一版对外稳定接口。
 
@@ -959,6 +968,9 @@ cbth job submit --target <cli|desktop> --thread-id <thread_id> --task-kind <kind
   - `delivery_requires_network=true`
   - `delivery_requires_write_access=true`
 - `inline_payload_bytes` 不是 submitter 直接声明的输入；它必须由 `cbth` 在 materialization / artifact ingest 阶段根据实际 inline payload 大小计算。
+- `requires_artifact_read` 也不是 submitter 直接声明的输入；它必须由 `cbth` 在 materialization / artifact ingest 阶段统一派生：
+  - 当 continuation 只需要 inline payload / summary 时为 `false`
+  - 只有当 continuation 需要在 `note-boundary-crossed` 之后继续调用 `cbth desktop read-artifact ...` 时才为 `true`
 - `steer_candidate` 也不是 submitter 直接声明的输入；它必须由 `cbth` / CLI adapter 根据归一化后的 delivery policy、target kind 与 inline payload 大小计算。
 
 返回 JSON 至少包含：

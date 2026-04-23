@@ -148,11 +148,12 @@
   - `delivery_requires_network`
   - `delivery_requires_write_access`
   - `inline_payload_bytes`
+  - `requires_artifact_read`
   - `steer_candidate`
   - `job submit` 的输入合同要同步落地：
     - submit flags / metadata-file.delivery_policy
     - 缺失时 fail-closed 默认值
-    - `inline_payload_bytes` / `steer_candidate` 由 core / adapter 派生
+    - `inline_payload_bytes` / `requires_artifact_read` / `steer_candidate` 由 core / adapter 派生
 - [ ] 为 CLI active-turn steer 落地可机判的 turn-risk 字段，至少包括：
   - `active_turn_kind`
   - `active_turn_requires_approval`
