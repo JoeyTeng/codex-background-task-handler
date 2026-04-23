@@ -26,6 +26,7 @@
     - binding 里只 durable 镜像当前安装选定 transport 与其 generation
     - 权威来源是 daemon-managed `desktop_installation_state`
     - v1 不支持 mixed Desktop `read_transport` bindings
+    - `~/.cbth` 文件权限与稳定 helper CLI 只是在降低意外暴露面；Desktop helper / snapshot 路线同样只支持 dedicated single-user deployment assumption
   - Desktop 顶部文案也已改成更保守的口径：`note-arm-pending` / `note-arm` / `note-boundary-crossed` 是 v1 规划中的窄写回依赖；`note-delivered` 已降级为未来 post-output ack 扩展点，但后台 heartbeat 能否无审批执行前者仍待实证
   - 而且 Desktop 自动续跑现在被明确成双门槛：
     - batch 本身必须是只读 / 低风险

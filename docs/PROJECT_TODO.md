@@ -45,7 +45,7 @@
   - `writeback_capability`
   - paused 状态读回校验
   - v1 明确不支持 mixed Desktop `read_transport` bindings
-- [ ] 为 Desktop 定死 installation-wide `read_transport` 权威来源：
+- [ ] 按已定稿合同实现 Desktop installation-wide `read_transport` 权威来源：
   - daemon-managed `desktop_installation_state`
   - preferred `~/.cbth/inbox/desktop-installation-state.json`
   - fallback `cbth desktop installation-state --json`
@@ -64,7 +64,7 @@
   - `cbth desktop claim-next-ready --bridge-thread-id ... --json`
   - `cbth desktop read-artifact --artifact-id ... --offset ... --max-bytes ... --json`
   - chunked payload return contract
-- [ ] 把 `claim-next-ready` 的语义定死并在实现里保持为纯 read/peek：
+- [ ] 按已定稿合同实现 `claim-next-ready` 的纯 read/peek 语义：
   - 不 reservation
   - 不隐藏 head batch
   - 不推进 attempt / batch durable 状态
@@ -80,13 +80,14 @@
   - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --bridge-arm-lease-id ... --json`
   - compare-and-swap 只允许唯一一次 `arm_pending -> cooldown`
   - idempotent retry 不得重复递增 `delivery_attempt_count`
-- [ ] 设计并实现 Desktop continuation-boundary 断点 helper：
+- [ ] 按已定稿合同实现 Desktop continuation-boundary 断点 helper：
   - `cbth desktop note-boundary-crossed --source-thread-id ... --attempt-id ... --generation ... --json`
   - 必须先于真正的 continuation boundary durable 成功
+  - success 前置条件必须包括：attempt 已 durable `cooldown`，且 `armed_generation` 仍匹配
   - 成功后当前 head batch 转为 `continuation_boundary_state=crossed_unacknowledged`
   - 同时切到 `replay_policy=manual_resolution_only`
   - success 返回同时提供 gated payload / artifact access
-- [ ] 为 Desktop 定死 continuation-boundary contract：
+- [ ] 按已定稿 continuation-boundary contract 实现并验证：
   - bridge 读到 ready entry，或 caller 仅拿到 gated payload / artifact access，都不能关闭 batch
   - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
   - 一旦 `note-boundary-crossed` 成功，当前 head batch 必须进入 `crossed_unacknowledged + replay_policy=manual_resolution_only`
@@ -105,9 +106,10 @@
   - `replay_policy=manual_resolution_only`
   - `redelivery_window_ends_at` 到期时自动 `manual_resolution_expired`
   - 如需 post-output ack / replay，后续单独设计 operator override
-- [ ] 为 “`automation_update` 已接受但 `note-arm` 未 durable 成功” 的 Desktop ghost-wake 场景定死 reconciliation contract：
+- [ ] 按已定稿合同实现 Desktop ghost-wake reconciliation：
   - 先 reconcile，而不是立刻视为歧义失败
   - 如果能证明 attempt 已进入 `cooldown` 且 `armed_generation` 匹配，则按成功 arm 处理
+  - 如果能证明同一 attempt 已成功 `note-boundary-crossed`，则 head batch 必须保持 `manual_resolution_only`
   - 如果能证明当前 generation 对应的 heartbeat 已重新 `PAUSED`，则当前 attempt 收敛到 `abandoned`，head batch 保持 `replay_policy=automatic`
   - 只有在既无法证明 arm 成功、也无法证明 pause 成功时，head batch 才进入 `manual_resolution_only`，binding 才进入 `degraded`
 - [ ] 为 Desktop arm flow 增补 durable `arm_pending` barrier：
@@ -131,7 +133,7 @@
   - daemon exit 条件也必须覆盖 `pause_deadline`
   - bridge 每轮先 pause/reconcile 已到期 generation
   - pause 连续失败时 binding 进入 `degraded`
-- [ ] 为 `note-boundary-crossed` 定死 compare-and-swap / 幂等合同：
+- [ ] 按已定稿合同实现 `note-boundary-crossed` 的 compare-and-swap / 幂等语义：
   - `note-boundary-crossed` 只允许唯一一次 `not_crossed -> crossed_unacknowledged`
   - 同一 attempt/generation 的重复调用必须返回 already-crossed / stale-no-op
 - [ ] 如果未来需要 post-output ack，再单独设计 `note-delivered` 合同：

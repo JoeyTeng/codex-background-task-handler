@@ -110,7 +110,11 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
    - 只有当以下条件同时满足时，这个 binding 才允许进入真正可自动续跑的 `bound` 状态：
      - `read_transport_capability=validated`
      - `writeback_capability=validated`
-     - 如当前 batch 的 `requires_artifact_read=true`，还必须有 `artifact_read_capability=validated`
+   - `artifact_read_capability=validated` 不是 `bound` 自身的定义；它只在某个具体 batch 的 `requires_artifact_read=true` 时，作为额外的 per-batch delivery gate 生效
+   - Desktop v1 的本地信任边界也必须收口为：
+     - `~/.cbth` 的 `0700/0600` 权限与稳定 `cbth desktop ...` CLI 面，只是在降低意外暴露面
+     - 它们不是 per-invocation 授权机制
+     - 因此整个 Desktop helper / snapshot 路线同样只支持 dedicated single-user deployment assumption
    - 未完成 binding 的 thread 可以提交 job，但不会被 bridge 自动续跑。
 
 4. `bridge heartbeat thread`
@@ -310,6 +314,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
      - bridge 不能立刻把这次 wake 视为歧义失败
      - 它必须先做一次 durable reconciliation：
        - 如果 attempt 已进入 `cooldown` 且 `armed_generation` 已等于当前 generation，则按成功处理
+       - 如果同一 attempt 已经成功 `note-boundary-crossed`，则当前 head batch 必须保持 `manual_resolution_only`
        - 如果当前 generation 对应的 heartbeat 已能被证明重新 `PAUSED`，则当前 attempt 收敛到 `abandoned`，head batch 保持 `replay_policy=automatic`
      - 只有在仍无法证明“已成功 arm”或“已成功 pause”时，才允许把当前 head batch 打到 `manual_resolution_only` 并把 binding 置为 `degraded`
    - `arm_pending_deadline` 到期时，这个 reconcile 必须强制完成收敛，禁止无限停留在 `arm_pending`：
@@ -330,6 +335,8 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 
 3. 这个 helper 必须一次性完成：
    - fresh compare-and-swap 校验
+   - attempt 已经 durable 处于 `cooldown`
+   - binding 上的 `armed_generation` 仍等于当前 `generation`
    - `continuation_boundary_state=not_crossed -> crossed_unacknowledged`
    - `replay_policy=automatic -> manual_resolution_only`
    - 返回 caller 继续消费当前 batch 所需的 payload / artifact access
@@ -338,6 +345,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
    - caller 还没有看到当前 batch 的 payload / artifact 内容
    - 即将跨过 continuation boundary
    - 但还没有真正开始产生后续输出 / 工具副作用
+   - 如果 caller 醒来时 `note-arm` 尚未 durable 成功，`note-boundary-crossed` 必须返回 not-armed-yet / stale-no-op，caller 直接退出
    - helper 在同一次 success 返回中完成 boundary crossing durable write，并返回 payload / artifact access
    - 如果返回 already-crossed / stale-no-op / error，caller 必须立即停止并退出，不得继续
 6. 对大结果，caller 只允许在 `note-boundary-crossed` success 之后，再调用：

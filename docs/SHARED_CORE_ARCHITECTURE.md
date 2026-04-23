@@ -192,6 +192,10 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - directory mode `0700`
   - regular file mode `0600`
   - 临时写入文件在 rename 前也必须保持同等权限
+- 但这些文件权限和稳定 `cbth desktop ...` CLI 面都不是 per-invocation 授权机制：
+  - 它们只能降低意外暴露面
+  - 不能防御“同一本机用户下的其他本地进程调用 helper / 恢复 prompt token”
+  - 因此 Desktop helper / snapshot 路线同样只支持 dedicated single-user deployment assumption
 
 ### 5. `local IPC`
 
@@ -304,8 +308,8 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - Desktop 自动续跑只对同时满足以下条件的 thread 生效：
   - `binding_state=bound`
   - `read_transport_capability=validated`
-  - 对 `requires_artifact_read=true` 的 batch，`artifact_read_capability=validated`
   - `writeback_capability=validated`
+- 对 `requires_artifact_read=true` 的 batch，还必须额外满足 `artifact_read_capability=validated`
 - Desktop v1 不支持同一安装里 mixed `read_transport` bindings：
   - 同一 Desktop 安装只允许一个 installation-wide `read_transport`
   - binding 上的 `read_transport + read_transport_generation` 只是这个安装当前选定 transport 的 durable 镜像，用于 bootstrap 校验、诊断和 stale-binding 检测
@@ -333,6 +337,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - 如果某次 `automation_update` 已被 Codex 接受，但后续 `note-arm` 没能 durable 成功：
   - bridge 必须先做 durable reconciliation
   - 如果能够证明同一 attempt 已进入 `cooldown` 且 `armed_generation` 与当前 generation 一致，则按“arm 成功但响应丢失”处理
+  - 如果能够证明同一 attempt 已经成功 `note-boundary-crossed`，则当前 head batch 必须保持 `manual_resolution_only`
   - 如果能够证明当前 generation 对应的 caller heartbeat 已经重新 `PAUSED`，则当前 attempt 进入 `abandoned`，head batch 保持 `replay_policy=automatic`
   - 只有在既无法证明 arm 成功、也无法证明 heartbeat 已重新 pause 时，当前 head batch 才切到 `replay_policy=manual_resolution_only`，binding 才进入 `degraded`
 - 一旦 caller 已成功写入 `cbth desktop note-boundary-crossed ...`，当前 batch 就必须保持 `manual_resolution_only`；第一版不再提供 post-boundary 自动成功收口。
@@ -867,6 +872,8 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
   - 只有它成功后，caller 才允许继续执行后续 continuation
   - 它也必须具备 compare-and-swap / stale-no-op 语义：
     - 只有当当前 head batch 仍匹配 `(source_thread_id, attempt_id, generation)`
+    - 且当前 attempt 已经 durable 进入 `cooldown`
+    - 且 binding 上的 `armed_generation` 仍等于当前 `generation`
     - 且 `continuation_boundary_state=not_crossed`
     - 且 batch 仍然 open
     - 才允许唯一一次把状态推进到 `crossed_unacknowledged`
