@@ -69,6 +69,13 @@ codex --remote ws://127.0.0.1:<port>
      - 启动时由 `cbth cli run --bind-thread-id <thread_id>` 提供
      - 或后续由显式命令如 `cbth cli bind --managed-session-id <id> --thread-id <thread_id>` 提供
    - 只要没有显式 bind，managed session 就必须保持 `awaiting_thread`，并 fail-closed 地禁止自动投递。
+   - 这个显式 bind 在 v1 只决定 delivery target：
+     - 它不证明前台当前正在看的 thread 一定等于 `bound_thread_id`
+     - 它也不要求 `cbth` 能从 app-server 侧可靠读出“当前 foreground thread id”
+   - 因此，第一版的 fixed-thread 合同是“投递目标固定”，不是“前台焦点已校验”。
+   - 一旦某个 managed session 已经进入 `binding_state=bound`：
+     - 后续再次执行 `cbth cli bind ...` 必须直接失败为 `already_bound`
+     - 第一版不允许在同一 managed session 内做隐式 rebind / overwrite
    - 一旦 durable 建立，`bound_thread_id` 就代表这条 managed session 的自动续跑目标 thread。
    - 第一版不承诺在同一 managed session 里自动追踪前台 TUI 的 thread 切换，也不承诺自动把 delivery retarget 到别的 thread。
    - 如果用户想把自动续跑目标换到另一个 thread，必须：
@@ -77,7 +84,8 @@ codex --remote ws://127.0.0.1:<port>
    - 这意味着第一版也不承诺一个 managed session 同时自动续跑多个 foreground-active threads。
    - 如果用户在同一个前台 TUI 里临时切到别的 thread：
      - daemon 仍只会把 ready batch 投递回 `bound_thread_id`
-     - 该 managed session 的 live-visibility 保证也只覆盖“前台停留在 `bound_thread_id` 上”的情形
+     - 只有当用户自己把前台停留在 `bound_thread_id` 上时，才复用已经验证过的 live-visibility 行为
+     - 第一版不验证、也不强制前台当前正在看的 thread 一定等于 `bound_thread_id`
      - 是否恰好在另一个 thread 里看到 sidecar delivery，不属于第一版合同
    - 如果前台连接在显式 bind 建立 `bound_thread_id` 之前就退出，或用户一直没有显式 bind：
      - 当前 managed session 必须保持/回到 `awaiting_thread`
@@ -473,12 +481,14 @@ cbth cli run
 5. managed session 初始保持 `awaiting_thread`
 6. 如果用户已经知道 caller thread，则通过 `cbth cli run --bind-thread-id <thread_id>` 在启动时显式建立 `bound_thread_id`
 7. 否则保持 `awaiting_thread`，直到用户后续显式执行 `cbth cli bind --managed-session-id <id> --thread-id <thread_id>`
+   - 如果 session 已经 `bound`，这条命令必须 fail-closed，不能把它当成 rebind
 8. sidecar 从共享核心读取 per-thread `delivery batch`
 9. 任务 ready 后：
    - 默认只在 caller thread idle 时：`thread/resume + turn/start`
    - 只有显式打开 steer feature flag，且 `turn/steer` 能力存在并满足只读/低风险策略时：允许 steer
 10. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
-11. 只要前台仍停留在 `bound_thread_id`，TUI 就通过该 thread 的已有订阅自然感知新 turn
+11. 如果用户手动让前台停留在 `bound_thread_id`，TUI 就会通过该 thread 的已有订阅自然感知新 turn
+   - 但 v1 不负责证明或强制这件事始终成立
 
 ## 仍待补的边界
 

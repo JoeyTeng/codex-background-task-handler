@@ -88,6 +88,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
      - `pause_deadline` (optional)
      - `read_transport`
      - `read_transport_capability`
+     - `artifact_read_capability`
      - `writeback_capability`
    - bridge 在运行期只允许更新这个已知 `caller_automation_id`，不做 blind create / discovery。
    - Desktop v1 不支持同一安装里 mixed `read_transport` bindings：
@@ -97,6 +98,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
    - 只有当以下条件同时满足时，这个 binding 才允许进入真正可自动续跑的 `bound` 状态：
      - `read_transport_capability=validated`
      - `writeback_capability=validated`
+     - 如需支持大 artifact 自动续跑，还必须有 `artifact_read_capability=validated`
    - 未完成 binding 的 thread 可以提交 job，但不会被 bridge 自动续跑。
 
 4. `bridge heartbeat thread`
@@ -169,6 +171,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 - 但这还不是充分条件；Desktop 自动续跑还必须额外满足：
   - 当前安装选定 `read_transport` 已验证可无审批执行
   - 当前 binding 的 `writeback_capability=validated`
+  - 对大 artifact batch，当前 binding 的 `artifact_read_capability=validated`
   - 也就是 `note-arm-pending` / `note-arm` / `note-boundary-crossed` 这组窄 helper 已经被证明可在 heartbeat 中无审批执行
 - 不满足这些条件的 batch 不得由 bridge 自动 arm caller heartbeat；它们保留为 manual/operator follow-up。
 - 这里的“只读 / 低风险”只描述 bridge 自动投递与断点写回这条外围机制本身。
@@ -244,6 +247,7 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
    - 且该 binding 必须同时满足：
      - `read_transport_capability=validated`
      - `writeback_capability=validated`
+     - 如果当前 batch 需要 artifact chunked read：`artifact_read_capability=validated`
    - bridge 必须再根据 `source_thread_id` 查询 binding，解析当前唯一允许更新的 `caller_automation_id`
    - 用 `automation_update` 更新这个已知 caller heartbeat
    - heartbeat prompt 中带上：

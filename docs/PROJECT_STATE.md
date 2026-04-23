@@ -30,6 +30,7 @@
     - batch 本身必须是只读 / 低风险
     - 目标安装上的读路径也必须已验证可无审批执行
     - 目标安装上的 `note-*` 写 helper 也必须已验证可无审批执行
+    - 对大 artifact batch，还必须额外验证 `read-artifact` capability
 - 同时，CLI 关键路径也收口为：
   - 明确依赖实验 RPC
   - 启动时 capability probe
@@ -134,6 +135,8 @@
   - 一个 managed session 在 v1 里只承诺一个固定的 `bound_thread_id`
   - `bound_thread_id` 只能通过显式 bind bootstrap 建立；当前上游 surface 不提供可依赖的前台来源归因
   - daemon 必须 durable 跟踪 `managed_session_id + bound_thread_id`
+  - 显式 bind 只决定 delivery target，不证明前台焦点
+  - session 一旦 `bound`，后续 bind 必须 fail-closed；如需换目标 thread，必须新开 session
   - 如果用户想把自动续跑目标换到另一个 thread，必须显式开新 session 或等待未来的 rebind contract
 - CLI 的 delivery completion contract 也继续收口：
   - `turn/start` / `turn/steer` 被接受，只表示 batch 已接入某个 caller turn 的 pending input

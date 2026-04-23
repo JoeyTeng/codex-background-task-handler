@@ -70,6 +70,7 @@
   - batch 自身满足只读 / 低风险 delivery policy
   - 当前安装上的 Desktop 读路径已被验证可在 heartbeat 中无审批执行
   - 当前安装上的 Desktop writeback helpers 已被验证可在 heartbeat 中无审批执行
+  - 对大 artifact batch，当前 binding 上的 `artifact_read_capability=validated`
 - 这里的“只读 / 低风险”只约束自动投递与断点写回这条外围机制本身。
 - caller 被唤醒后的后续推理与工具选择仍受 Codex 自身的 sandbox / approval policy 约束；本项目不把这些后续动作一并宣称成“已被外围系统降成低风险”。
 - Desktop 的关键投递路径优先依赖只读状态面：
@@ -270,6 +271,10 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - `unknown`
   - `validated`
   - `unavailable`
+- `artifact_read_capability`
+  - `unknown`
+  - `validated`
+  - `unavailable`
 - `writeback_capability`
   - `unknown`
   - `validated`
@@ -283,6 +288,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - Desktop 自动续跑只对同时满足以下条件的 thread 生效：
   - `binding_state=bound`
   - `read_transport_capability=validated`
+  - 对大 artifact batch，`artifact_read_capability=validated`
   - `writeback_capability=validated`
 - Desktop v1 不支持同一安装里 mixed `read_transport` bindings：
   - 同一 Desktop 安装只允许一个 installation-wide `read_transport`

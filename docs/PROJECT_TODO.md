@@ -22,6 +22,7 @@
   - 无未收口的 ready/materialized/cooldown batch
   - 无等待中的 `arm_pending_deadline` / `pause_deadline` / `cooldown_until` / `redelivery_window_ends_at` / `delivery_turn_id`
 - [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 `cbth` 物化出的只读 inbox snapshot / artifact 文件，且不会卡审批。
+- [ ] 单独验证 `cbth desktop read-artifact ...` 在 heartbeat 中的无审批能力，并把结果写回 `artifact_read_capability`。
 - [ ] 单独验证 Desktop heartbeat 在后台运行时，是否能无审批执行窄 `cbth desktop ...` helper：
   - `note-arm-pending`
   - `list-arm-pending`
@@ -37,6 +38,7 @@
   - `pause_deadline`
   - `read_transport` (mirrors the installation-wide chosen transport)
   - `read_transport_capability`
+  - `artifact_read_capability`
   - `writeback_capability`
   - paused 状态读回校验
   - v1 明确不支持 mixed Desktop `read_transport` bindings
@@ -86,6 +88,7 @@
   - 仅限 `delivery_read_only=true`
   - 且 `delivery_requires_approval/network/write_access=false`
   - Desktop 还必须额外满足 `read_transport_capability=validated`
+  - 对大 artifact batch，Desktop 还必须额外满足 `artifact_read_capability=validated`
   - Desktop 还必须额外满足 `writeback_capability=validated`
   - 非只读 batch 只走 manual/operator follow-up
 - [ ] 为 post-continuation-boundary 的 operator-resolution contract 定死收口规则：
@@ -201,6 +204,8 @@
   - durable `managed_session_id + bound_thread_id`
   - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
   - 通过显式 bind bootstrap 建立 `bound_thread_id`，而不是靠前台事件流自动归因
+  - 显式 bind 只决定 delivery target，不证明前台焦点
+  - session 已经 `bound` 后再次 bind 必须 fail-closed，不能当成隐式 rebind
   - 第一版不做前台 thread-switch 的自动观测或自动 retarget
   - 如需把自动续跑目标换到别的 thread，必须显式开新 session 或等待未来 rebind contract
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
