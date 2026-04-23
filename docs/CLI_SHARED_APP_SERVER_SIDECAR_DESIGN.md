@@ -355,7 +355,7 @@ thread/resume + turn/start
   - `turn/start` 失败时的 retry-on-next-idle 约束
 - idle 路径的 batch close 语义必须是：
   - `turn/start` 被接受时：只记录 `delivery_turn_id`，attempt 进入 `cooldown`
-  - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍然是当前 generation/head delivery 时，batch 才允许关闭为 CLI-delivered
+  - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍然是当前 generation/head delivery 时，batch 才允许关闭为 `close_reason=delivered`
   - 如果该 turn 在被接受之后又失败、中断、被替换，或 batch 已被 supersede，则不得因为早先的 `turn/start` 接受而关闭 batch
   - 对这类“accepted 后又变得不可信”的 turn，第一版不得自动 replay；当前 attempt 必须收敛到 `abandoned`，当前 head batch 必须进入 `replay_policy=manual_resolution_only`
 - 如果 websocket / daemon / app-server continuity 在 accepted 之后丢失：
@@ -379,7 +379,7 @@ cbth batch inspect-head --source-thread-id <thread_id> --json
   - 再结合外部可见证据（例如 thread history / rollout /人工确认）做二选一收口：
 
 ```text
-cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_cli_delivery --json
+cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_delivery --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_unconfirmed --json
 ```
 

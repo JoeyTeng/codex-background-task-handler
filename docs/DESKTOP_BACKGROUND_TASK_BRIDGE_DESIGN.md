@@ -51,9 +51,11 @@
      - `helper_cli_read`
    - `direct_file_read` 建议至少包含：
      - `~/.cbth/inbox/ready-threads.json`
+     - `~/.cbth/inbox/arm-pending-bindings.json`
      - `~/.cbth/inbox/pause-due-bindings.json`
      - `~/.cbth/inbox/by-thread/<thread_id>.json`
      - `~/.cbth/artifacts/<artifact_id>/manifest.json`
+     - `~/.cbth/artifacts/<artifact_id>/payload`
    - `helper_cli_read` 建议提供一组窄 helper：
 
 ```text
@@ -496,11 +498,17 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
   - caller 一定读取了 artifact
   - caller 一定完成了后续工作
 - 第一版推荐的 `close_reason` 至少包括：
+  - `delivered`
   - `superseded`
-  - `operator_closed`
+  - `operator_confirmed_delivery`
+  - `operator_closed_unconfirmed`
   - `cancelled`
   - `redelivery_window_exhausted`
+  - `manual_resolution_expired`
   - `max_attempts_exhausted`
+- 其中：
+  - `delivered` 是共享核心的 canonical 枚举值，供 CLI 等可信自动送达路径使用
+  - Desktop v1 自动路径默认只会产出其余几类 `close_reason`，不会在 post-boundary 阶段自动写出 `delivered`
 - 也就是说，Desktop 第一版的自动续跑语义是：
   - `at-least-once wakeup scheduling`
   - not `exactly-once consumption`
@@ -572,7 +580,8 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 
 ```text
 cbth desktop binding repair --source-thread-id <thread_id> --caller-automation-id <automation_id> --read-transport <transport> --json
-cbth batch close-head --source-thread-id <thread_id> --reason operator_closed --json
+cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_unconfirmed --json
+cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_delivery --json
 cbth batch inspect-head --source-thread-id <thread_id> --json
 cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <true|false> --json
 ```

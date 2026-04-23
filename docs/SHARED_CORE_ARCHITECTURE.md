@@ -66,6 +66,7 @@
 - `cbth desktop note-delivered ...` 目前不属于第一版自动成功路径；它保留为未来可能的 post-output / post-side-effect ack 扩展点。
 - 因此，Desktop 第一版的自动续跑门槛不是“batch 只读”单条件，而是两层同时成立：
   - batch 自身满足只读 / 低风险 delivery policy
+  - 当前安装上的 Desktop 读路径已被验证可在 heartbeat 中无审批执行
   - 当前安装上的 Desktop writeback helpers 已被验证可在 heartbeat 中无审批执行
 - 这里的“只读 / 低风险”只约束自动投递与断点写回这条外围机制本身。
 - caller 被唤醒后的后续推理与工具选择仍受 Codex 自身的 sandbox / approval policy 约束；本项目不把这些后续动作一并宣称成“已被外围系统降成低风险”。
@@ -300,7 +301,8 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 - 一旦 caller 已成功写入 `cbth desktop note-boundary-crossed ...`，当前 batch 就必须保持 `manual_resolution_only`；第一版不再提供 post-boundary 自动成功收口。
 - 为了避免 FIFO 队列永久卡死，第一版必须给 operator 至少两条显式恢复路径：
   - `cbth desktop binding repair --source-thread-id ... --caller-automation-id ... --read-transport ... --json`
-  - `cbth batch close-head --source-thread-id ... --reason operator_closed --json`
+  - `cbth batch close-head --source-thread-id ... --reason operator_closed_unconfirmed --json`
+  - `cbth batch close-head --source-thread-id ... --reason operator_confirmed_delivery --json`
 
 ### 10. `long-run task runners`
 
@@ -634,6 +636,26 @@ cooldown -> superseded
 - `cooldown`
 - `closed`
 
+### Canonical `close_reason`
+
+- `delivered`
+  - 可信 delivery channel 已被观察到完成并允许自动关闭
+  - 例如 CLI 在同一 `managed_session_id + session_epoch` 上观察到可信的 `turn/completed`
+- `superseded`
+  - 当前 head batch 被更新 generation 或更新 head batch 取代
+- `operator_confirmed_delivery`
+  - operator 基于 durable 证据与外部可见证据确认该 batch 已经送达/生效后人工关闭
+- `operator_closed_unconfirmed`
+  - operator 明确决定停止继续跟踪该 batch，但不宣称它已被确认送达
+- `cancelled`
+  - 上游任务或用户显式取消
+- `redelivery_window_exhausted`
+  - batch 仍处于 `replay_policy=automatic`，但重投窗口已到期
+- `manual_resolution_expired`
+  - batch 已处于 `replay_policy=manual_resolution_only`，且在人工处理窗口到期后被系统关闭
+- `max_attempts_exhausted`
+  - 已达到 `max_delivery_attempts`
+
 ### Attempt 计数语义
 
 - `delivery_attempt_count` 统计的是“被投递通道接受的尝试次数”，不是“生成过多少 prepared attempt”。
@@ -724,9 +746,9 @@ cooldown -> superseded
 
 第一版把以下情况都视为 batch 终态：
 
-- CLI adapter 报告该 batch 已成功送达
-- operator / user 显式关闭或取消该 batch
-- redelivery window 结束且不再继续自动重投
+- 可信 delivery channel 报告该 batch 已送达，对应 `close_reason=delivered`
+- operator / user 显式关闭或取消该 batch，对应 `operator_confirmed_delivery`、`operator_closed_unconfirmed` 或 `cancelled`
+- redelivery window 结束且不再继续自动重投，对应 `redelivery_window_exhausted` 或 `manual_resolution_expired`
 
 这意味着：
 
@@ -764,7 +786,7 @@ cooldown -> superseded
   - 如果 `delivery_attempt_count >= max_delivery_attempts`，该 batch 必须自动进入：
     - `close_reason=max_attempts_exhausted`
     - `closed`
-- 只有在 operator 关闭、batch 被 supersede、未来版本引入的 post-output ack 明确成功、redelivery window 结束、或 `max_attempts_exhausted` 时，batch 才进入 `closed`
+- 只有在 operator 关闭、batch 被 superseded、可信 delivery channel 明确成功、redelivery window 结束、或 `max_attempts_exhausted` 时，batch 才进入 `closed`
 - caller 的“明确 crossing 已发生”在第一版里应实现为一个窄 helper：
 
 ```text
@@ -902,7 +924,8 @@ cbth job query <job_id> --json
 
 ```text
 cbth desktop binding repair --source-thread-id <thread_id> --caller-automation-id <automation_id> --read-transport <transport> --json
-cbth batch close-head --source-thread-id <thread_id> --reason operator_closed --json
+cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_unconfirmed --json
+cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_delivery --json
 cbth batch inspect-head --source-thread-id <thread_id> --json
 cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <true|false> --json
 ```

@@ -35,7 +35,6 @@
   - `source_thread_id`
   - `caller_automation_id`
   - `armed_generation`
-  - `arm_pending_deadline`
   - `pause_deadline`
   - `read_transport`
   - `read_transport_capability`
@@ -43,8 +42,11 @@
   - paused 状态读回校验
 - [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
   - `ready-threads.json`
+  - `arm-pending-bindings.json`
+  - `pause-due-bindings.json`
   - `by-thread/<thread_id>.json`
   - `artifacts/<artifact_id>/manifest.json`
+  - `artifacts/<artifact_id>/payload`
 - [ ] 落实 `~/.cbth` 的权限合同：
   - directories `0700`
   - regular files `0600`

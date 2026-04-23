@@ -98,8 +98,8 @@
 - caller heartbeat lifecycle 也已收口：
   - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
   - `armed_generation` 作为这个长期复用 heartbeat 的 generation 栅栏
-  - `arm_pending_deadline` 作为 bridge/daemon 在 `automation_update` 与 `note-arm` 之间崩溃时的 reconcile 截止点
-  - `pause_deadline` 作为 one-shot wake 的 cleanup 截止点
+  - `arm_pending_deadline` 是当前 head attempt 的 reconcile 截止点，不属于 binding 自身的 durable 字段
+  - `pause_deadline` 才是 binding / armed generation 级的一次性 wake cleanup 截止点
   - daemon 自动退出条件也必须覆盖这两个 deadline
   - bridge 还需要一个专门的 overdue-binding 输入面：
     - `~/.cbth/inbox/arm-pending-bindings.json`
