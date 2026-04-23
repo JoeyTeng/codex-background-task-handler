@@ -95,7 +95,7 @@
   - attempt 不再保留单独的 durable `armed`
   - bridge 在真正调用 `automation_update` 前，先把 attempt durable 推到 `arm_pending`
   - 只有 bridge arm 成功并 `note-arm` durable 记录后，attempt 才进入 `cooldown`
-  - `cooldown` 期满后若仍可重投，再创建新 attempt
+  - `cooldown` 期满后若仍可重投，也必须重新进入 eligible ready / fresh-arm gate；Desktop 同一 binding 必须等上一代 `armed_generation` quiesced 后才允许新 attempt
   - 若 `delivery_attempt_count >= max_delivery_attempts`，batch 必须自动关闭到 `close_reason=max_attempts_exhausted`
 - Desktop 的送达语义也进一步收紧：
   - `claim-next-ready` 虽然名字里带 `claim`，但第一版必须是纯 read/peek helper，不能 reservation 或隐藏 head batch

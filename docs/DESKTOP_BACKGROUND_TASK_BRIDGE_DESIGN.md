@@ -749,7 +749,8 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
 
 - 第一版不依赖 caller 回写失败状态。
 - `cbth` 通过保留 batch、cooldown 与 redelivery timeout 决定是否再次 arm。
-- 如果 `cooldown_until` 到期后，该 batch 仍然是当前 head batch，且 `replay_policy=automatic`、`close_reason` 仍为空、`now < redelivery_window_ends_at`、并且 `delivery_attempt_count < max_delivery_attempts`，就应该创建新 attempt 并再次 arm，而不是把旧 attempt 直接视为成功送达。
+- 如果 `cooldown_until` 到期后，该 batch 仍然是当前 head batch，且 `replay_policy=automatic`、`close_reason` 仍为空、`now < redelivery_window_ends_at`、并且 `delivery_attempt_count < max_delivery_attempts`，它只能重新进入 eligible ready / fresh-arm gate，而不是把旧 attempt 直接视为成功送达。
+- 对 Desktop 来说，这个 gate 仍要求同一 binding 的上一代 `armed_generation` 已 quiesced 并写入 `armed_generation_quiesced_at`；否则 bridge 必须先等待 pause/reconcile，不得直接创建新 attempt 并再次 arm。
 
 ### Caller 请求开启 continuation，但 `note-boundary-crossed` 失败
 

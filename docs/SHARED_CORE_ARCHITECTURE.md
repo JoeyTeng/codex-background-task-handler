@@ -1167,7 +1167,8 @@ cooldown -> superseded
 - 因此，Desktop batch 不应在第一次 arm 成功后直接 `closed`。
 - 推荐行为是：
   - arm 成功 -> attempt 进入 `cooldown`
-  - `cooldown_until` 到期后，如果该 batch 仍是 head、`replay_policy=automatic`、`now < redelivery_window_ends_at`、且 `delivery_attempt_count < max_delivery_attempts` -> 创建新 attempt 并再次 arm
+  - `cooldown_until` 到期后，如果该 batch 仍是 head、`replay_policy=automatic`、`now < redelivery_window_ends_at`、且 `delivery_attempt_count < max_delivery_attempts` -> 重新进入 eligible ready / fresh-arm gate
+  - 对 Desktop 来说，重新进入 fresh-arm gate 仍必须满足同一 binding 的上一代 `armed_generation` 已 quiesced；否则只能等待 pause/reconcile，不能直接创建新 attempt 并再次 arm
   - 如果 `delivery_attempt_count >= max_delivery_attempts`，该 batch 必须自动进入：
     - `close_reason=max_attempts_exhausted`
     - `closed`
