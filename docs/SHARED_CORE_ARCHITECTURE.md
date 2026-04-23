@@ -155,7 +155,7 @@ cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
-cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
+cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
 ```
 
 bridge 侧两种传输必须返回同一个 ready-entry schema。
@@ -342,7 +342,8 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - 只有在既无法证明 arm 成功、也无法证明 heartbeat 已重新 pause 时，当前 head batch 才切到 `replay_policy=manual_resolution_only`，binding 才进入 `degraded`
 - 一旦 caller 已成功写入 `cbth desktop note-boundary-crossed ...`，当前 batch 就必须保持 `manual_resolution_only`；第一版不再提供 post-boundary 自动成功收口。
 - 为了避免 FIFO 队列永久卡死，第一版必须给 operator 至少两条显式恢复路径：
-  - `cbth desktop binding repair --source-thread-id ... --caller-automation-id ... --read-transport ... --json`
+  - `cbth desktop binding repair --source-thread-id ... --caller-automation-id ... --json`
+  - `cbth desktop installation-state repair --read-transport ... --json`
   - `cbth batch close-head --source-thread-id ... --reason operator_closed_unconfirmed --json`
   - `cbth batch close-head --source-thread-id ... --reason operator_confirmed_delivery --json`
 
@@ -859,7 +860,7 @@ cooldown -> superseded
 - caller 的“明确 crossing 已发生”在第一版里应实现为一个窄 helper：
 
 ```text
-cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
+cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
 ```
 
 - `note-boundary-crossed` 是 Desktop 第一版必需的 gated continuation helper：
@@ -886,6 +887,13 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
     - inline payload / summary
     - artifact manifest
     - 后续 `read-artifact` 所需的 chunked access token / parameters
+  - 对大 artifact，`note-boundary-crossed` success 返回必须至少提供：
+    - `artifact_id`
+    - opaque `artifact_read_lease_id`
+  - `cbth desktop read-artifact ...` 必须要求这个 `artifact_read_lease_id`：
+    - 单独持有 `artifact_id` 不足以继续读取
+    - lease 必须至少绑定 `(source_thread_id, attempt_id, generation, snapshot_revision)`
+    - stale wake 或其他本地调用方即使拿到旧 `artifact_id`，也不得绕过 continuation boundary 继续读大 artifact
   - 这样即使 caller 在之后崩溃，`cbth` 也不会再自动 redelivery 这个可能已产生副作用的 batch
 - 第一版不再尝试在 continuation boundary 之后自动把 batch 收口到 “已送达”：
   - 无论后续是纯文本回复，还是工具 / 行动步骤
@@ -922,6 +930,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 cbth daemon run
 cbth cli run
 cbth desktop ...
+cbth desktop installation-state repair
 cbth job submit
 cbth job complete
 cbth job fail
@@ -944,6 +953,10 @@ cbth desktop binding unbind
   - 该前台会话只能视为探索性 remote TUI
   - 不进入 v1 的 managed-session auto-continuation 合同
 - `cbth desktop ...` 预留给 Desktop bootstrap / helper。
+- `cbth desktop installation-state repair ...` 是 installation-wide Desktop transport / capability state 的稳定 operator 面：
+  - 它才允许切换 `read_transport`
+  - 成功时必须原子更新 installation state，并递增 `read_transport_generation`
+  - 同时把所有镜像不再匹配的 bindings 推到 `degraded`
 - `cbth job ...` 是第一版对外稳定的任务提交与状态回报面。
 - `cbth batch close-head` / `inspect-head` 与 `cbth desktop binding repair` / `unbind` 也必须作为第一版稳定的 operator recovery 面存在。
 - `cbth desktop binding repair ...` 的成功输出必须至少回显：
@@ -1045,7 +1058,8 @@ cbth job query <job_id> --json
 给人工排障和恢复 Desktop degraded thread 使用：
 
 ```text
-cbth desktop binding repair --source-thread-id <thread_id> --caller-automation-id <automation_id> --read-transport <transport> --json
+cbth desktop binding repair --source-thread-id <thread_id> --caller-automation-id <automation_id> --json
+cbth desktop installation-state repair --read-transport <transport> --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_unconfirmed --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_delivery --json
 cbth batch inspect-head --source-thread-id <thread_id> --json

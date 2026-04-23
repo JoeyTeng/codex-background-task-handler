@@ -69,7 +69,7 @@ cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
-cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
+cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
 ```
 
    - 底层仍可用 SQLite / 普通文件 / `mmap`，但这属于内部实现细节。
@@ -351,7 +351,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 6. 对大结果，caller 只允许在 `note-boundary-crossed` success 之后，再调用：
 
 ```text
-cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
+cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
 ```
 
 7. 第一版不再提供自动 `note-delivered` 收口：
@@ -443,13 +443,14 @@ cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
-cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
+cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
 cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-arm-lease-id <lease_id> --json
 ```
 
 `read-artifact` 的第一版返回合同至少包括：
 
 - `artifact_id`
+- `artifact_read_lease_id`
 - `content_type`
 - `size_bytes`
 - `offset`
@@ -457,6 +458,8 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 - `data_base64`
 - `next_offset`
 - `eof`
+
+也就是说，大 artifact 的后续读取不能只靠 `artifact_id`；必须同时带上 `note-boundary-crossed` success 返回的 `artifact_read_lease_id`。
 
 也就是说，`helper_cli_read` 对大 artifact 的 fallback 不是返回一个路径，而是返回一个显式 chunked payload 协议。
 
@@ -619,7 +622,8 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 - operator 必须通过显式 CLI 路径来解开这个状态，至少支持两类动作：
 
 ```text
-cbth desktop binding repair --source-thread-id <thread_id> --caller-automation-id <automation_id> --read-transport <transport> --json
+cbth desktop binding repair --source-thread-id <thread_id> --caller-automation-id <automation_id> --json
+cbth desktop installation-state repair --read-transport <transport> --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_unconfirmed --json
 cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_delivery --json
 cbth batch inspect-head --source-thread-id <thread_id> --json
@@ -628,12 +632,20 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
 
   - 推荐语义：
   - `binding repair`：
-    - 重新验证 paused status / read transport / `read-artifact` capability / narrow helpers
+    - 重新验证 paused status / 当前 installation state / `read-artifact` capability / narrow helpers
+    - 不得直接切换 installation-wide `read_transport`
+    - 如果 operator 提供新的 `caller_automation_id`：
+      - 必须证明该 automation 仍然 `target_thread_id == source_thread_id`
+      - 必须证明它当前没有被别的 binding 占用
     - 成功返回的 binding snapshot 必须回显 `artifact_read_capability`
     - 成功后把 binding 从 `degraded` 恢复到 `bound`
     - 只对“尚未成功写入 `note-boundary-crossed`”的失败允许把当前 head batch 重新放回可投递状态
     - 如果 degraded 的来源是 `note-arm` outcome unknown 这类 post-boundary / post-arm 歧义场景，`binding repair` 不得自动重投当前 head batch
     - 它恢复的是当前 caller heartbeat 与后续调度能力；但在当前 head batch 被显式关闭或超时自动关闭前，FIFO 仍会被这个 head batch 挡住
+  - `installation-state repair`：
+    - 是唯一允许切换 installation-wide `read_transport` 的 operator 路径
+    - 成功时必须原子更新 installation state，并递增 `read_transport_generation`
+    - 同时把所有镜像不再匹配的 bindings 推到 `degraded`
   - `batch close-head`：
     - 显式关闭当前 head batch
     - 让后续 FIFO 队列继续前进

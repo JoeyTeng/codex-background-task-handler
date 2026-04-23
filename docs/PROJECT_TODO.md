@@ -62,7 +62,7 @@
   - regular files `0600`
 - [ ] 设计并实现 `helper_cli_read` fallback：
   - `cbth desktop claim-next-ready --bridge-thread-id ... --json`
-  - `cbth desktop read-artifact --artifact-id ... --offset ... --max-bytes ... --json`
+  - `cbth desktop read-artifact --artifact-id ... --artifact-read-lease-id ... --offset ... --max-bytes ... --json`
   - chunked payload return contract
 - [ ] 按已定稿合同实现 `claim-next-ready` 的纯 read/peek 语义：
   - 不 reservation
@@ -81,7 +81,7 @@
   - compare-and-swap 只允许唯一一次 `arm_pending -> cooldown`
   - idempotent retry 不得重复递增 `delivery_attempt_count`
 - [ ] 按已定稿合同实现 Desktop continuation-boundary 断点 helper：
-  - `cbth desktop note-boundary-crossed --source-thread-id ... --attempt-id ... --generation ... --json`
+  - `cbth desktop note-boundary-crossed --source-thread-id ... --attempt-id ... --generation ... --expected-snapshot-revision ... --json`
   - 必须先于真正的 continuation boundary durable 成功
   - success 前置条件必须包括：attempt 已 durable `cooldown`，且 `armed_generation` 仍匹配
   - 成功后当前 head batch 转为 `continuation_boundary_state=crossed_unacknowledged`
@@ -144,6 +144,7 @@
   - `cbth batch inspect-head ...`
   - `cbth batch close-head ...`
   - `cbth desktop binding repair ...`
+  - `cbth desktop installation-state repair ...`
   - `cbth desktop binding unbind ...`
 - [ ] 定死 caller heartbeat 的长期生命周期合同：
   - 预绑定 `caller_automation_id`
