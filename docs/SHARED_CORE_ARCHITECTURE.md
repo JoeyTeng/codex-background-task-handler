@@ -150,7 +150,7 @@
 ~/.cbth/inbox/pause-due-bindings.json
 ~/.cbth/inbox/by-thread/<thread_id>.json   # diagnostic / future caller path
 ~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / future caller path
-~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / future caller path
+~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / operator path
 ```
 
 2. `helper_cli_read`
@@ -183,7 +183,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 ~/.cbth/inbox/pause-due-bindings.json
 ~/.cbth/inbox/by-thread/<thread_id>.json   # diagnostic / future caller path
 ~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / future caller path
-~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / future caller path
+~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / operator path
 ```
 
 更新方式：
@@ -200,6 +200,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - 但这些文件权限和稳定 `cbth desktop ...` CLI 面都不是 per-invocation 授权机制：
   - 它们只能降低意外暴露面
   - 不能防御“同一本机用户下的其他本地进程调用 helper / 恢复 prompt token”
+  - 因此 `(batch_id, attempt_id, generation, snapshot_revision)` 在 v1 里只是 correctness fencing，不是对抗同用户本地进程的身份认证
   - 因此 Desktop helper / snapshot 路线同样只支持 dedicated single-user deployment assumption
 
 ### 5. `local IPC`
@@ -912,14 +913,13 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
     - 且当前 attempt 已经 durable 进入 `cooldown`
     - 且 binding 上的 `armed_generation` 仍等于当前 `generation`
     - 且 batch 仍然 open
-    - 且满足以下二选一：
-      - `continuation_boundary_state=not_crossed`，允许 fresh transition
-      - `continuation_boundary_state=crossed_unacknowledged`，且 durable 记录仍属于同一 `(attempt_id, generation, snapshot_revision)`，允许 replay-safe reissue
-    - fresh transition 只允许唯一一次把状态推进到 `crossed_unacknowledged`
-    - replay-safe reissue 不得再次推进状态，但必须允许 caller 重新取回 continuation access
+    - 且 `continuation_boundary_state=not_crossed`
+    - 才允许唯一一次把状态推进到 `crossed_unacknowledged`
+    - 一旦已经 `crossed_unacknowledged`，自动 caller path 的重复调用必须返回 `already-crossed` / stale-no-op，而不是再次授权 continuation
   - 它一旦成功，当前 head batch 必须 durable 进入：
     - `continuation_boundary_state=crossed_unacknowledged`
     - `replay_policy=manual_resolution_only`
+    - 并同时 durable 保存一份 operator-only `boundary_recovery_envelope`
   - 成功返回时至少要携带其一：
     - inline payload / summary
     - artifact manifest
@@ -938,7 +938,6 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
         - batch 关闭
         - 当前 attempt 被 `superseded` / `abandoned`
         - operator close / unbind / repair 把该 batch 收口或移出当前 continuation
-        - 同一 `(attempt_id, generation, snapshot_revision)` 的 replay-safe `note-boundary-crossed` 重新签发了更新的 lease
     - stale wake 或其他本地调用方即使拿到旧 `artifact_id`，也不得绕过 continuation boundary 继续读大 artifact
   - 这样即使 caller 在之后崩溃，`cbth` 也不会再自动 redelivery 这个可能已产生副作用的 batch
 - 第一版不再尝试在 continuation boundary 之后自动把 batch 收口到 “已送达”：
@@ -949,9 +948,12 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 - 在 v1 自动 caller path 里，caller 不得在 `note-boundary-crossed` 之前直接读取 per-thread envelope / artifact payload。
 - 如果 `note-boundary-crossed` 返回 error / stale-no-op：
   - caller 必须立即停止，不得继续输出或产生工具副作用
-- 如果 `note-boundary-crossed` 对同一 `(attempt_id, generation, snapshot_revision)` 返回 replay-safe success：
-  - caller 允许继续
-  - 但必须使用 helper 当前返回的 payload / access token，而不是假设旧 response 仍然有效
+- 如果 `note-boundary-crossed` 已经成功过一次，而 caller 没拿到那次 response：
+  - 自动 caller path 不得再次 continuation
+  - 后续只能走 operator recovery：
+    - `cbth batch inspect-head ...` 必须暴露 `boundary_recovery_envelope`
+    - 以及必要的 artifact manifest / diagnostic refs
+  - v1 选择 safety over liveness：不允许靠下一次 heartbeat 自动重放同一 delivery
 - 如果 caller 已经越过 continuation boundary 但还没成功得到 `note-boundary-crossed` 的 success 返回：
   - 这属于违背第一版安全合同的实现错误
   - 正确实现必须保证“先 `note-boundary-crossed` 成功返回，再继续”

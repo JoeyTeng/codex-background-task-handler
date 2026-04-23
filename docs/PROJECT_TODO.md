@@ -23,7 +23,11 @@
   - 无 active clients
   - 无未收口的 ready/materialized/cooldown batch
   - 无等待中的 `arm_pending_deadline` / `pause_deadline` / `cooldown_until` / `redelivery_window_ends_at` / `delivery_turn_id`
-- [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 `cbth` 物化出的只读 inbox snapshot / artifact 文件，且不会卡审批。
+- [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 bridge-side 所需的只读 inbox snapshot，且不会卡审批：
+  - `ready-threads.json`
+  - `arm-pending-bindings.json`
+  - `pause-due-bindings.json`
+  - 大 artifact 的正式自动路径不再依赖直接读 `artifacts/<artifact_id>/payload`
 - [ ] 单独验证 `cbth desktop read-artifact ...` 在 heartbeat 中的无审批能力，并把结果写回 `artifact_read_capability`。
 - [ ] 单独验证 Desktop heartbeat 在后台运行时，是否能无审批执行窄 `cbth desktop ...` helper：
   - `note-arm-pending`
@@ -57,8 +61,8 @@
   - `arm-pending-bindings.json`
   - `pause-due-bindings.json`
   - `by-thread/<thread_id>.json`
-  - `artifacts/<artifact_id>/manifest.json`
-  - `artifacts/<artifact_id>/payload`
+  - `artifacts/<artifact_id>/manifest.json` (diagnostic / operator path)
+  - `artifacts/<artifact_id>/payload` (diagnostic / operator path; not the automatic continuation path)
 - [ ] 落实 `~/.cbth` 的权限合同：
   - directories `0700`
   - regular files `0600`
@@ -96,7 +100,7 @@
   - bridge 读到 ready entry，或 caller 仅拿到 gated payload / artifact access，都不能关闭 batch
   - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
   - 一旦 `note-boundary-crossed` 成功，当前 head batch 必须进入 `crossed_unacknowledged + replay_policy=manual_resolution_only`
-  - 同一 `(attempt_id, generation, snapshot_revision)` 的重试必须 replay-safe 返回 continuation access
+  - 自动 caller path 不提供 replay-safe continuation；response 丢失后改走 operator recovery
   - 第一版不提供 post-boundary 自动 close
   - 如果未来需要支持 post-output ack，再单独设计 observation / response-digest contract
 - [ ] 明确第一版自动续跑的总安全门槛：
@@ -141,7 +145,8 @@
   - pause 连续失败时 binding 进入 `degraded`
 - [ ] 按已定稿合同实现 `note-boundary-crossed` 的 compare-and-swap / 幂等语义：
   - `note-boundary-crossed` 只允许唯一一次 `not_crossed -> crossed_unacknowledged`
-  - 同一 `(attempt_id, generation, snapshot_revision)` 的重复调用必须 replay-safe 返回 continuation access
+  - 自动 caller path 的重复调用必须返回 `already-crossed` / stale-no-op
+  - `batch inspect-head` 必须提供 operator-only `boundary_recovery_envelope`
   - stale / mismatch / closed batch 才返回 stale-no-op
 - [ ] 为 Desktop 大 artifact gated read 定死 lease 生命周期：
   - `note-boundary-crossed` 返回 `artifact_read_lease_id + artifact_read_lease_deadline`

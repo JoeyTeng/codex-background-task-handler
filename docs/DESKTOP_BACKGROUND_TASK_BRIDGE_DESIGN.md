@@ -60,7 +60,7 @@
      - `~/.cbth/inbox/pause-due-bindings.json`
      - `~/.cbth/inbox/by-thread/<thread_id>.json` (diagnostic / future path)
      - `~/.cbth/artifacts/<artifact_id>/manifest.json` (diagnostic / future path)
-     - `~/.cbth/artifacts/<artifact_id>/payload` (diagnostic / future path)
+     - `~/.cbth/artifacts/<artifact_id>/payload` (diagnostic / operator path)
    - `helper_cli_read` 建议提供一组窄 helper：
 
 ```text
@@ -126,6 +126,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
    - Desktop v1 的本地信任边界也必须收口为：
      - `~/.cbth` 的 `0700/0600` 权限与稳定 `cbth desktop ...` CLI 面，只是在降低意外暴露面
      - 它们不是 per-invocation 授权机制
+     - prompt token / helper 参数在 v1 里只承担 correctness fencing，不承担抗同用户恶意进程的身份认证
      - 因此整个 Desktop helper / snapshot 路线同样只支持 dedicated single-user deployment assumption
    - 未完成 binding 的 thread 可以提交 job，但不会被 bridge 自动续跑。
 
@@ -150,6 +151,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
      - boundary crossing 已 durable 记录
      - 当前 batch 已切到 `crossed_unacknowledged + replay_policy=manual_resolution_only`
      - caller 已获得继续消费当前 batch 所需的 payload / artifact access
+     - 同时 durable 保存一份 operator-only `boundary_recovery_envelope`
    - 它必须发生在真正跨过 continuation boundary 之前：
      - 例如真正开始产出后续 assistant 文本
      - 或真正开始发起下一个基于该 batch 的工具 / 行动步骤
@@ -352,25 +354,22 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 ```
 
 3. 这个 helper 必须一次性完成：
-   - fresh compare-and-swap 校验，或同一 tuple 的 replay-safe reissue
+   - fresh compare-and-swap 校验
    - attempt 已经 durable 处于 `cooldown`
    - binding 上的 `armed_generation` 仍等于当前 `generation`
-   - fresh 路径下：
-     - `continuation_boundary_state=not_crossed -> crossed_unacknowledged`
-     - `replay_policy=automatic -> manual_resolution_only`
-   - replay-safe 路径下：
-     - 不再次推进状态
-     - 但必须重新返回 continuation access
+   - `continuation_boundary_state=not_crossed -> crossed_unacknowledged`
+   - `replay_policy=automatic -> manual_resolution_only`
+   - durable 保存 operator-only `boundary_recovery_envelope`
    - 返回 caller 继续消费当前 batch 所需的 payload / artifact access
-4. 只有 `note-boundary-crossed` fresh success 或 replay-safe success 后，caller 才允许继续后续工作。
+4. 只有 `note-boundary-crossed` fresh success 后，caller 才允许继续后续工作。
 5. `note-boundary-crossed` 的调用时机必须是：
    - caller 还没有看到当前 batch 的 payload / artifact 内容
    - 即将跨过 continuation boundary
    - 但还没有真正开始产生后续输出 / 工具副作用
    - 如果 caller 醒来时 `note-arm` 尚未 durable 成功，`note-boundary-crossed` 必须返回 not-armed-yet / stale-no-op，caller 直接退出
    - helper 在同一次 success 返回中完成 boundary crossing durable write，并返回 payload / artifact access
-   - 如果同一 `(attempt_id, generation, snapshot_revision)` 之前已经成功 crossed，但 caller 丢失了 response，重复调用必须返回 replay-safe success，而不是把 batch 永久楔死
-   - 只有返回 stale-no-op / error 时，caller 才必须立即停止并退出，不得继续
+   - 如果同一 `(attempt_id, generation, snapshot_revision)` 之前已经成功 crossed，但 caller 丢失了 response，自动 caller path 不得继续；只能转入 operator recovery
+   - 只有返回 fresh success 时 caller 才允许继续；返回 `already-crossed` / stale-no-op / error 时都必须立即停止并退出，不得继续
 6. 对大结果，caller 只允许在 `note-boundary-crossed` success 之后，再调用：
 
 ```text
@@ -455,7 +454,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
 ```text
 ~/.cbth/inbox/by-thread/<thread_id>.json   # diagnostic / future caller path
 ~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / future caller path
-~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / future caller path
+~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / operator path
 ```
 
 ### Helper fallback
@@ -488,7 +487,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 
 - 它只对当前 `crossed_unacknowledged` 的同一 `(attempt_id, generation, snapshot_revision)` 有效
 - 一旦 batch 被 close、attempt 被 supersede / abandon、operator repair / unbind 收口，旧 lease 必须立即失效
-- 如果同一 attempt 发生 replay-safe `note-boundary-crossed` 重试，daemon 可以重发新的 lease，但必须让旧 lease 失效
+- 如果 caller 没拿到第一次 `note-boundary-crossed` success 的返回值，自动 caller path 不得重新申请新的 artifact lease；只能通过 operator recovery 读取 durable `boundary_recovery_envelope` / manifest 做人工收口
 
 也就是说，`helper_cli_read` 对大 artifact 的 fallback 不是返回一个路径，而是返回一个显式 chunked payload 协议。
 

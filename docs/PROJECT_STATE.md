@@ -97,7 +97,7 @@
   - `arm_pending` attempt 不再是新的 ready head；bridge 必须先 reconcile 它，不能重复 arm 同一 generation
   - `note-boundary-crossed` 现在不只是断点写回，而是 gated continuation helper：
     - caller 必须先拿到它的 success 返回，才允许看到 payload / artifact access
-    - 对同一 `(attempt_id, generation, snapshot_revision)` 的重试还必须 replay-safe，避免“已 crossed 但 response 丢失”把 batch 永久楔死
+    - 这一步在 v1 是单次 crossing，不再提供自动 replay-safe continuation；response 丢失后改走 operator recovery
   - 如果 `note-boundary-crossed` 尚未 success，caller 不得真正跨过 continuation boundary
   - `note-boundary-crossed` 需要 compare-and-swap / stale-no-op 语义，避免重复 wake 或 supersede 后重复记账
   - 一旦 `note-boundary-crossed` 成功，当前 head batch 就必须保持 `crossed_unacknowledged + replay_policy=manual_resolution_only`
@@ -338,7 +338,7 @@ scripts/desktop_thread_inject_poc.py
   - 再由外部 sidecar client 对同一 thread 发起第二轮 turn，marker 为 `TUI_SIDECAR_MARKER_20260422`
 - 对应 thread 为 `019db614-1fb7-70a3-956f-7a96c48f0226`。
 - PTY 输出中确实出现了 sidecar 触发的第二轮用户输入与 assistant 最终结果 `TUI_SIDECAR_MARKER_20260422`。
-- 因此，CLI 方向的结论已经不只是“协议层上的前台 client 会收到通知”，而是“真实前台 TUI 会把 sidecar 触发的新 turn 展示给用户”。
+- 因此，CLI 方向的结论已经不只是“协议层上的前台 client 会收到通知”，而是“当用户手动把前台停留在同一个 `bound_thread_id` 时，真实前台 TUI 也会把 sidecar 触发的新 turn 展示给用户”。
 - 独立设计文档已记录在：
   - `docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md`
 - 又补做了 active-turn `turn/steer` 的定点 PoC，用来验证“caller thread 还在 running 时，sidecar 能否把同一个 turn steer 下去，而且不会让 turn 提前结束”。
