@@ -55,27 +55,21 @@ codex --remote ws://127.0.0.1:<port>
    - 第一版一个 managed CLI session 只承诺一个固定的 caller thread。
    - daemon 必须 durable 维护：
      - `managed_session_id`
-     - `binding_state`
-       - `awaiting_thread`
-       - `bound`
      - `bound_thread_id`
-   - managed session 初始必须处于 `binding_state=awaiting_thread`，此时：
-     - `bound_thread_id=null`
-     - daemon 不得自动投递任何 ready batch
    - 第一版不再尝试从 shared `app-server` 的事件流里自动归因“哪个 turn 来自前台 TUI”：
      - 当前上游 surface 没有 per-client identity / source attribution
      - 因此 daemon 不能可靠地靠被动观察事件流来推断 `bound_thread_id`
-   - `bound_thread_id` 只能通过显式 bootstrap 建立：
-     - 启动时由 `cbth cli run --bind-thread-id <thread_id>` 提供
-     - 或后续由显式命令如 `cbth cli bind --managed-session-id <id> --thread-id <thread_id>` 提供
-   - 只要没有显式 bind，managed session 就必须保持 `awaiting_thread`，并 fail-closed 地禁止自动投递。
-   - 这个显式 bind 在 v1 只决定 delivery target：
+   - 因此第一版的 managed-session bootstrap 也必须收口为：
+     - 只支持启动时由 `cbth cli run --bind-thread-id <thread_id>` 显式建立 `bound_thread_id`
+     - 不提供 late-bind stable surface
+     - 不提供依赖 `managed_session_id` 的外部发现/回填合同
+   - 如果调用方在启动时拿不到 caller `thread_id`：
+     - 该前台会话仍可作为探索性 remote TUI 使用
+     - 但它不进入 v1 的 managed-session auto-continuation 合同
+   - 这个启动时显式 bootstrap 在 v1 只决定 delivery target：
      - 它不证明前台当前正在看的 thread 一定等于 `bound_thread_id`
      - 它也不要求 `cbth` 能从 app-server 侧可靠读出“当前 foreground thread id”
    - 因此，第一版的 fixed-thread 合同是“投递目标固定”，不是“前台焦点已校验”。
-   - 一旦某个 managed session 已经进入 `binding_state=bound`：
-     - 后续再次执行 `cbth cli bind ...` 必须直接失败为 `already_bound`
-     - 第一版不允许在同一 managed session 内做隐式 rebind / overwrite
    - 一旦 durable 建立，`bound_thread_id` 就代表这条 managed session 的自动续跑目标 thread。
    - 第一版不承诺在同一 managed session 里自动追踪前台 TUI 的 thread 切换，也不承诺自动把 delivery retarget 到别的 thread。
    - 如果用户想把自动续跑目标换到另一个 thread，必须：
@@ -87,10 +81,6 @@ codex --remote ws://127.0.0.1:<port>
      - 只有当用户自己把前台停留在 `bound_thread_id` 上时，才复用已经验证过的 live-visibility 行为
      - 第一版不验证、也不强制前台当前正在看的 thread 一定等于 `bound_thread_id`
      - 是否恰好在另一个 thread 里看到 sidecar delivery，不属于第一版合同
-   - 如果前台连接在显式 bind 建立 `bound_thread_id` 之前就退出，或用户一直没有显式 bind：
-     - 当前 managed session 必须保持/回到 `awaiting_thread`
-     - 直到用户显式提供某个 caller thread 并完成 bind
-     - 在此期间自动续跑必须 fail-closed
    - 一旦某个 `bound_thread_id` 上的 attempt 已经 accepted，并 durable 记录了 `delivery_turn_id`：
      - 它仍允许等待自己匹配的 `turn/completed` 并正常 close
      - 不需要因为前台 UI 临时切到别的 thread 就强行中止或重开这次已 accepted 的投递
@@ -426,7 +416,7 @@ cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_un
   - 当前 batch 的 `delivery_requires_approval=false`
   - 当前 batch 的 `delivery_requires_network=false`
   - 当前 batch 的 `delivery_requires_write_access=false`
-  - 当前 batch 的 `steer_candidate=true`
+  - 当前 delivery 在 CLI adapter 的本地 steer policy 下被判定为 steer-eligible
   - 当前 batch 的 `inline_payload_bytes` 没超过 CLI adapter 的 steer 上限
   - 当前 thread 未触发最小连续发送间隔限制
 - 不满足上述任一条件时，batch 保持排队，等 caller idle 后再 `turn/start`。
@@ -477,18 +467,20 @@ cbth cli run
    - 监听 loopback
    - 不依赖 loopback websocket auth
 3. 启动时对实验 RPC 做 capability probe
-4. `cbth cli run` 连接该 managed session，并启动前台 `codex --remote ...`
-5. managed session 初始保持 `awaiting_thread`
-6. 如果用户已经知道 caller thread，则通过 `cbth cli run --bind-thread-id <thread_id>` 在启动时显式建立 `bound_thread_id`
-7. 否则保持 `awaiting_thread`，直到用户后续通过 `cbth cli run --session-handle-file <path>` 写出的稳定句柄拿到 `managed_session_id`，再显式执行 `cbth cli bind --managed-session-id <id> --thread-id <thread_id>`
-   - 如果 session 已经 `bound`，这条命令必须 fail-closed，不能把它当成 rebind
-8. sidecar 从共享核心读取 per-thread `delivery batch`
-9. 任务 ready 后：
+4. `cbth cli run --bind-thread-id <thread_id>` 创建/恢复一个 fixed-thread managed session，并启动前台 `codex --remote ...`
+5. sidecar 从共享核心读取 per-thread `delivery batch`
+6. 任务 ready 后：
    - 默认只在 caller thread idle 时：`thread/resume + turn/start`
    - 只有显式打开 steer feature flag，且 `turn/steer` 能力存在并满足只读/低风险策略时：允许 steer
-10. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
-11. 如果用户手动让前台停留在 `bound_thread_id`，TUI 就会通过该 thread 的已有订阅自然感知新 turn
+7. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
+8. 如果用户手动让前台停留在 `bound_thread_id`，TUI 就会通过该 thread 的已有订阅自然感知新 turn
    - 但 v1 不负责证明或强制这件事始终成立
+
+v1 范围外：
+
+- 通过后续 `cbth cli bind ...` 对已有 session 做 late-bind
+- 通过 `managed_session_id` 外部发现/回填一个尚未 fixed-thread bootstrap 的 session
+- 在同一 managed session 里自动重绑定到新的 caller thread
 
 ## 仍待补的边界
 

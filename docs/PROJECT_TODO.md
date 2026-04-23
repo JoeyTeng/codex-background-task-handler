@@ -149,12 +149,11 @@
   - `delivery_requires_write_access`
   - `inline_payload_bytes`
   - `requires_artifact_read`
-  - `steer_candidate`
   - `job submit` 的输入合同要同步落地：
     - submit flags / metadata-file.delivery_policy
     - 缺失时 fail-closed 默认值
     - `inline_payload_bytes` / `requires_artifact_read` 由 core 派生
-    - `steer_candidate` 由 CLI adapter 在共享核心字段之上判定
+    - CLI adapter 再在共享核心字段之上本地判定是否 steer-eligible
 - [ ] 为 CLI active-turn steer 落地可机判的 turn-risk 字段，至少包括：
   - `active_turn_kind`
   - `active_turn_requires_approval`
@@ -205,10 +204,9 @@
 - [ ] 按已定稿合同实现 CLI managed session 的 fixed-thread contract：
   - durable `managed_session_id + bound_thread_id`
   - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
-  - 通过显式 bind bootstrap 建立 `bound_thread_id`，而不是靠前台事件流自动归因
-  - 通过 `cbth cli run --session-handle-file <path>` 提供无竞态的 `managed_session_id` 发现路径
-  - 显式 bind 只决定 delivery target，不证明前台焦点
-  - session 已经 `bound` 后再次 bind 必须 fail-closed，不能当成隐式 rebind
+  - 通过 `cbth cli run --bind-thread-id <thread_id>` 在启动时建立 `bound_thread_id`，而不是靠前台事件流自动归因
+  - v1 不提供 late-bind 或 `managed_session_id` 外部发现/回填的 stable surface
+  - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点
   - 第一版不做前台 thread-switch 的自动观测或自动 retarget
   - 如需把自动续跑目标换到别的 thread，必须显式开新 session 或等待未来 rebind contract
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件

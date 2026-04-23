@@ -671,7 +671,6 @@ cooldown -> superseded
 - `inline_payload_bytes`
 - `artifact_count`
 - `requires_artifact_read`
-- `steer_candidate`
 
 ### Delivery batch 状态
 
@@ -896,8 +895,6 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 ```text
 cbth daemon run
 cbth cli run
-cbth cli bind
-cbth cli status
 cbth desktop ...
 cbth job submit
 cbth job complete
@@ -913,16 +910,13 @@ cbth desktop binding unbind
 说明：
 
 - `cbth cli run` 是 CLI 集成入口。
-- `cbth cli bind` 是 CLI fixed-thread bootstrap 的稳定入口：
-  - 只允许把 `awaiting_thread` session 推进到 `bound`
-  - 如果 session 已经 `bound`，必须返回 `already_bound`
-- `cbth cli status` 是 CLI managed-session discovery / inspection 的稳定入口：
-  - 至少支持 `--managed-session-id <id> --json`
-  - 成功输出必须回显 `managed_session_id`
-  - 并返回 `binding_state` / `bound_thread_id`
-- `cbth cli run` 如果需要支持后续 late-bind，必须提供一个无竞态的 session 句柄传递合同：
-  - 例如 `--session-handle-file <path>`
-  - 在启动前台 TUI 前原子写出 `managed_session_id`
+- `cbth cli run --bind-thread-id <thread_id>` 是 CLI fixed-thread bootstrap 的稳定入口：
+  - v1 只支持启动时显式建立 `bound_thread_id`
+  - 不提供 late-bind stable surface
+  - 也不把 `managed_session_id` 暴露成需要外部回填 thread id 的 bootstrap 契约
+- 如果调用方在启动时拿不到 caller `thread_id`：
+  - 该前台会话只能视为探索性 remote TUI
+  - 不进入 v1 的 managed-session auto-continuation 合同
 - `cbth desktop ...` 预留给 Desktop bootstrap / helper。
 - `cbth job ...` 是第一版对外稳定的任务提交与状态回报面。
 - `cbth batch close-head` / `inspect-head` 与 `cbth desktop binding repair` / `unbind` 也必须作为第一版稳定的 operator recovery 面存在。
@@ -980,7 +974,9 @@ cbth job submit --target <cli|desktop> --thread-id <thread_id> --task-kind <kind
 - `requires_artifact_read` 也不是 submitter 直接声明的输入；它必须由 `cbth` 在 materialization / artifact ingest 阶段统一派生：
   - 当 continuation 只需要 inline payload / summary 时为 `false`
   - 只有当 continuation 需要在 `note-boundary-crossed` 之后继续调用 `cbth desktop read-artifact ...` 时才为 `true`
-- `steer_candidate` 也不是 submitter 直接声明的输入；它必须由 `cbth` / CLI adapter 根据归一化后的 delivery policy、target kind 与 inline payload 大小计算。
+- CLI adapter 可以在共享核心 canonical batch 字段之上，本地派生一个临时的 `steer_candidate` / `steer_eligible` 判定：
+  - 但它不是 shared-core durable schema 的一部分
+  - 也不作为跨端 canonical delivery policy 字段冻结
 
 返回 JSON 至少包含：
 

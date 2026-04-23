@@ -39,7 +39,8 @@
   - 更强本地 auth 边界留待上游支持 loopback auth 后再补
   - shared `app-server` 由 daemon 持有，而不是前台 wrapper 临时持有
   - 一个 managed CLI session 在 v1 里只绑定一个 `bound_thread_id`
-  - 这个 `bound_thread_id` 在 v1 必须通过显式 bind bootstrap 建立，而不是靠前台事件流自动归因
+  - 这个 `bound_thread_id` 在 v1 必须通过 `cbth cli run --bind-thread-id <thread_id>` 启动时显式建立，而不是靠前台事件流自动归因
+  - v1 不再承诺 late-bind，也不把 `managed_session_id` 暴露成外部回填 thread id 的 stable bootstrap surface
   - 前台 thread-switch 的自动观测/自动 retarget 不属于 v1 合同
   - 默认仅在 idle 时 `turn/start`
   - `turn/steer` 只作为只读、低风险场景下的受限优化
@@ -101,13 +102,14 @@
   - 只处理 `delivery_read_only=true`
   - 且不需要 approval/network/write access 的 batch
   - Desktop 还必须满足安装级 `read_transport_capability=validated`
+  - 对 `requires_artifact_read=true` 的 batch，Desktop 还必须额外满足 `artifact_read_capability=validated`
   - Desktop 还必须满足 `writeback_capability=validated`
   - 非只读 batch 一律不自动续跑，留给 operator/manual follow-up
   - 这些字段的输入合同也已收口为：
     - submitter 显式提供 delivery policy
     - 若缺失则 core fail-closed 写入保守默认值
     - `inline_payload_bytes` / `requires_artifact_read` 由 core 统一派生，不由 submitter 直填
-    - `steer_candidate` 继续由 CLI adapter 在共享核心字段之上判定
+    - CLI adapter 再在共享核心字段之上本地判定是否 steer-eligible
 - caller heartbeat lifecycle 也已收口：
   - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
   - `armed_generation` 作为这个长期复用 heartbeat 的 generation 栅栏
@@ -134,10 +136,10 @@
 - CLI managed session contract 也已补硬：
   - shared `app-server` 由 daemon 持有
   - 一个 managed session 在 v1 里只承诺一个固定的 `bound_thread_id`
-  - `bound_thread_id` 只能通过显式 bind bootstrap 建立；当前上游 surface 不提供可依赖的前台来源归因
+  - `bound_thread_id` 只能通过 `cbth cli run --bind-thread-id <thread_id>` 在启动时显式建立；当前上游 surface 不提供可依赖的前台来源归因
   - daemon 必须 durable 跟踪 `managed_session_id + bound_thread_id`
-  - 显式 bind 只决定 delivery target，不证明前台焦点
-  - session 一旦 `bound`，后续 bind 必须 fail-closed；如需换目标 thread，必须新开 session
+  - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点
+  - v1 不提供 late-bind / external discovery surface；如需换目标 thread，必须新开 session
   - 如果用户想把自动续跑目标换到另一个 thread，必须显式开新 session 或等待未来的 rebind contract
 - CLI 的 delivery completion contract 也继续收口：
   - `turn/start` / `turn/steer` 被接受，只表示 batch 已接入某个 caller turn 的 pending input
