@@ -31,7 +31,6 @@
   - `read-artifact`
   - `note-arm`
   - `note-boundary-crossed`
-  - `note-delivered`
 - [ ] 为 Desktop bootstrap 设计并实现 `desktop binding` 流程，至少 durable 记录：
   - `source_thread_id`
   - `caller_automation_id`
@@ -58,14 +57,16 @@
   - 不 reservation
   - 不隐藏 head batch
   - 不推进 attempt / batch durable 状态
-- [ ] 为 Desktop bridge 落地内部 `bridge_arm_lease` 串行化合同：
+- [ ] 把 Desktop `bridge_arm_lease` 合同收口成 `note-arm-pending` 的可执行 acquire/carry-forward 语义：
   - key 为 `(source_thread_id, attempt_id, generation)`
+  - `note-arm-pending` 返回稳定的 `bridge_arm_lease_id`
+  - `note-arm` 必须显式回传该 `bridge_arm_lease_id`
   - 不改变 head batch 的外部可见性
   - `note-arm` unknown 时先 reconcile，再决定是否 degraded/manual
 - [ ] 设计并实现 Desktop bridge 的窄写回 helper：
   - `cbth desktop note-arm-pending --source-thread-id ... --attempt-id ... --generation ... --json`
   - compare-and-swap 只允许唯一一次 `prepared -> arm_pending`
-  - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --json`
+  - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --bridge-arm-lease-id ... --json`
   - compare-and-swap 只允许唯一一次 `arm_pending -> cooldown`
   - idempotent retry 不得重复递增 `delivery_attempt_count`
 - [ ] 设计并实现 Desktop continuation-boundary 断点 helper：
@@ -73,26 +74,24 @@
   - 必须先于真正的 continuation boundary durable 成功
   - 成功后当前 head batch 转为 `continuation_boundary_state=crossed_unacknowledged`
   - 同时切到 `replay_policy=manual_resolution_only`
-- [ ] 设计并实现 caller 成功关闭当前 head batch 的窄 helper：
-  - `cbth desktop note-delivered --source-thread-id ... --attempt-id ... --generation ... --json`
 - [ ] 为 Desktop 定死 continuation-boundary contract：
   - 仅读完 envelope / artifact 不能关闭 batch
-  - 只有 `note-boundary-crossed` 已成功、且 caller 已经完成 continuation preparation、helper 仍可调用时，才允许 `note-delivered`
   - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
-  - 第一版明确不支持纯文本最终回复自动走到 `caller_acknowledged`
-  - 如果未来需要支持，单独设计 output-observation / response-digest contract
+  - 一旦 `note-boundary-crossed` 成功，当前 head batch 必须进入 `crossed_unacknowledged + replay_policy=manual_resolution_only`
+  - 第一版不提供 post-boundary 自动 close
+  - 如果未来需要支持 post-output ack，再单独设计 observation / response-digest contract
 - [ ] 明确第一版自动续跑的总安全门槛：
   - 仅限 `delivery_read_only=true`
   - 且 `delivery_requires_approval/network/write_access=false`
   - Desktop 还必须额外满足 `read_transport_capability=validated`
   - Desktop 还必须额外满足 `writeback_capability=validated`
   - 非只读 batch 只走 manual/operator follow-up
-- [ ] 为 post-continuation-boundary 的 `note-delivered` 失败场景定死 operator-resolution contract：
+- [ ] 为 post-continuation-boundary 的 operator-resolution contract 定死收口规则：
   - `binding repair` 不得自动 replay 当前 head batch
   - 第一版默认只允许人工 `batch close-head`
   - `replay_policy=manual_resolution_only`
   - `redelivery_window_ends_at` 到期时自动 `manual_resolution_expired`
-  - 如需 replay，后续单独设计 operator override
+  - 如需 post-output ack / replay，后续单独设计 operator override
 - [ ] 为 “`automation_update` 已接受但 `note-arm` 未 durable 成功” 的 Desktop ghost-wake 场景定死 reconciliation contract：
   - 先 reconcile，而不是立刻视为歧义失败
   - 如果能证明 attempt 已进入 `cooldown` 且 `armed_generation` 匹配，则按成功 arm 处理
@@ -118,11 +117,13 @@
   - daemon exit 条件也必须覆盖 `pause_deadline`
   - bridge 每轮先 pause/reconcile 已到期 generation
   - pause 连续失败时 binding 进入 `degraded`
-- [ ] 为 `note-boundary-crossed` / `note-delivered` 定死 compare-and-swap / 幂等合同：
+- [ ] 为 `note-boundary-crossed` 定死 compare-and-swap / 幂等合同：
   - `note-boundary-crossed` 只允许唯一一次 `not_crossed -> crossed_unacknowledged`
   - 同一 attempt/generation 的重复调用必须返回 already-crossed / stale-no-op
-  - `note-delivered` 只允许唯一一次 `crossed_unacknowledged -> acknowledged`
-  - 已 `acknowledged` 的重复调用只能返回 already-delivered / idempotent success
+- [ ] 如果未来需要 post-output ack，再单独设计 `note-delivered` 合同：
+  - 不进入 v1 自动续跑主路径
+  - 必须建立 post-output / post-side-effect observation contract
+  - 不能靠“continuation preparation 已完成”来自动关闭 batch
 - [ ] 把 Desktop operator recovery / cleanup 命令面定死并实现：
   - `cbth batch inspect-head ...`
   - `cbth batch close-head ...`
