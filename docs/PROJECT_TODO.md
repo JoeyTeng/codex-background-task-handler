@@ -205,6 +205,7 @@
   - durable `managed_session_id + bound_thread_id`
   - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
   - 通过显式 bind bootstrap 建立 `bound_thread_id`，而不是靠前台事件流自动归因
+  - 提供稳定的 `cbth cli status --latest --json`，用于发现 `managed_session_id`
   - 显式 bind 只决定 delivery target，不证明前台焦点
   - session 已经 `bound` 后再次 bind 必须 fail-closed，不能当成隐式 rebind
   - 第一版不做前台 thread-switch 的自动观测或自动 retarget

@@ -480,7 +480,7 @@ cbth cli run
 4. `cbth cli run` 连接该 managed session，并启动前台 `codex --remote ...`
 5. managed session 初始保持 `awaiting_thread`
 6. 如果用户已经知道 caller thread，则通过 `cbth cli run --bind-thread-id <thread_id>` 在启动时显式建立 `bound_thread_id`
-7. 否则保持 `awaiting_thread`，直到用户后续显式执行 `cbth cli bind --managed-session-id <id> --thread-id <thread_id>`
+7. 否则保持 `awaiting_thread`，直到用户后续先执行 `cbth cli status --latest --json` 发现 `managed_session_id`，再显式执行 `cbth cli bind --managed-session-id <id> --thread-id <thread_id>`
    - 如果 session 已经 `bound`，这条命令必须 fail-closed，不能把它当成 rebind
 8. sidecar 从共享核心读取 per-thread `delivery batch`
 9. 任务 ready 后：

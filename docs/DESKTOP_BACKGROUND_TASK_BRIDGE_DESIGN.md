@@ -243,6 +243,7 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
      - `generation`
      - `snapshot_revision`
      - `snapshot_path`
+     - `requires_artifact_read`
    - 该 thread 必须已经存在 `binding_state=bound` 的 desktop binding
    - 且该 binding 必须同时满足：
      - `read_transport_capability=validated`

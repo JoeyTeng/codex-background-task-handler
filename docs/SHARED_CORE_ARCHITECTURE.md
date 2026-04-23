@@ -449,6 +449,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - `generation`
   - `snapshot_revision`
   - `snapshot_path`
+  - `requires_artifact_read`
 - bridge 获取这组 token 的来源合同必须是二选一：
   - `direct_file_read` 路径：`ready-threads.json` 的每个 ready entry 必须直接携带这整组 prompt token
   - `helper_cli_read` 路径：`cbth desktop claim-next-ready ...` 必须一次性返回这整组 prompt token
@@ -896,6 +897,7 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --attempt-id <
 cbth daemon run
 cbth cli run
 cbth cli bind
+cbth cli status
 cbth desktop ...
 cbth job submit
 cbth job complete
@@ -914,6 +916,10 @@ cbth desktop binding unbind
 - `cbth cli bind` 是 CLI fixed-thread bootstrap 的稳定入口：
   - 只允许把 `awaiting_thread` session 推进到 `bound`
   - 如果 session 已经 `bound`，必须返回 `already_bound`
+- `cbth cli status` 是 CLI managed-session discovery / inspection 的稳定入口：
+  - 至少支持 `--latest --json`
+  - 成功输出必须回显 `managed_session_id`
+  - 并返回 `binding_state` / `bound_thread_id`
 - `cbth desktop ...` 预留给 Desktop bootstrap / helper。
 - `cbth job ...` 是第一版对外稳定的任务提交与状态回报面。
 - `cbth batch close-head` / `inspect-head` 与 `cbth desktop binding repair` / `unbind` 也必须作为第一版稳定的 operator recovery 面存在。
@@ -1059,6 +1065,7 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
   - `generation`
   - `snapshot_revision`
   - `snapshot_path`
+  - `requires_artifact_read`
 - bridge 必须再根据 `source_thread_id` 查询 binding，解析当前唯一允许更新的 `caller_automation_id`
 - 当前首选路径是：
   - bridge heartbeat 只读 `ready-threads.json`

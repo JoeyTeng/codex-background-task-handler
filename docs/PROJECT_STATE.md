@@ -106,7 +106,7 @@
   - 这些字段的输入合同也已收口为：
     - submitter 显式提供 delivery policy
     - 若缺失则 core fail-closed 写入保守默认值
-    - `inline_payload_bytes` / `requires_artifact_read` / `steer_candidate` 由 core 或 adapter 派生，不由 submitter 直填
+    - `inline_payload_bytes` / `requires_artifact_read` / `steer_candidate` 由 core 统一派生，不由 submitter 直填
 - caller heartbeat lifecycle 也已收口：
   - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
   - `armed_generation` 作为这个长期复用 heartbeat 的 generation 栅栏
