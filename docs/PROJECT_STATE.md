@@ -23,7 +23,8 @@
   - 其中 `direct_file_read` 仍是候选优先路径，`helper_cli_read` 只是条件性 fallback
   - 同时又补了一层 explicit desktop binding：bridge 运行期只更新已知 caller automation，不做 blind create/discovery
   - Desktop 的 `read_transport` 也已收口为 installation-wide 选择：
-    - binding 里只 durable 镜像当前安装选定 transport
+    - binding 里只 durable 镜像当前安装选定 transport 与其 generation
+    - 权威来源是 daemon-managed `desktop_installation_state`
     - v1 不支持 mixed Desktop `read_transport` bindings
   - Desktop 顶部文案也已改成更保守的口径：`note-arm-pending` / `note-arm` / `note-boundary-crossed` 是 v1 规划中的窄写回依赖；`note-delivered` 已降级为未来 post-output ack 扩展点，但后台 heartbeat 能否无审批执行前者仍待实证
   - 而且 Desktop 自动续跑现在被明确成双门槛：
@@ -36,11 +37,12 @@
   - 启动时 capability probe
   - 基于本机 `codex-cli 0.123.0` 的当前上游能力，第一版实际合同收口为 loopback-only shared `app-server`
   - `--ws-auth` 目前仍只适用于 non-loopback listeners，因此不再把 per-session bearer-token auth 当成 v1 既有能力
-  - 更强本地 auth 边界留待上游支持 loopback auth 后再补
+  - 因而 v1 只能在“专用单用户工作站 / 等价隔离环境”这个部署前提下成立；更强本地 auth 边界留待上游支持 loopback auth 后再补
   - shared `app-server` 由 daemon 持有，而不是前台 wrapper 临时持有
   - 一个 managed CLI session 在 v1 里只绑定一个 `bound_thread_id`
   - 这个 `bound_thread_id` 在 v1 必须通过 `cbth cli run --bind-thread-id <thread_id>` 启动时显式建立，而不是靠前台事件流自动归因
   - v1 不再承诺 late-bind，也不把 `managed_session_id` 暴露成外部回填 thread id 的 stable bootstrap surface
+  - 同一个 `bound_thread_id` 在 v1 最多只允许一个 non-retired managed session；`cbth cli run --bind-thread-id` 必须是 attach-or-create，而不是 blind create
   - 前台 thread-switch 的自动观测/自动 retarget 不属于 v1 合同
   - 默认仅在 idle 时 `turn/start`
   - `turn/steer` 只作为只读、低风险场景下的受限优化
@@ -118,6 +120,7 @@
   - 其中 `pause_not_before` 明确保证 bridge 至少给 caller 一次完整 heartbeat 触发机会，再允许回收这次 wake
   - bridge 的 ready entry 也已收口：
     - 只要求返回 prompt token
+    - `snapshot_path` 只保留在 bridge-side locator，不进入 caller prompt
     - `caller_automation_id` 一律由 bridge 通过 `source_thread_id -> binding` lookup 解析
   - daemon 自动退出条件也必须覆盖这两个 deadline
   - bridge 还需要一个专门的 overdue-binding 输入面：
@@ -138,6 +141,7 @@
   - 一个 managed session 在 v1 里只承诺一个固定的 `bound_thread_id`
   - `bound_thread_id` 只能通过 `cbth cli run --bind-thread-id <thread_id>` 在启动时显式建立；当前上游 surface 不提供可依赖的前台来源归因
   - daemon 必须 durable 跟踪 `managed_session_id + bound_thread_id`
+  - 同一个 `bound_thread_id` 最多只允许一个 non-retired managed session；不可安全复用时必须 fail-closed，而不是并发创建第二个 session
   - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点
   - v1 不提供 late-bind / external discovery surface；如需换目标 thread，必须新开 session
   - 如果用户想把自动续跑目标换到另一个 thread，必须显式开新 session 或等待未来的 rebind contract
@@ -165,7 +169,8 @@
 - 因此 CLI 第一版现在改成更现实的安全边界：
   - loopback-only listener
   - daemon-owned ephemeral port
-  - 单机 / 单用户 / 同一 OS-user trust domain
+  - unauthenticated local control plane
+  - 仅在 dedicated single-user deployment assumption 下支持
 - `--remote-auth-token-env` 仍是上游已存在的 surface，但在当前 loopback 合同下不再被当成第一版既有依赖。
 - `~/.cbth` 的 Desktop 侧文件路径也新增了权限合同：
   - directory `0700`

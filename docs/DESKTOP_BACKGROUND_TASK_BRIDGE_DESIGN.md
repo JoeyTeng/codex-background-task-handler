@@ -87,14 +87,26 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
      - `pause_not_before` (optional)
      - `pause_deadline` (optional)
      - `read_transport`
+     - `read_transport_generation`
      - `read_transport_capability`
      - `artifact_read_capability`
      - `writeback_capability`
    - bridge 在运行期只允许更新这个已知 `caller_automation_id`，不做 blind create / discovery。
    - Desktop v1 不支持同一安装里 mixed `read_transport` bindings：
      - 同一安装只允许一个 installation-wide `read_transport`
-     - binding 上的 `read_transport` 只是这个安装当前选定 transport 的 durable 镜像
-     - 如果 binding 记录与安装当前 transport 不一致，该 binding 必须进入 `degraded` 或重新 bootstrap
+     - binding 上的 `read_transport + read_transport_generation` 只是这个安装当前选定 transport 的 durable 镜像
+     - 如果 binding 镜像与安装当前 installation state 不一致，该 binding 必须进入 `degraded` 或重新 bootstrap
+   - Desktop 安装级还必须有一个 daemon-managed `desktop_installation_state` 作为权威来源：
+     - `read_transport`
+     - `read_transport_generation`
+     - `read_transport_capability`
+     - `artifact_read_capability`
+     - `writeback_capability`
+     - `validated_at`
+   - 推荐暴露面：
+     - preferred: `~/.cbth/inbox/desktop-installation-state.json`
+     - fallback: `cbth desktop installation-state --json`
+   - bootstrap / repair 是唯一允许更新 installation state 的路径；bridge 运行期必须先读 installation state，再核对 binding 镜像
    - 只有当以下条件同时满足时，这个 binding 才允许进入真正可自动续跑的 `bound` 状态：
      - `read_transport_capability=validated`
      - `writeback_capability=validated`
@@ -256,7 +268,9 @@ fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
      - `attempt_id`
      - `generation`
      - `snapshot_revision`
-     - `snapshot_path`
+   - 其中 `snapshot_path` 只属于 bridge 侧 ready-source locator：
+     - 可用于 bridge 自己读取/核对 envelope
+     - 不得写入 caller heartbeat prompt
    - 在真正调用 `automation_update` 前，bridge 必须先调用一个窄 helper，把当前 attempt durable 推到 `arm_pending`，同时 acquire 当前 generation 的 `bridge_arm_lease`：
 
 ```text
@@ -386,6 +400,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - `cooldown_until`
 - bridge arm caller heartbeat 前，必须先原子创建/更新 attempt，并在真正调用 `automation_update` 前先把它 durable 推到 `arm_pending`。
 - caller prompt 中必须显式携带 `batch_id + attempt_id + generation + snapshot_revision`。
+- `snapshot_path` 只用于 bridge 侧直接读取 / 核对 envelope，不属于 caller prompt token。
 - `note-boundary-crossed` 的 success 返回也必须回显这四者；caller 必须先比较 helper 返回值与 prompt 期望值是否一致，只要 mismatch 就立即 no-op。
 - 同一 thread 上出现新的 generation 后，所有旧 heartbeat prompt 都只能看到 mismatch，不得重复消费当前 head batch。
 - 第一版不要求 `cbth` 在关键路径上同步拿到 `automation_id`。

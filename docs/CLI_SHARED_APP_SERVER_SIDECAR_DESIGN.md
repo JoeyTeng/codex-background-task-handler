@@ -56,6 +56,11 @@ codex --remote ws://127.0.0.1:<port>
    - daemon 必须 durable 维护：
      - `managed_session_id`
      - `bound_thread_id`
+     - `session_state`
+       - `live`
+       - `detached`
+       - `stale`
+       - `retired`
    - 第一版不再尝试从 shared `app-server` 的事件流里自动归因“哪个 turn 来自前台 TUI”：
      - 当前上游 surface 没有 per-client identity / source attribution
      - 因此 daemon 不能可靠地靠被动观察事件流来推断 `bound_thread_id`
@@ -70,6 +75,15 @@ codex --remote ws://127.0.0.1:<port>
      - 它不证明前台当前正在看的 thread 一定等于 `bound_thread_id`
      - 它也不要求 `cbth` 能从 app-server 侧可靠读出“当前 foreground thread id”
    - 因此，第一版的 fixed-thread 合同是“投递目标固定”，不是“前台焦点已校验”。
+   - 同一个 `bound_thread_id` 在任意时刻最多只允许一个 non-retired managed session：
+     - `cbth cli run --bind-thread-id <thread_id>` 必须是 attach-or-create，而不是 blind create
+     - 如果 daemon 已经找到同一个 `bound_thread_id` 的 `live` / `detached` session，就必须复用它
+     - 如果找到的是 `stale` session：
+       - 且它仍有 active foreground client、未收口 accepted attempt、或未清空的 delivery work，则必须 fail-closed 为 `session_conflict` / `stale_session_pending_resolution`
+       - 只有在它已经满足 retirement 条件后，daemon 才允许先把旧 session 标为 `retired`，再创建新的 managed session
+   - 因此，`managed_session_id` 只在“同一个仍被复用的逻辑 session”内稳定：
+     - attach/recover 到同一 logical session 时不变
+     - 旧 session 一旦被 `retired`，后续再为同一个 `bound_thread_id` 新建 managed session 时，必须分配新的 `managed_session_id`
    - 一旦 durable 建立，`bound_thread_id` 就代表这条 managed session 的自动续跑目标 thread。
    - 第一版不承诺在同一 managed session 里自动追踪前台 TUI 的 thread 切换，也不承诺自动把 delivery retarget 到别的 thread。
    - 如果用户想把自动续跑目标换到另一个 thread，必须：
@@ -95,20 +109,23 @@ codex --remote ws://127.0.0.1:<port>
   - `--remote-auth-token-env <ENV_VAR>`
 - 但截至本机 `codex-cli 0.123.0`，`codex app-server --help` 仍把 `--ws-auth` 明确标成“for non-loopback listeners”。
 - 这意味着第一版在 `127.0.0.1` / `localhost` 上的 shared `app-server` 目前不能把 bearer-token auth 当成既有能力来依赖。
-- 因此，第一版的最小安全边界必须改成：
+- 因此，第一版不能把 loopback listener 描述成真正的本地 auth 边界；当前更准确的说法是：
   - shared `app-server` 只监听 `127.0.0.1` / `localhost`
   - daemon 为每个 managed session 选择随机高位本地端口
   - shared `app-server` 只在该 managed session 生命周期内存在
-  - 前台 `codex --remote` 与 sidecar 都被视为同一 OS-user trust domain 下的本地 client
-- 第一版明确不承诺防御“同一用户下的其他本地进程误连 loopback app-server”。
+  - 上述措施只是在降低意外暴露面，不是授权机制
+- 第一版明确不承诺防御“本机上其他本地进程附着 loopback app-server”。
+- 因此 v1 的支持部署前提必须收口为：
+  - 专用单用户工作站、单用户开发 VM，或等价的本机隔离环境
+  - 不支持多用户共享主机、共享 shell 机、或把“本机上其他进程也不可信”纳入威胁模型的环境
 - 更强的 auth 边界有两条未来路径：
   - 上游将 websocket auth 扩展到 loopback listeners
   - 或本项目改成不同的本地 transport / wrapper 形状
 - 在那之前，第一版只能把 CLI shared `app-server` 视为：
-  - 单机
-  - 单用户
   - loopback-only
-  - daemon-owned ephemeral control plane
+  - unauthenticated local control plane
+  - daemon-owned ephemeral process
+  - 仅在 dedicated single-user deployment assumption 下支持
 
 ## Shared App-Server 所有权
 
@@ -135,6 +152,11 @@ codex --remote ws://127.0.0.1:<port>
       - shared `app-server` 进程被重启或重建
       - daemon 自己重启后无法证明已恢复到同一个连续 event stream
       - 任何 accepted `delivery_turn_id` 的后续观察连续性无法再证明
+- `cbth cli run --bind-thread-id <thread_id>` 的 v1 合同必须是：
+  - 先按 `bound_thread_id` 查询是否已经存在 non-retired managed session
+  - 如果存在可复用 session：attach/reuse
+  - 如果存在 `stale` session：只有在它已满足 retirement 条件后才允许替换
+  - 如果存在不可安全替换的 `stale` / conflicting session：直接 fail-closed，不得并发创建第二个 session
 - 当同时满足以下条件时，daemon 才允许清理该 managed session：
   - 没有 active jobs
   - 没有连接中的 foreground client
@@ -467,13 +489,17 @@ cbth cli run
    - 监听 loopback
    - 不依赖 loopback websocket auth
 3. 启动时对实验 RPC 做 capability probe
-4. `cbth cli run --bind-thread-id <thread_id>` 创建/恢复一个 fixed-thread managed session，并启动前台 `codex --remote ...`
-5. sidecar 从共享核心读取 per-thread `delivery batch`
-6. 任务 ready 后：
+4. `cbth cli run --bind-thread-id <thread_id>` 先执行 attach-or-create：
+   - 同一 `bound_thread_id` 有可复用 session 时 attach/reuse
+   - 同一 `bound_thread_id` 有不可安全替换的 stale/conflicting session 时 fail-closed
+   - 只有在没有 non-retired session，或旧 session 已满足 retirement 条件时，才创建新的 managed session
+5. attach/create 成功后再启动前台 `codex --remote ...`
+6. sidecar 从共享核心读取 per-thread `delivery batch`
+7. 任务 ready 后：
    - 默认只在 caller thread idle 时：`thread/resume + turn/start`
    - 只有显式打开 steer feature flag，且 `turn/steer` 能力存在并满足只读/低风险策略时：允许 steer
-7. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
-8. 如果用户手动让前台停留在 `bound_thread_id`，TUI 就会通过该 thread 的已有订阅自然感知新 turn
+8. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
+9. 如果用户手动让前台停留在 `bound_thread_id`，TUI 就会通过该 thread 的已有订阅自然感知新 turn
    - 但 v1 不负责证明或强制这件事始终成立
 
 v1 范围外：

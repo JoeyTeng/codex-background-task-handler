@@ -267,6 +267,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - `read_transport`
   - `direct_file_read`
   - `helper_cli_read`
+- `read_transport_generation`
 - `read_transport_capability`
   - `unknown`
   - `validated`
@@ -283,6 +284,21 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - `updated_at`
 - `last_verified_at`
 
+- Desktop 安装级还必须有一个单独的 singleton `desktop_installation_state` 作为权威来源：
+  - `read_transport`
+  - `read_transport_generation`
+  - `read_transport_capability`
+  - `artifact_read_capability`
+  - `writeback_capability`
+  - `validated_at`
+  - `updated_by_bootstrap_or_repair`
+- 这个 installation state 的 source of truth 必须由 `cbth` durable 持有：
+  - bootstrap / repair 是唯一允许更新它的路径
+  - bridge 运行期必须优先读取它，再检查 binding 上的镜像字段是否一致
+  - 推荐暴露面：
+    - preferred: `~/.cbth/inbox/desktop-installation-state.json`
+    - fallback: `cbth desktop installation-state --json`
+
 约束：
 
 - Desktop 自动续跑只对同时满足以下条件的 thread 生效：
@@ -292,8 +308,8 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - `writeback_capability=validated`
 - Desktop v1 不支持同一安装里 mixed `read_transport` bindings：
   - 同一 Desktop 安装只允许一个 installation-wide `read_transport`
-  - binding 上的 `read_transport` 只是这个安装当前选定 transport 的 durable 镜像，用于 bootstrap 校验、诊断和 stale-binding 检测
-  - 如果 binding 记录的 `read_transport` 与安装当前 transport 不一致，该 binding 必须进入 `degraded` 或重新 bootstrap
+  - binding 上的 `read_transport + read_transport_generation` 只是这个安装当前选定 transport 的 durable 镜像，用于 bootstrap 校验、诊断和 stale-binding 检测
+  - 如果 binding 镜像与 installation state 不一致，该 binding 必须进入 `degraded` 或重新 bootstrap
 - `unbound` thread 可以继续提交 job，但 bridge 不得尝试自动 arm caller heartbeat。
 - 运行期 bridge 不负责发现新的 caller automation id；第一版要求这个 id 通过 bootstrap 预先 durable 绑定。
 - `degraded` 表示该 thread 暂时失去自动续跑能力：
@@ -443,19 +459,22 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - `prepared`
   - `arm_pending`
   - `cooldown`
-- bridge 为 caller arm heartbeat 时，必须把以下值同时写入 caller prompt：
+- bridge 为 caller arm heartbeat 时，必须把以下 caller prompt token 写入 prompt：
   - `batch_id`
   - `attempt_id`
   - `generation`
   - `snapshot_revision`
-  - `snapshot_path`
+- `snapshot_path` 只属于 bridge-side read locator，不得在 v1 caller prompt 中暴露。
 - `requires_artifact_read` 是 bridge-side gating metadata，不是 caller stale-wake token 的一部分。
 - bridge 获取 ready entry 的来源合同必须是二选一：
-  - `direct_file_read` 路径：`ready-threads.json` 的每个 ready entry 必须直接携带上述 caller prompt token，加上 `requires_artifact_read`
-  - `helper_cli_read` 路径：`cbth desktop claim-next-ready ...` 必须一次性返回上述 caller prompt token，加上 `requires_artifact_read`
+  - `direct_file_read` 路径：`ready-threads.json` 的每个 ready entry 必须携带：
+    - caller prompt token：`batch_id + attempt_id + generation + snapshot_revision`
+    - bridge-side locator：`snapshot_path`
+    - gating metadata：`requires_artifact_read`
+  - `helper_cli_read` 路径：`cbth desktop claim-next-ready ...` 必须一次性返回同样三类信息
 - `caller_automation_id` 不要求由 ready entry 直接携带：
   - bridge 必须始终根据 `source_thread_id` 查询 desktop binding 来解析它
-  - 如果 binding 缺失、不是 `bound`、或其 `read_transport` 与当前安装已选定 transport 不一致，则 bridge 不得继续 arm
+  - 如果 binding 缺失、不是 `bound`、或其 `read_transport + read_transport_generation` 与当前 installation state 不一致，则 bridge 不得继续 arm
 - `cbth desktop claim-next-ready ...` 虽然名字里带 `claim`，但第一版语义必须是：
   - 纯读取 / peek helper
   - 不得创建 reservation

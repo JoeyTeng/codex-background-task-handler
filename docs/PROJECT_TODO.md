@@ -1,5 +1,7 @@
 # Project TODO
 
+当前仍有几条关键 capability / contract 没实证完成；在这些项完成前，不应把 v1 描述成端到端已验证。
+
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
 - [x] 确认桌面端私有 `app-server` 当前正持有该 rollout 文件。
 - [x] 实现最小 PoC 脚本，通过外部独立 `codex app-server` 对该 thread 执行 `read` / `resume` / `inject_items`。
@@ -37,11 +39,17 @@
   - `armed_generation`
   - `pause_deadline`
   - `read_transport` (mirrors the installation-wide chosen transport)
+  - `read_transport_generation`
   - `read_transport_capability`
   - `artifact_read_capability`
   - `writeback_capability`
   - paused 状态读回校验
   - v1 明确不支持 mixed Desktop `read_transport` bindings
+- [ ] 为 Desktop 定死 installation-wide `read_transport` 权威来源：
+  - daemon-managed `desktop_installation_state`
+  - preferred `~/.cbth/inbox/desktop-installation-state.json`
+  - fallback `cbth desktop installation-state --json`
+  - bootstrap / repair 是唯一写入路径
 - [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
   - `ready-threads.json`
   - `arm-pending-bindings.json`
@@ -203,10 +211,14 @@
   - 如果上游未来支持 loopback auth，再补对应 auth contract validation
 - [ ] 按已定稿合同实现 CLI managed session 的 fixed-thread contract：
   - durable `managed_session_id + bound_thread_id`
+  - durable `session_state`
   - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
   - 通过 `cbth cli run --bind-thread-id <thread_id>` 在启动时建立 `bound_thread_id`，而不是靠前台事件流自动归因
   - v1 不提供 late-bind 或 `managed_session_id` 外部发现/回填的 stable surface
   - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点
+  - 同一个 `bound_thread_id` 最多只允许一个 non-retired managed session
+  - `cbth cli run --bind-thread-id` 必须是 attach-or-create
+  - stale session 只有在已满足 retirement 条件时才允许被替换；否则必须 fail-closed
   - 第一版不做前台 thread-switch 的自动观测或自动 retarget
   - 如需把自动续跑目标换到别的 thread，必须显式开新 session 或等待未来 rebind contract
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
