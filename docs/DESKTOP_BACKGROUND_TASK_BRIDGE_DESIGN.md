@@ -64,17 +64,24 @@
      - 默认禁用
      - 不属于 automatic caller path
      - 不得在 `note-boundary-crossed` 之前向 caller 暴露 payload / artifact 内容
-   - `helper_cli_read` 建议提供一组窄 helper：
+   - Desktop helper surface 必须分层，不把所有 helper 都混成 `helper_cli_read`：
 
 ```text
+# mandatory preflight
 cbth desktop bridge-preflight --bridge-thread-id <thread_id> --json
-cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --json
+
+# optional bridge-side helper_cli_read fallback
 cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
-cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <batch_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
-cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
+
+# writeback / gated continuation
+cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --json
 cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --bridge-arm-lease-id <lease_id> --json
+cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <batch_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
+
+# operator / future-expansion recovery
+cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
 ```
 
    - `bridge-preflight` 是每轮 bridge wake 的必经 helper，不是 `helper_cli_read` fallback：
@@ -181,8 +188,8 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
    - 也就是说，v1 不再把“系统层面阻止 post-boundary 普通工具”当成架构保证：
      - 如果 caller 偏离这条 supported path，属于 unsupported implementation drift
      - 核心 delivery state machine 只保证 batch 已 durable 记录 handoff 并释放 FIFO，而不再保证后续动作可自动重放或证明可见
-   - 如果 caller 在 `note-boundary-crossed` 成功返回前崩溃，batch 仍可 redelivery。
-   - 如果 caller 已经成功写入 `note-boundary-crossed` 后再崩溃，batch 已经 `handoff_recorded`，不得自动 redelivery。
+   - 如果 caller 在调用 `note-boundary-crossed` 前崩溃，或 durable reconciliation 能正向证明该 helper 没有提交 crossing mutation，batch 才可按普通 pre-boundary 条件 redelivery。
+   - 如果 `note-boundary-crossed` 已经 durable 提交，但 success response 没有返回 caller，batch 也已经 `handoff_recorded`，不得自动 redelivery；后续只能按 `batch_id` operator recovery。
    - 因此，`note-boundary-crossed` 就是 v1 的最后一个自动 durable 断点：
      - crossing 之后不再尝试自动把 batch 收口成 “已送达”
      - 后续如需恢复，只能通过 operator recovery 读取 `boundary_recovery_envelope`
@@ -530,17 +537,24 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <ba
 - automatic caller continuation 在 `note-boundary-crossed` 之前没有稳定的 file-read 接口可用。
 - 即使这些导出存在，也只能用于 operator / debug，不得被 caller prompt 当作 pre-boundary payload source。
 
-### Helper fallback
+### Helper surface
 
 ```text
+# mandatory preflight
 cbth desktop bridge-preflight --bridge-thread-id <thread_id> --json
+
+# optional bridge-side helper_cli_read fallback
 cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
-cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
-cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <batch_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
-cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
+
+# writeback / gated continuation
+cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --json
 cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --bridge-arm-lease-id <lease_id> --json
+cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <batch_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
+
+# operator / future-expansion recovery
+cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
 ```
 
 `bridge-preflight` 是每轮 bridge wake 的 mandatory helper；它成功后，`direct_file_read` 才能读取 freshly generated snapshots。`read-artifact` 保留给 operator/manual recovery，或 future-expansion；它不再属于 v1 automatic caller path。若未来重新启用，它的返回合同至少包括：

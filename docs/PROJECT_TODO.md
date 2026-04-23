@@ -76,8 +76,10 @@
 - [ ] 落实 `~/.cbth` 的权限合同：
   - directories `0700`
   - regular files `0600`
-- [ ] 设计并实现 Desktop bridge preflight 与 `helper_cli_read` fallback：
+- [ ] 设计并实现 Desktop bridge preflight 与 bridge-side `helper_cli_read` fallback：
   - `cbth desktop bridge-preflight --bridge-thread-id ... --json`
+  - `cbth desktop list-arm-pending --bridge-thread-id ... --json`
+  - `cbth desktop list-pause-due --bridge-thread-id ... --json`
   - `cbth desktop claim-next-ready --bridge-thread-id ... --json`
   - `bridge-preflight` 是每轮 bridge wake 的 mandatory helper；`direct_file_read` 也必须先通过它刷新 snapshots
   - `cbth desktop read-artifact --artifact-id ... --artifact-read-lease-id ... --offset ... --max-bytes ... --json` 只属于 operator/manual recovery 或 future-expansion；v1 里传入的 lease 必须来自 operator recovery 签发的 `artifact_recovery_lease_id`

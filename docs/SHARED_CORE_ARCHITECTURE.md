@@ -173,18 +173,35 @@
 ~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / operator path
 ```
 
-2. mandatory preflight plus optional `helper_cli_read`
+2. mandatory preflight
 
 ```text
 cbth desktop bridge-preflight --bridge-thread-id <thread_id> --json
+```
+
+3. optional bridge-side `helper_cli_read` fallback
+
+```text
 cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
+```
+
+4. writeback / gated continuation helpers
+
+```text
+cbth desktop note-arm-pending --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --json
+cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --bridge-arm-lease-id <lease_id> --json
 cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <batch_id> --attempt-id <attempt_id> --generation <generation> --expected-snapshot-revision <revision> --json
+```
+
+5. operator / future-expansion artifact helper
+
+```text
 cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id <lease_id> --offset <offset> --max-bytes <n> --json
 ```
 
-bridge 侧两种传输必须返回同一个 ready-entry schema。
+bridge 侧 `direct_file_read` 与 `helper_cli_read` 必须返回同一个 ready-entry schema。
 caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` success 返回来获得 inline continuation payload / summary。
 
 `bridge-preflight` 是每轮 bridge wake 的 mandatory helper：它按需拉起 daemon，执行 overdue sweep / auto-close / artifact GC / binding reconcile，并原子刷新本轮 snapshot。`helper_cli_read` 的合同要额外收紧：
@@ -193,8 +210,8 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - 它只是 Desktop 在 `direct_file_read` 失败时可考虑的窄 helper fallback。
 - 在把它升级成正式受支持路径之前，必须单独验证：
   - heartbeat turn 无审批执行 `bridge-preflight`
-  - heartbeat turn 无审批执行这些窄 `cbth desktop ...` helper
-  - helper 返回的 bridge-side metadata / locator 合同与 `direct_file_read` 等价
+  - heartbeat turn 无审批执行 bridge-side read fallback helpers
+  - read fallback helper 返回的 bridge-side metadata / locator 合同与 `direct_file_read` 等价
   - automatic caller path 需要的 continuation 内容只允许通过 `note-boundary-crossed` success 暴露
 - 因此，第一版当前真正的优先候选仍然是 `bridge-preflight + direct_file_read`；额外 `helper_cli_read` 只是条件性 fallback，不应在文档里被表述成已验证主路径。
 
@@ -276,6 +293,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - bridge heartbeat thread
   - caller heartbeat
   - `automation_update` update/pause on a bound caller automation
+  - mandatory `cbth desktop bridge-preflight ...`
   - bridge-side delivery envelope 读取（`direct_file_read` 或 `helper_cli_read`）
   - caller-side gated continuation access (`cbth desktop note-boundary-crossed ...`)
   - narrow helper writeback (`cbth desktop note-arm-pending ...`, `cbth desktop note-arm ...`, `cbth desktop note-boundary-crossed ...`)

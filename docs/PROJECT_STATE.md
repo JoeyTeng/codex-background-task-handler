@@ -82,15 +82,11 @@
   - 用于在 bridge 真正调用 `automation_update` 前，把当前 head attempt durable 推到 `arm_pending`
   - `cbth desktop note-arm ...`
   - 用于在 bridge 成功 `automation_update` 后，把 attempt durable 推进到 `cooldown`
-- Desktop helper/control 链路也进一步补完整：
-  - `cbth desktop bridge-preflight ...`
-  - `cbth desktop note-arm-pending ...`
-  - `cbth desktop list-arm-pending ...`
-  - `cbth desktop list-pause-due ...`
-  - `cbth desktop claim-next-ready ...`
-  - `cbth desktop read-artifact ...`（operator/manual recovery 或 future-expansion）
-  - `cbth desktop note-arm ...`
-  - `cbth desktop note-boundary-crossed ...`
+- Desktop helper/control 链路也进一步按职责分层：
+  - mandatory preflight：`cbth desktop bridge-preflight ...`
+  - optional bridge-side read fallback：`list-arm-pending` / `list-pause-due` / `claim-next-ready`
+  - writeback / gated continuation：`note-arm-pending` / `note-arm` / `note-boundary-crossed`
+  - operator/manual recovery 或 future-expansion：`read-artifact`
 - 但除了 mandatory `bridge-preflight` 外，额外 helper read fallback 仍被重新降级成“条件性 fallback”：
   - 它仍要求 heartbeat turn 无审批执行窄 `cbth desktop ...` 命令
   - 在这个前提被实证前，不能把额外 helper read fallback 当作已验证主路径
@@ -108,6 +104,7 @@
     - caller 必须先拿到它的 fresh success 返回，才允许看到 inline continuation payload / summary
     - helper mutation 前必须校验完整 caller prompt token：`source_thread_id + batch_id + attempt_id + generation + expected_snapshot_revision`
     - 这一步在 v1 是单次 crossing，不再提供自动 replay-safe continuation；response 丢失后改走 operator recovery
+    - redelivery 只能发生在 durable reconciliation 正向证明 crossing mutation 没有提交时；helper 已提交但 response 丢失仍按 `handoff_recorded` 处理
   - 如果 `note-boundary-crossed` 尚未 success，caller 不得真正跨过 continuation boundary
   - `note-boundary-crossed` 需要 compare-and-swap / stale-no-op 语义，避免重复 wake 或 supersede 后重复记账
   - 一旦 `note-boundary-crossed` 成功，当前 batch 就必须进入 `closed + close_reason=handoff_recorded + replay_policy=manual_resolution_only`
