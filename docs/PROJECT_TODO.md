@@ -29,13 +29,12 @@
   - `arm-pending-bindings.json`
   - `pause-due-bindings.json`
   - 大 artifact 的正式自动路径不再依赖直接读 `artifacts/<artifact_id>/payload`
-- [ ] 单独验证 `cbth desktop read-artifact ...` 在 heartbeat 中的无审批能力，并把结果写回 `artifact_read_capability`。
+- [ ] 如果未来要把大 artifact 纳入 automatic caller path，再单独验证 `cbth desktop read-artifact ...` 在 heartbeat / caller 路径中的无审批能力，并把结果写回 `artifact_read_capability`。
 - [ ] 单独验证 Desktop heartbeat 在后台运行时，是否能无审批执行窄 `cbth desktop ...` helper：
   - `note-arm-pending`
   - `list-arm-pending`
   - `list-pause-due`
   - `claim-next-ready`
-  - `read-artifact`
   - `note-arm`
   - `note-boundary-crossed`
 - [ ] 为 Desktop bootstrap 设计并实现 `desktop binding` 流程，至少 durable 记录：
@@ -100,13 +99,20 @@
   - `cbth desktop note-boundary-crossed --source-thread-id ... --attempt-id ... --generation ... --expected-snapshot-revision ... --json`
   - 必须先于真正的 continuation boundary durable 成功
   - success 前置条件必须包括：attempt 已 durable `cooldown`，且 `armed_generation` 仍匹配
+  - 还必须包括 binding / installation-state 仍有效：
+    - `binding_state=bound`
+    - `read_transport_generation` 未漂移
+    - `validation_fingerprint` 未漂移
+    - `read_transport_capability=validated`
+    - `writeback_capability=validated`
   - 成功后当前 head batch 转为 `continuation_boundary_state=crossed_unacknowledged`
   - 同时切到 `replay_policy=manual_resolution_only`
-  - success 返回同时提供 gated payload / artifact access
+  - success 返回同时提供 gated inline continuation payload / summary
 - [ ] 按已定稿 continuation-boundary contract 实现并验证：
-  - bridge 读到 ready entry，或 caller 仅拿到 gated payload / artifact access，都不能关闭 batch
+  - bridge 读到 ready entry，或 caller 仅拿到 gated inline continuation payload / summary，都不能关闭 batch
   - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
   - 一旦 `note-boundary-crossed` 成功，当前 head batch 必须进入 `crossed_unacknowledged + replay_policy=manual_resolution_only`
+  - post-boundary 只允许进入一次性 inline text handoff phase；普通 Codex 工具不属于 supported automatic path
   - 自动 caller path 不提供 replay-safe continuation；response 丢失后改走 operator recovery
   - 第一版不提供 post-boundary 自动 close
   - 如果未来需要支持 post-output ack，再单独设计 observation / response-digest contract
@@ -114,8 +120,8 @@
   - 仅限 `delivery_read_only=true`
   - 且 `delivery_requires_approval/network/write_access=false`
   - Desktop 还必须额外满足 `read_transport_capability=validated`
-  - 对大 artifact batch，Desktop 还必须额外满足 `artifact_read_capability=validated`
   - Desktop 还必须额外满足 `writeback_capability=validated`
+  - `requires_artifact_read=true` 的 batch 不进入 v1 automatic caller path
   - 非只读 batch 只走 manual/operator follow-up
 - [ ] 为 post-continuation-boundary 的 operator-resolution contract 定死收口规则：
   - `binding repair` 不得自动 replay 当前 head batch
@@ -155,8 +161,9 @@
   - 自动 caller path 的重复调用必须返回 `already-crossed` / stale-no-op
   - `batch inspect-head` 必须提供 operator-only `boundary_recovery_envelope`
   - stale / mismatch / closed batch 才返回 stale-no-op
-- [ ] 为 Desktop 大 artifact gated read 定死 lease 生命周期：
-  - `note-boundary-crossed` 返回 `artifact_read_lease_id + artifact_read_lease_deadline`
+- [ ] 为 Desktop operator/manual 大 artifact recovery 定死 lease 生命周期：
+  - automatic caller path 不再依赖 `artifact_read_lease`
+  - operator recovery 需要单独的 `artifact_recovery_lease_id + artifact_read_lease_deadline`
   - `read-artifact` 只能在持有当前有效 lease 时读取
   - lease 在 batch close / supersede / abandon / operator repair-or-close / deadline 到期 / lease rotation 后必须失效
   - `batch inspect-head` 还必须能返回 operator-only `artifact_recovery_lease_id`（或等价 re-lease surface）
@@ -184,6 +191,10 @@
 - [ ] 把 CLI current-state sync 升成最小 capability probe 的正式要求：
   - 缺少 `thread/read` 或等价 current-state 面时，v1 不支持 detached managed-session auto-continuation
   - 这个 sync 至少必须对 `bound_thread_id` 返回 `has_active_regular_turn` 与可选 `active_turn_id`
+- [ ] 把 CLI fresh-thread bootstrap 收口成正式合同：
+  - `cbth cli run --new-thread` 仅在 capability probe 已证明 `thread/start` 可用时允许
+  - daemon 必须先创建 brand-new thread，再把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
+  - 如果既没有现成 `thread_id`，也没有 `thread/start` capability，则前台只能视为探索性 remote TUI
 - [ ] 把 accepted-turn 负终态观察面升成最小 capability probe 的正式要求：
   - 最小 capability set 不只包括 `turn/completed`
   - 还必须能对当前 `delivery_turn_id` 观察并 durable 区分：
@@ -269,11 +280,13 @@
   - durable `session_state`
     - include `parked` for live-part torn down while manual batch still waits operator resolution
   - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
-  - 通过 `cbth cli run --bind-thread-id <thread_id>` 在启动时建立 `bound_thread_id`，而不是靠前台事件流自动归因
+  - 通过显式 bootstrap 建立 `bound_thread_id`，而不是靠前台事件流自动归因：
+    - `cbth cli run --bind-thread-id <thread_id>`
+    - 或 `thread/start` 可用时的 `cbth cli run --new-thread`
   - v1 不提供 late-bind 或 `managed_session_id` 外部发现/回填的 stable surface
   - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点
   - 同一个 `bound_thread_id` 最多只允许一个 non-retired managed session
-  - `cbth cli run --bind-thread-id` 必须是 attach-or-create
+  - existing-thread bootstrap 的 `cbth cli run --bind-thread-id` 必须是 attach-or-create
   - `parked` session 且 manual batch 未终态时，attach 必须 fail-closed 为 `session_pending_manual_resolution`
   - attach 遇到 requested session profile drift 时，不得原地改写；只能 fail-closed 或 retire-and-recreate
   - stale session 只有在已满足 retirement 条件时才允许被替换；否则必须 fail-closed

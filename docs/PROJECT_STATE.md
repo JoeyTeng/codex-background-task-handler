@@ -39,7 +39,10 @@
     - batch 本身必须是只读 / 低风险
     - 目标安装上的读路径也必须已验证可无审批执行
     - 目标安装上的 `note-*` 写 helper 也必须已验证可无审批执行
-    - 对大 artifact batch，还必须额外验证 `read-artifact` capability
+  - 同时又进一步收紧成：
+    - v1 automatic caller path 只支持 `note-boundary-crossed` fresh success 后的一次性 inline text handoff
+    - 大 artifact continuation 与 post-boundary 普通工具步骤不再纳入 v1 automatic path
+    - 这两类场景直接留给 operator/manual follow-up
 - 同时，CLI 关键路径也收口为：
   - 明确依赖实验 RPC
   - 启动时 capability probe
@@ -48,7 +51,9 @@
   - 因而 v1 只能在“专用单用户工作站 / 等价隔离环境”这个部署前提下成立；更强本地 auth 边界留待上游支持 loopback auth 后再补
   - shared `app-server` 由 daemon 持有，而不是前台 wrapper 临时持有
   - 一个 managed CLI session 在 v1 里只绑定一个 `bound_thread_id`
-  - 这个 `bound_thread_id` 在 v1 必须通过 `cbth cli run --bind-thread-id <thread_id>` 启动时显式建立，而不是靠前台事件流自动归因
+  - 这个 `bound_thread_id` 在 v1 现在有两个显式 bootstrap：
+    - 已知 thread 的 `cbth cli run --bind-thread-id <thread_id>`
+    - 以及 `thread/start` 可用时的 `cbth cli run --new-thread`
   - v1 不再承诺 late-bind，也不把 `managed_session_id` 暴露成外部回填 thread id 的 stable bootstrap surface
   - 同一个 `bound_thread_id` 在 v1 最多只允许一个 non-retired managed session；`cbth cli run --bind-thread-id` 必须是 attach-or-create，而不是 blind create
   - 前台 thread-switch 的自动观测/自动 retarget 不属于 v1 合同
@@ -81,7 +86,7 @@
   - `cbth desktop list-arm-pending ...`
   - `cbth desktop list-pause-due ...`
   - `cbth desktop claim-next-ready ...`
-  - `cbth desktop read-artifact ...`
+  - `cbth desktop read-artifact ...`（operator/manual recovery 或 future-expansion）
   - `cbth desktop note-arm ...`
   - `cbth desktop note-boundary-crossed ...`
 - 但这条 helper fallback 也被重新降级成“条件性 fallback”：
@@ -98,11 +103,12 @@
   - `claim-next-ready` 虽然名字里带 `claim`，但第一版必须是纯 read/peek helper，不能 reservation 或隐藏 head batch
   - `arm_pending` attempt 不再是新的 ready head；bridge 必须先 reconcile 它，不能重复 arm 同一 generation
   - `note-boundary-crossed` 现在不只是断点写回，而是 gated continuation helper：
-    - caller 必须先拿到它的 success 返回，才允许看到 payload / artifact access
+    - caller 必须先拿到它的 fresh success 返回，才允许看到 inline continuation payload / summary
     - 这一步在 v1 是单次 crossing，不再提供自动 replay-safe continuation；response 丢失后改走 operator recovery
   - 如果 `note-boundary-crossed` 尚未 success，caller 不得真正跨过 continuation boundary
   - `note-boundary-crossed` 需要 compare-and-swap / stale-no-op 语义，避免重复 wake 或 supersede 后重复记账
   - 一旦 `note-boundary-crossed` 成功，当前 head batch 就必须保持 `crossed_unacknowledged + replay_policy=manual_resolution_only`
+  - post-boundary 只允许进入一次性 inline text handoff phase，不把普通 Codex 工具纳入 supported automatic path
   - 第一版不再尝试把纯文本回复或后续工具动作自动收口成 “已送达”
   - 因此 post-boundary 阶段的默认收口方式只剩：
     - operator 显式 close
@@ -114,8 +120,8 @@
   - 只处理 `delivery_read_only=true`
   - 且不需要 approval/network/write access 的 batch
   - Desktop 还必须满足安装级 `read_transport_capability=validated`
-  - 对 `requires_artifact_read=true` 的 batch，Desktop 还必须额外满足 `artifact_read_capability=validated`
   - Desktop 还必须满足 `writeback_capability=validated`
+  - `requires_artifact_read=true` 的 batch 不再进入 Desktop automatic caller path
   - 非只读 batch 一律不自动续跑，留给 operator/manual follow-up
   - 这些字段的输入合同也已收口为：
     - submitter 显式提供 delivery policy
@@ -151,7 +157,10 @@
 - CLI managed session contract 也已补硬：
   - shared `app-server` 由 daemon 持有
   - 一个 managed session 在 v1 里只承诺一个固定的 `bound_thread_id`
-  - `bound_thread_id` 只能通过 `cbth cli run --bind-thread-id <thread_id>` 在启动时显式建立；当前上游 surface 不提供可依赖的前台来源归因
+  - `bound_thread_id` 通过两种显式 bootstrap 建立：
+    - `cbth cli run --bind-thread-id <thread_id>`
+    - 或 `thread/start` 可用时的 `cbth cli run --new-thread`
+  - 当前上游 surface 仍不提供可依赖的前台来源归因
   - daemon 必须 durable 跟踪 `managed_session_id + bound_thread_id`
   - daemon 还必须 durable 跟踪 session-scoped risk profile：
     - `session_allows_approval`
@@ -333,7 +342,7 @@ scripts/desktop_thread_inject_poc.py
   - 固定 `bridge heartbeat thread` 负责轮询可投递 thread / batch
   - bootstrap 预绑定 `caller_automation_id`
   - bridge 运行期只更新这个已知 heartbeat，不做 blind create / retarget
-  - bridge 侧优先读取只读 inbox snapshot；caller thread 被唤醒后必须先通过 `note-boundary-crossed` 成功跨过 gated continuation boundary，拿到 payload / artifact access 后才能继续原任务
+  - bridge 侧优先读取只读 inbox snapshot；caller thread 被唤醒后必须先通过 `note-boundary-crossed` 成功跨过 gated continuation boundary，拿到 inline continuation payload / summary 后才能进入一次性 handoff phase
 - 该方案不依赖：
   - 外部 live push 当前 Desktop thread
   - 外部直接改 Codex automation DB

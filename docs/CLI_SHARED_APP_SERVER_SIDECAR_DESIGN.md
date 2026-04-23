@@ -77,11 +77,15 @@ codex --remote ws://127.0.0.1:<port>
    - 第一版不再尝试从 shared `app-server` 的事件流里自动归因“哪个 turn 来自前台 TUI”：
      - 当前上游 surface 没有 per-client identity / source attribution
      - 因此 daemon 不能可靠地靠被动观察事件流来推断 `bound_thread_id`
-   - 因此第一版的 managed-session bootstrap 也必须收口为：
-     - 只支持启动时由 `cbth cli run --bind-thread-id <thread_id>` 显式建立 `bound_thread_id`
-     - 不提供 late-bind stable surface
-     - 不提供依赖 `managed_session_id` 的外部发现/回填合同
-   - 如果调用方在启动时拿不到 caller `thread_id`：
+   - 因此第一版的 managed-session bootstrap 也必须收口为两个显式入口：
+     - existing-thread mode：
+       - 启动时由 `cbth cli run --bind-thread-id <thread_id>` 显式建立 `bound_thread_id`
+     - fresh-thread mode：
+       - 仅当 capability probe 证明 `thread/start` 可用时，允许 `cbth cli run --new-thread`
+       - daemon 先创建一个新 thread，再把返回的 `thread_id` durable 绑定成新的 `bound_thread_id`
+   - 不提供 late-bind stable surface
+   - 不提供依赖 `managed_session_id` 的外部发现/回填合同
+   - 如果调用方既拿不到 caller `thread_id`，也没有 `thread/start` 能力：
      - 该前台会话仍可作为探索性 remote TUI 使用
      - 但它不进入 v1 的 managed-session auto-continuation 合同
    - 这个启动时显式 bootstrap 在 v1 只决定 delivery target：
@@ -165,7 +169,7 @@ codex --remote ws://127.0.0.1:<port>
       - shared `app-server` 进程被重启或重建
       - daemon 自己重启后无法证明已恢复到同一个连续 event stream
       - 任何 accepted `delivery_turn_id` 的后续观察连续性无法再证明
-- `cbth cli run --bind-thread-id <thread_id>` 的 v1 合同必须是：
+- existing-thread mode（`cbth cli run --bind-thread-id <thread_id>`）的 v1 合同必须是：
   - 先按 `bound_thread_id` 查询是否已经存在 non-retired managed session
   - 如果存在 `live` / `detached` session：
     - 先比较 requested session profile 与 durable `session_allows_*` profile
@@ -182,6 +186,10 @@ codex --remote ws://127.0.0.1:<port>
     - 只有在这些 manual batch 已终态后，daemon 才允许先 retire 这个 `parked` session，再创建新的 managed session
   - 如果存在 `stale` session：只有在它已满足 retirement 条件后才允许替换
   - 如果存在不可安全替换的 `stale` / conflicting session：直接 fail-closed，不得并发创建第二个 session
+- fresh-thread mode（`cbth cli run --new-thread`）的 v1 合同必须是：
+  - 只在 capability probe 已证明 `thread/start` 可用时允许
+  - daemon 必须先创建一个 brand-new thread，并把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
+  - 这个新 `bound_thread_id` 之后同样进入既定的单 session / fixed-thread / attach-or-create 合同
 - 当同时满足以下条件时，daemon 才允许清理该 managed session：
   - 没有 active jobs
   - 没有连接中的 foreground client
@@ -246,6 +254,8 @@ capabilities.experimentalApi = true
     - `turn_interrupted`
     - `turn_replaced`
   - 缺少这些负终态观察面时，v1 不得宣称自己能安全收口 accepted delivery
+- `thread/start` 仍然不是 existing-thread resume 模式的最小必需能力。
+- 但如果要支持 `cbth cli run --new-thread` 这种 fresh-thread bootstrap，capability probe 还必须额外证明 `thread/start` 可用。
 - 如果缺少 `turn/steer`，CLI adapter 仍可工作，但只能在 caller idle 时投递。
 - 不能把 PoC 中碰巧可用的实验 RPC 直接当成长期稳定契约。
 - 第一版 shipping 配置默认关闭 `turn/steer`，直到 active-turn 分类与安全门槛被实证支持。
@@ -606,13 +616,21 @@ cbth cli run
    - 监听 loopback
    - 不依赖 loopback websocket auth
 3. 启动时对实验 RPC 做 capability probe
-4. `cbth cli run --bind-thread-id <thread_id>` 先执行 attach-or-create：
-   - 同一 `bound_thread_id` 有 `live` / `detached` session 时，先比较 requested profile 与 durable profile；只有完全一致才允许 attach/reuse
-   - 如果 profile drift 且旧 session 仍未满足 retirement 条件：fail-closed 为 `session_profile_mismatch`
-   - 同一 `bound_thread_id` 有 `parked` session 且 unresolved manual batch 尚未终态时：fail-closed 为 `session_pending_manual_resolution`
-   - 同一 `bound_thread_id` 有不可安全替换的 stale/conflicting session 时 fail-closed
-   - 只有在没有 non-retired session，或旧 `parked/stale` session 已满足 retirement 条件时，才创建新的 managed session
-5. attach/create 成功后再启动前台 `codex --remote ...`
+4. CLI bootstrap 必须先选定显式模式：
+   - existing-thread mode：`cbth cli run --bind-thread-id <thread_id>`
+   - fresh-thread mode：`cbth cli run --new-thread`（仅在 `thread/start` capability 已通过 probe 时允许）
+5. attach-or-create / create-new 必须遵守：
+   - existing-thread mode：
+     - 同一 `bound_thread_id` 有 `live` / `detached` session 时，先比较 requested profile 与 durable profile；只有完全一致才允许 attach/reuse
+     - 如果 profile drift 且旧 session 仍未满足 retirement 条件：fail-closed 为 `session_profile_mismatch`
+     - 同一 `bound_thread_id` 有 `parked` session 且 unresolved manual batch 尚未终态时：fail-closed 为 `session_pending_manual_resolution`
+     - 同一 `bound_thread_id` 有不可安全替换的 stale/conflicting session 时 fail-closed
+     - 只有在没有 non-retired session，或旧 `parked/stale` session 已满足 retirement 条件时，才创建新的 managed session
+   - fresh-thread mode：
+     - daemon 必须先调用 `thread/start` 创建 brand-new thread
+     - 再把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
+     - 同时仍适用同一 `bound_thread_id` 最多一个 non-retired managed session 的唯一性合同
+6. attach/create 成功后再启动前台 `codex --remote ...`
 6. sidecar 从共享核心读取 per-thread `delivery batch`
 7. 任务 ready 后：
    - 默认只在 caller thread idle 时：`thread/resume + turn/start`
