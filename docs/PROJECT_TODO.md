@@ -153,7 +153,8 @@
   - `job submit` 的输入合同要同步落地：
     - submit flags / metadata-file.delivery_policy
     - 缺失时 fail-closed 默认值
-    - `inline_payload_bytes` / `requires_artifact_read` / `steer_candidate` 由 core / adapter 派生
+    - `inline_payload_bytes` / `requires_artifact_read` 由 core 派生
+    - `steer_candidate` 由 CLI adapter 在共享核心字段之上判定
 - [ ] 为 CLI active-turn steer 落地可机判的 turn-risk 字段，至少包括：
   - `active_turn_kind`
   - `active_turn_requires_approval`
@@ -205,7 +206,7 @@
   - durable `managed_session_id + bound_thread_id`
   - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
   - 通过显式 bind bootstrap 建立 `bound_thread_id`，而不是靠前台事件流自动归因
-  - 提供稳定的 `cbth cli status --latest --json`，用于发现 `managed_session_id`
+  - 通过 `cbth cli run --session-handle-file <path>` 提供无竞态的 `managed_session_id` 发现路径
   - 显式 bind 只决定 delivery target，不证明前台焦点
   - session 已经 `bound` 后再次 bind 必须 fail-closed，不能当成隐式 rebind
   - 第一版不做前台 thread-switch 的自动观测或自动 retarget
