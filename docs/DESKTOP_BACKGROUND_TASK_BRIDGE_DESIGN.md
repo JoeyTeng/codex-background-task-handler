@@ -58,9 +58,10 @@
      - `~/.cbth/inbox/ready-threads.json`
      - `~/.cbth/inbox/arm-pending-bindings.json`
      - `~/.cbth/inbox/pause-due-bindings.json`
-     - `~/.cbth/inbox/by-thread/<thread_id>.json` (optional diagnostic export, disabled by default)
-     - `~/.cbth/artifacts/<artifact_id>/manifest.json` (diagnostic / operator path only)
-     - `~/.cbth/artifacts/<artifact_id>/payload` (diagnostic / operator path)
+   - `~/.cbth/inbox/by-thread/<thread_id>.json` 与 artifact 路径只允许作为 operator/debug export：
+     - 默认禁用
+     - 不属于 automatic caller path
+     - 不得在 `note-boundary-crossed` 之前向 caller 暴露 payload / artifact 内容
    - `helper_cli_read` 建议提供一组窄 helper：
 
 ```text
@@ -233,6 +234,19 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 bridge heartbeat 每分钟醒一次：
 
 1. 先做上一轮已 arm generation 的 pause / reconcile：
+   - 每轮 wake 必须遵守 bounded work budget：
+     - `max_reconcile_items_per_wake`
+     - `max_reconcile_wall_time_ms`
+     - `max_new_arms_per_wake = 1`
+   - bridge 必须把 reconcile lane 与 fresh-arm lane 分开建模：
+     - reconcile lane 先处理 overdue / safety-critical item
+     - fresh-arm lane 最多为一个新的 ready caller 安排 wake
+   - 如果 reconcile backlog 超出本轮预算：
+     - 剩余 item 必须保持 durable 可见，留给下轮 wake
+     - bridge 不得在单轮里无界循环
+   - 单个 degraded / overdue binding 不得独占整个 bridge：
+     - 只要存在不依赖同一 binding 安全收口的 ready thread
+     - bridge 就必须尽量保留 fresh-arm lane 给其中一个 ready thread
    - 所有仍处于 `arm_pending` 的 attempt 都必须比新 arm 更优先被处理
    - 只要某个 thread 的 head attempt 仍是 `arm_pending`，bridge 就不得对同一 `attempt_id + generation` 重新 arm
    - arm-pending 的读取面必须是：
@@ -449,13 +463,17 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
 ~/.cbth/inbox/ready-threads.json
 ```
 
-### Caller 侧
+### Operator / diagnostic exports
 
 ```text
 ~/.cbth/inbox/by-thread/<thread_id>.json   # optional diagnostic export, disabled by default
 ~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / operator path only
 ~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / operator path
 ```
+
+- 它们不属于 automatic caller path。
+- automatic caller continuation 在 `note-boundary-crossed` 之前没有稳定的 file-read 接口可用。
+- 即使这些导出存在，也只能用于 operator / debug，不得被 caller prompt 当作 pre-boundary payload source。
 
 ### Helper fallback
 
@@ -523,6 +541,10 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
 
 - 每次醒来只做一次状态检查。
 - 每次醒来先做 pause / reconcile，再决定是否 arm 新 batch。
+- 每次醒来必须遵守 bounded work budget：
+  - reconcile work 超预算时只 durable defer，不得在本轮无界循环
+  - fresh-arm lane 最多处理一个新的 ready caller
+  - 只要存在不依赖同一 binding reconcile 的 ready thread，就不得让 unrelated ready work 被单个坏 binding 永久饿死
 - 只读取 ready index，不依赖通用 `cbth job ...` CLI。
 - 没有 ready thread 就立即结束。
 - 有 ready thread 时，只更新对应 caller thread 的已绑定 heartbeat，不直接展开主任务。
@@ -765,6 +787,7 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
 2. 让 sidecar 只负责写 job 状态与完成结果。
 3. 由 `cbth` 自己把结果 ingest 到 managed artifact store。
 4. 由 `cbth` 物化 `ready-threads.json` 与 bridge-side inbox snapshot。
+   - 这些自动路径 snapshot 只包含 ready/reconcile metadata，不包含 pre-boundary payload / artifact 内容。
 5. 让 bridge thread 每分钟读取 `ready-threads.json`。
 6. bridge 发现可投递 batch 后，为对应 caller thread arm 一次 heartbeat。
 7. caller thread 醒来后先调用 `note-boundary-crossed`，拿到 gated payload / artifact access 后继续任务。

@@ -21,8 +21,8 @@
 - [ ] 实现按需启动的本地 daemon：自动拉起、idle timeout，并把退出条件收紧为：
   - 无 active jobs
   - 无 active clients
-  - 无未收口的 ready/materialized/cooldown batch
-  - 无等待中的 `arm_pending_deadline` / `pause_deadline` / `cooldown_until` / `redelivery_window_ends_at` / `delivery_turn_id`
+  - 无需要在当前 idle timeout 内继续本地观察的近端 delivery work
+  - open 但长窗口的 batch / attempt 不单独阻止退出；由下次启动时的 overdue sweep 收口
 - [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 bridge-side 所需的只读 inbox snapshot，且不会卡审批：
   - `ready-threads.json`
   - `arm-pending-bindings.json`
@@ -63,6 +63,12 @@
   - `by-thread/<thread_id>.json` (optional diagnostic export, disabled by default)
   - `artifacts/<artifact_id>/manifest.json` (diagnostic / operator path)
   - `artifacts/<artifact_id>/payload` (diagnostic / operator path; not the automatic continuation path)
+- [ ] 为 Desktop bridge 实现 bounded fairness / work budget contract：
+  - 每轮 wake 有独立 reconcile lane 与 fresh-arm lane
+  - `max_reconcile_items_per_wake`
+  - `max_reconcile_wall_time_ms`
+  - `max_new_arms_per_wake=1`
+  - 单个 degraded / overdue binding 不得让 unrelated ready thread 永久饿死
 - [ ] 落实 `~/.cbth` 的权限合同：
   - directories `0700`
   - regular files `0600`
@@ -248,6 +254,7 @@
   - 如果上游未来支持 loopback auth，再补对应 auth contract validation
 - [ ] 按已定稿合同实现 CLI managed session 的 fixed-thread contract：
   - durable `managed_session_id + bound_thread_id`
+  - durable `session_allows_approval + session_allows_network + session_allows_write_access`
   - durable `session_state`
   - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
   - 通过 `cbth cli run --bind-thread-id <thread_id>` 在启动时建立 `bound_thread_id`，而不是靠前台事件流自动归因
@@ -260,6 +267,7 @@
   - 如需把自动续跑目标换到别的 thread，必须显式开新 session 或等待未来 rebind contract
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
   - accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
+  - detached auto-delivery 只允许在 session-scoped risk profile 三项都为 `false` 时开启
   - 如果 `delivery_turn_id` 的观察连续性丢失，则当前 head batch 进入 `manual_resolution_only`
   - 落地 `session_epoch` 的生成、递增与 continuity 判定规则
   - 按当前合同实现 continuity-loss 场景的 `inspect-head -> close-head(reason=...)` operator-resolution flow

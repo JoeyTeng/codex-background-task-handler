@@ -56,8 +56,8 @@
 
 - 第一版不把“Desktop heartbeat turn 能稳定执行通用 `cbth job ...` CLI”当作既定前提。
 - Desktop adapter 的稳定关键路径应优先依赖：
-  - bridge 侧只读 inbox snapshot 文件
-  - caller 侧由窄 helper 原子开启 continuation，并在同一次 helper 成功返回后才暴露 payload / artifact 读取入口
+  - bridge 侧只读 ready/reconcile metadata snapshot 文件
+  - caller 侧由窄 helper 原子开启 continuation，并且在 `note-boundary-crossed` success 之前，不向 automatic caller path 物化 payload / artifact 内容
 - 只有在 bridge 侧 `direct_file_read` 不成立、且 helper 执行能力已被单独验证后，才条件性依赖读 helper：
   - `cbth desktop list-arm-pending ...`
   - `cbth desktop list-pause-due ...`
@@ -148,6 +148,11 @@
 ~/.cbth/inbox/ready-threads.json
 ~/.cbth/inbox/arm-pending-bindings.json
 ~/.cbth/inbox/pause-due-bindings.json
+```
+
+附加的 `by-thread/<thread_id>.json` / artifact 文件只允许作为 operator/debug export：
+
+```text
 ~/.cbth/inbox/by-thread/<thread_id>.json   # optional diagnostic export, disabled by default
 ~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / operator path only
 ~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / operator path
@@ -175,16 +180,20 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - helper 返回的 envelope / artifact 内容与 `direct_file_read` 完全等价
 - 因此，第一版当前真正的优先候选仍然是 `direct_file_read`；`helper_cli_read` 只是条件性 fallback，不应在文档里被表述成已验证主路径。
 
-`direct_file_read` 的第一版候选路径：
+`direct_file_read` 的第一版自动路径只暴露 bridge-ready / reconcile metadata：
 
 ```text
 ~/.cbth/inbox/ready-threads.json
 ~/.cbth/inbox/arm-pending-bindings.json
 ~/.cbth/inbox/pause-due-bindings.json
-~/.cbth/inbox/by-thread/<thread_id>.json   # optional diagnostic export, disabled by default
-~/.cbth/artifacts/<artifact_id>/manifest.json   # diagnostic / operator path only
-~/.cbth/artifacts/<artifact_id>/payload   # diagnostic / operator path
 ```
+
+`by-thread/<thread_id>.json` 与 artifact 文件只允许作为 operator/debug export，默认不属于自动 caller path，也不应用来绕过 continuation boundary。
+- 也就是说，pre-boundary automatic path 在磁盘上只看得到：
+  - ready / reconcile metadata
+  - prompt token
+  - bridge-side internal locator
+- 真正的 payload / artifact access 只能在 `note-boundary-crossed` 成功返回中首次 materialize 给 caller。
 
 更新方式：
 
@@ -391,13 +400,27 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 1. 任意入口调用 `cbth ...` 时，先检查 daemon 是否存在。
 2. 如果不存在，则自动拉起 daemon。
 3. daemon 记录当前活跃接入端与当前 active jobs。
-4. 只要还有 active jobs，daemon 就继续运行。
-5. 当同时满足以下条件时，daemon 才允许退出：
+4. 只要还存在以下任一条件，daemon 就继续运行：
+   - active jobs
+   - 活跃 integration clients
+   - 需要在当前 idle timeout 内继续观察的近端 delivery work
+     - 例如等待匹配的 `delivery_turn_id -> turn/completed`
+     - 例如 `arm_pending_deadline` / `pause_deadline` / `cooldown_until` 会在当前 idle timeout 内到期
+     - 例如 artifact GC / auto-close deadline 已经 overdue，或会在当前 idle timeout 内到期
+5. 只有当同时满足以下条件时，daemon 才允许退出：
    - 没有 active jobs
    - 没有活跃 integration clients
-   - 没有未收口的 delivery batches / attempts
-   - 没有等待中的 `arm_pending_deadline` / `pause_deadline` / `cooldown_until` / `redelivery_window_ends_at` / `delivery_turn_id` 完成观察
-6. 再加一层 idle timeout，避免短时间内频繁启停。
+   - 没有需要在当前 idle timeout 内继续本地观察的近端 delivery work
+6. 以下 durable 状态本身不阻止 daemon 退出：
+   - open 但长窗口的 batch / attempt
+   - `manual_resolution_only` head batch
+   - 超出当前 idle timeout 的 `redelivery_window_ends_at`
+   - 超出当前 idle timeout 的 `arm_pending_deadline` / `pause_deadline` / artifact GC deadline
+7. 对这些“允许跨进程休眠”的长窗口状态：
+   - 必须 durable 落盘
+   - 下次任意入口拉起 daemon 时，必须先做 deterministic overdue sweep
+   - sweep 完成前不得处理新的 submit / delivery 请求
+8. 再加一层 idle timeout，避免短时间内频繁启停。
 
 ## 第一版建议
 
@@ -653,6 +676,21 @@ cooldown -> superseded
   - 只有 pre-accept 的 benign race / non-steerable reject 才允许自动重试
 - 第一版不允许在“accepted turn 的观察连续性已经丢失”后，靠重新投递来猜测原 turn 是否已经产生副作用。
 
+### CLI managed session profile
+
+- detached auto-delivery 不只依赖 batch 自身的 delivery policy，还依赖 managed session 自身的 durable risk profile。
+- 每条 managed session 都必须 durable 记录：
+  - `session_allows_approval`
+  - `session_allows_network`
+  - `session_allows_write_access`
+- 这些字段属于 session-scoped contract：
+  - 在 `cbth cli run --bind-thread-id ...` bootstrap / attach-or-create 时写入
+  - 不得在单次 batch 投递时临时推导
+  - 只有三者都为 `false` 时，CLI detached auto-delivery 才允许开启
+- 任一字段为 `true` 或 `unknown` 时：
+  - batch 即使本身是 `delivery_read_only=true`
+  - 也必须回落到 manual/operator path
+
 ## 共享数据模型
 
 ### Job 关键字段
@@ -685,6 +723,20 @@ cooldown -> superseded
 
 - `consumed` 不再作为第一版关键路径上的强语义。
 - 对第一版来说，delivery 与 artifact retention 由 `delivery batch` 和 `artifact` 自己管理。
+
+### Managed session 关键字段 (CLI)
+
+- `managed_session_id`
+- `bound_thread_id`
+- `session_epoch`
+- `session_state`
+  - `live`
+  - `detached`
+  - `stale`
+  - `retired`
+- `session_allows_approval`
+- `session_allows_network`
+- `session_allows_write_access`
 
 ### Delivery batch 关键字段
 

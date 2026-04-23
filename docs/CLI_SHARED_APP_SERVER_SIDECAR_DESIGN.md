@@ -56,11 +56,18 @@ codex --remote ws://127.0.0.1:<port>
    - daemon 必须 durable 维护：
      - `managed_session_id`
      - `bound_thread_id`
+     - `session_allows_approval`
+     - `session_allows_network`
+     - `session_allows_write_access`
      - `session_state`
        - `live`
        - `detached`
        - `stale`
        - `retired`
+   - 这三个 `session_allows_*` 字段属于 v1 的 session-scoped risk profile：
+     - 必须在 bootstrap / attach-or-create 时 durable 写入
+     - detached auto-delivery 只能在三者都为 `false` 时开启
+     - 任一字段为 `true` 或 `unknown` 都必须 fail-closed 到 manual/operator path
    - 第一版不再尝试从 shared `app-server` 的事件流里自动归因“哪个 turn 来自前台 TUI”：
      - 当前上游 surface 没有 per-client identity / source attribution
      - 因此 daemon 不能可靠地靠被动观察事件流来推断 `bound_thread_id`
