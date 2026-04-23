@@ -66,8 +66,13 @@ codex --remote ws://127.0.0.1:<port>
        - `retired`
    - 这三个 `session_allows_*` 字段属于 v1 的 session-scoped risk profile：
      - 必须在 bootstrap / attach-or-create 时 durable 写入
+     - 对 non-retired managed session 来说是 immutable profile
      - detached auto-delivery 只能在三者都为 `false` 时开启
      - 任一字段为 `true` 或 `unknown` 都必须 fail-closed 到 manual/operator path
+   - attach/reuse 时如果调用方请求的 session profile 与 durable profile 不一致：
+     - 不得原地改写现有 profile
+     - 如果旧 session 仍有 active foreground client、未收口 accepted attempt、或其他未解决 delivery work，则必须 fail-closed 为 `session_profile_mismatch`
+     - 只有在旧 session 已满足 retirement 条件后，daemon 才允许 retire 旧 session，并创建新的 `managed_session_id`
    - 第一版不再尝试从 shared `app-server` 的事件流里自动归因“哪个 turn 来自前台 TUI”：
      - 当前上游 surface 没有 per-client identity / source attribution
      - 因此 daemon 不能可靠地靠被动观察事件流来推断 `bound_thread_id`
@@ -169,7 +174,7 @@ codex --remote ws://127.0.0.1:<port>
   - 没有连接中的 foreground client
   - 没有需要继续投递的 sidecar client
   - 没有挂起的 ready/materialized/cooldown batch
-  - 没有仍在等待匹配 `turn/completed` 的 `delivery_turn_id`
+  - 没有仍在 `delivery_observation_deadline` 之内等待匹配 `turn/completed` 的 `delivery_turn_id`
 
 ## 实验 RPC 依赖面
 
@@ -375,6 +380,7 @@ thread/resume + turn/start
   - `managed_session_id`
   - `session_epoch`
   - `delivery_observation_state=tracking`
+  - `delivery_observation_deadline`
 - 其中：
   - `managed_session_id` 是 daemon 为该逻辑 CLI 会话分配的稳定 id
   - `session_epoch` 是这个 managed session 当前“可证明连续的 shared app-server event stream”的单调递增代号
@@ -382,6 +388,11 @@ thread/resume + turn/start
   - 前台 / sidecar 重连到同一个仍存活的 app-server 实例时不变
   - app-server 进程被重建，或 daemon 恢复后无法证明 continuity 时必须递增
 - 只有在后续仍能证明自己附着在同一个 `managed_session_id + session_epoch` 的事件流上时，CLI adapter 才允许继续等待那个 `delivery_turn_id` 的 `turn/completed`。
+- `delivery_observation_deadline` 是 accepted attempt 的硬边界：
+  - 由 `accepted_at + max_turn_observation_window` 推导
+  - `max_turn_observation_window` 必须显式大于 daemon 的 `idle timeout`
+  - deadline 未到时，这个 attempt 属于 daemon 必须继续保活的近端 observation work
+  - deadline 到期仍未看到可信 `turn/completed` 时，attempt 必须 fail-closed 到 `manual_resolution_only`，而不是继续无限常驻或静默退出
 - 对每个 managed session，CLI adapter 还必须维护一个独立的 thread activity state：
   - `unknown`
   - `active`

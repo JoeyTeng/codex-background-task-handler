@@ -262,12 +262,15 @@
   - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点
   - 同一个 `bound_thread_id` 最多只允许一个 non-retired managed session
   - `cbth cli run --bind-thread-id` 必须是 attach-or-create
+  - attach 遇到 requested session profile drift 时，不得原地改写；只能 fail-closed 或 retire-and-recreate
   - stale session 只有在已满足 retirement 条件时才允许被替换；否则必须 fail-closed
   - 第一版不做前台 thread-switch 的自动观测或自动 retarget
   - 如需把自动续跑目标换到别的 thread，必须显式开新 session 或等待未来 rebind contract
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
   - accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
+  - accepted attempt 必须 durable 记录 `delivery_observation_deadline`
   - detached auto-delivery 只允许在 session-scoped risk profile 三项都为 `false` 时开启
+  - `delivery_observation_deadline` 到期仍未看到可信 `turn/completed` 时，必须 fail-closed 到 `manual_resolution_only`
   - 如果 `delivery_turn_id` 的观察连续性丢失，则当前 head batch 进入 `manual_resolution_only`
   - 落地 `session_epoch` 的生成、递增与 continuity 判定规则
   - 按当前合同实现 continuity-loss 场景的 `inspect-head -> close-head(reason=...)` operator-resolution flow

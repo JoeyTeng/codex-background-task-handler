@@ -177,7 +177,8 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - 它只是 Desktop 在 `direct_file_read` 失败时可考虑的窄 helper fallback。
 - 在把它升级成正式受支持路径之前，必须单独验证：
   - heartbeat turn 无审批执行这些窄 `cbth desktop ...` helper
-  - helper 返回的 envelope / artifact 内容与 `direct_file_read` 完全等价
+  - helper 返回的 bridge-side metadata / locator 合同与 `direct_file_read` 等价
+  - payload / artifact 内容仍然只允许通过 `note-boundary-crossed` / `read-artifact` 暴露
 - 因此，第一版当前真正的优先候选仍然是 `direct_file_read`；`helper_cli_read` 只是条件性 fallback，不应在文档里被表述成已验证主路径。
 
 `direct_file_read` 的第一版自动路径只暴露 bridge-ready / reconcile metadata：
@@ -401,12 +402,13 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 2. 如果不存在，则自动拉起 daemon。
 3. daemon 记录当前活跃接入端与当前 active jobs。
 4. 只要还存在以下任一条件，daemon 就继续运行：
-   - active jobs
-   - 活跃 integration clients
-   - 需要在当前 idle timeout 内继续观察的近端 delivery work
-     - 例如等待匹配的 `delivery_turn_id -> turn/completed`
-     - 例如 `arm_pending_deadline` / `pause_deadline` / `cooldown_until` 会在当前 idle timeout 内到期
-     - 例如 artifact GC / auto-close deadline 已经 overdue，或会在当前 idle timeout 内到期
+  - active jobs
+  - 活跃 integration clients
+  - 需要在当前 idle timeout 内继续观察的近端 delivery work
+    - 例如等待匹配的 `delivery_turn_id -> turn/completed`
+      - 这类 CLI observation 必须同时受 `delivery_observation_deadline` 约束
+    - 例如 `arm_pending_deadline` / `pause_deadline` / `cooldown_until` 会在当前 idle timeout 内到期
+    - 例如 artifact GC / auto-close deadline 已经 overdue，或会在当前 idle timeout 内到期
 5. 只有当同时满足以下条件时，daemon 才允许退出：
    - 没有 active jobs
    - 没有活跃 integration clients
@@ -472,6 +474,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 - `delivery_observation_state` (CLI optional)
   - `tracking`
   - `lost`
+- `delivery_observation_deadline` (CLI optional)
 - `binding_id` (optional)
 - `automation_id` (optional)
 - `automation_binding_state`
@@ -532,6 +535,30 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
   - 不得移动 head batch
   - 不得递增 `delivery_attempt_count`
   - 不得改变当前 attempt / batch 的 durable 状态
+- Desktop 的 ready 选择器不能依赖任意 SQL 顺序或 bridge 本地启发式：
+  - daemon 必须维护一个 durable 的 canonical fair-ready order
+  - `ready-threads.json` 与 `claim-next-ready` 都只是这个 fair-ready order 的只读视图
+  - eligible ready thread 至少要求：
+    - 当前 head batch 仍 open 且 `replay_policy=automatic`
+    - 当前 thread 没有 unresolved 的同 thread safety item
+      - 例如 `arm_pending`
+      - 例如 overdue `pause_deadline`
+      - 例如 binding `degraded`
+      - 例如 `eligible_after > now`
+  - 在 eligible 集合内，daemon 必须按 durable `ready_cursor` 做 round-robin：
+    - `ready_cursor` 至少按 target-kind / bridge 作用域维护
+    - tie-break 至少稳定到 `ready_at` / `source_thread_id`
+  - `claim-next-ready` 是 pure peek，因此不直接推进 `ready_cursor`
+  - `ready_cursor` 只在以下事件发生后推进：
+    - fresh delivery 被通道接受
+      - Desktop: `note-arm` 成功
+      - CLI: `turn/start` 或 `turn/steer` 被 server 接受
+    - operator / daemon 显式 close 或 skip 当前 head batch
+  - 如果某个 ready candidate 在 fresh delivery 被接受之前就失败：
+    - daemon 必须 durable 地把它移出当前 immediate-eligible 集合
+      - 例如写 `eligible_after`
+      - 或让当前 attempt 进入 `abandoned` / `arm_pending`
+    - 不得让它在下一轮继续无界占据 fair-ready order 的首位
 - `claim-next-ready` 保持纯 peek 的同时，daemon 仍必须在 bridge 运行期内部提供一条不对外暴露的短租约：
   - `bridge_arm_lease`
   - 以 `(source_thread_id, attempt_id, generation)` 为 key
@@ -659,6 +686,7 @@ cooldown -> superseded
   - `managed_session_id`
   - `session_epoch`
   - `delivery_turn_id`
+  - `delivery_observation_deadline`
 - 其中：
   - `managed_session_id` 是 daemon 为一条逻辑 managed CLI session 分配的稳定 durable id
   - `session_epoch` 是该 managed session 当前“可证明连续的 shared app-server event stream”的单调递增序号
@@ -666,6 +694,15 @@ cooldown -> superseded
   - 只要 daemon 还能证明自己仍附着在同一个未重建的 shared `app-server` 实例上，短暂 websocket 重连不递增
   - 只要 app-server 进程重启、managed session 被重建，或 daemon 恢复后无法证明事件流连续性，就必须递增
 - 如果 daemon 只是 websocket 短暂断开、但能够重新附着到同一个 `managed_session_id + session_epoch`，则允许继续等待对应的 `turn/completed`。
+- `delivery_observation_deadline` 是 accepted CLI attempt 的硬边界：
+  - 在 `turn/start` / `turn/steer` 被接受时写入
+  - 由 `accepted_at + max_turn_observation_window` 推导
+  - `max_turn_observation_window` 必须显式大于当前 daemon `idle timeout`
+  - 只要 deadline 未到，未收口的 `delivery_turn_id` 就属于“近端 observation work”，会阻止 daemon 退出
+- 如果在 `delivery_observation_deadline` 到期前仍未观察到可信的 `turn/completed`，则不得静默退出：
+  - 当前 attempt 必须收敛到 `abandoned`
+  - 当前 head batch durable 进入 `replay_policy=manual_resolution_only`
+  - 之后 daemon 才允许按正常 idle 规则退出
 - 只要 `managed_session_id` 或 `session_epoch` 的连续性无法再证明，当前 head batch 就不得自动 replay：
   - 当前 attempt 收敛到 `abandoned`
   - 当前 head batch durable 进入 `replay_policy=manual_resolution_only`
@@ -685,8 +722,12 @@ cooldown -> superseded
   - `session_allows_write_access`
 - 这些字段属于 session-scoped contract：
   - 在 `cbth cli run --bind-thread-id ...` bootstrap / attach-or-create 时写入
+  - 对 non-retired managed session 来说是 immutable profile
   - 不得在单次 batch 投递时临时推导
   - 只有三者都为 `false` 时，CLI detached auto-delivery 才允许开启
+- `attach-or-create` 发现 requested profile 与 durable profile 不一致时，不得原地改写：
+  - 如果旧 session 仍有 active foreground client、未收口 accepted attempt、或其他未解决 delivery work，则必须 fail-closed 为 `session_profile_mismatch`
+  - 只有在旧 session 已满足 retirement 条件后，daemon 才允许把它标为 `retired`，并创建一个带新 profile 的新 `managed_session_id`
 - 任一字段为 `true` 或 `unknown` 时：
   - batch 即使本身是 `delivery_read_only=true`
   - 也必须回落到 manual/operator path

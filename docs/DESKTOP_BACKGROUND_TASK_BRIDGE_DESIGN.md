@@ -247,6 +247,13 @@ bridge heartbeat 每分钟醒一次：
    - 单个 degraded / overdue binding 不得独占整个 bridge：
      - 只要存在不依赖同一 binding 安全收口的 ready thread
      - bridge 就必须尽量保留 fresh-arm lane 给其中一个 ready thread
+   - ready 来源本身必须是 daemon-owned fair-ready order，而不是 bridge 本地临时挑选：
+     - `ready-threads.json` 的 entry 顺序必须已经是 canonical fair order
+     - `claim-next-ready` pure peek 返回的也必须是这个 fair order 的当前第一项
+     - fair order 只包含当前 eligible ready thread：
+       - 同 thread unresolved reconcile item 必须先把该 thread 排除在 eligible 集合外
+       - degraded / capability-invalid binding 也不得继续占据 ready 首位
+     - daemon 必须用 durable `ready_cursor` / `eligible_after` 等等价机制避免同一个 pre-accept 失败 candidate 在每轮里永久霸占第一项
    - 所有仍处于 `arm_pending` 的 attempt 都必须比新 arm 更优先被处理
    - 只要某个 thread 的 head attempt 仍是 `arm_pending`，bridge 就不得对同一 `attempt_id + generation` 重新 arm
    - arm-pending 的读取面必须是：
@@ -545,6 +552,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
   - reconcile work 超预算时只 durable defer，不得在本轮无界循环
   - fresh-arm lane 最多处理一个新的 ready caller
   - 只要存在不依赖同一 binding reconcile 的 ready thread，就不得让 unrelated ready work 被单个坏 binding 永久饿死
+- ready 选择必须尊重 daemon 提供的 canonical fair order；bridge 不得自行按本地启发式重排 ready thread。
 - 只读取 ready index，不依赖通用 `cbth job ...` CLI。
 - 没有 ready thread 就立即结束。
 - 有 ready thread 时，只更新对应 caller thread 的已绑定 heartbeat，不直接展开主任务。
