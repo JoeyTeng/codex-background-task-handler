@@ -190,6 +190,7 @@
   - 因此 daemon 退出条件只需要在 `delivery_observation_deadline` 窗口内覆盖这些未收口的 `delivery_turn_id` 观察
   - 但只要 `managed_session_id + session_epoch` 的观察连续性丢失，就不得自动 replay；当前 head batch 必须进入 `manual_resolution_only`
   - 同样地，只要 accepted 的 `delivery_turn_id` 后续出现失败/中断/替换等不可信终局，也必须 fail-closed 到 `manual_resolution_only`
+  - accepted attempt fail-closed 到 `manual_resolution_only` 后，managed session 的 live 部分可以结束，但 durable session 要先转成 `parked`，等 manual batch 终态后再允许 replace
   - continuity-loss 后的最小人工收口路径也已收口为：`batch inspect-head` 看 durable 证据，再用 `batch close-head` 带明确 reason 收口
 - 同时又补了一个和 TUI 当前实现一致的判断：
   - active-turn steer 语义更接近现有 TUI 的 `pending_steers` / queued-follow-up 行为

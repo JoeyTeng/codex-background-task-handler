@@ -167,7 +167,10 @@ codex --remote ws://127.0.0.1:<port>
       - 任何 accepted `delivery_turn_id` 的后续观察连续性无法再证明
 - `cbth cli run --bind-thread-id <thread_id>` 的 v1 合同必须是：
   - 先按 `bound_thread_id` 查询是否已经存在 non-retired managed session
-  - 如果存在可复用 session：attach/reuse
+  - 如果存在可复用的 `live` / `detached` session：attach/reuse
+  - 如果存在 `parked` session：
+    - 且其 unresolved manual batch 仍未 operator close / `manual_resolution_expired` auto-close：必须 fail-closed 为 `session_pending_manual_resolution`
+    - 只有在这些 manual batch 已终态后，daemon 才允许先 retire 这个 `parked` session，再创建新的 managed session
   - 如果存在 `stale` session：只有在它已满足 retirement 条件后才允许替换
   - 如果存在不可安全替换的 `stale` / conflicting session：直接 fail-closed，不得并发创建第二个 session
 - 当同时满足以下条件时，daemon 才允许清理该 managed session：
@@ -394,8 +397,11 @@ thread/resume + turn/start
 - accepted attempt 还必须 durable 绑定：
   - `managed_session_id`
   - `session_epoch`
+  - `delivery_accepted_at`
   - `delivery_observation_state=tracking`
   - `delivery_observation_deadline`
+  - `last_observed_turn_event=null`
+  - `last_observed_turn_event_at=null`
 - 其中：
   - `managed_session_id` 是 daemon 为该逻辑 CLI 会话分配的稳定 id
   - `session_epoch` 是这个 managed session 当前“可证明连续的 shared app-server event stream”的单调递增代号
@@ -404,7 +410,7 @@ thread/resume + turn/start
   - app-server 进程被重建，或 daemon 恢复后无法证明 continuity 时必须递增
 - 只有在后续仍能证明自己附着在同一个 `managed_session_id + session_epoch` 的事件流上时，CLI adapter 才允许继续等待那个 `delivery_turn_id` 的 `turn/completed`。
 - `delivery_observation_deadline` 是 accepted attempt 的硬边界：
-  - 由 `accepted_at + max_turn_observation_window` 推导
+  - 由 `delivery_accepted_at + max_turn_observation_window` 推导
   - `max_turn_observation_window` 必须显式大于 daemon 的 `idle timeout`
   - deadline 未到时，这个 attempt 属于 daemon 必须继续保活的近端 observation work
   - deadline 到期仍未看到可信 `turn/completed` 时：
@@ -412,6 +418,16 @@ thread/resume + turn/start
     - `delivery_observation_state=expired`
     - 当前 head batch 必须进入 `replay_policy=manual_resolution_only`
     - 之后 daemon 才允许退出，而不是继续无限常驻或静默退出
+- `last_observed_turn_event` / `last_observed_turn_event_at` 的 durable 合同必须是：
+  - 只记录当前 `delivery_turn_id` 上真实观察到的事件
+  - accepted 时初始化为 `null`
+  - 后续只允许由同一 `delivery_turn_id` 的观察更新
+  - 推荐最小枚举至少包括：
+    - `turn_started`
+    - `turn_completed`
+    - `turn_failed`
+    - `turn_interrupted`
+    - `turn_replaced`
 - 对每个 managed session，CLI adapter 还必须维护一个独立的 thread activity state：
   - `unknown`
   - `active`
@@ -572,9 +588,10 @@ cbth cli run
    - 不依赖 loopback websocket auth
 3. 启动时对实验 RPC 做 capability probe
 4. `cbth cli run --bind-thread-id <thread_id>` 先执行 attach-or-create：
-   - 同一 `bound_thread_id` 有可复用 session 时 attach/reuse
+   - 同一 `bound_thread_id` 有可复用的 `live` / `detached` session 时 attach/reuse
+   - 同一 `bound_thread_id` 有 `parked` session 且 manual batch 尚未终态时：fail-closed 为 `session_pending_manual_resolution`
    - 同一 `bound_thread_id` 有不可安全替换的 stale/conflicting session 时 fail-closed
-   - 只有在没有 non-retired session，或旧 session 已满足 retirement 条件时，才创建新的 managed session
+   - 只有在没有 non-retired session，或旧 `parked/stale` session 已满足 retirement 条件时，才创建新的 managed session
 5. attach/create 成功后再启动前台 `codex --remote ...`
 6. sidecar 从共享核心读取 per-thread `delivery batch`
 7. 任务 ready 后：

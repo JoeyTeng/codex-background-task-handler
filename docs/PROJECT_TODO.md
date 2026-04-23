@@ -265,6 +265,7 @@
   - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点
   - 同一个 `bound_thread_id` 最多只允许一个 non-retired managed session
   - `cbth cli run --bind-thread-id` 必须是 attach-or-create
+  - `parked` session 且 manual batch 未终态时，attach 必须 fail-closed 为 `session_pending_manual_resolution`
   - attach 遇到 requested session profile drift 时，不得原地改写；只能 fail-closed 或 retire-and-recreate
   - stale session 只有在已满足 retirement 条件时才允许被替换；否则必须 fail-closed
   - 第一版不做前台 thread-switch 的自动观测或自动 retarget
@@ -274,6 +275,7 @@
   - accepted attempt 必须 durable 记录 `delivery_accepted_at`
   - accepted attempt 必须 durable 记录 `last_observed_turn_event + last_observed_turn_event_at`
   - accepted attempt 必须 durable 记录 `delivery_observation_deadline`
+  - `delivery_observation_deadline` 的计算基准必须统一为 `delivery_accepted_at`
   - detached auto-delivery 只允许在 session-scoped risk profile 三项都为 `false` 时开启
   - `delivery_observation_deadline` 到期仍未看到可信 `turn/completed` 时：
     - 当前 attempt -> `abandoned`

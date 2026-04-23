@@ -704,7 +704,7 @@ cooldown -> superseded
 - 如果 daemon 只是 websocket 短暂断开、但能够重新附着到同一个 `managed_session_id + session_epoch`，则允许继续等待对应的 `turn/completed`。
 - `delivery_observation_deadline` 是 accepted CLI attempt 的硬边界：
   - 在 `turn/start` / `turn/steer` 被接受时写入
-  - 由 `accepted_at + max_turn_observation_window` 推导
+  - 由 `delivery_accepted_at + max_turn_observation_window` 推导
   - `max_turn_observation_window` 必须显式大于当前 daemon `idle timeout`
   - 只要 deadline 未到，未收口的 `delivery_turn_id` 就属于“近端 observation work”，会阻止 daemon 退出
 - 如果在 `delivery_observation_deadline` 到期前仍未观察到可信的 `turn/completed`，则不得静默退出：
@@ -720,6 +720,16 @@ cooldown -> superseded
 - 一旦 attempt 已 `abandoned`、`delivery_observation_state != tracking`、或 batch 已进入 `replay_policy=manual_resolution_only`：
   - 迟到的 `turn/completed` 只能作为 operator/debug 证据保留
   - 不得再自动把 batch 关闭成 `close_reason=delivered`
+- `last_observed_turn_event` / `last_observed_turn_event_at` 的 canonical 合同必须是：
+  - 只记录当前 `delivery_turn_id` 上真实观察到的事件
+  - accepted 时初始化为 `null`
+  - 后续只能由同一 `delivery_turn_id` 的观察更新
+  - 推荐最小枚举至少包括：
+    - `turn_started`
+    - `turn_completed`
+    - `turn_failed`
+    - `turn_interrupted`
+    - `turn_replaced`
 - 只要 `managed_session_id` 或 `session_epoch` 的连续性无法再证明，当前 head batch 就不得自动 replay：
   - 当前 attempt 收敛到 `abandoned`
   - 当前 head batch durable 进入 `replay_policy=manual_resolution_only`
