@@ -7,7 +7,7 @@ Reference experiments and companion tooling for making long-running background w
 Validated foundations plus the current first-version direction:
 
 - Desktop enabling experiments validated: automation-based bridge/retargeting experiments work. The current first-version delivery contract is built around a bound caller-heartbeat plus a delivery-envelope abstraction, with `direct_file_read` as the preferred path and a narrow helper fallback when approval-free file reads are not available. The full automatic path still depends on installation-local validation of both the chosen read transport and the narrow `note-*` writeback helpers.
-- CLI foundation validated: the shared `app-server` route works and foreground TUI visibility is proven. The current first-version contract depends on capability probing around the experimental RPC surface, uses a loopback-only daemon-owned control plane, and keeps `turn/steer` as a gated optimization instead of a default path. Stronger local auth is deferred until upstream loopback auth support exists.
+- CLI foundation validated: the shared `app-server` route works for a daemon-owned fixed-thread managed session, and foreground TUI visibility is proven while the foreground remains on that bound caller thread. The current first-version contract depends on capability probing around the experimental RPC surface, uses a loopback-only daemon-owned control plane, and keeps `turn/steer` as a gated optimization instead of a default path. Stronger local auth is deferred until upstream loopback auth support exists, and automatic thread rebind/switch routing is intentionally out of scope for v1.
 
 The shared architecture is converging on one Rust binary with thin integration entrypoints:
 
@@ -48,7 +48,7 @@ The current PoC script is [scripts/desktop_thread_inject_poc.py](scripts/desktop
 
 The current CLI shared-server PoC is [scripts/cli_shared_app_server_poc.mjs](scripts/cli_shared_app_server_poc.mjs). It connects two websocket clients to the same shared `codex app-server`, seeds a frontend thread, then validates that a sidecar client can resume the same thread and that the frontend client receives the resulting live turn notifications.
 
-In addition to the protocol-level PoC, the shared-server CLI route has also been validated against a real foreground TUI session running through `codex --remote`, confirming that the user-facing TUI output reflects the sidecar-triggered turn. That PTY validation matches the current loopback-only upstream surface available in `codex-cli 0.123.0`.
+In addition to the protocol-level PoC, the shared-server CLI route has also been validated against a real foreground TUI session running through `codex --remote`, confirming that the user-facing TUI output reflects the sidecar-triggered turn while the foreground stays on the managed session's bound caller thread. That PTY validation matches the current loopback-only upstream surface available in `codex-cli 0.123.0`.
 
 The current CLI active-turn steering PoC is [scripts/cli_turn_steer_poc.mjs](scripts/cli_turn_steer_poc.mjs). It starts a long-running turn, submits `turn/steer` from a second client while that turn is still active, and validates that the same turn completes normally instead of ending early.
 

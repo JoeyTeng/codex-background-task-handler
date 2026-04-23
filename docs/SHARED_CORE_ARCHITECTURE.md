@@ -134,6 +134,7 @@
 
 ```text
 ~/.cbth/inbox/ready-threads.json
+~/.cbth/inbox/pause-due-bindings.json
 ~/.cbth/inbox/by-thread/<thread_id>.json
 ~/.cbth/artifacts/<artifact_id>/manifest.json
 ~/.cbth/artifacts/<artifact_id>/payload
@@ -142,6 +143,7 @@
 2. `helper_cli_read`
 
 ```text
+cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
 cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
@@ -162,6 +164,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 
 ```text
 ~/.cbth/inbox/ready-threads.json
+~/.cbth/inbox/pause-due-bindings.json
 ~/.cbth/inbox/by-thread/<thread_id>.json
 ~/.cbth/artifacts/<artifact_id>/manifest.json
 ~/.cbth/artifacts/<artifact_id>/payload
@@ -284,9 +287,10 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
   - bridge 的下一轮 reconciliation 必须优先处理所有已到 `pause_deadline` 的 binding
   - 如果 pause 在限定的 bridge 重试窗口内仍无法被验证，binding 必须进入 `degraded`
 - 如果某次 `automation_update` 已被 Codex 接受，但后续 `note-arm` 没能 durable 成功：
-  - 当前 head batch 必须立即切到 `replay_policy=manual_resolution_only`
-  - 当前 binding 必须进入 `degraded`
-  - 后续任何 repair / re-arm 前都必须先验证该 bound caller heartbeat 已被重新 `PAUSED`
+  - bridge 必须先做 durable reconciliation
+  - 如果能够证明同一 attempt 已进入 `cooldown` 且 `armed_generation` 与当前 generation 一致，则按“arm 成功但响应丢失”处理
+  - 如果能够证明当前 generation 对应的 caller heartbeat 已经重新 `PAUSED`，则当前 attempt 进入 `abandoned`，head batch 保持 `replay_policy=automatic`
+  - 只有在既无法证明 arm 成功、也无法证明 heartbeat 已重新 pause 时，当前 head batch 才切到 `replay_policy=manual_resolution_only`，binding 才进入 `degraded`
 - 如果 caller 已成功写入 `cbth desktop note-boundary-crossed ...`，但 `cbth desktop note-delivered ...` 失败，也必须走同一条 `degraded` 收敛路径，而不是继续自动 redelivery。
 - 为了避免 FIFO 队列永久卡死，第一版必须给 operator 至少两条显式恢复路径：
   - `cbth desktop binding repair --source-thread-id ... --caller-automation-id ... --read-transport ... --json`
@@ -472,7 +476,10 @@ cooldown -> superseded
 - 第一版 durable 状态里不再保留单独的 `armed`。
 - 一次 wakeup arm 一旦被 delivery channel 接受并被 `note-arm` durable 记录，attempt 就直接进入 `cooldown`。
 - `cooldown` 表示 `cbth` 正在等待这次 wakeup 的最短观察窗口结束；窗口结束后，如果 batch 仍是 head 且仍允许自动重投，就会生成新 attempt，而不是直接把旧 attempt 视为成功关闭。
-- 如果某次 wakeup arm 已被 delivery channel 接受，但 `note-arm` 结果无法 durable 确认，则当前 attempt 必须收敛到 `abandoned`，当前 head batch 必须进入 `manual_resolution_only`，而不是继续自动 redelivery。
+- 如果某次 wakeup arm 已被 delivery channel 接受，但 `note-arm` 结果无法 durable 确认，则必须先走 reconcile：
+  - 能证明 arm 成功 -> 按成功 arm 处理
+  - 能证明 caller heartbeat 已重新 `PAUSED` -> 当前 attempt 收敛到 `abandoned`，head batch 仍可保持 `replay_policy=automatic`
+  - 只有两者都无法证明时，当前 head batch 才进入 `manual_resolution_only`
 
 ### 最小连续发送间隔
 
@@ -512,6 +519,10 @@ cooldown -> superseded
   - 当前 attempt 收敛到 `abandoned`
   - 当前 head batch durable 进入 `replay_policy=manual_resolution_only`
   - 之后只允许 operator close，或等待 `redelivery_window_ends_at` 到期自动关闭
+- 一旦某个 accepted CLI attempt 对应的 `delivery_turn_id` 在之后出现失败、中断、替换，或其他无法被证明为“同一 turn 正常完成”的终局结果：
+  - 当前 attempt 同样必须收敛到 `abandoned`
+  - 当前 head batch durable 进入 `replay_policy=manual_resolution_only`
+  - 只有 pre-accept 的 benign race / non-steerable reject 才允许自动重试
 - 第一版不允许在“accepted turn 的观察连续性已经丢失”后，靠重新投递来猜测原 turn 是否已经产生副作用。
 
 ## 共享数据模型
@@ -628,6 +639,8 @@ cooldown -> superseded
     - 如果当前 attempt 已经是 `cooldown`
     - 且 binding 的 `armed_generation` 已等于该 generation
     - 则把这次 unknown 当作“已成功 arm，但响应丢失”
+    - 如果当前 generation 的 caller heartbeat 已能被证明重新 `PAUSED`
+    - 则当前 attempt 收敛到 `abandoned`，而 head batch 继续保留 `replay_policy=automatic`
   - 只有在既无法证明 arm 成功、也无法证明 bound heartbeat 已经被重新 pause 时，才允许把当前 head batch durable 推到 `replay_policy=manual_resolution_only` 并把 binding 推到 `degraded`
 
 ### Artifact 关键字段
@@ -682,10 +695,10 @@ cooldown -> superseded
 - 它只是“`cbth` 不再自动重投该 batch”的 durable 决策点
 - `redelivery_window_ends_at` 与 `max_delivery_attempts` 必须 durable 落在 batch 上，而不是只存在于单次 attempt 的临时计算里。
 - 这条 batch deadline / redelivery window 合同同样适用于：
-  - CLI 中因 `current_thread_id` 切走而暂时挂起的 backlog
+  - CLI 中暂时没有 attached managed session、或仍等待为同一 caller thread 建立新 managed session 的 backlog
   - Desktop 中进入 `degraded` 但尚未被 operator 明确关闭的 head batch
 - 换句话说：
-- “保留在原 thread 上等待人工或用户切回”不等于无限期阻塞
+- “保留在原 caller thread 上等待人工处理或后续重新附着”不等于无限期阻塞
 - 如果 batch 在自己的 `redelivery_window_ends_at` 之前仍未恢复到可安全投递/关闭状态，就必须自动进入终态，并释放后续 FIFO/GC 压力
 - `replay_policy` 是 durable 的 batch 级合同：
   - `automatic`：
@@ -708,7 +721,7 @@ cooldown -> superseded
 - 因此，Desktop batch 不应在第一次 arm 成功后直接 `closed`。
 - 推荐行为是：
   - arm 成功 -> attempt 进入 `cooldown`
-  - `cooldown_until` 到期后，如果该 batch 仍是 head、`now < redelivery_window_ends_at`、且 `delivery_attempt_count < max_delivery_attempts` -> 创建新 attempt 并再次 arm
+  - `cooldown_until` 到期后，如果该 batch 仍是 head、`replay_policy=automatic`、`now < redelivery_window_ends_at`、且 `delivery_attempt_count < max_delivery_attempts` -> 创建新 attempt 并再次 arm
   - 如果 `delivery_attempt_count >= max_delivery_attempts`，该 batch 必须自动进入：
     - `close_reason=max_attempts_exhausted`
     - `closed`
@@ -874,6 +887,7 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
   - `helper_cli_read`：只读 envelope/helper
   - `cbth desktop note-arm ...`：bridge 成功 arm 后的窄写回
 - 第一版如果不用 `direct_file_read`，则 helper 链路必须是完整可用的：
+  - `cbth desktop list-pause-due ...`
   - `cbth desktop claim-next-ready ...`
   - `cbth desktop read-envelope ...`
   - `cbth desktop read-artifact ...`
@@ -884,6 +898,9 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
   - 它仍然要求 heartbeat turn 能无审批执行窄 `cbth desktop ...` 命令
   - 在这个前提被实证前，不应把它表述成已验证的默认主路径
 - 其中 `cbth desktop read-artifact ...` 必须提供 chunked payload 协议，而不是返回一个需要再次 file-read 的路径。
+- 其中 bridge 的 overdue-binding cleanup 也必须有对应只读输入面：
+  - `~/.cbth/inbox/pause-due-bindings.json`
+  - 或 `cbth desktop list-pause-due --bridge-thread-id <thread_id> --json`
 - 其中 `cbth desktop claim-next-ready ...` 必须一次性返回 bridge 写 prompt 所需的整组 token：
   - `source_thread_id`
   - `batch_id`

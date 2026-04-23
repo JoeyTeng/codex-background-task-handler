@@ -51,35 +51,24 @@ codex --remote ws://127.0.0.1:<port>
    - sidecar 不直接从外部任务脚本拿结果，而是消费共享核心里的 thread-scoped queue / delivery batch。
    - 但就“第二个 client 能否续跑同一 live thread”这一核心能力而言，不需要 heartbeat 或 Desktop 那套 bridge 结构。
 
-5. `managed session routing`
-   - 第一版一个 managed CLI session 只承诺一个当前 caller thread。
-   - daemon 必须维护：
-     - `session_id`
-     - `current_thread_id`
-   - 当前台 TUI 在同一 managed session 中显式新建、恢复或切换到另一个 thread 时：
-     - daemon 必须把 `current_thread_id` 更新为新的前台 thread
-     - 后续 ready batch 只允许续跑这个最新的 `current_thread_id`
-   - 第一版不承诺一个 managed session 同时自动续跑多个 foreground-active threads。
-   - 对旧 `source_thread_id` 的合同必须是：
-     - 旧 thread 上已经存在的 batch 不得被静默丢弃
-     - 也不得自动迁移到新的 `current_thread_id`
-     - 它们必须继续挂在原 `source_thread_id` 上保持 `queued/materialized`
-     - 直到以下事件之一发生：
-       - 前台重新切回该 thread，使它再次成为 `current_thread_id`
-       - operator 显式关闭该 head batch
-       - batch 自己的 `redelivery_window_ends_at` / `delivery_deadline` 到期，自动关闭为超时终态
-       - 后续版本引入显式 reassign/migrate contract
-   - 也就是说，第一版的“只续跑最新 thread”是自动投递边界，不是丢弃旧 thread backlog 的理由。
-   - 因此，旧 thread backlog 的安全合同是：
-     - 可以挂起
-     - 但不能无限挂起
-     - 仍然必须受共享核心已有的 deadline / redelivery window 约束
-     - 超时后正常进入 batch 终态，从而释放 FIFO 和 artifact GC 压力
-   - 但 `current_thread_id` 的切换只约束“新的自动投递 attempt 应该发往哪个 thread”：
-     - 如果某个旧 thread 的 attempt 已经 accepted，并且已经 durable 记录了 `delivery_turn_id`
-     - 那么即使用户随后切到别的 thread
-     - 该旧 attempt 仍允许等待自己匹配的 `turn/completed` 并正常 close
-     - 不需要因为 `current_thread_id` 改变而强行中止或重开这次已 accepted 的投递
+5. `managed session binding`
+   - 第一版一个 managed CLI session 只承诺一个固定的 caller thread。
+   - daemon 必须 durable 维护：
+     - `managed_session_id`
+     - `bound_thread_id`
+   - `bound_thread_id` 一旦建立，就代表这条 managed session 的自动续跑目标 thread。
+   - 第一版不承诺在同一 managed session 里自动追踪前台 TUI 的 thread 切换，也不承诺自动把 delivery retarget 到别的 thread。
+   - 如果用户想把自动续跑目标换到另一个 thread，必须：
+     - 显式启动一个新的 managed session
+     - 或等待未来版本引入明确的 rebind contract
+   - 这意味着第一版也不承诺一个 managed session 同时自动续跑多个 foreground-active threads。
+   - 如果用户在同一个前台 TUI 里临时切到别的 thread：
+     - daemon 仍只会把 ready batch 投递回 `bound_thread_id`
+     - 该 managed session 的 live-visibility 保证也只覆盖“前台停留在 `bound_thread_id` 上”的情形
+     - 是否恰好在另一个 thread 里看到 sidecar delivery，不属于第一版合同
+   - 一旦某个 `bound_thread_id` 上的 attempt 已经 accepted，并 durable 记录了 `delivery_turn_id`：
+     - 它仍允许等待自己匹配的 `turn/completed` 并正常 close
+     - 不需要因为前台 UI 临时切到别的 thread 就强行中止或重开这次已 accepted 的投递
 
 ## 本地信任边界
 
@@ -367,7 +356,8 @@ thread/resume + turn/start
 - idle 路径的 batch close 语义必须是：
   - `turn/start` 被接受时：只记录 `delivery_turn_id`，attempt 进入 `cooldown`
   - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍然是当前 generation/head delivery 时，batch 才允许关闭为 CLI-delivered
-  - 如果该 turn 在完成前失败、被替换、或 batch 已被 supersede，则不得因为早先的 `turn/start` 接受而关闭 batch
+  - 如果该 turn 在被接受之后又失败、中断、被替换，或 batch 已被 supersede，则不得因为早先的 `turn/start` 接受而关闭 batch
+  - 对这类“accepted 后又变得不可信”的 turn，第一版不得自动 replay；当前 attempt 必须收敛到 `abandoned`，当前 head batch 必须进入 `replay_policy=manual_resolution_only`
 - 如果 websocket / daemon / app-server continuity 在 accepted 之后丢失：
   - 且无法再证明自己回到了同一个 `managed_session_id + session_epoch`
   - 当前 attempt 必须切到 `delivery_observation_state=lost`
@@ -424,7 +414,8 @@ cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_un
 - 因此，steer 路径的 batch close 语义必须是：
   - `turn/steer` 被接受时：只记录当前 `delivery_turn_id = active_turn_id`，attempt 进入 `cooldown`
   - 只有当同一个 `delivery_turn_id` 之后出现 `turn/completed`，且该 attempt 仍是当前 head delivery 时，batch 才允许关闭
-  - 如果 steer 被拒绝为 non-steerable、或当前 turn 在完成前失败/被替换，则 batch 不得关闭，必须继续走 queued / retry-on-idle 流程
+  - 如果 steer 在被接受之前就被拒绝为 non-steerable，batch 不得关闭，必须继续走 queued / retry-on-idle 流程
+  - 如果 steer 已被接受，但当前 turn 之后失败、中断、被替换，或观察连续性丢失，则 batch 同样不得关闭，且必须 fail-closed 到 `replay_policy=manual_resolution_only`
 
 ## 架构结论
 
@@ -462,13 +453,13 @@ cbth cli run
    - 不依赖 loopback websocket auth
 3. 启动时对实验 RPC 做 capability probe
 4. `cbth cli run` 连接该 managed session，并启动前台 `codex --remote ...`
-5. CLI 入口为当前会话保存 `thread_id`
+5. CLI 入口为当前 managed session durable 建立 `bound_thread_id`
 6. sidecar 从共享核心读取 per-thread `delivery batch`
 7. 任务 ready 后：
    - 默认只在 caller thread idle 时：`thread/resume + turn/start`
    - 只有显式打开 steer feature flag，且 `turn/steer` 能力存在并满足只读/低风险策略时：允许 steer
 8. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
-9. 前台 TUI 通过已有线程订阅自然感知新 turn
+9. 只要前台仍停留在 `bound_thread_id`，TUI 就通过该 thread 的已有订阅自然感知新 turn
 
 ## 仍待补的边界
 

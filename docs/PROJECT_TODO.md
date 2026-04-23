@@ -86,10 +86,15 @@
   - `replay_policy=manual_resolution_only`
   - `redelivery_window_ends_at` 到期时自动 `manual_resolution_expired`
   - 如需 replay，后续单独设计 operator override
-- [ ] 为 “`automation_update` 已接受但 `note-arm` 未 durable 成功” 的 Desktop ghost-wake 场景定死收敛合同：
-  - head batch 进入 `manual_resolution_only`
-  - binding 进入 `degraded`
-  - repair / re-arm 前必须先验证 bound heartbeat 已被 `PAUSED`
+- [ ] 为 “`automation_update` 已接受但 `note-arm` 未 durable 成功” 的 Desktop ghost-wake 场景定死 reconciliation contract：
+  - 先 reconcile，而不是立刻视为歧义失败
+  - 如果能证明 attempt 已进入 `cooldown` 且 `armed_generation` 匹配，则按成功 arm 处理
+  - 如果能证明当前 generation 对应的 heartbeat 已重新 `PAUSED`，则当前 attempt 收敛到 `abandoned`，head batch 保持 `replay_policy=automatic`
+  - 只有在既无法证明 arm 成功、也无法证明 pause 成功时，head batch 才进入 `manual_resolution_only`，binding 才进入 `degraded`
+- [ ] 为 bridge overdue-binding cleanup 定义 durable 只读输入面：
+  - `~/.cbth/inbox/pause-due-bindings.json`
+  - `cbth desktop list-pause-due --bridge-thread-id ... --json`
+  - bridge 每轮必须先 reconcile 这些 binding，再读取新的 ready batch
 - [ ] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
 - [ ] 把 caller heartbeat 的 one-shot cleanup 合同落进实现：
@@ -162,13 +167,12 @@
   - 前台退出但 active jobs 未结束时继续保活
   - 后续重连 / resume contract
   - 如果上游未来支持 loopback auth，再补对应 auth contract validation
-- [ ] 定死 CLI managed session 的 thread-routing contract：
-  - durable `session_id + current_thread_id`
-  - 前台切换 thread 时更新 `current_thread_id`
-  - ready batch 只允许续跑最新的 `current_thread_id`
-  - 非当前 thread 的 backlog 保持挂起，不自动迁移、不静默丢弃
-  - backlog 仍受 batch 自己的 `redelivery_window_ends_at` / `delivery_deadline` 约束，不能无限挂起
-  - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 thread 完成事件
+- [ ] 定死 CLI managed session 的 fixed-thread contract：
+  - durable `managed_session_id + bound_thread_id`
+  - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
+  - 第一版不做前台 thread-switch 的自动观测或自动 retarget
+  - 如需把自动续跑目标换到别的 thread，必须显式开新 session 或等待未来 rebind contract
+  - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
   - accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
   - 如果 `delivery_turn_id` 的观察连续性丢失，则当前 head batch 进入 `manual_resolution_only`
   - 明确 `session_epoch` 的生成、递增与 continuity 判定规则
@@ -182,4 +186,5 @@
 - [ ] 为 CLI adapter 落实 delivery completion contract：
   - accepted `turn/start` / `turn/steer` 只记录 `delivery_turn_id`
   - 只有匹配的 `turn/completed` 才允许 close batch
-  - non-steerable / interrupted / replaced turn 不得被算作成功送达
+  - pre-accept 的 benign race / non-steerable reject 可以回退到 retry-on-idle
+  - 但 accepted 之后的 interrupted / replaced / failed turn 必须 fail-closed 到 `manual_resolution_only`

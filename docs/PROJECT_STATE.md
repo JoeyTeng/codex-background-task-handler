@@ -34,6 +34,8 @@
   - `--ws-auth` 目前仍只适用于 non-loopback listeners，因此不再把 per-session bearer-token auth 当成 v1 既有能力
   - 更强本地 auth 边界留待上游支持 loopback auth 后再补
   - shared `app-server` 由 daemon 持有，而不是前台 wrapper 临时持有
+  - 一个 managed CLI session 在 v1 里只绑定一个 `bound_thread_id`
+  - 前台 thread-switch 的自动观测/自动 retarget 不属于 v1 合同
   - 默认仅在 idle 时 `turn/start`
   - `turn/steer` 只作为只读、低风险场景下的受限优化
 - 共享核心也补上了 reviewer 指出的 thread 级缺口：
@@ -90,6 +92,9 @@
   - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
   - `armed_generation` 作为这个长期复用 heartbeat 的 generation 栅栏
   - `pause_deadline` 作为 one-shot wake 的 cleanup 截止点
+  - bridge 还需要一个专门的 overdue-binding 输入面：
+    - `~/.cbth/inbox/pause-due-bindings.json`
+    - 或 `cbth desktop list-pause-due ...`
   - 正常路径只由 bridge / operator `pause` / `update` / `reuse`
   - caller prompt 自己不直接 pause 这个长期复用 automation
   - stale wake、snapshot 不可读、成功送达、degraded 都先 no-op / helper writeback，再由 bridge 后续切回 `PAUSED`
@@ -100,20 +105,19 @@
   - `turn/start` 失败要被当成 benign race，回到等待下一个 idle，而不是视为成功送达
 - CLI managed session contract 也已补硬：
   - shared `app-server` 由 daemon 持有
-  - 一个 managed session 只承诺一个当前 caller thread
-  - daemon 必须 durable 跟踪 `session_id + current_thread_id`
-  - 当前台在同一 managed session 中切换 thread 时，只允许后续 ready batch 续跑最新的 `current_thread_id`
-  - 旧 thread 上未关闭的 batch 不能被静默丢弃，也不能自动迁移；它们必须继续挂在原 `source_thread_id` 上等待重新切回或 operator 处理
+  - 一个 managed session 在 v1 里只承诺一个固定的 `bound_thread_id`
+  - daemon 必须 durable 跟踪 `managed_session_id + bound_thread_id`
+  - 如果用户想把自动续跑目标换到另一个 thread，必须显式开新 session 或等待未来的 rebind contract
 - CLI 的 delivery completion contract 也继续收口：
   - `turn/start` / `turn/steer` 被接受，只表示 batch 已接入某个 caller turn 的 pending input
   - 每次 accepted attempt 都必须 durable 记录 `delivery_turn_id`
   - accepted attempt 还必须 durable 绑定 `managed_session_id + session_epoch`
   - `managed_session_id` 是逻辑会话 id；`session_epoch` 是该会话当前可证明连续的 app-server 事件流代号
   - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍是当前 head delivery 时，batch 才允许关闭
-  - 非当前 thread 的 backlog 可以挂起，但仍受 batch 自己的 deadline / redelivery window 约束，不能无限阻塞 FIFO/GC
-  - 如果某次旧 thread attempt 已经 accepted 并带有 `delivery_turn_id`，后续即使 `current_thread_id` 改变，它仍可等待匹配的 `turn/completed` 正常收口
+  - 如果某次 accepted attempt 已经带有 `delivery_turn_id`，即使前台 UI 临时切到别的 thread，它也仍可等待匹配的 `turn/completed` 正常收口
   - 因此 daemon 退出条件也必须覆盖这些未收口的 ready/materialized/cooldown batch 与 `delivery_turn_id` 观察
   - 但只要 `managed_session_id + session_epoch` 的观察连续性丢失，就不得自动 replay；当前 head batch 必须进入 `manual_resolution_only`
+  - 同样地，只要 accepted 的 `delivery_turn_id` 后续出现失败/中断/替换等不可信终局，也必须 fail-closed 到 `manual_resolution_only`
   - continuity-loss 后的最小人工收口路径也已收口为：`batch inspect-head` 看 durable 证据，再用 `batch close-head` 带明确 reason 收口
 - 同时又补了一个和 TUI 当前实现一致的判断：
   - active-turn steer 语义更接近现有 TUI 的 `pending_steers` / queued-follow-up 行为

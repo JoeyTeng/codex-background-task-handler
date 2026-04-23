@@ -51,11 +51,13 @@
      - `helper_cli_read`
    - `direct_file_read` 建议至少包含：
      - `~/.cbth/inbox/ready-threads.json`
+     - `~/.cbth/inbox/pause-due-bindings.json`
      - `~/.cbth/inbox/by-thread/<thread_id>.json`
      - `~/.cbth/artifacts/<artifact_id>/manifest.json`
    - `helper_cli_read` 建议提供一组窄 helper：
 
 ```text
+cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 cbth desktop read-envelope --source-thread-id <thread_id> --expected-attempt-id <attempt_id> --expected-generation <generation> --expected-snapshot-revision <revision> --json
 cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-bytes <n> --json
@@ -177,6 +179,12 @@ bridge heartbeat 每分钟醒一次：
 1. 先做上一轮已 arm generation 的 pause / reconcile：
    - 所有到达 `pause_deadline` 的 binding 都必须优先处理
    - 只有在 bridge 确认这些 one-shot wake 已被 pause 或进入 `degraded` 后，才允许继续 arm 新 batch
+   - overdue binding 的读取面必须是：
+
+```text
+preferred: ~/.cbth/inbox/pause-due-bindings.json
+fallback:  cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
+```
 
 2. 读取 bridge 侧的 ready 来源：
 
@@ -233,7 +241,7 @@ cbth desktop note-arm --source-thread-id <thread_id> --attempt-id <attempt_id> -
      - bridge 不能立刻把这次 wake 视为歧义失败
      - 它必须先做一次 durable reconciliation：
        - 如果 attempt 已进入 `cooldown` 且 `armed_generation` 已等于当前 generation，则按成功处理
-       - 否则再尝试验证当前 heartbeat 是否已被 pause
+       - 如果当前 generation 对应的 heartbeat 已能被证明重新 `PAUSED`，则当前 attempt 收敛到 `abandoned`，head batch 保持 `replay_policy=automatic`
      - 只有在仍无法证明“已成功 arm”或“已成功 pause”时，才允许把当前 head batch 打到 `manual_resolution_only` 并把 binding 置为 `degraded`
 
 ### 3. caller thread 被唤醒
@@ -498,10 +506,14 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
   - 当前 attempt 标为 `abandoned` 或保持 `prepared`，由调度器决定是否重建新 attempt
   - 下一次 bridge heartbeat 只能基于新的 head attempt 再试
 - 如果 `automation_update` 已被接受，但 `note-arm` 没能 durable 成功：
-  - 当前 head batch 不再保持自动可投递
-  - 它必须进入 `replay_policy=manual_resolution_only`
-  - 当前 binding 进入 `degraded`
-  - 先完成 pause verification，再允许任何 repair / re-arm
+  - bridge 不得立刻把它视为歧义失败
+  - 它必须先做 reconciliation：
+    - 如果 attempt 已进入 `cooldown` 且 `armed_generation` 匹配，则按 arm 成功处理
+    - 如果当前 generation 对应的 heartbeat 已能被证明重新 `PAUSED`，则当前 attempt 收敛到 `abandoned`，head batch 继续保持 `replay_policy=automatic`
+  - 只有在既无法证明 arm 成功、也无法证明 pause 成功时：
+    - 当前 head batch 才进入 `replay_policy=manual_resolution_only`
+    - 当前 binding 才进入 `degraded`
+    - 后续任何 repair / re-arm 前都必须先验证 bound heartbeat 已被 `PAUSED`
 
 ### Caller heartbeat 醒来但 snapshot 不可读
 
@@ -519,7 +531,7 @@ cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt
 
 - 第一版不依赖 caller 回写失败状态。
 - `cbth` 通过保留 batch、cooldown 与 redelivery timeout 决定是否再次 arm。
-- 如果 `cooldown_until` 到期后，该 batch 仍然是当前 head batch，且 `close_reason` 仍为空、`now < redelivery_window_ends_at`、并且 `delivery_attempt_count < max_delivery_attempts`，就应该创建新 attempt 并再次 arm，而不是把旧 attempt 直接视为成功送达。
+- 如果 `cooldown_until` 到期后，该 batch 仍然是当前 head batch，且 `replay_policy=automatic`、`close_reason` 仍为空、`now < redelivery_window_ends_at`、并且 `delivery_attempt_count < max_delivery_attempts`，就应该创建新 attempt 并再次 arm，而不是把旧 attempt 直接视为成功送达。
 
 ### Caller 已读到 envelope，但 `note-boundary-crossed` 失败
 
