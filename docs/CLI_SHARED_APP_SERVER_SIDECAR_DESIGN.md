@@ -60,6 +60,26 @@ codex --remote-auth-token-env CBTH_REMOTE_AUTH_TOKEN --remote ws://127.0.0.1:<po
      - daemon 必须把 `current_thread_id` 更新为新的前台 thread
      - 后续 ready batch 只允许续跑这个最新的 `current_thread_id`
    - 第一版不承诺一个 managed session 同时自动续跑多个 foreground-active threads。
+   - 对旧 `source_thread_id` 的合同必须是：
+     - 旧 thread 上已经存在的 batch 不得被静默丢弃
+     - 也不得自动迁移到新的 `current_thread_id`
+     - 它们必须继续挂在原 `source_thread_id` 上保持 `queued/materialized`
+     - 直到以下事件之一发生：
+       - 前台重新切回该 thread，使它再次成为 `current_thread_id`
+       - operator 显式关闭该 head batch
+       - batch 自己的 `redelivery_window_ends_at` / `delivery_deadline` 到期，自动关闭为超时终态
+       - 后续版本引入显式 reassign/migrate contract
+   - 也就是说，第一版的“只续跑最新 thread”是自动投递边界，不是丢弃旧 thread backlog 的理由。
+   - 因此，旧 thread backlog 的安全合同是：
+     - 可以挂起
+     - 但不能无限挂起
+     - 仍然必须受共享核心已有的 deadline / redelivery window 约束
+     - 超时后正常进入 batch 终态，从而释放 FIFO 和 artifact GC 压力
+   - 但 `current_thread_id` 的切换只约束“新的自动投递 attempt 应该发往哪个 thread”：
+     - 如果某个旧 thread 的 attempt 已经 accepted，并且已经 durable 记录了 `delivery_turn_id`
+     - 那么即使用户随后切到别的 thread
+     - 该旧 attempt 仍允许等待自己匹配的 `turn/completed` 并正常 close
+     - 不需要因为 `current_thread_id` 改变而强行中止或重开这次已 accepted 的投递
 
 ## 本地信任边界
 
@@ -107,6 +127,8 @@ codex --remote-auth-token-env CBTH_REMOTE_AUTH_TOKEN --remote ws://127.0.0.1:<po
   - 没有 active jobs
   - 没有连接中的 foreground client
   - 没有需要继续投递的 sidecar client
+  - 没有挂起的 ready/materialized/cooldown batch
+  - 没有仍在等待匹配 `turn/completed` 的 `delivery_turn_id`
 
 ## 实验 RPC 依赖面
 
@@ -273,11 +295,28 @@ CLI adapter 不直接按单 job 投递，而是消费共享核心为每个 threa
 - 同一 `source_thread_id` 只允许一个 in-flight delivery attempt。
 - ready jobs 先进入 thread-scoped FIFO 队列。
 - daemon 对同一 thread 上的相邻 jobs 做 batch 合并。
+- 第一版自动投递的前提要先过共享核心的安全门槛：
+  - `delivery_read_only=true`
+  - `delivery_requires_approval=false`
+  - `delivery_requires_network=false`
+  - `delivery_requires_write_access=false`
+- 不满足这些条件的 batch 不得自动 `turn/start`；它们保留为 operator/manual 路径。
 - 默认只在 caller thread idle 时使用：
 
 ```text
 thread/resume + turn/start
 ```
+
+- 无论 `turn/start` 还是 `turn/steer`，第一版都必须把“RPC 被 server 接受”与“batch 已成功送达”分开建模。
+- 对 CLI 来说，accepted delivery 的第一层语义是：
+  - batch 已被接入某个具体 caller turn 的 pending input / input queue
+  - 但 batch 还不能因此立刻 `closed`
+- 每次 accepted delivery attempt 都必须 durable 记录一个：
+  - `delivery_turn_id`
+  - idle 路径下来自 `turn/start` 返回的新 turn id
+  - steer 路径下来自当前 active regular turn id
+- accepted 之后，attempt 进入 `cooldown`；是否真正关闭 batch，要看后续同一个 `delivery_turn_id` 的 turn 结果。
+- 因此，`delivery_turn_id` 也必须落进共享核心的 durable attempt schema，而不是只存在于 CLI adapter 的内存里。
 
 ### Idle 判定与 race contract
 
@@ -305,6 +344,10 @@ thread/resume + turn/start
   - daemon 的 per-thread attempt lease
   - app-server 的 live event stream
   - `turn/start` 失败时的 retry-on-next-idle 约束
+- idle 路径的 batch close 语义必须是：
+  - `turn/start` 被接受时：只记录 `delivery_turn_id`，attempt 进入 `cooldown`
+  - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍然是当前 generation/head delivery 时，batch 才允许关闭为 CLI-delivered
+  - 如果该 turn 在完成前失败、被替换、或 batch 已被 supersede，则不得因为早先的 `turn/start` 接受而关闭 batch
 
 ### `turn/steer` 的策略
 
@@ -321,6 +364,15 @@ thread/resume + turn/start
   - 当前 batch 的 `inline_payload_bytes` 没超过 CLI adapter 的 steer 上限
   - 当前 thread 未触发最小连续发送间隔限制
 - 不满足上述任一条件时，batch 保持排队，等 caller idle 后再 `turn/start`。
+- 由于第一版自动续跑整体都只允许只读 batch，上面的 `turn/steer` 安全门槛其实是对默认总门槛的进一步细化，而不是独立例外。
+- steer 路径的 delivery contract 要额外参考现有 TUI 语义：
+  - accepted steer 表示新输入被并入当前 active regular turn 的 pending input
+  - non-steerable turn 不算成功送达，而是必须像 TUI 一样回落到 queued-follow-up 语义
+  - race / expected-turn mismatch 只能重试或回退，不能直接 close batch
+- 因此，steer 路径的 batch close 语义必须是：
+  - `turn/steer` 被接受时：只记录当前 `delivery_turn_id = active_turn_id`，attempt 进入 `cooldown`
+  - 只有当同一个 `delivery_turn_id` 之后出现 `turn/completed`，且该 attempt 仍是当前 head delivery 时，batch 才允许关闭
+  - 如果 steer 被拒绝为 non-steerable、或当前 turn 在完成前失败/被替换，则 batch 不得关闭，必须继续走 queued / retry-on-idle 流程
 
 ## 架构结论
 

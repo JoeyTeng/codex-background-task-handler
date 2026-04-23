@@ -12,16 +12,17 @@
   - 一个共享的 CLI 控制面
   - 两个薄的 Codex integration adapters：CLI 与 Desktop
 - 第一版不做系统级常驻服务；改为按需启动的本地 daemon。
-- 该 daemon 生命周期独立于单个 Codex 前台实例，但在没有 active jobs 且没有活跃接入端时会自动退出。
+- 该 daemon 生命周期独立于单个 Codex 前台实例，但只有在没有 active jobs、没有活跃接入端、且没有未收口的 delivery work / timers 时才会自动退出。
 - 第一版稳定外部接口只做 CLI，不承诺公开 socket / Web / plugin 协议。
 - 因此，之前设计里提到的 `background-taskctl` helper，应收敛成主 binary 的 `cbth job ...` 子命令，而不是第二个长期维护的独立工具。
 - 经过 reviewer 复核后，Desktop 关键路径又做了一个更保守的收口：
   - 不再把“heartbeat turn 稳定执行通用 `cbth job ...` CLI”当作既定前提
-  - 改为定义统一 delivery envelope schema，并给出两条受支持传输：
+  - 改为定义统一 delivery envelope schema，并给出两条候选读取传输：
     - `direct_file_read`
     - `helper_cli_read`
-  - 其中 `direct_file_read` 仍是候选优先路径，`helper_cli_read` 是已定义 fallback
+  - 其中 `direct_file_read` 仍是候选优先路径，`helper_cli_read` 只是条件性 fallback
   - 同时又补了一层 explicit desktop binding：bridge 运行期只更新已知 caller automation，不做 blind create/discovery
+  - Desktop 顶部文案也已改成更保守的口径：`note-arm` / `note-delivered` 仍是规划中的窄写回依赖，但后台 heartbeat 能否无审批执行它们还待实证
 - 同时，CLI 关键路径也收口为：
   - 明确依赖实验 RPC
   - 启动时 capability probe
@@ -47,18 +48,34 @@
   - 用于在 bridge 成功 `automation_update` 后，把 attempt durable 推进到 `cooldown`
 - 同时又补上了 caller 成功分支：
   - `cbth desktop note-delivered ...`
-  - 用于在 caller 成功读取当前 envelope 后，把 head batch 自动关闭到 `caller_acknowledged`
+  - 只允许在 caller 已读取 envelope 且跨过 continuation boundary 后，把 head batch 自动关闭到 `caller_acknowledged`
 - Desktop helper fallback 也进一步补成完整链路：
   - `cbth desktop claim-next-ready ...`
   - `cbth desktop read-envelope ...`
   - `cbth desktop read-artifact ...`
   - `cbth desktop note-arm ...`
   - `cbth desktop note-delivered ...`
+- 但这条 helper fallback 也被重新降级成“条件性 fallback”：
+  - 它仍要求 heartbeat turn 无审批执行窄 `cbth desktop ...` 命令
+  - 在这个前提被实证前，不能把它当作已验证主路径
+  - 当前真正优先候选仍是 `direct_file_read`
 - Desktop 的 delivery state machine 也继续收紧：
   - attempt 不再保留单独的 durable `armed`
   - bridge arm 成功并 durable 记录后，attempt 直接进入 `cooldown`
   - `cooldown` 期满后若仍可重投，再创建新 attempt
   - 若 `delivery_attempt_count >= max_delivery_attempts`，batch 必须自动关闭到 `close_reason=max_attempts_exhausted`
+- Desktop 的送达语义也进一步收紧：
+  - `claim-next-ready` 虽然名字里带 `claim`，但第一版必须是纯 read/peek helper，不能 reservation 或隐藏 head batch
+  - `note-delivered` 不能在“刚读完 envelope”时就执行
+  - caller 只有在当前 turn 中完成 continuation preparation、且 helper 仍可调用时，才允许用 `note-delivered` 关闭 batch
+  - 如果 `note-delivered` 在 post-continuation-boundary 场景下失败，batch 进入人工判定语义，`binding repair` 不得自动重投它
+  - `note-arm` 也新增了 CAS/幂等合同，避免 bridge 重试导致重复计数
+  - 这类歧义 batch 的 durable 表达应落成 `replay_policy=manual_resolution_only`
+  - 默认只允许 operator close；若长期无人处理，则在 `redelivery_window_ends_at` 到期时自动 close 释放 FIFO/GC
+- 第一版自动续跑总门槛也已统一：
+  - 只处理 `delivery_read_only=true`
+  - 且不需要 approval/network/write access 的 batch
+  - 非只读 batch 一律不自动续跑，留给 operator/manual follow-up
 - caller heartbeat lifecycle 也已收口：
   - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
   - 正常路径只 `pause` / `update` / `reuse`
@@ -73,6 +90,17 @@
   - 一个 managed session 只承诺一个当前 caller thread
   - daemon 必须 durable 跟踪 `session_id + current_thread_id`
   - 当前台在同一 managed session 中切换 thread 时，只允许后续 ready batch 续跑最新的 `current_thread_id`
+  - 旧 thread 上未关闭的 batch 不能被静默丢弃，也不能自动迁移；它们必须继续挂在原 `source_thread_id` 上等待重新切回或 operator 处理
+- CLI 的 delivery completion contract 也继续收口：
+  - `turn/start` / `turn/steer` 被接受，只表示 batch 已接入某个 caller turn 的 pending input
+  - 每次 accepted attempt 都必须 durable 记录 `delivery_turn_id`
+  - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且该 attempt 仍是当前 head delivery 时，batch 才允许关闭
+  - 非当前 thread 的 backlog 可以挂起，但仍受 batch 自己的 deadline / redelivery window 约束，不能无限阻塞 FIFO/GC
+  - 如果某次旧 thread attempt 已经 accepted 并带有 `delivery_turn_id`，后续即使 `current_thread_id` 改变，它仍可等待匹配的 `turn/completed` 正常收口
+  - 因此 daemon 退出条件也必须覆盖这些未收口的 ready/materialized/cooldown batch 与 `delivery_turn_id` 观察
+- 同时又补了一个和 TUI 当前实现一致的判断：
+  - active-turn steer 语义更接近现有 TUI 的 `pending_steers` / queued-follow-up 行为
+  - non-steerable turn 必须回落到排队，而不是被算作成功送达
 - 结果保留责任也已收敛：
   - `cbth job complete --result-file <path>` 的语义改为 ingest/copy 到 `cbth` 自己管理的 artifact store
   - 原始外部文件不再承担长期保留责任

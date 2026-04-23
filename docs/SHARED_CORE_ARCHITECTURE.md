@@ -33,7 +33,11 @@
 - 核心进程采用按需启动的本地 daemon 模式：
   - 有命令调用时，如 daemon 不存在则自动拉起。
   - 有 active jobs 时，即使前台 CLI / Desktop 实例退出，daemon 也可继续活着。
-  - 当没有 active jobs 且没有活跃接入端时，daemon 在 idle timeout 后自动退出。
+  - 当且仅当以下条件同时满足时，daemon 才允许在 idle timeout 后自动退出：
+    - 没有 active jobs
+    - 没有活跃接入端
+    - 没有未收口的 delivery batches / attempts
+    - 没有等待中的 `cooldown_until` / `redelivery_window_ends_at` / `delivery_turn_id` 完成观察
 
 ### 3. 第一版公共接口只做 CLI
 
@@ -46,9 +50,14 @@
 ### 4. Desktop 关键路径优先只读
 
 - 第一版不把“Desktop heartbeat turn 能稳定执行通用 `cbth job ...` CLI”当作既定前提。
-- 但 Desktop adapter 明确依赖一组窄 helper：
+- Desktop adapter 的稳定关键路径应优先依赖：
+  - 只读 inbox snapshot 文件
+  - 只读 artifact manifest / artifact 文件
+- 只有在 `direct_file_read` 不成立、且 helper 执行能力已被单独验证后，才条件性依赖读 helper：
+  - `cbth desktop claim-next-ready ...`
   - `cbth desktop read-envelope ...`
   - `cbth desktop read-artifact ...`
+- 当前无论读路径怎么选，写回 helper 仍是既定窄依赖：
   - `cbth desktop note-arm ...`
   - `cbth desktop note-delivered ...`
 - Desktop 的关键投递路径优先依赖只读状态面：
@@ -134,6 +143,15 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 
 两种传输必须返回同一个 envelope schema。
 
+`helper_cli_read` 的合同要额外收紧：
+
+- 它不是“完全摆脱本地 CLI 执行依赖”的路径。
+- 它只是 Desktop 在 `direct_file_read` 失败时可考虑的窄 helper fallback。
+- 在把它升级成正式受支持路径之前，必须单独验证：
+  - heartbeat turn 无审批执行这些窄 `cbth desktop ...` helper
+  - helper 返回的 envelope / artifact 内容与 `direct_file_read` 完全等价
+- 因此，第一版当前真正的优先候选仍然是 `direct_file_read`；`helper_cli_read` 只是条件性 fallback，不应在文档里被表述成已验证主路径。
+
 `direct_file_read` 的第一版候选路径：
 
 ```text
@@ -149,7 +167,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 - 外部语义固定为“读快照文件”。
 - 后续如果内部改成 `mmap` / shared memory，只能在不改变这一语义的前提下做。
 - `direct_file_read` 在 Desktop 无审批读取能力得到实证前，仍视为候选内部 contract，而不是已冻结接口。
-- 如果 `direct_file_read` 无法满足无审批读取约束，Desktop 第一版必须退回 `helper_cli_read`，而不是继续把未验证前提当主链路。
+- 如果 `direct_file_read` 无法满足无审批读取约束，Desktop 第一版只能切到“已单独验证过的 `helper_cli_read`”，否则就继续保留为候选方案；不能直接把未验证 helper 执行前提当主链路。
 - 无论哪种传输，`~/.cbth` 根目录默认要求：
   - directory mode `0700`
   - regular file mode `0600`
@@ -311,6 +329,7 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 - `batch_id`
 - `generation`
 - `state`
+- `delivery_turn_id` (optional)
 - `binding_id` (optional)
 - `automation_id` (optional)
 - `automation_binding_state`
@@ -352,6 +371,16 @@ cbth desktop read-artifact --artifact-id <artifact_id> --offset <offset> --max-b
 - bridge 获取这组 token 的来源合同必须是二选一：
   - `direct_file_read` 路径：`ready-threads.json` 的每个 ready entry 必须直接携带这整组 prompt token
   - `helper_cli_read` 路径：`cbth desktop claim-next-ready ...` 必须一次性返回这整组 prompt token 与 `caller_automation_id`
+- `cbth desktop claim-next-ready ...` 虽然名字里带 `claim`，但第一版语义必须是：
+  - 纯读取 / peek helper
+  - 不得创建 reservation
+  - 不得移动 head batch
+  - 不得递增 `delivery_attempt_count`
+  - 不得改变当前 attempt / batch 的 durable 状态
+- Desktop 第一版里，bridge 侧真正允许推进 durable 状态的动作只有：
+  - `automation_update` 被 Codex 接受
+  - 随后的 `cbth desktop note-arm ...` 成功
+- 因此，即使 bridge 在 `claim-next-ready` 返回后崩溃，head batch 也必须仍然保持可见、可重读、可再次 arm。
 - caller 读取 envelope 后，必须先比较：
   - `snapshot.batch_id`
   - `snapshot.attempt_id`
@@ -455,6 +484,9 @@ cooldown -> superseded
 - `delivery_attempt_count`
 - `head_attempt_id`
 - `generation`
+- `replay_policy`
+  - `automatic`
+  - `manual_resolution_only`
 - `closed_at`
 - `close_reason`
 - `delivery_mode`
@@ -490,6 +522,17 @@ cooldown -> superseded
   - `prepared` attempt 本身不消耗 attempt budget
   - CLI benign race 不得递增 `delivery_attempt_count`
   - 只有真正进入 delivery channel 的尝试才会逼近 `max_delivery_attempts`
+- `cbth desktop note-arm ...` 的合同必须再补两条：
+  - compare-and-swap：
+    - 只有当 `(source_thread_id, attempt_id, generation)` 仍指向当前 head attempt
+    - 且当前 durable 状态仍是 `prepared`
+    - 才允许执行唯一一次 `prepared -> cooldown`
+  - idempotent retry：
+    - 如果同一 attempt 之前已经成功进入 `cooldown`
+    - 重复 `note-arm` 必须返回 idempotent success / already-armed
+    - 但不得再次递增 `delivery_attempt_count`
+    - 也不得再次推进任何状态
+- 如果 `attempt_id` / `generation` 已失配，或该 attempt 已经 `superseded/abandoned/closed`，`note-arm` 必须返回 stale/no-op，而不是重复记账。
 
 ### Artifact 关键字段
 
@@ -542,6 +585,19 @@ cooldown -> superseded
 - `closed` 不是“用户一定已经消费”的证明
 - 它只是“`cbth` 不再自动重投该 batch”的 durable 决策点
 - `redelivery_window_ends_at` 与 `max_delivery_attempts` 必须 durable 落在 batch 上，而不是只存在于单次 attempt 的临时计算里。
+- 这条 batch deadline / redelivery window 合同同样适用于：
+  - CLI 中因 `current_thread_id` 切走而暂时挂起的 backlog
+  - Desktop 中进入 `degraded` 但尚未被 operator 明确关闭的 head batch
+- 换句话说：
+- “保留在原 thread 上等待人工或用户切回”不等于无限期阻塞
+- 如果 batch 在自己的 `redelivery_window_ends_at` 之前仍未恢复到可安全投递/关闭状态，就必须自动进入终态，并释放后续 FIFO/GC 压力
+- `replay_policy` 是 durable 的 batch 级合同：
+  - `automatic`：
+    - 允许按正常合同继续自动 redelivery
+  - `manual_resolution_only`：
+    - 不允许自动 replay
+    - 只允许 operator 显式 close
+    - 或在 `redelivery_window_ends_at` 到期时自动 close，以释放 FIFO/GC
 
 ### Desktop 第一版送达语义
 
@@ -560,16 +616,35 @@ cooldown -> superseded
   - 如果 `delivery_attempt_count >= max_delivery_attempts`，该 batch 必须自动进入：
     - `close_reason=max_attempts_exhausted`
     - `closed`
-  - 只有在 operator 关闭、batch 被 supersede、caller 明确回写成功、redelivery window 结束、或 `max_attempts_exhausted` 时，batch 才进入 `closed`
+- 只有在 operator 关闭、batch 被 supersede、caller 明确回写成功、redelivery window 结束、或 `max_attempts_exhausted` 时，batch 才进入 `closed`
 - caller 的“明确回写成功”在第一版里应实现为一个窄 helper：
 
 ```text
 cbth desktop note-delivered --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --json
 ```
 
-- 一旦该 helper 成功，当前 head batch 必须自动进入：
+- 这里的“delivered”语义必须收紧为：
+  - caller 已成功读取当前 envelope / artifact
+  - 并且已经在当前 caller turn 中完成 continuation preparation
+  - `note-delivered` 必须发生在 turn 仍然活着、helper 仍可调用时
+  - 第一版的 continuation preparation 至少意味着 caller 已经：
+    - 构造好了将要发送的 assistant 输出
+    - 或确定并准备发起下一个基于该 batch 的工具 / 行动步骤
+- 仅读到 envelope / artifact 本身，不足以调用 `note-delivered`。
+- 如果 caller 在读完 envelope 后、真正完成 continuation preparation 前崩溃，`note-delivered` 不得执行，batch 必须保持可 redelivery。
+- 一旦 `note-delivered` 成功，当前 head batch 才必须自动进入：
   - `close_reason=caller_acknowledged`
   - 不再继续 redelivery
+- 反过来，如果 caller 已经跨过 continuation boundary，但 `note-delivered` 失败：
+  - 当前 head batch 不得自动重投
+  - `binding repair` 只负责恢复 binding / helper / automation 健康度
+  - 不得把这个“已发生潜在副作用但未成功 close”的 head batch 自动放回可投递状态
+  - 第一版安全默认值是：
+    - 当前 head batch 保持 open
+    - `replay_policy=manual_resolution_only`
+    - 等待 operator 显式 `batch close-head ...`
+    - 或在 `redelivery_window_ends_at` 到期时自动关闭为 `close_reason=manual_resolution_expired`
+    - 未来版本如果要支持人工 replay，必须单独引入专门的 operator override contract
 
 ## 第一版稳定外部接口
 
@@ -677,6 +752,9 @@ cbth batch close-head --source-thread-id <thread_id> --reason operator_closed --
   - `cbth desktop read-artifact ...`
   - `cbth desktop note-arm ...`
   - `cbth desktop note-delivered ...`
+- 但这条 helper 链路目前只能算条件性 fallback：
+  - 它仍然要求 heartbeat turn 能无审批执行窄 `cbth desktop ...` 命令
+  - 在这个前提被实证前，不应把它表述成已验证的默认主路径
 - 其中 `cbth desktop read-artifact ...` 必须提供 chunked payload 协议，而不是返回一个需要再次 file-read 的路径。
 - 其中 `cbth desktop claim-next-ready ...` 必须一次性返回 bridge 写 prompt 所需的整组 token：
   - `source_thread_id`
@@ -689,7 +767,7 @@ cbth batch close-head --source-thread-id <thread_id> --reason operator_closed --
 - 当前首选路径是：
   - bridge heartbeat 只读 `ready-threads.json`
   - caller heartbeat 通过 `direct_file_read` 读取自己的 per-thread envelope 与 artifact
-- 如果 `direct_file_read` 不能满足无审批读取约束，则第一版 Desktop 必须切回 `helper_cli_read`，而不是继续假设文件读取成立。
+- 如果 `direct_file_read` 不能满足无审批读取约束，则 Desktop 设计要么切回经过单独验证的 `helper_cli_read`，要么继续保留为候选方案；不能直接把未验证的 helper 执行前提当成已经成立。
 - Desktop 自动续跑只对已完成 binding 的 thread 生效；未绑定 thread 不得被 bridge 自动 arm。
 
 ## 为什么第一版只做 CLI 脚本

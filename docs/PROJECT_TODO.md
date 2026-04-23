@@ -16,8 +16,18 @@
 - [x] 单独沉淀 Desktop background-task bridge 技术方案文档。
 - [x] 单独沉淀共享核心架构文档，明确单 binary、多入口、按需启动 daemon 的生命周期方案。
 - [ ] 用 Rust 实现主 binary 的共享 `job` CLI 子命令，替代单独的 `background-taskctl` helper。
-- [ ] 实现按需启动的本地 daemon：自动拉起、idle timeout、无 active jobs/clients 时自动退出。
+- [ ] 实现按需启动的本地 daemon：自动拉起、idle timeout，并把退出条件收紧为：
+  - 无 active jobs
+  - 无 active clients
+  - 无未收口的 ready/materialized/cooldown batch
+  - 无等待中的 `cooldown_until` / `redelivery_window_ends_at` / `delivery_turn_id`
 - [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 `cbth` 物化出的只读 inbox snapshot / artifact 文件，且不会卡审批。
+- [ ] 单独验证 Desktop heartbeat 在后台运行时，是否能无审批执行窄 `cbth desktop ...` helper：
+  - `claim-next-ready`
+  - `read-envelope`
+  - `read-artifact`
+  - `note-arm`
+  - `note-delivered`
 - [ ] 为 Desktop bootstrap 设计并实现 `desktop binding` 流程，至少 durable 记录：
   - `source_thread_id`
   - `caller_automation_id`
@@ -35,10 +45,30 @@
   - `cbth desktop read-envelope --source-thread-id ... --expected-attempt-id ... --expected-generation ... --expected-snapshot-revision ... --json`
   - `cbth desktop read-artifact --artifact-id ... --offset ... --max-bytes ... --json`
   - chunked payload return contract
+- [ ] 把 `claim-next-ready` 的语义定死并在实现里保持为纯 read/peek：
+  - 不 reservation
+  - 不隐藏 head batch
+  - 不推进 attempt / batch durable 状态
 - [ ] 设计并实现 Desktop bridge 的窄写回 helper：
   - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --json`
+  - compare-and-swap 只允许唯一一次 `prepared -> cooldown`
+  - idempotent retry 不得重复递增 `delivery_attempt_count`
 - [ ] 设计并实现 caller 成功关闭当前 head batch 的窄 helper：
   - `cbth desktop note-delivered --source-thread-id ... --attempt-id ... --generation ... --json`
+- [ ] 为 Desktop 定死 continuation-boundary contract：
+  - 仅读完 envelope / artifact 不能关闭 batch
+  - 只有 caller 已经完成 continuation preparation、且 helper 仍可调用时，才允许 `note-delivered`
+  - 纯文本成功路径也必须能走到 `caller_acknowledged`
+- [ ] 明确第一版自动续跑的总安全门槛：
+  - 仅限 `delivery_read_only=true`
+  - 且 `delivery_requires_approval/network/write_access=false`
+  - 非只读 batch 只走 manual/operator follow-up
+- [ ] 为 post-continuation-boundary 的 `note-delivered` 失败场景定死 operator-resolution contract：
+  - `binding repair` 不得自动 replay 当前 head batch
+  - 第一版默认只允许人工 `batch close-head`
+  - `replay_policy=manual_resolution_only`
+  - `redelivery_window_ends_at` 到期时自动 `manual_resolution_expired`
+  - 如需 replay，后续单独设计 operator override
 - [ ] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
 - [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
 - [ ] 定死 caller heartbeat 的长期生命周期合同：
@@ -59,6 +89,7 @@
   - `batch_id`
   - `attempt_id`
   - `generation`
+  - `delivery_turn_id` (CLI)
   - optional `automation_id`
   - stale wake no-op 规则
 - [ ] 明确 Desktop 第一版的 `close_reason` / redelivery window contract，保证 `closed` 只表示停止自动重投，而不是隐含“caller 已消费”。
@@ -74,6 +105,7 @@
   - `redelivery_window_ends_at`
   - `max_delivery_attempts`
   - `delivery_attempt_count`
+  - `replay_policy`
 - [ ] 用 Rust 实现 managed artifact store，并把 `cbth job complete --result-file <path>` 定义成 ingest/copy 语义。
 - [ ] 实现 artifact retention / GC contract：
   - `min_artifact_ttl = 24h`
@@ -98,9 +130,16 @@
   - durable `session_id + current_thread_id`
   - 前台切换 thread 时更新 `current_thread_id`
   - ready batch 只允许续跑最新的 `current_thread_id`
+  - 非当前 thread 的 backlog 保持挂起，不自动迁移、不静默丢弃
+  - backlog 仍受 batch 自己的 `redelivery_window_ends_at` / `delivery_deadline` 约束，不能无限挂起
+  - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 thread 完成事件
 - [ ] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
   - 基于 `turn/started` / `turn/completed` / `thread/status/changed`
   - `turn/start` race 失败后回到等待下一个 idle
 - [x] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为，且不会导致当前 turn 提前结束。
 - [ ] 为 CLI adapter 明确定义实验 RPC 的最小能力集、capability probe 和 fail-closed 策略。
 - [ ] 把 `turn/steer` 维持为默认关闭的 gated optimization，并明确不满足条件时的 idle-only fallback。
+- [ ] 为 CLI adapter 落实 delivery completion contract：
+  - accepted `turn/start` / `turn/steer` 只记录 `delivery_turn_id`
+  - 只有匹配的 `turn/completed` 才允许 close batch
+  - non-steerable / interrupted / replaced turn 不得被算作成功送达
