@@ -23,7 +23,6 @@ const runUrl = `${config.serverUrl}/${repo.owner}/${repo.name}/actions/runs/${co
 
 let statusSha = config.headSha;
 let statusReady = false;
-let gateActorLogin = "";
 
 main().catch(async (error) => {
   const gateError =
@@ -46,8 +45,6 @@ main().catch(async (error) => {
 async function main() {
   const pullRequest = await loadPullRequest();
   statusSha = statusSha || pullRequest.head.sha;
-  gateActorLogin = await loadAuthenticatedLogin();
-  console.log(`Gate comments will be owned by ${gateActorLogin}.`);
 
   await setCommitStatus("pending", "Waiting for Codex review on current head");
   statusReady = true;
@@ -130,14 +127,6 @@ async function loadPullRequest() {
   return data;
 }
 
-async function loadAuthenticatedLogin() {
-  const { data } = await request("GET", "/user");
-  if (!data.login) {
-    throw new Error("could not determine authenticated GitHub login");
-  }
-  return data.login;
-}
-
 async function ensureGateComment() {
   const existing = await findGateComment();
   if (existing) {
@@ -167,7 +156,6 @@ async function findGateComment() {
   });
 
   return comments
-    .filter((comment) => comment.user?.login === gateActorLogin)
     .filter((comment) => hasCurrentHeadMarker(comment.body || ""))
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
 }

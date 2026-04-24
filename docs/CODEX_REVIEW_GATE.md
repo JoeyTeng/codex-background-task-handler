@@ -7,7 +7,7 @@
 - `.github/workflows/codex-review-gate.yml` 使用 `pull_request_target`，因此 gate 由默认分支上的可信 workflow 控制，不执行 PR 代码。
 - workflow 会把 `codex/review-gate` commit status 写到 PR head SHA。
 - 如果当前 head SHA 已经有 Codex inline review comments，status 直接失败。
-- 否则 workflow 会创建或复用由 workflow token 创建的 comment：
+- 否则 workflow 会创建或复用当前 head SHA 对应的 marker comment：
 
   ```text
   @codex review
@@ -19,6 +19,7 @@
   ```
 
 - workflow 只接受当前 head marker comment 上 `chatgpt-codex-connector` 的 `+1` reaction。
+- marker comment 本身不代表通过；即使有人手工创建了同样的 marker，也仍然必须等到 Codex bot 对这条当前 head comment 给出 `+1` reaction。
 - `eyes` 表示 Codex 已经接收请求，gate 会继续 poll。
 - PR body reactions 以及旧 head SHA 的 comments/reactions 全部忽略。
 - gate 超时时间是 30 分钟。
