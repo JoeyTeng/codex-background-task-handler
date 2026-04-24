@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,13 +38,6 @@ struct ArtifactIngestRecord {
 struct ManifestSyncReport {
     synced: usize,
     failed: usize,
-}
-
-impl ManifestSyncReport {
-    fn add(&mut self, other: Self) {
-        self.synced += other.synced;
-        self.failed += other.failed;
-    }
 }
 
 impl Store {
@@ -367,25 +361,15 @@ impl Store {
         let expired_artifacts = query_deletable_artifacts_tx(&tx, now)?;
         let manifest_sync_artifacts = query_artifacts_for_manifest_sync_tx(&tx)?;
         tx.commit()?;
-        let mut manifest_report = ManifestSyncReport::default();
-        manifest_report.add(sync_artifact_manifests(
+        let mut manifest_sync_candidates = artifacts_to_sync;
+        manifest_sync_candidates.extend(automatic_artifacts_to_sync);
+        manifest_sync_candidates.extend(manifest_sync_artifacts);
+        let manifest_report = sync_artifact_manifests(
             &self.conn,
             layout,
-            &artifacts_to_sync,
+            &dedupe_artifacts_by_id(manifest_sync_candidates),
             now,
-        ));
-        manifest_report.add(sync_artifact_manifests(
-            &self.conn,
-            layout,
-            &automatic_artifacts_to_sync,
-            now,
-        ));
-        manifest_report.add(sync_artifact_manifests(
-            &self.conn,
-            layout,
-            &manifest_sync_artifacts,
-            now,
-        ));
+        );
 
         let mut deleted_artifact_ids = Vec::new();
         let mut artifact_delete_failures = 0_usize;
@@ -515,6 +499,14 @@ fn sync_artifact_manifests(
         }
     }
     report
+}
+
+fn dedupe_artifacts_by_id(artifacts: Vec<ArtifactRecord>) -> Vec<ArtifactRecord> {
+    let mut seen = HashSet::with_capacity(artifacts.len());
+    artifacts
+        .into_iter()
+        .filter(|artifact| seen.insert(artifact.artifact_id.clone()))
+        .collect()
 }
 
 fn validate_artifact_record(artifact: &ArtifactRecord) -> Result<()> {

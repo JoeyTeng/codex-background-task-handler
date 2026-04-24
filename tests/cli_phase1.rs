@@ -361,6 +361,7 @@ fn maintenance_sweep_closes_expired_automatic_batches() {
     let sweep_now = (redelivery_window_ends_at + 1).to_string();
     let sweep = cbth(&home, &["maintenance", "sweep", "--now", &sweep_now]);
     assert_eq!(sweep["sweep"]["expired_automatic_batches_closed"], 1);
+    assert_eq!(sweep["sweep"]["artifact_manifests_synced"], 1);
 
     let inspected = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
     assert_eq!(inspected["batch"]["batch"]["state"], "closed");
