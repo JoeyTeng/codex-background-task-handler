@@ -430,3 +430,12 @@ scripts/desktop_thread_inject_poc.py
   - 模型实际发起了 `exec_command: sleep 10`
   - steer 文本作为新的 user message 被写入同一个 rollout
   - 最终 `agent_message` 与 `task_complete.last_agent_message` 都是 `CLI_TURN_STEER_APPLIED_MARKER_20260422`
+
+## Phase 1 Implementation Priority
+
+- 第一个实现 PR 先做共享核心最小闭环，而不是直接实现 Desktop heartbeat 或 CLI shared app-server adapter。
+- 工程优先级固定为：
+  - correctness first：状态机、artifact ingest、FIFO、operator close 等语义必须可恢复、可审计、fail-closed
+  - long-running reliability second：所有后台或未来 daemon-facing 组件都必须避免无界内存增长、泄漏文件句柄/子进程、孤儿任务和不可停止轮询
+  - resource efficiency third：默认 idle 路径应保持低内存、低 CPU，轮询和 sweep 必须有明确 budget / batch limit
+- Phase 1 因此优先落地本地 store、artifact ownership、batch lifecycle、operator CLI 和测试，再把 daemon auto-start、Desktop bridge、CLI live continuation 放到后续 PR。
