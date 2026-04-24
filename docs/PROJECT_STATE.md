@@ -4,6 +4,16 @@
 
 验证一套纯外围方案，分别覆盖 Codex Desktop 与 CLI 两条交互路径，让长时间后台任务可以在不修改上游 `codex` 仓库的前提下恢复或继续 caller thread。
 
+## Repo CI / review gate
+
+- 已新增一个外围 `codex/review-gate` commit status：
+  - workflow 使用 `pull_request_target` 运行默认分支上的可信脚本，不执行 PR 代码
+  - 脚本把 status 写到 PR 当前 head SHA
+  - 当前 head 上 Codex inline review comments 会使 gate fail
+  - clean pass 只接受当前 head marker comment 上 `chatgpt-codex-connector` 的 `+1` reaction
+  - PR body reaction 与旧 head comment/reaction 都被忽略
+- workflow 落到默认分支后，还需要把 `codex/review-gate` 加进远端 ruleset 的 required status checks。
+
 ## 当前架构方向
 
 - 双端方案现在共享一套更清晰的核心抽象：
