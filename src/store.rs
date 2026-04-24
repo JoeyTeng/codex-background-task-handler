@@ -4,7 +4,9 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Transaction, params};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 
 use crate::artifact::{ingest_marker_path, rewrite_artifact_manifest};
 use crate::fs_layout::{
@@ -348,7 +350,7 @@ impl Store {
         let artifacts_to_sync = extend_closed_batch_artifact_retention_tx(&tx, &batch_id, now)?;
         let inspect = query_batch_inspect_tx(&tx, &batch_id)?;
         tx.commit()?;
-        let _ = sync_artifact_manifests(&self.conn, layout, &artifacts_to_sync, now);
+        let _ = sync_artifact_manifests(&mut self.conn, layout, &artifacts_to_sync, now);
         Ok(inspect)
     }
 
@@ -365,7 +367,7 @@ impl Store {
         manifest_sync_candidates.extend(automatic_artifacts_to_sync);
         manifest_sync_candidates.extend(manifest_sync_artifacts);
         let manifest_report = sync_artifact_manifests(
-            &self.conn,
+            &mut self.conn,
             layout,
             &dedupe_artifacts_by_id(manifest_sync_candidates),
             now,
@@ -469,36 +471,70 @@ struct CleanupReport {
 }
 
 fn sync_artifact_manifests(
-    conn: &Connection,
+    conn: &mut Connection,
     layout: &FsLayout,
     artifacts: &[ArtifactRecord],
     now: i64,
 ) -> ManifestSyncReport {
     let mut report = ManifestSyncReport::default();
     for artifact in artifacts {
-        let sync_result = rewrite_artifact_manifest(layout, artifact).and_then(|()| {
-            conn.execute(
-                "UPDATE artifacts
-                 SET manifest_synced_retention_until = retention_until,
-                     manifest_sync_attempted_at = ?
-                 WHERE artifact_id = ? AND retention_until = ?",
-                params![now, artifact.artifact_id, artifact.retention_until],
-            )?;
-            Ok(())
-        });
-        if sync_result.is_ok() {
-            report.synced += 1;
-        } else {
-            let _ = conn.execute(
-                "UPDATE artifacts
-                 SET manifest_sync_attempted_at = ?
-                 WHERE artifact_id = ?",
-                params![now, artifact.artifact_id],
-            );
-            report.failed += 1;
+        match sync_artifact_manifest(conn, layout, &artifact.artifact_id, now) {
+            Ok(true) => report.synced += 1,
+            Ok(false) => {}
+            Err(_) => {
+                let _ = mark_artifact_manifest_sync_attempted(conn, &artifact.artifact_id, now);
+                report.failed += 1;
+            }
         }
     }
     report
+}
+
+fn sync_artifact_manifest(
+    conn: &mut Connection,
+    layout: &FsLayout,
+    artifact_id: &str,
+    now: i64,
+) -> Result<bool> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(artifact) = query_artifact_by_id_tx(&tx, artifact_id)? else {
+        tx.commit()?;
+        return Ok(false);
+    };
+    if artifact.manifest_synced_retention_until >= artifact.retention_until {
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    rewrite_artifact_manifest(layout, &artifact)?;
+    let changed = tx.execute(
+        "UPDATE artifacts
+         SET manifest_synced_retention_until = retention_until,
+             manifest_sync_attempted_at = ?
+         WHERE artifact_id = ?
+           AND retention_until = ?
+           AND manifest_synced_retention_until < retention_until",
+        params![now, artifact.artifact_id, artifact.retention_until],
+    )?;
+    if changed != 1 {
+        bail!("artifact {} manifest sync CAS failed", artifact.artifact_id);
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+fn mark_artifact_manifest_sync_attempted(
+    conn: &Connection,
+    artifact_id: &str,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE artifacts
+         SET manifest_sync_attempted_at = ?
+         WHERE artifact_id = ?",
+        params![now, artifact_id],
+    )?;
+    Ok(())
 }
 
 fn dedupe_artifacts_by_id(artifacts: Vec<ArtifactRecord>) -> Vec<ArtifactRecord> {
@@ -1068,6 +1104,19 @@ fn query_artifact_for_job_tx(tx: &Transaction<'_>, job_id: &str) -> Result<Optio
     .map_err(Into::into)
 }
 
+fn query_artifact_by_id_tx(
+    tx: &Transaction<'_>,
+    artifact_id: &str,
+) -> Result<Option<ArtifactRecord>> {
+    tx.query_row(
+        "SELECT * FROM artifacts WHERE artifact_id = ?",
+        params![artifact_id],
+        artifact_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 fn rows_to_jobs(mut rows: rusqlite::Rows<'_>) -> Result<Vec<JobRecord>> {
     let mut jobs = Vec::new();
     while let Some(row) = rows.next()? {
@@ -1300,6 +1349,71 @@ mod tests {
     }
 
     #[test]
+    fn manifest_sync_reloads_current_artifact_before_rewrite() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let job_id = "stale-candidate-job";
+        let artifact_id = "stale-candidate-artifact";
+        let artifact_dir = layout.artifact_dir(artifact_id);
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        fs::write(artifact_dir.join("payload"), b"payload").expect("payload");
+        fs::write(
+            artifact_dir.join("manifest.json"),
+            br#"{"retention_until":100}"#,
+        )
+        .expect("manifest");
+        insert_completed_job(&store.conn, job_id);
+        store
+            .conn
+            .execute(
+                "INSERT INTO artifacts (
+                    artifact_id, job_id, relative_path, original_filename,
+                    size_bytes, sha256, created_at, retention_until,
+                    manifest_synced_retention_until, manifest_sync_attempted_at,
+                    gc_attempted_at
+                ) VALUES (?, ?, ?, NULL, 7, 'sha', 1, 200, 100, 0, 0)",
+                params![
+                    artifact_id,
+                    job_id,
+                    format!("artifacts/{artifact_id}/payload")
+                ],
+            )
+            .expect("insert artifact");
+
+        let stale_candidate = ArtifactRecord {
+            artifact_id: artifact_id.to_owned(),
+            job_id: job_id.to_owned(),
+            relative_path: format!("artifacts/{artifact_id}/payload"),
+            original_filename: None,
+            size_bytes: 7,
+            sha256: "sha".to_owned(),
+            created_at: 1,
+            retention_until: 100,
+            manifest_synced_retention_until: 100,
+            manifest_sync_attempted_at: 0,
+            gc_attempted_at: 0,
+        };
+        let report = sync_artifact_manifests(&mut store.conn, &layout, &[stale_candidate], 50);
+        assert_eq!(report.synced, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(artifact_manifest_retention_until(&artifact_dir), 200);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT manifest_synced_retention_until
+                     FROM artifacts
+                     WHERE artifact_id = ?",
+                    params![artifact_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("synced retention"),
+            200
+        );
+    }
+
+    #[test]
     fn artifact_gc_failures_do_not_starve_later_artifacts() {
         let home = tempfile::tempdir().expect("temp home");
         let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
@@ -1392,5 +1506,11 @@ mod tests {
             |row| row.get(0),
         )
         .expect("count")
+    }
+
+    fn artifact_manifest_retention_until(artifact_dir: &std::path::Path) -> i64 {
+        let bytes = fs::read(artifact_dir.join("manifest.json")).expect("manifest");
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        manifest["retention_until"].as_i64().expect("retention")
     }
 }
