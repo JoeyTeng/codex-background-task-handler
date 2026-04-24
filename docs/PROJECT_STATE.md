@@ -10,8 +10,9 @@
   - workflow 使用 `pull_request_target` 运行默认分支上的可信脚本，不执行 PR 代码
   - 脚本把 status 写到 PR 当前 head SHA
   - 当前 head 上 Codex inline review comments 会使 gate fail
-  - clean pass 只接受当前 head marker comment 上 `chatgpt-codex-connector` 的 `+1` reaction
-  - PR body reaction 与旧 head comment/reaction 都被忽略
+  - marker comment 只用于触发 Codex 并建立等待起点
+  - clean pass 接受 marker 后的 Codex clean top-level comment；marker 后的新 PR body `+1` 只作为 fallback
+  - 通过前会重新确认 PR head 没变，旧 PR body reaction 与旧 head comment/reaction 都被忽略
 - workflow 落到默认分支后，还需要把 `codex/review-gate` 加进远端 ruleset 的 required status checks。
 
 ## 当前架构方向

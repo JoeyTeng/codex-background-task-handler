@@ -6,6 +6,10 @@ const CODEX_BOT_LOGINS = new Set([
   "chatgpt-codex-connector[bot]",
 ]);
 const GATE_MARKER = "codex-review-gate";
+const CODEX_CLEAN_COMMENT_PATTERNS = [
+  "codex review: didn't find any major issues",
+  "codex review: did not find any major issues",
+];
 
 class GateFailure extends Error {
   constructor(state, description, message) {
@@ -59,7 +63,7 @@ async function main() {
   console.log(`Watching gate comment ${gateComment.html_url || `#${gateComment.id}`} for ${statusSha}.`);
 
   await waitForCodexResult(gateComment);
-  await setCommitStatus("success", "Codex clean reaction found for current head");
+  await setCommitStatus("success", "Codex clean review found for current head");
   console.log(`${STATUS_CONTEXT} passed for ${statusSha}.`);
 }
 
@@ -166,26 +170,20 @@ function hasCurrentHeadMarker(body) {
 
 async function waitForCodexResult(gateComment) {
   const deadline = Date.now() + config.maxWaitMs;
+  const gateCreatedAt = parseTimestamp(gateComment.created_at, "gate comment creation time");
 
   while (true) {
+    await failIfPullRequestHeadChanged();
     await failIfCurrentHeadHasCodexFindings();
 
-    const reactions = await paginate(
-      `${repoPath}/issues/comments/${gateComment.id}/reactions`,
-      { per_page: "100" },
-    );
-    const codexThumbsUp = reactions.find(
-      (reaction) => isCodexBot(reaction.user?.login) && reaction.content === "+1",
-    );
-    if (codexThumbsUp) {
+    const cleanSignal = await findCodexCleanSignal(gateCreatedAt);
+    if (cleanSignal) {
+      await failIfPullRequestHeadChanged();
       await failIfCurrentHeadHasCodexFindings();
-      console.log(`Codex clean reaction observed at ${codexThumbsUp.created_at}.`);
+      console.log(`Codex clean ${cleanSignal.kind} observed at ${cleanSignal.createdAt}.`);
       return;
     }
 
-    const codexEyes = reactions.find(
-      (reaction) => isCodexBot(reaction.user?.login) && reaction.content === "eyes",
-    );
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
       throw new GateFailure(
@@ -195,13 +193,73 @@ async function waitForCodexResult(gateComment) {
       );
     }
 
-    const state = codexEyes ? "Codex acknowledged with eyes" : "No Codex reaction yet";
     console.log(
-      `${state}; sleeping ${Math.round(config.pollIntervalMs / 1000)}s ` +
+      `No Codex clean signal yet; sleeping ${Math.round(config.pollIntervalMs / 1000)}s ` +
         `(${Math.round(remainingMs / 1000)}s remaining).`,
     );
     await sleep(Math.min(config.pollIntervalMs, remainingMs));
   }
+}
+
+async function failIfPullRequestHeadChanged() {
+  const pullRequest = await loadPullRequest();
+  if (pullRequest.head.sha === statusSha) {
+    return;
+  }
+
+  throw new GateFailure(
+    "error",
+    "PR head changed while waiting for Codex",
+    `PR head changed from ${statusSha} to ${pullRequest.head.sha}; this gate run is stale.`,
+  );
+}
+
+async function findCodexCleanSignal(gateCreatedAt) {
+  const comments = await paginate(`${repoPath}/issues/${config.prNumber}/comments`, {
+    per_page: "100",
+  });
+  const cleanComment = comments.find((comment) => {
+    const createdAt = parseTimestamp(comment.created_at, "issue comment creation time");
+    return (
+      createdAt >= gateCreatedAt &&
+      isCodexBot(comment.user?.login) &&
+      isCodexCleanComment(comment.body || "")
+    );
+  });
+  if (cleanComment) {
+    return {
+      kind: "top-level comment",
+      createdAt: cleanComment.created_at,
+      url: cleanComment.html_url,
+    };
+  }
+
+  const pullRequestReactions = await paginate(
+    `${repoPath}/issues/${config.prNumber}/reactions`,
+    { per_page: "100" },
+  );
+  const cleanReaction = pullRequestReactions.find((reaction) => {
+    const createdAt = parseTimestamp(reaction.created_at, "pull request reaction creation time");
+    return (
+      createdAt >= gateCreatedAt &&
+      isCodexBot(reaction.user?.login) &&
+      reaction.content === "+1"
+    );
+  });
+  if (cleanReaction) {
+    return {
+      kind: "PR body +1 reaction",
+      createdAt: cleanReaction.created_at,
+      url: null,
+    };
+  }
+
+  return null;
+}
+
+function isCodexCleanComment(body) {
+  const normalized = body.trim().toLowerCase();
+  return CODEX_CLEAN_COMMENT_PATTERNS.some((pattern) => normalized.includes(pattern));
 }
 
 async function failIfCurrentHeadHasCodexFindings() {
@@ -250,6 +308,14 @@ async function findCurrentHeadCodexFindings() {
 
 function isCodexBot(login) {
   return CODEX_BOT_LOGINS.has(login || "");
+}
+
+function parseTimestamp(value, description) {
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) {
+    throw new Error(`invalid ${description}: ${value}`);
+  }
+  return parsed;
 }
 
 async function setCommitStatus(state, description) {

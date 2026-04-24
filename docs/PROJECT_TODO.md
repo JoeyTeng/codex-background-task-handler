@@ -4,7 +4,8 @@
 
 - [ ] `codex/review-gate` workflow 合入默认分支后，把同名 commit status 加进远端 ruleset 的 required status checks，并用一个测试 PR 验证：
   - gate comment 可以触发 Codex
-  - 当前 head marker comment 上的 `+1` 会使 status 通过
+  - marker 后的 Codex clean top-level comment 会使 status 通过
+  - marker 后的新 PR body `+1` 可以作为 fallback clean signal
   - 当前 head 上的 Codex inline review comments 会使 status 失败
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
 - [x] 确认桌面端私有 `app-server` 当前正持有该 rollout 文件。
