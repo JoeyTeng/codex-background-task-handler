@@ -12,32 +12,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust-linux:
-    name: Rust (Linux)
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Run tests
-        run: cargo test --locked
-
-  rust-macos:
-    name: Rust (macOS manual)
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: macos-latest
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
 
     steps:
       - name: Checkout
