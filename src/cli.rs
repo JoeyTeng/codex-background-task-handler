@@ -9,6 +9,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::artifact::{ingest_result_file, remove_ingest_marker_best_effort};
+use crate::daemon::{
+    DaemonEnsureOptions, DaemonServeOptions, daemon_ensure, daemon_request, daemon_serve,
+};
 use crate::fs_layout::{FsLayout, remove_dir_all_durable};
 use crate::models::{
     DEFAULT_MAX_DELIVERY_ATTEMPTS, DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, NewJob,
@@ -42,6 +45,10 @@ enum Commands {
     Maintenance {
         #[command(subcommand)]
         command: MaintenanceCommand,
+    },
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
     },
 }
 
@@ -186,6 +193,33 @@ struct MaintenanceSweepArgs {
     now: Option<i64>,
 }
 
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    Serve(DaemonServeArgs),
+    Ensure(DaemonEnsureArgs),
+    Ping,
+    Status,
+    Stop,
+}
+
+#[derive(Debug, Args)]
+struct DaemonServeArgs {
+    #[arg(long, default_value_t = 300)]
+    idle_timeout_seconds: u64,
+
+    #[arg(long)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DaemonEnsureArgs {
+    #[arg(long, default_value_t = 300)]
+    idle_timeout_seconds: u64,
+
+    #[arg(long, default_value_t = 5)]
+    startup_timeout_seconds: u64,
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let layout = FsLayout::resolve(cli.home)?;
@@ -198,6 +232,7 @@ fn dispatch(command: Commands, layout: &FsLayout) -> Result<Value> {
         Commands::Job { command } => dispatch_job(command, layout),
         Commands::Batch { command } => dispatch_batch(command, layout),
         Commands::Maintenance { command } => dispatch_maintenance(command, layout),
+        Commands::Daemon { command } => dispatch_daemon(command, layout),
     }
 }
 
@@ -346,6 +381,39 @@ fn dispatch_maintenance(command: MaintenanceCommand, layout: &FsLayout) -> Resul
     }
 }
 
+fn dispatch_daemon(command: DaemonCommand, layout: &FsLayout) -> Result<Value> {
+    match command {
+        DaemonCommand::Serve(args) => {
+            validate_nonzero_u64("idle_timeout_seconds", args.idle_timeout_seconds)?;
+            let now = match args.now {
+                Some(value) => value,
+                None => now_epoch_seconds()?,
+            };
+            daemon_serve(
+                layout,
+                DaemonServeOptions {
+                    idle_timeout_seconds: args.idle_timeout_seconds,
+                    startup_sweep_now: now,
+                },
+            )
+        }
+        DaemonCommand::Ensure(args) => {
+            validate_nonzero_u64("idle_timeout_seconds", args.idle_timeout_seconds)?;
+            validate_nonzero_u64("startup_timeout_seconds", args.startup_timeout_seconds)?;
+            daemon_ensure(
+                layout,
+                DaemonEnsureOptions {
+                    idle_timeout_seconds: args.idle_timeout_seconds,
+                    startup_timeout_seconds: args.startup_timeout_seconds,
+                },
+            )
+        }
+        DaemonCommand::Ping => daemon_request(layout, "ping"),
+        DaemonCommand::Status => daemon_request(layout, "status"),
+        DaemonCommand::Stop => daemon_request(layout, "stop"),
+    }
+}
+
 fn load_submit_metadata(path: Option<&Path>) -> Result<(String, DeliveryPolicy)> {
     let Some(path) = path else {
         return Ok(("{}".to_owned(), DeliveryPolicy::fail_closed()));
@@ -390,6 +458,14 @@ fn apply_cli_policy_overrides(policy: &mut DeliveryPolicy, overrides: PartialDel
 }
 
 fn validate_positive(name: &str, value: i64) -> Result<()> {
+    if value > 0 {
+        Ok(())
+    } else {
+        bail!("{name} must be positive")
+    }
+}
+
+fn validate_nonzero_u64(name: &str, value: u64) -> Result<()> {
     if value > 0 {
         Ok(())
     } else {

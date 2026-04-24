@@ -1,5 +1,6 @@
 mod artifact;
 mod cli;
+mod daemon;
 mod fs_layout;
 mod models;
 mod store;

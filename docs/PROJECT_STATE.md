@@ -442,6 +442,28 @@ scripts/desktop_thread_inject_poc.py
   - steer 文本作为新的 user message 被写入同一个 rollout
   - 最终 `agent_message` 与 `task_complete.last_agent_message` 都是 `CLI_TURN_STEER_APPLIED_MARKER_20260422`
 
+## 当前实现进展
+
+- Phase 1 已经通过 PR #2 squash merge 到 `master`，merge commit 为 `6678f25a591208d09d53546dc78a1e9f22b83767`。
+- Phase 2 当前分支为 `codex/phase-2-daemon-ipc`，第一批实现范围限定在共享 daemon / IPC 基础，不接入 CLI `app-server` 或 Desktop heartbeat：
+  - `cbth daemon serve`
+  - `cbth daemon ensure`
+  - `cbth daemon ping`
+  - `cbth daemon status`
+  - `cbth daemon stop`
+- 当前 daemon 基础合同：
+  - 使用 `~/.cbth/run/cbth.sock` Unix domain socket
+  - `~/.cbth` 与 `run` 目录必须是当前 uid owned 且不宽于 `0700`
+  - socket 必须是当前 uid owned 且不宽于 `0600`
+  - server accept 后校验 peer uid，不支持 same-user proof 的平台 fail closed
+  - `daemon ensure` 会按需拉起 foreground `daemon serve`
+  - daemon 启动时先跑一次 maintenance sweep
+  - daemon 在简单 idle timeout 后退出并清理 socket
+- 当前 daemon 仍只是共享 IPC foundation：
+  - job/batch commands 还没有默认通过 daemon RPC 执行
+  - active delivery work / active clients / `delivery_observation_deadline` 尚未接入 daemon 退出条件
+  - CLI managed session 与 Desktop bridge adapters 尚未实现
+
 ## Phase 1 Implementation Priority
 
 - 第一个实现 PR 先做共享核心最小闭环，而不是直接实现 Desktop heartbeat 或 CLI shared app-server adapter。
@@ -475,7 +497,7 @@ scripts/desktop_thread_inject_poc.py
   - failed result ingest 会保留 `artifact_ingests` cleanup 输入面，避免 partial artifact cleanup 未确认时形成不可重试泄漏
   - metadata file 读取要求 regular file，并使用 bounded read 重新确认 `MAX_METADATA_BYTES` 上限
   - artifact / marker manifest 写入使用唯一临时文件再 rename，避免并发 sweep / close 之间抢同一个 `.tmp`
-- 当前仍刻意不包含：
+- Phase 1 PR 当时刻意不包含：
   - daemon auto-start / idle lifecycle
   - Unix socket same-user IPC
   - Desktop heartbeat / bridge helpers
