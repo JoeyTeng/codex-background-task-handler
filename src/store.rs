@@ -1,8 +1,9 @@
 use std::fs;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, Transaction, params};
 
 use crate::artifact::{ingest_marker_path, rewrite_artifact_manifest};
 use crate::fs_layout::{
@@ -20,6 +21,8 @@ const MAX_EXPIRED_BATCHES_PER_SWEEP: i64 = 100;
 const MAX_DELETABLE_ARTIFACTS_PER_SWEEP: i64 = 100;
 const MAX_MANIFEST_SYNCS_PER_SWEEP: i64 = 100;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const SQLITE_OPEN_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
+const SQLITE_OPEN_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
 
 pub struct Store {
     conn: Connection,
@@ -45,16 +48,39 @@ impl ManifestSyncReport {
 
 impl Store {
     pub fn open(layout: &FsLayout) -> Result<Self> {
+        let retry_started = SystemTime::now();
+        let mut retry_delay = SQLITE_OPEN_RETRY_INITIAL_DELAY;
+        loop {
+            match Self::open_once(layout) {
+                Ok(store) => return Ok(store),
+                Err(error) if is_sqlite_busy_or_locked(&error) => {
+                    if retry_started.elapsed().unwrap_or_default() >= SQLITE_BUSY_TIMEOUT {
+                        return Err(error);
+                    }
+                    thread::sleep(retry_delay);
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(SQLITE_OPEN_RETRY_MAX_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn open_once(layout: &FsLayout) -> Result<Self> {
         layout.ensure()?;
         let db_path = layout.db_path();
         ensure_private_file_exists(&db_path)?;
         let conn = Connection::open(&db_path)
             .with_context(|| format!("open sqlite database {}", db_path.display()))?;
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        migrate(&conn)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .context("enable sqlite foreign_keys")?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .context("enable sqlite WAL journal mode")?;
+        conn.pragma_update(None, "synchronous", "FULL")
+            .context("enable sqlite FULL synchronous mode")?;
+        migrate(&conn).context("migrate sqlite schema")?;
         set_private_file_permissions_if_exists(&db_path)?;
         set_private_file_permissions_if_exists(&db_path.with_extension("sqlite3-wal"))?;
         set_private_file_permissions_if_exists(&db_path.with_extension("sqlite3-shm"))?;
@@ -521,6 +547,16 @@ fn mark_artifact_gc_attempted(conn: &Connection, artifact_id: &str, now: i64) ->
         params![now, artifact_id],
     )?;
     Ok(())
+}
+
+fn is_sqlite_busy_or_locked(error: &anyhow::Error) -> bool {
+    let Some(sqlite_error) = error.downcast_ref::<rusqlite::Error>() else {
+        return false;
+    };
+    matches!(
+        sqlite_error.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
 }
 
 fn artifact_ingest_is_active_or_too_recent(artifact_dir: &std::path::Path) -> Result<bool> {

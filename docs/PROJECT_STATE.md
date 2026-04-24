@@ -456,7 +456,7 @@ scripts/desktop_thread_inject_poc.py
 - 当前 `codex/phase-1-core-cli` 分支已经落地第一版 Rust `cbth` binary。
 - 已实现的共享核心范围：
   - 本地 `~/.cbth` / `CBTH_HOME` 状态目录与 `0700` / `0600` 权限约束；新建目录和 DB 文件后同步父目录，避免 fresh home 成功返回后丢失 directory entry
-  - SQLite store 与 schema 初始化，WAL 模式下使用 `synchronous=FULL`，避免命令成功返回后 DB ownership commit 比 artifact fsync 更弱；SQLite busy timeout 设为 30 秒，用于承受短时多进程 CLI 启动风暴
+  - SQLite store 与 schema 初始化，WAL 模式下使用 `synchronous=FULL`，避免命令成功返回后 DB ownership commit 比 artifact fsync 更弱；SQLite busy timeout 设为 30 秒，并且 store open / schema 初始化阶段对 `BUSY` / `LOCKED` 做有界 retry，用于承受短时多进程 CLI 启动风暴
   - `job submit` / `job complete` / `job fail` / `job inspect` / `job list`
   - `job complete --result-file` 的 streaming artifact ingest、SHA-256、manifest 与 retention metadata
   - DB-backed pending artifact ingest 记录与 result artifact ingest marker，用于避免 cleanup 删除仍在复制中的大 artifact，并让 crash orphan cleanup 有有界 DB 输入面；异常 ingest id 不参与文件系统删除
