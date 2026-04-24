@@ -17,7 +17,7 @@
 - [x] 验证 bridge automation thread 是否能通过 `automation_update` 稳定为别的 caller thread 创建/更新 heartbeat automation，而无需外部直接改 Codex automation DB。
 - [x] 单独沉淀 Desktop background-task bridge 技术方案文档。
 - [x] 单独沉淀共享核心架构文档，明确单 binary、多入口、按需启动 daemon 的生命周期方案。
-- [ ] 用 Rust 实现主 binary 的共享 `job` CLI 子命令，替代单独的 `background-taskctl` helper。
+- [x] 用 Rust 实现主 binary 的共享 `job` CLI 子命令，替代单独的 `background-taskctl` helper。
 - [ ] 实现按需启动的本地 daemon：自动拉起、idle timeout，并把退出条件收紧为：
   - 无 active jobs
   - 无 active clients
@@ -84,7 +84,7 @@
   - `max_reconcile_wall_time_ms`
   - `max_new_arms_per_wake=1`
   - 单个 degraded / overdue binding 不得让 unrelated ready thread 永久饿死
-- [ ] 落实 `~/.cbth` 的权限合同：
+- [x] 落实 `~/.cbth` 的权限合同：
   - directories `0700`
   - regular files `0600`
 - [ ] 设计并实现 Desktop bridge preflight 与 bridge-side `helper_cli_read` fallback：
@@ -241,7 +241,7 @@
   - 只有 operator unbind / destroy 才允许删除
 - [x] 为 Desktop bridge 设计基于 delivery envelope 的共享状态面，不把后台 heartbeat 对通用 `cbth job ...` CLI 的执行能力当成前提。
 - [x] 为共享核心设计 thread-scoped FIFO 队列、batch 合并规则和最小连续发送间隔。
-- [ ] 为共享核心落地可机判的 delivery policy 字段，至少包括：
+- [x] 为共享核心落地可机判的 delivery policy 字段，至少包括：
   - `delivery_read_only`
   - `delivery_requires_approval`
   - `delivery_requires_network`
@@ -295,8 +295,8 @@
   - 超限 payload 进入 managed artifact / recovery object
   - `boundary_recovery_retention_until` 至少覆盖 `closed_at + post_close_ttl`、关联 artifact retention、operator pin
   - `cbth batch inspect --batch-id ...` 是 `handoff_recorded` 历史 batch 的稳定恢复入口
-- [ ] 用 Rust 实现 managed artifact store，并把 `cbth job complete --result-file <path>` 定义成 ingest/copy 语义。
-- [ ] 实现 artifact retention / GC contract：
+- [x] 用 Rust 实现 managed artifact store，并把 `cbth job complete --result-file <path>` 定义成 ingest/copy 语义。
+- [x] 实现 artifact retention / GC contract：
   - `min_artifact_ttl = 24h`
   - `post_close_ttl = 72h`
   - GC 仅在 batch 终态后触发
