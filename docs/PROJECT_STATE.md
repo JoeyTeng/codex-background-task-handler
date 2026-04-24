@@ -247,6 +247,17 @@
   - file `0600`
   - automatic Desktop path 在 pre-boundary 阶段只暴露 ready/reconcile metadata
   - `by-thread/<thread_id>.json` 与 artifact 文件保留为 operator/debug export，默认不属于 automatic caller path
+- phase 1 Rust local-store 实现边界已明确为 macOS / Linux：
+  - 当前依赖 Unix 风格的私有权限、atomic replace 与 directory sync 语义
+  - 纯 Windows 支持需要单独设计 IPC、ACL、replace/sync 合同后再纳入
+- phase 1 CLI 的人工关闭 reason 已收口到 operator 专用 canonical reason：
+  - `operator_closed_unconfirmed`
+  - `operator_confirmed_delivery`
+  - `manual_resolution_expired` / `max_attempts_exhausted` / `redelivery_window_exhausted` 继续作为系统状态机 reason，而不是 `batch close-head` 的用户输入 reason
+- phase 1 orphan ingest cleanup 已修正一个 future-clock 风险：
+  - `maintenance sweep --now <future>` 可以用合成时间做 overdue 判定
+  - 但 pending ingest stale selection、`.ingest-active` marker observation 与 retry refresh 都必须按真实 wall clock 处理
+  - 否则一次未来 sweep 可能抢删刚创建但 marker 尚未落下的 ingest ownership，或把已崩溃 ingest 的 `updated_at` 固定到未来
 - Desktop bootstrap 合约也已收紧：
   - 不能只相信一次 `PAUSED` 创建请求
   - 必须 create/update 后读回验证 paused 状态
@@ -430,3 +441,47 @@ scripts/desktop_thread_inject_poc.py
   - 模型实际发起了 `exec_command: sleep 10`
   - steer 文本作为新的 user message 被写入同一个 rollout
   - 最终 `agent_message` 与 `task_complete.last_agent_message` 都是 `CLI_TURN_STEER_APPLIED_MARKER_20260422`
+
+## Phase 1 Implementation Priority
+
+- 第一个实现 PR 先做共享核心最小闭环，而不是直接实现 Desktop heartbeat 或 CLI shared app-server adapter。
+- 工程优先级固定为：
+  - correctness first：状态机、artifact ingest、FIFO、operator close 等语义必须可恢复、可审计、fail-closed
+  - long-running reliability second：所有后台或未来 daemon-facing 组件都必须避免无界内存增长、泄漏文件句柄/子进程、孤儿任务和不可停止轮询
+  - resource efficiency third：默认 idle 路径应保持低内存、低 CPU，轮询和 sweep 必须有明确 budget / batch limit
+- Phase 1 因此优先落地本地 store、artifact ownership、batch lifecycle、operator CLI 和测试，再把 daemon auto-start、Desktop bridge、CLI live continuation 放到后续 PR。
+
+## Phase 1 Implementation Checkpoint
+
+- 当前 `codex/phase-1-core-cli` 分支已经落地第一版 Rust `cbth` binary。
+- 已实现的共享核心范围：
+  - 本地 `~/.cbth` / `CBTH_HOME` 状态目录与 `0700` / `0600` 权限约束；新建目录和 DB 文件后同步父目录，避免 fresh home 成功返回后丢失 directory entry
+  - SQLite store 与 schema 初始化，WAL 模式下使用 `synchronous=FULL`，避免命令成功返回后 DB ownership commit 比 artifact fsync 更弱；SQLite busy timeout 设为 30 秒，并且 store open / schema 初始化阶段对 `BUSY` / `LOCKED` 做有界 retry，用于承受短时多进程 CLI 启动风暴
+  - `job submit` / `job complete` / `job fail` / `job inspect` / `job list`
+  - `job complete --result-file` 的 streaming artifact ingest、SHA-256、manifest 与 retention metadata
+  - DB-backed pending artifact ingest 记录与 result artifact ingest marker，用于避免 cleanup 删除仍在复制中的大 artifact，并让 crash orphan cleanup 有有界 DB 输入面；异常 ingest id 不参与文件系统删除
+  - thread-scoped open batch、head batch 查询、operator `batch close-head`
+  - fail-closed delivery policy 默认值、metadata / CLI override、metadata policy 短字段 alias 与 unknown-field 拒绝
+  - `redelivery_window_seconds` 等 timestamp 派生使用 checked arithmetic，避免 CLI 超大输入造成 panic / wrap
+  - Phase 1 尚未持久化 inline handoff payload，因此 completed job batch 统一保持 `requires_artifact_read=true`
+  - `maintenance sweep` 的基础 manual-expiry、automatic redelivery-window expiry、artifact-GC、manifest reconcile、orphan artifact cleanup 入口
+  - sweep lane 现在都有有界 work budget：expired batch close、artifact delete、manifest sync、orphan scan/delete 都不会一次性无界展开
+  - artifact manifest reconcile 通过 DB 中的 `manifest_synced_retention_until` / `manifest_sync_attempted_at` 记录 durable progress，per-artifact 失败不会阻塞后续 GC / cleanup lane，也不会让长期失败集合饿死后续 artifact
+  - artifact GC 通过 `gc_attempted_at` 记录 durable attempt progress，per-artifact 删除失败不会让后续可删 artifact 长期饥饿
+  - artifact ingest 创建 per-artifact directory 后会同步父 `artifacts/` 目录，避免 DB commit 指向未 durable 的目录 entry
+  - artifact maintenance 写入/删除路径按 `artifact_id` 计算 canonical store path，并校验 DB 中的 `relative_path` 未漂移
+  - artifact 目录删除必须在 remove 后同步父目录，只有删除成功或确认 NotFound 后才丢弃 DB ownership
+  - pending ingest cleanup 同样校验 `artifact_id` 与 `relative_path`，且 stale selection / active ingest marker 新鲜度均按真实 wall clock 判断，不受 `maintenance sweep --now` 影响
+  - failed result ingest 会保留 `artifact_ingests` cleanup 输入面，避免 partial artifact cleanup 未确认时形成不可重试泄漏
+  - metadata file 读取要求 regular file，并使用 bounded read 重新确认 `MAX_METADATA_BYTES` 上限
+  - artifact / marker manifest 写入使用唯一临时文件再 rename，避免并发 sweep / close 之间抢同一个 `.tmp`
+- 当前仍刻意不包含：
+  - daemon auto-start / idle lifecycle
+  - Unix socket same-user IPC
+  - Desktop heartbeat / bridge helpers
+  - CLI shared app-server managed session
+  - `turn/start` / `turn/steer` delivery adapter
+- 已覆盖的自动化检查：
+  - `cargo fmt --check`
+  - `cargo clippy --all-targets -- -D warnings`
+  - `cargo test`

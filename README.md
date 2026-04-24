@@ -27,12 +27,47 @@ Design docs:
   - architecture notes
   - experiment logs
   - next-step tracking
+- `src/`
+  - Rust `cbth` binary and shared core modules
+- `tests/`
+  - Rust integration tests for the phase 1 CLI
 - `scripts/`
   - lightweight Python probes and reference PoCs
-- future Rust crates
-  - sidecar supervisor
-  - job-control CLI / daemon entrypoints
-  - production background-task bridge components
+
+## Rust CLI Usage
+
+Phase 1 provides a synchronous Rust CLI backed by a local SQLite store and managed artifact directory. It does not start a daemon yet.
+
+State lives under `~/.cbth` by default. Use `--home <path>` or `CBTH_HOME` for tests and isolated runs.
+The phase 1 local-store file semantics are supported on macOS and Linux; pure Windows support is out of scope until the IPC, atomic-replace, and directory-sync contracts are designed separately.
+
+```bash
+cargo run --bin cbth -- \
+  job submit \
+  --source-thread-id <thread-id> \
+  --summary "wait for CI" \
+  --delivery-read-only true \
+  --delivery-requires-approval false \
+  --delivery-requires-network false \
+  --delivery-requires-write-access false
+
+cargo run --bin cbth -- \
+  job complete \
+  --job-id <job-id> \
+  --result-file ./result.txt \
+  --summary "CI passed"
+
+cargo run --bin cbth -- \
+  batch inspect-head \
+  --source-thread-id <thread-id>
+
+cargo run --bin cbth -- \
+  batch close-head \
+  --source-thread-id <thread-id> \
+  --reason operator-closed-unconfirmed
+```
+
+If delivery policy is omitted, the core records a fail-closed policy: not read-only, requires approval, requires network, and requires write access. Completed result files are streamed into the managed artifact store; the original `--result-file` path is only an input. Phase 1 does not persist inline handoff payloads yet, so completed job batches conservatively keep `requires_artifact_read=true` even for small artifacts.
 
 ## Python Usage
 
@@ -56,10 +91,10 @@ The current CLI active-turn steering PoC is [scripts/cli_turn_steer_poc.mjs](scr
 
 This repo is expected to grow around one shared Rust core with thin per-surface entrypoints:
 
-1. A Rust daemon/store/job-control core with a stable CLI surface.
-2. A managed artifact store plus thread-scoped inbox / delivery-batch scheduler inside that core.
-3. Thin CLI and Desktop integration entrypoints on top of that core.
-4. Small reference probes for one-off Desktop or protocol experiments.
+1. Extend the phase 1 Rust CLI/store core into an on-demand daemon and same-user IPC surface.
+2. Add thread-scoped inbox snapshots and delivery adapter helpers on top of the existing batch/artifact model.
+3. Add thin CLI and Desktop integration entrypoints.
+4. Keep small reference probes for one-off Desktop or protocol experiments.
 
 Rust is the preferred implementation language for the real sidecar because it keeps resource usage low and is a better fit for cross-platform deployment anywhere Codex itself can run.
 
