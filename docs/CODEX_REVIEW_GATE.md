@@ -28,7 +28,15 @@
 
 workflow 合入默认分支并至少运行一次后，把 `codex/review-gate` 加到仓库 ruleset 的 required status checks。这个 context 建议选择 "any source"，因为 status 可能由 `GITHUB_TOKEN` 写入，也可能由 `CODEX_REVIEW_GATE_TOKEN` 写入。
 
-首次引入这个 workflow 的 PR 不能完整自测 gate，因为 `pull_request_target` 只会运行默认分支上已经存在的 workflow。需要先让 workflow 落到默认分支，再用后续测试 PR 验证 `codex/review-gate` 的真实行为。
+首次引入这个 workflow 的 PR 不能完整自测 gate，因为 `pull_request_target` 只会运行 base/default branch 上已经存在的 workflow。这个 PR 也不会因为新 commit 自动创建 gate comment 或写入 `codex/review-gate` status。
+
+推荐启用顺序：
+
+1. 先把 workflow 合入要保护的 base/default branch。
+2. 再开一个后续测试 PR，确认 workflow 会在 `opened` / `synchronize` 时创建当前 head marker comment，并写入 `codex/review-gate` status。
+3. 确认测试 PR 的 gate 能通过或失败后，再把 `codex/review-gate` 加到 ruleset required status checks。
+
+不要在 workflow 还没进入受保护分支前提前要求 `codex/review-gate`，否则当前引入 PR 会被一个没有 runner 能创建的 required status 卡住。
 
 workflow 默认使用 `GITHUB_TOKEN`。如果本仓库里 GitHub Actions comment 不能触发 Codex，则配置 `CODEX_REVIEW_GATE_TOKEN` secret。建议使用 fine-grained token，并授予：
 
