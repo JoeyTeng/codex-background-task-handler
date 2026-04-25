@@ -59,7 +59,7 @@ async function main() {
   }
 
   await failIfCurrentHeadHasCodexFindings();
-  const gateComment = await ensureGateComment();
+  const gateComment = await createGateComment();
   console.log(`Watching gate comment ${gateComment.html_url || `#${gateComment.id}`} for ${statusSha}.`);
 
   await waitForCodexResult(gateComment);
@@ -131,17 +131,11 @@ async function loadPullRequest() {
   return data;
 }
 
-async function ensureGateComment() {
-  const existing = await findGateComment();
-  if (existing) {
-    console.log(`Reusing existing gate comment ${existing.html_url || `#${existing.id}`}.`);
-    return existing;
-  }
-
+async function createGateComment() {
   const body = [
     "@codex review",
     "",
-    "<!-- codex-review-gate",
+    `<!-- ${GATE_MARKER}`,
     `head=${statusSha}`,
     `run=${runUrl}`,
     "-->",
@@ -152,20 +146,6 @@ async function ensureGateComment() {
   });
   console.log(`Created gate comment ${data.html_url || `#${data.id}`}.`);
   return data;
-}
-
-async function findGateComment() {
-  const comments = await paginate(`${repoPath}/issues/${config.prNumber}/comments`, {
-    per_page: "100",
-  });
-
-  return comments
-    .filter((comment) => hasCurrentHeadMarker(comment.body || ""))
-    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
-}
-
-function hasCurrentHeadMarker(body) {
-  return body.includes(GATE_MARKER) && body.includes(`head=${statusSha}`);
 }
 
 async function waitForCodexResult(gateComment) {
@@ -231,26 +211,6 @@ async function findCodexCleanSignal(gateCreatedAt) {
       kind: "top-level comment",
       createdAt: cleanComment.created_at,
       url: cleanComment.html_url,
-    };
-  }
-
-  const pullRequestReactions = await paginate(
-    `${repoPath}/issues/${config.prNumber}/reactions`,
-    { per_page: "100" },
-  );
-  const cleanReaction = pullRequestReactions.find((reaction) => {
-    const createdAt = parseTimestamp(reaction.created_at, "pull request reaction creation time");
-    return (
-      createdAt >= gateCreatedAt &&
-      isCodexBot(reaction.user?.login) &&
-      reaction.content === "+1"
-    );
-  });
-  if (cleanReaction) {
-    return {
-      kind: "PR body +1 reaction",
-      createdAt: cleanReaction.created_at,
-      url: null,
     };
   }
 
