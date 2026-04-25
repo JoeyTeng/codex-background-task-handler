@@ -6,10 +6,6 @@ const CODEX_BOT_LOGINS = new Set([
   "chatgpt-codex-connector[bot]",
 ]);
 const GATE_MARKER = "codex-review-gate";
-const CODEX_CLEAN_COMMENT_PATTERNS = [
-  "codex review: didn't find any major issues",
-  "codex review: did not find any major issues",
-];
 
 class GateFailure extends Error {
   constructor(state, description, message) {
@@ -66,7 +62,7 @@ async function main() {
   console.log(`Watching gate comment ${gateComment.html_url || `#${gateComment.id}`} for ${statusSha}.`);
 
   await waitForCodexResult(gateComment);
-  await setCommitStatus("success", "Codex clean review found for current head");
+  await setCommitStatus("success", "Codex reviewed current head without inline findings");
   console.log(`${STATUS_CONTEXT} passed for ${statusSha}.`);
 }
 
@@ -173,11 +169,11 @@ async function waitForCodexResult(gateComment) {
     await failIfPullRequestHeadChanged();
     await failIfCurrentHeadHasCodexFindings();
 
-    const cleanSignal = await findCodexCleanSignal(gateCreatedAt, gateToken);
-    if (cleanSignal) {
+    const reviewSignal = await findCodexReviewSignal(gateCreatedAt, gateToken);
+    if (reviewSignal) {
       await failIfPullRequestHeadChanged();
       await failIfCurrentHeadHasCodexFindings();
-      console.log(`Codex clean ${cleanSignal.kind} observed at ${cleanSignal.createdAt}.`);
+      console.log(`Codex ${reviewSignal.kind} observed at ${reviewSignal.createdAt}.`);
       return;
     }
 
@@ -185,13 +181,13 @@ async function waitForCodexResult(gateComment) {
     if (remainingMs <= 0) {
       throw new GateFailure(
         "failure",
-        "Timed out waiting for Codex clean review",
-        `Timed out after ${Math.round(config.maxWaitMs / 1000)}s waiting for Codex on ${statusSha}.`,
+        "Timed out waiting for Codex review response",
+        `Timed out after ${Math.round(config.maxWaitMs / 1000)}s waiting for Codex token echo on ${statusSha}.`,
       );
     }
 
     console.log(
-      `No Codex clean signal yet; sleeping ${Math.round(config.pollIntervalMs / 1000)}s ` +
+      `No Codex review signal yet; sleeping ${Math.round(config.pollIntervalMs / 1000)}s ` +
         `(${Math.round(remainingMs / 1000)}s remaining).`,
     );
     await sleep(Math.min(config.pollIntervalMs, remainingMs));
@@ -215,33 +211,27 @@ function failIfLoadedPullRequestHeadChanged(pullRequest, phase) {
   );
 }
 
-async function findCodexCleanSignal(gateCreatedAt, gateToken) {
+async function findCodexReviewSignal(gateCreatedAt, gateToken) {
   const comments = await paginate(`${repoPath}/issues/${config.prNumber}/comments`, {
     per_page: "100",
   });
-  const cleanComment = comments.find((comment) => {
+  const reviewComment = comments.find((comment) => {
     const createdAt = parseTimestamp(comment.created_at, "issue comment creation time");
     return (
       createdAt >= gateCreatedAt &&
       isCodexBot(comment.user?.login) &&
-      isCodexCleanComment(comment.body || "") &&
       hasGateToken(comment.body || "", gateToken)
     );
   });
-  if (cleanComment) {
+  if (reviewComment) {
     return {
-      kind: "top-level comment",
-      createdAt: cleanComment.created_at,
-      url: cleanComment.html_url,
+      kind: "top-level token echo",
+      createdAt: reviewComment.created_at,
+      url: reviewComment.html_url,
     };
   }
 
   return null;
-}
-
-function isCodexCleanComment(body) {
-  const normalized = body.trim().toLowerCase();
-  return CODEX_CLEAN_COMMENT_PATTERNS.some((pattern) => normalized.includes(pattern));
 }
 
 function hasGateToken(body, gateToken) {

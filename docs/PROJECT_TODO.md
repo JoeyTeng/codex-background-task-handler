@@ -4,7 +4,7 @@
 
 - [ ] `codex/review-gate` workflow 合入 repository default branch 后，把同名 commit status 加进远端 ruleset 的 required status checks，并用一个后续测试 PR 验证：
   - gate comment 可以触发 Codex
-  - marker 后的 Codex clean top-level comment 会原样带回本次 `codex-review-gate-token`，并使 status 通过
+  - marker 后的 Codex top-level comment 会原样带回本次 `codex-review-gate-token`，并在当前 head 没有 Codex inline findings 时使 status 通过
   - 当前 head 上的 Codex inline review comments 会使 status 失败
   - 不能用临时非默认 base branch 自测 `pull_request_target`，因为 workflow source/reference 来自 repository default branch
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。

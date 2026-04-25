@@ -11,7 +11,8 @@
   - 脚本把 status 写到 PR 当前 head SHA
   - 当前 head 上 Codex inline review comments 会使 gate fail
   - 每个 workflow run 都创建新的 marker comment，用于触发 Codex 并建立等待起点
-  - clean pass 只接受 marker 后的 Codex clean top-level comment，且必须原样带回本次 marker 的 `codex-review-gate-token`
+  - pass signal 只接受 marker 后的 Codex top-level comment，且必须原样带回本次 marker 的 `codex-review-gate-token`
+  - 通过前会再次确认当前 head 没有 Codex inline review comments，不依赖 Codex clean summary 的自然语言文案
   - 创建 marker 前和通过前会重新确认 PR head 没变；PR body reaction 不作为通过信号，因为它不能绑定到当前 head
 - workflow 落到默认分支后，还需要把 `codex/review-gate` 加进远端 ruleset 的 required status checks。
 - 2026-04-25 用临时非默认 base branch 测试过：PR 只触发普通 `pull_request` CI，没有触发 `Codex Review Gate`；真实 GitHub Actions bot 路径要等 workflow 进入 repository default branch 后再测。
