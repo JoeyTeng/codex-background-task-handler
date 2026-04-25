@@ -16,6 +16,7 @@
   - 创建 marker 前和通过前会重新确认 PR head 没变；PR body reaction 不作为通过信号，因为它不能绑定到当前 head
 - workflow 落到默认分支后，还需要把 `codex/review-gate` 加进远端 ruleset 的 required status checks。
 - 2026-04-25 用临时非默认 base branch 测试过：PR 只触发普通 `pull_request` CI，没有触发 `Codex Review Gate`；真实 GitHub Actions bot 路径要等 workflow 进入 repository default branch 后再测。
+- 2026-04-25 在默认分支首次实测时，`Codex Review Gate` 成功触发并写入 `codex/review-gate` status，但 marker comment 创建失败：workflow 选择了 `CODEX_REVIEW_GATE_TOKEN` secret，导致 `POST /issues/8/comments` 返回 `403 Resource not accessible by integration`。当前修正方向是强制使用 `github.token`，保证 marker 身份是 `github-actions[bot]`。
 
 ## 当前架构方向
 
