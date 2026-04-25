@@ -85,6 +85,7 @@ function readConfig() {
     apiUrl: stripTrailingSlash(process.env.GITHUB_API_URL || "https://api.github.com"),
     serverUrl: stripTrailingSlash(process.env.GITHUB_SERVER_URL || "https://github.com"),
     runId: requiredEnv("GITHUB_RUN_ID"),
+    runAttempt: process.env.GITHUB_RUN_ATTEMPT || "1",
     maxWaitMs: secondsEnv("MAX_WAIT_SECONDS", 1800) * 1000,
     pollIntervalMs: secondsEnv("POLL_INTERVAL_SECONDS", 30) * 1000,
   };
@@ -132,12 +133,19 @@ async function loadPullRequest() {
 }
 
 async function createGateComment() {
+  const gateToken = createGateToken();
   const body = [
     "@codex review",
+    "",
+    "If this review is clean, include this exact line in your top-level response:",
+    "",
+    `codex-review-gate-token: ${gateToken}`,
     "",
     `<!-- ${GATE_MARKER}`,
     `head=${statusSha}`,
     `run=${runUrl}`,
+    `run_attempt=${config.runAttempt}`,
+    `token=${gateToken}`,
     "-->",
   ].join("\n");
 
@@ -145,18 +153,24 @@ async function createGateComment() {
     body,
   });
   console.log(`Created gate comment ${data.html_url || `#${data.id}`}.`);
+  data.gateToken = gateToken;
   return data;
+}
+
+function createGateToken() {
+  return `${config.runId}.${config.runAttempt}.${statusSha}`;
 }
 
 async function waitForCodexResult(gateComment) {
   const deadline = Date.now() + config.maxWaitMs;
   const gateCreatedAt = parseTimestamp(gateComment.created_at, "gate comment creation time");
+  const gateToken = gateComment.gateToken || extractGateToken(gateComment.body || "");
 
   while (true) {
     await failIfPullRequestHeadChanged();
     await failIfCurrentHeadHasCodexFindings();
 
-    const cleanSignal = await findCodexCleanSignal(gateCreatedAt);
+    const cleanSignal = await findCodexCleanSignal(gateCreatedAt, gateToken);
     if (cleanSignal) {
       await failIfPullRequestHeadChanged();
       await failIfCurrentHeadHasCodexFindings();
@@ -194,7 +208,7 @@ async function failIfPullRequestHeadChanged() {
   );
 }
 
-async function findCodexCleanSignal(gateCreatedAt) {
+async function findCodexCleanSignal(gateCreatedAt, gateToken) {
   const comments = await paginate(`${repoPath}/issues/${config.prNumber}/comments`, {
     per_page: "100",
   });
@@ -203,7 +217,8 @@ async function findCodexCleanSignal(gateCreatedAt) {
     return (
       createdAt >= gateCreatedAt &&
       isCodexBot(comment.user?.login) &&
-      isCodexCleanComment(comment.body || "")
+      isCodexCleanComment(comment.body || "") &&
+      hasGateToken(comment.body || "", gateToken)
     );
   });
   if (cleanComment) {
@@ -220,6 +235,18 @@ async function findCodexCleanSignal(gateCreatedAt) {
 function isCodexCleanComment(body) {
   const normalized = body.trim().toLowerCase();
   return CODEX_CLEAN_COMMENT_PATTERNS.some((pattern) => normalized.includes(pattern));
+}
+
+function hasGateToken(body, gateToken) {
+  return body.includes(`codex-review-gate-token: ${gateToken}`);
+}
+
+function extractGateToken(body) {
+  const match = body.match(/^token=(.+)$/m);
+  if (!match) {
+    throw new Error("gate comment is missing correlation token");
+  }
+  return match[1].trim();
 }
 
 async function failIfCurrentHeadHasCodexFindings() {
