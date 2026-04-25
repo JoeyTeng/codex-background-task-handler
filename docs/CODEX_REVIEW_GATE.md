@@ -27,7 +27,7 @@
 - marker comment 用来触发 Codex 并建立当前 head 的等待起点；它本身不代表通过。每次 run 都创建新的 marker comment，避免同一 head 的重跑复用旧 trigger 后继续超时。
 - workflow 只接受 marker comment 之后 `chatgpt-codex-connector` 发出的 clean top-level PR comment，例如 “didn't find any major issues”，且该 comment 必须原样带回本次 marker 的 `codex-review-gate-token`。
 - PR body `+1` reaction 不能作为当前 head 的通过信号，因为它没有 commit 绑定，也可能来自别的 run/head 的延迟结果。
-- 通过前 workflow 会重新确认 PR head 仍然等于本次 run 的 head SHA。
+- 创建 marker comment 前和通过前，workflow 都会重新确认 PR head 仍然等于本次 run 的 head SHA。
 - gate 超时时间是 30 分钟。
 
 ## 仓库配置

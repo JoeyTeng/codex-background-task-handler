@@ -52,13 +52,16 @@ async function main() {
 
   await setCommitStatus("pending", "Waiting for Codex review on current head");
   statusReady = true;
+  failIfLoadedPullRequestHeadChanged(pullRequest, "before starting Codex review");
 
   if (pullRequest.draft) {
     console.log(`PR #${config.prNumber} is draft; leaving ${STATUS_CONTEXT} pending.`);
     return;
   }
 
+  await failIfPullRequestHeadChanged("before checking Codex findings");
   await failIfCurrentHeadHasCodexFindings();
+  await failIfPullRequestHeadChanged("before creating Codex review trigger");
   const gateComment = await createGateComment();
   console.log(`Watching gate comment ${gateComment.html_url || `#${gateComment.id}`} for ${statusSha}.`);
 
@@ -128,7 +131,7 @@ async function loadPullRequest() {
   if (!statusSha) {
     statusSha = data.head.sha;
   }
-  console.log(`Loaded PR #${config.prNumber}; current head is ${statusSha}.`);
+  console.log(`Loaded PR #${config.prNumber}; PR head is ${data.head.sha}; gate head is ${statusSha}.`);
   return data;
 }
 
@@ -195,15 +198,19 @@ async function waitForCodexResult(gateComment) {
   }
 }
 
-async function failIfPullRequestHeadChanged() {
+async function failIfPullRequestHeadChanged(phase = "while waiting for Codex") {
   const pullRequest = await loadPullRequest();
+  failIfLoadedPullRequestHeadChanged(pullRequest, phase);
+}
+
+function failIfLoadedPullRequestHeadChanged(pullRequest, phase) {
   if (pullRequest.head.sha === statusSha) {
     return;
   }
 
   throw new GateFailure(
     "error",
-    "PR head changed while waiting for Codex",
+    `PR head changed ${phase}`,
     `PR head changed from ${statusSha} to ${pullRequest.head.sha}; this gate run is stale.`,
   );
 }
