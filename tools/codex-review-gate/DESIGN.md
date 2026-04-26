@@ -68,6 +68,8 @@ After bootstrap, the gate enforces a serialized marker relationship:
 
 If a push happens while a marker is outstanding, the new head should remain `pending`. The workflow should wait for the outstanding marker to close or timeout, then baseline again and issue a fresh marker for the latest head.
 
+`After the marker` means the Codex reaction timestamp must be strictly later than the marker comment timestamp. Even though GitHub exposes reaction timestamps with second-level granularity, the gate assumes a real Codex completion signal should arrive materially after the marker, on the order of at least several seconds and usually much longer. A reaction with the same timestamp second as the marker is therefore treated as not attributable to that marker instead of being accepted as a pass candidate.
+
 ## Stalled Retry
 
 Because a GitHub PR-body `+1` is an active reaction state rather than an append-only event stream, Codex may leave an old `+1` unchanged after a later clean review. In that case the gate cannot prove that the later review completed.
