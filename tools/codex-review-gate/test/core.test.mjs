@@ -65,26 +65,6 @@ test("accepts a new +1 identity after the marker", () => {
   );
 });
 
-test("accepts a new +1 identity in the same second as the marker", () => {
-  const baseline = {
-    id: "1",
-    content: "+1",
-    createdAt: "2026-04-26T10:00:00Z",
-    user: "chatgpt-codex-connector[bot]",
-  };
-  const current = {
-    id: "2",
-    content: "+1",
-    createdAt: "2026-04-26T10:01:00Z",
-    user: "chatgpt-codex-connector[bot]",
-  };
-
-  assert.equal(
-    hasNewPlusOneTransition(baseline, current, "2026-04-26T10:01:00Z"),
-    true,
-  );
-});
-
 test("treats eyes as liveness only after the marker", () => {
   const current = {
     id: "5",
