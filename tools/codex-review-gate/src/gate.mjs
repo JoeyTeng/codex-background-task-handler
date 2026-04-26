@@ -14,6 +14,7 @@ import {
   decideBootstrapProgress,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
+  hasNewCompletionComment,
   hasNewEyesTransition,
   hasNewPlusOneTransition,
   isoNow,
@@ -23,6 +24,7 @@ import {
   parseStateCommentBody,
   parseTimestamp,
   reconcileStateWithMarkerComment,
+  selectLatestCodexCompletionComment,
   stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
   truncate,
@@ -105,9 +107,11 @@ async function driveGate() {
       await failIfPullRequestHeadChanged("before passing Codex review gate");
       const finalSnapshot = await loadSnapshot();
       failIfCurrentHeadHasCodexFindings(finalSnapshot.findings);
-      await setCommitStatus("success", "Codex +1 observed and current head has no inline findings");
+      await setCommitStatus("success", "Codex completion observed and current head has no inline findings");
       state = closeActiveMarker(state, "passed", isoNow(), {
         observedPlusOne: state.activeMarker?.observedPlusOne || snapshot.reactions.plusOne,
+        observedCompletionComment:
+          state.activeMarker?.observedCompletionComment || snapshot.completionComment,
       });
       try {
         stateComment = await saveState(state, stateComment);
@@ -158,14 +162,14 @@ async function ensureState(snapshot, previousState, previousComment) {
         now,
         statusHead: statusSha,
         runUrl,
-        reactions: snapshot.reactions,
+        reactions: snapshot.baseline,
         findings: snapshot.findings,
       })
     : createInitialState({
         now,
         statusHead: statusSha,
         runUrl,
-        reactions: snapshot.reactions,
+        reactions: snapshot.baseline,
         findings: snapshot.findings,
       });
 
@@ -195,7 +199,7 @@ async function advanceBootstrap(state, stateComment, snapshot) {
       status: bootstrapProgress.status,
       startedAt,
       graceEndsAt: bootstrapProgress.graceEndsAt,
-      baseline: snapshot.reactions,
+      baseline: snapshot.baseline,
       currentHeadFindingIds: snapshot.findings.ids,
       closedAt: bootstrapProgress.closedAt || state.bootstrap?.closedAt,
       closeReason: bootstrapProgress.closeReason,
@@ -220,7 +224,7 @@ async function advanceBootstrap(state, stateComment, snapshot) {
 
 async function advanceMarker(state, stateComment, snapshot) {
   if (!state.activeMarker) {
-    const marker = await createGateMarker(snapshot.reactions, state);
+    const marker = await createGateMarker(snapshot.baseline, state);
     state = normalizeState({
       ...state,
       updatedAt: isoNow(),
@@ -242,6 +246,7 @@ async function advanceMarker(state, stateComment, snapshot) {
       currentHeadSha: statusSha,
       lastObservedPlusOne: snapshot.reactions.plusOne,
       lastObservedEyes: snapshot.reactions.eyes,
+      lastObservedCompletionComment: snapshot.completionComment,
     };
     if (activeMarker.observedPlusOne) {
       closure.observedPlusOne = activeMarker.observedPlusOne;
@@ -295,12 +300,34 @@ async function advanceMarker(state, stateComment, snapshot) {
     return { kind: "pass", state, stateComment };
   }
 
+  if (
+    hasNewCompletionComment(
+      activeMarker.baseline?.completionComment,
+      snapshot.completionComment,
+      activeMarker.createdAt,
+    )
+  ) {
+    state = normalizeState({
+      ...state,
+      updatedAt: isoNow(),
+      activeMarker: {
+        ...activeMarker,
+        state: "pass_candidate",
+        passCandidateAt: isoNow(),
+        observedCompletionComment: snapshot.completionComment,
+      },
+    });
+    stateComment = await saveState(state, stateComment);
+    return { kind: "pass", state, stateComment };
+  }
+
   const markerAgeMs = Date.now() - parseTimestamp(activeMarker.createdAt, "marker creation time");
   if (markerAgeMs >= config.markerTimeoutMs) {
     state = closeActiveMarker(state, "stalled", isoNow(), {
       stalledAfterSeconds: Math.round(config.markerTimeoutMs / 1000),
       lastObservedPlusOne: snapshot.reactions.plusOne,
       lastObservedEyes: snapshot.reactions.eyes,
+      lastObservedCompletionComment: snapshot.completionComment,
     });
     stateComment = await saveState(state, stateComment);
     await setCommitStatus("pending", "Codex review marker stalled; retrying with fresh baseline");
@@ -368,12 +395,19 @@ async function loadSnapshot() {
     statusSha,
     config.codexBotLogins,
   );
+  const reactions = summarizeCodexReactions(issueReactions, config.codexBotLogins);
+  const completionComment = selectLatestCodexCompletionComment(comments, config.codexBotLogins);
 
   return {
     comments,
     issueReactions,
     reviewComments,
-    reactions: summarizeCodexReactions(issueReactions, config.codexBotLogins),
+    reactions,
+    completionComment,
+    baseline: {
+      ...reactions,
+      completionComment,
+    },
     findings,
   };
 }

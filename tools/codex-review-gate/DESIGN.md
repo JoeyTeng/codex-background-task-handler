@@ -13,7 +13,7 @@ The runner is packaged as a local composite action so this directory can later m
 - Codex inline PR review comments are the strongest failure signal. They carry a reviewed commit through the PR review / review-comment APIs, so comments attached to the current `HEAD_SHA` should fail the gate.
 - Codex `eyes` reactions are liveness only. They mean Codex has likely accepted or started work, but they are not a pass signal.
 - Codex `+1` reactions can be used as a clean/pass candidate only when the active reaction is new relative to the gate baseline. A pre-existing unchanged `+1` is not enough.
-- Codex top-level clean comments are useful diagnostics, but their natural language wording is not authoritative and should not be parsed for pass/fail.
+- Codex top-level comments after the active marker can be used as review-completion evidence. Their natural language wording is not authoritative and should not be parsed for pass/fail; the pass/fail decision still comes from whether current-head inline findings exist.
 - PR-open auto review is out of band. Its first `+1` or inline review comments should be recorded as bootstrap baseline, not used to pass a later controlled review marker.
 
 ## State Model
@@ -27,9 +27,10 @@ The state should record at least:
 - bootstrap status and timestamp
 - active Codex PR-body `+1` reaction identity, including `id` and `created_at` when present
 - active Codex `eyes` reaction identity when present
+- active Codex top-level completion comment identity when present
 - known Codex inline review / review-comment ids already counted as baseline
 - outstanding marker comment id, marker head sha, marker creation time, and marker attempt number
-- marker baseline `+1` identity
+- marker baseline `+1`, `eyes`, and top-level completion comment identities
 - marker state: `waiting_ack`, `waiting_result`, `pass_candidate`, `stalled`, `passed`, or `failed`
 - last status write head and run url
 
@@ -59,7 +60,7 @@ After bootstrap, the gate enforces a serialized marker relationship:
 2. Before creating a marker, record the current active Codex `+1` reaction identity as the marker baseline.
 3. Do not create another marker until the outstanding marker has either observed a new `+1` transition or timed out.
 4. `eyes` after the marker moves the state to ongoing, but the status remains `pending`.
-5. A pass candidate exists only when the active Codex `+1` reaction is absent in the marker baseline and now present, or its `id` / `created_at` changed after the marker baseline.
+5. A pass candidate exists when the active Codex `+1` reaction is absent in the marker baseline and now present, its `id` / `created_at` changed after the marker baseline, or a new Codex top-level completion comment appears after the marker baseline.
 6. A pre-existing unchanged `+1` is never reused for pass.
 7. On a pass candidate, persist `pass_candidate` on the active marker before final validation so a rerun can recover the observed `+1`.
 8. Re-fetch the PR and fail closed if `HEAD_SHA` changed.
@@ -108,7 +109,7 @@ The strong parts are:
 The thin parts are:
 
 - PR-body `+1` is not append-only. If GitHub keeps one active reaction per bot/content pair, there may be no new event for later clean reviews, so the gate can only stay pending and retry.
-- Timeout retry weakens strict attribution. A very delayed old review that deletes/re-adds or otherwise updates the `+1` after a new marker could be misattributed to the new marker. Long timeouts, serial markers, and fresh baselines reduce this risk but cannot eliminate it without a Codex-provided token, commit id, or per-marker reaction target.
+- Timeout retry weakens strict attribution. A very delayed old review that deletes/re-adds or otherwise updates the `+1`, or posts a top-level completion comment after a new marker, could be misattributed to the new marker. Observed Codex behavior suggests newer review triggers supersede older onflight reviews, and serial markers plus fresh baselines reduce the risk, but it cannot be eliminated without a Codex-provided token, commit id, or per-marker reaction target.
 - Bootstrap is inherently weaker because PR-open auto review is not marker controlled. The first round treats existing signals as baseline only, waits for a short grace period, then starts a controlled marker even when a stale `eyes` reaction remains visible.
 - If Codex stops emitting PR-body `+1` for clean reviews, the gate should stall rather than pass. That is fail-closed but may block merges until the signal model is revised.
 - If Codex moves findings from inline review comments to top-level comments, the current script would not classify them as findings. This is accepted for now and partially covered by requiring conversation resolution, but it is not a full substitute for a first-class Codex verdict.

@@ -52,6 +52,19 @@ export function reactionIdentity(reaction) {
   };
 }
 
+export function issueCommentIdentity(comment) {
+  if (!comment) {
+    return null;
+  }
+
+  return {
+    id: String(comment.id),
+    createdAt: comment.created_at,
+    user: comment.user?.login || "",
+    url: comment.html_url || null,
+  };
+}
+
 export function summarizeCodexReactions(reactions, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
   return {
     plusOne: selectLatestCodexReaction(reactions, "+1", botLogins),
@@ -76,7 +89,31 @@ export function selectLatestCodexReaction(reactions, content, botLogins = DEFAUL
   return matches[0] || null;
 }
 
+export function selectLatestCodexCompletionComment(comments, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
+  const matches = comments
+    .filter((comment) => isCodexBot(comment.user?.login, botLogins))
+    .map(issueCommentIdentity);
+
+  matches.sort((left, right) => {
+    const byCreatedAt = parseTimestamp(right.createdAt, "Codex issue comment creation time") -
+      parseTimestamp(left.createdAt, "Codex issue comment creation time");
+    if (byCreatedAt !== 0) {
+      return byCreatedAt;
+    }
+    return Number(right.id) - Number(left.id);
+  });
+
+  return matches[0] || null;
+}
+
 export function sameReactionIdentity(left, right) {
+  if (!left || !right) {
+    return !left && !right;
+  }
+  return String(left.id) === String(right.id) && left.createdAt === right.createdAt;
+}
+
+export function sameIssueCommentIdentity(left, right) {
   if (!left || !right) {
     return !left && !right;
   }
@@ -113,6 +150,20 @@ export function hasNewEyesTransition(baselineEyes, currentEyes, markerCreatedAt)
   }
 
   return !sameReactionIdentity(baselineEyes, currentEyes);
+}
+
+export function hasNewCompletionComment(baselineComment, currentComment, markerCreatedAt) {
+  if (!currentComment) {
+    return false;
+  }
+
+  const currentCreatedAt = parseTimestamp(currentComment.createdAt, "Codex completion comment creation time");
+  const markerCreated = parseTimestamp(markerCreatedAt, "marker creation time");
+  if (currentCreatedAt <= markerCreated) {
+    return false;
+  }
+
+  return !sameIssueCommentIdentity(baselineComment, currentComment);
 }
 
 export function codexAutoReviewLooksOngoing(reactions) {

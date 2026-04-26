@@ -10,12 +10,15 @@ import {
   decideBootstrapProgress,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
+  hasNewCompletionComment,
   hasNewEyesTransition,
   hasNewPlusOneTransition,
+  issueCommentIdentity,
   markerFromComment,
   parseStateCommentBody,
   reconcileStateWithMarkerComment,
   reactionIdentity,
+  selectLatestCodexCompletionComment,
   stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
 } from "../src/core.mjs";
@@ -68,6 +71,40 @@ test("accepts a new +1 identity after the marker", () => {
   );
 });
 
+test("accepts a new Codex completion comment after the marker", () => {
+  const baseline = {
+    id: "1",
+    createdAt: "2026-04-26T10:00:00Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/1",
+  };
+  const current = {
+    id: "2",
+    createdAt: "2026-04-26T10:05:00Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/2",
+  };
+
+  assert.equal(
+    hasNewCompletionComment(baseline, current, "2026-04-26T10:01:00Z"),
+    true,
+  );
+});
+
+test("requires Codex completion comments to be after the marker", () => {
+  const current = {
+    id: "2",
+    createdAt: "2026-04-26T10:00:00Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/2",
+  };
+
+  assert.equal(
+    hasNewCompletionComment(null, current, "2026-04-26T10:01:00Z"),
+    false,
+  );
+});
+
 test("detects active markers from obsolete heads", () => {
   assert.equal(activeMarkerIsObsolete({ headSha: "old" }, "new"), true);
   assert.equal(activeMarkerIsObsolete({ headSha: "new" }, "new"), false);
@@ -106,6 +143,25 @@ test("summarizes only Codex bot PR-body reactions", () => {
     plusOne: reactionIdentity(reactions[1]),
     eyes: reactionIdentity(reactions[2]),
   });
+});
+
+test("selects only Codex bot top-level completion comments", () => {
+  const comments = [
+    {
+      id: 1,
+      created_at: "2026-04-26T10:00:00Z",
+      html_url: "https://example.invalid/comments/1",
+      user: { login: "octocat" },
+    },
+    {
+      id: 2,
+      created_at: "2026-04-26T10:01:00Z",
+      html_url: "https://example.invalid/comments/2",
+      user: { login: "chatgpt-codex-connector[bot]" },
+    },
+  ];
+
+  assert.deepEqual(selectLatestCodexCompletionComment(comments), issueCommentIdentity(comments[1]));
 });
 
 test("round-trips hidden state metadata", () => {

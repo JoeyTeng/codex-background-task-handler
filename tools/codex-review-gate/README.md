@@ -23,7 +23,7 @@ The checked-in runner implements the reaction-driven serialized marker design:
 - It treats PR-open automatic review output as first-round baseline only.
 - It serializes controlled `@codex review` marker comments.
 - It treats Codex `eyes` reactions as liveness only.
-- It passes only when a new Codex PR-body `+1` reaction identity appears after the active marker baseline and the current head has no Codex inline findings.
+- It passes only when a new Codex PR-body `+1` reaction identity or Codex top-level completion comment appears after the active marker baseline and the current head has no Codex inline findings.
 - It marks unchanged old `+1` reactions as pending/stalled instead of reusing them.
 
 ## 工作方式
@@ -42,7 +42,8 @@ The checked-in runner implements the reaction-driven serialized marker design:
     "headSha": "<head-sha>",
     "baseline": {
       "plusOne": "<current Codex +1 reaction identity or null>",
-      "eyes": "<current Codex eyes reaction identity or null>"
+      "eyes": "<current Codex eyes reaction identity or null>",
+      "completionComment": "<current Codex top-level completion comment identity or null>"
     }
   }
   -->
@@ -51,7 +52,7 @@ The checked-in runner implements the reaction-driven serialized marker design:
 - marker comment 用来触发 Codex 并建立当前 head 的等待起点；它本身不代表通过。
 - workflow 不解析 Codex clean comment 文案，也不要求 Codex echo token。
 - `eyes` 只说明 Codex ongoing。
-- pass candidate 只来自 marker baseline 之后新出现或更新的 Codex PR-body `+1` reaction identity。
+- pass candidate 只来自 marker baseline 之后新出现或更新的 Codex PR-body `+1` reaction identity，或 marker 之后新出现的 Codex top-level completion comment；completion comment 的文案不参与判定，通过前仍只看当前 head 有没有 Codex inline findings。
 - 这里的 “之后” 是严格晚于 marker comment timestamp；如果 reaction 和 marker 落在同一秒，runner 会按不可归因于当前 marker 处理。实际 Codex completion signal 预期会明显晚于 marker，通常不需要为同秒 timestamp 放宽通过条件。
 - 如果 push 发生时旧 marker 还没完成，runner 会立刻把旧 marker 标为 `obsolete_head`，然后为最新 head 重新 baseline / 发 marker；不会等旧 marker 的一小时 timeout。
 - 如果 sticky state comment 丢失，runner 不会把旧 marker comment 重新激活为可通过的 active marker；它会把该 marker 记为 `state_lost`，重新 baseline 后发新 marker。
