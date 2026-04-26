@@ -1,5 +1,8 @@
+use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,7 +13,8 @@ use serde_json::{Value, json};
 
 use crate::artifact::{ingest_result_file, remove_ingest_marker_best_effort};
 use crate::daemon::{
-    DaemonEnsureOptions, DaemonServeOptions, daemon_ensure, daemon_request, daemon_serve,
+    DaemonEnsureOptions, DaemonServeOptions, daemon_ensure, daemon_request, daemon_request_payload,
+    daemon_serve, validate_daemon_autostart_endpoint,
 };
 use crate::fs_layout::{FsLayout, remove_dir_all_durable};
 use crate::models::{
@@ -20,6 +24,9 @@ use crate::models::{
 use crate::store::{Store, new_id};
 
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
+const DIRECT_STORE_ENV: &str = "CBTH_ALLOW_DIRECT_STORE";
+const DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS: u64 = 300;
+const DEFAULT_DAEMON_STARTUP_TIMEOUT_SECONDS: u64 = 5;
 
 #[derive(Debug, Parser)]
 #[command(name = "cbth")]
@@ -27,6 +34,9 @@ const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 pub struct Cli {
     #[arg(long, global = true)]
     home: Option<PathBuf>,
+
+    #[arg(long, global = true, hide = true)]
+    direct_store: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -180,6 +190,13 @@ impl CloseReason {
             Self::OperatorConfirmedDelivery => "operator_confirmed_delivery",
         }
     }
+
+    fn cli_value(&self) -> &'static str {
+        match self {
+            Self::OperatorClosedUnconfirmed => "operator-closed-unconfirmed",
+            Self::OperatorConfirmedDelivery => "operator-confirmed-delivery",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -209,6 +226,9 @@ struct DaemonServeArgs {
 
     #[arg(long)]
     now: Option<i64>,
+
+    #[arg(long, hide = true)]
+    skip_startup_sweep: bool,
 }
 
 #[derive(Debug, Args)]
@@ -222,17 +242,225 @@ struct DaemonEnsureArgs {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    if cli.direct_store {
+        require_direct_store_env()?;
+    }
     let layout = FsLayout::resolve(cli.home)?;
-    let output = dispatch(cli.command, &layout)?;
+    let output = dispatch(
+        cli.command,
+        &layout,
+        DispatchMode::Client {
+            direct_store: cli.direct_store,
+        },
+    )?;
     write_json(&output)
 }
 
-fn dispatch(command: Commands, layout: &FsLayout) -> Result<Value> {
+enum DispatchMode {
+    Client { direct_store: bool },
+    Direct,
+}
+
+fn dispatch(command: Commands, layout: &FsLayout, mode: DispatchMode) -> Result<Value> {
+    if let DispatchMode::Client {
+        direct_store: false,
+    } = mode
+        && let Some(argv) = daemon_argv_for_mutating_command(&command)?
+    {
+        let startup_sweep_now = daemon_startup_sweep_for_command(&command)?;
+        validate_daemon_autostart_endpoint(layout)?;
+        daemon_ensure(
+            layout,
+            DaemonEnsureOptions {
+                idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
+                startup_timeout_seconds: DEFAULT_DAEMON_STARTUP_TIMEOUT_SECONDS,
+                startup_sweep_now,
+            },
+        )?;
+        return daemon_request_payload(layout, "dispatch", json!({ "argv": argv_payload(argv) }));
+    }
+
+    dispatch_direct(command, layout)
+}
+
+pub(crate) fn dispatch_daemon_argv(layout: &FsLayout, argv: Vec<Vec<u8>>) -> Result<Value> {
+    let mut parse_argv = Vec::with_capacity(argv.len() + 1);
+    parse_argv.push(OsString::from("cbth"));
+    parse_argv.extend(argv.into_iter().map(OsString::from_vec));
+    let cli = Cli::try_parse_from(parse_argv)?;
+    if cli.home.is_some() {
+        bail!("daemon dispatch must not include --home");
+    }
+    if cli.direct_store {
+        bail!("daemon dispatch must not include --direct-store");
+    }
+    match cli.command {
+        Commands::Daemon { .. } => bail!("daemon dispatch cannot execute daemon commands"),
+        command => dispatch(command, layout, DispatchMode::Direct),
+    }
+}
+
+fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
     match command {
         Commands::Job { command } => dispatch_job(command, layout),
         Commands::Batch { command } => dispatch_batch(command, layout),
         Commands::Maintenance { command } => dispatch_maintenance(command, layout),
         Commands::Daemon { command } => dispatch_daemon(command, layout),
+    }
+}
+
+fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsString>>> {
+    let argv = match command {
+        Commands::Job {
+            command: JobCommand::Submit(args),
+        } => {
+            let mut argv = vec![OsString::from("job"), OsString::from("submit")];
+            push_string_arg(&mut argv, "--source-thread-id", &args.source_thread_id);
+            push_string_arg(&mut argv, "--summary", &args.summary);
+            if let Some(path) = &args.metadata_file {
+                push_path_arg(&mut argv, "--metadata-file", &absolute_cli_path(path)?);
+            }
+            push_optional_bool_arg(&mut argv, "--delivery-read-only", args.delivery_read_only);
+            push_optional_bool_arg(
+                &mut argv,
+                "--delivery-requires-approval",
+                args.delivery_requires_approval,
+            );
+            push_optional_bool_arg(
+                &mut argv,
+                "--delivery-requires-network",
+                args.delivery_requires_network,
+            );
+            push_optional_bool_arg(
+                &mut argv,
+                "--delivery-requires-write-access",
+                args.delivery_requires_write_access,
+            );
+            argv
+        }
+        Commands::Job {
+            command: JobCommand::Complete(args),
+        } => {
+            let mut argv = vec![OsString::from("job"), OsString::from("complete")];
+            push_string_arg(&mut argv, "--job-id", &args.job_id);
+            push_path_arg(
+                &mut argv,
+                "--result-file",
+                &absolute_cli_path(&args.result_file)?,
+            );
+            push_optional_string_arg(&mut argv, "--summary", args.summary.as_deref());
+            push_i64_arg(
+                &mut argv,
+                "--max-delivery-attempts",
+                args.max_delivery_attempts,
+            );
+            push_i64_arg(
+                &mut argv,
+                "--redelivery-window-seconds",
+                args.redelivery_window_seconds,
+            );
+            argv
+        }
+        Commands::Job {
+            command: JobCommand::Fail(args),
+        } => {
+            let mut argv = vec![OsString::from("job"), OsString::from("fail")];
+            push_string_arg(&mut argv, "--job-id", &args.job_id);
+            push_string_arg(&mut argv, "--reason", &args.reason);
+            push_i64_arg(
+                &mut argv,
+                "--max-delivery-attempts",
+                args.max_delivery_attempts,
+            );
+            push_i64_arg(
+                &mut argv,
+                "--redelivery-window-seconds",
+                args.redelivery_window_seconds,
+            );
+            argv
+        }
+        Commands::Batch {
+            command: BatchCommand::CloseHead(args),
+        } => {
+            let mut argv = vec![OsString::from("batch"), OsString::from("close-head")];
+            push_string_arg(&mut argv, "--source-thread-id", &args.source_thread_id);
+            push_string_arg(&mut argv, "--reason", args.reason.cli_value());
+            push_optional_string_arg(&mut argv, "--note", args.note.as_deref());
+            argv
+        }
+        Commands::Maintenance {
+            command: MaintenanceCommand::Sweep(args),
+        } => {
+            let mut argv = vec![OsString::from("maintenance"), OsString::from("sweep")];
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Job {
+            command: JobCommand::Inspect(_) | JobCommand::List(_),
+        }
+        | Commands::Batch {
+            command: BatchCommand::InspectHead(_) | BatchCommand::Inspect(_),
+        }
+        | Commands::Daemon { .. } => return Ok(None),
+    };
+    Ok(Some(argv))
+}
+
+fn daemon_startup_sweep_for_command(command: &Commands) -> Result<Option<i64>> {
+    match command {
+        Commands::Maintenance {
+            command: MaintenanceCommand::Sweep(_),
+        } => Ok(None),
+        _ => Ok(Some(now_epoch_seconds()?)),
+    }
+}
+
+fn require_direct_store_env() -> Result<()> {
+    match env::var(DIRECT_STORE_ENV) {
+        Ok(value) if value == "1" => Ok(()),
+        _ => bail!("--direct-store requires {DIRECT_STORE_ENV}=1"),
+    }
+}
+
+fn argv_payload(argv: Vec<OsString>) -> Vec<Vec<u8>> {
+    argv.into_iter().map(OsString::into_vec).collect()
+}
+
+fn push_optional_bool_arg(argv: &mut Vec<OsString>, flag: &str, value: Option<bool>) {
+    if let Some(value) = value {
+        push_string_arg(argv, flag, &value.to_string());
+    }
+}
+
+fn push_optional_string_arg(argv: &mut Vec<OsString>, flag: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        push_string_arg(argv, flag, value);
+    }
+}
+
+fn push_i64_arg(argv: &mut Vec<OsString>, flag: &str, value: i64) {
+    push_string_arg(argv, flag, &value.to_string());
+}
+
+fn push_string_arg(argv: &mut Vec<OsString>, flag: &str, value: &str) {
+    argv.push(OsString::from(format!("{flag}={value}")));
+}
+
+fn push_path_arg(argv: &mut Vec<OsString>, flag: &str, value: &Path) {
+    let mut bytes = Vec::with_capacity(flag.len() + 1 + value.as_os_str().as_bytes().len());
+    bytes.extend_from_slice(flag.as_bytes());
+    bytes.push(b'=');
+    bytes.extend_from_slice(value.as_os_str().as_bytes());
+    argv.push(OsString::from_vec(bytes));
+}
+
+fn absolute_cli_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(env::current_dir()?.join(path))
     }
 }
 
@@ -385,15 +613,22 @@ fn dispatch_daemon(command: DaemonCommand, layout: &FsLayout) -> Result<Value> {
     match command {
         DaemonCommand::Serve(args) => {
             validate_nonzero_u64("idle_timeout_seconds", args.idle_timeout_seconds)?;
-            let now = match args.now {
-                Some(value) => value,
-                None => now_epoch_seconds()?,
+            if args.skip_startup_sweep && args.now.is_some() {
+                bail!("--skip-startup-sweep cannot be combined with --now");
+            }
+            let startup_sweep_now = if args.skip_startup_sweep {
+                None
+            } else {
+                Some(match args.now {
+                    Some(value) => value,
+                    None => now_epoch_seconds()?,
+                })
             };
             daemon_serve(
                 layout,
                 DaemonServeOptions {
                     idle_timeout_seconds: args.idle_timeout_seconds,
-                    startup_sweep_now: now,
+                    startup_sweep_now,
                 },
             )
         }
@@ -405,6 +640,7 @@ fn dispatch_daemon(command: DaemonCommand, layout: &FsLayout) -> Result<Value> {
                 DaemonEnsureOptions {
                     idle_timeout_seconds: args.idle_timeout_seconds,
                     startup_timeout_seconds: args.startup_timeout_seconds,
+                    startup_sweep_now: Some(now_epoch_seconds()?),
                 },
             )
         }

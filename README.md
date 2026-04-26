@@ -36,10 +36,11 @@ Design docs:
 
 ## Rust CLI Usage
 
-The Rust CLI currently provides synchronous store commands plus a first daemon control surface backed by a same-user Unix socket.
+The Rust CLI currently provides read-only store inspection commands, daemon-routed mutating job/batch/maintenance commands, and a daemon control surface backed by a same-user Unix socket.
 
 State lives under `~/.cbth` by default. Use `--home <path>` or `CBTH_HOME` for tests and isolated runs.
 The local-store and daemon IPC semantics are supported on macOS and Linux; pure Windows support is out of scope until the IPC, atomic-replace, and directory-sync contracts are designed separately.
+By default, `job submit`, `job complete`, `job fail`, `batch close-head`, and `maintenance sweep` first ensure the local daemon is running, then execute through its same-user Unix socket. Read-only commands such as `job inspect`, `job list`, `batch inspect-head`, and `batch inspect` read the local store directly.
 
 ```bash
 cargo run --bin cbth -- \
@@ -67,7 +68,7 @@ cargo run --bin cbth -- \
   --reason operator-closed-unconfirmed
 ```
 
-If delivery policy is omitted, the core records a fail-closed policy: not read-only, requires approval, requires network, and requires write access. Completed result files are streamed into the managed artifact store; the original `--result-file` path is only an input. Phase 1 does not persist inline handoff payloads yet, so completed job batches conservatively keep `requires_artifact_read=true` even for small artifacts.
+If delivery policy is omitted, the core records a fail-closed policy: not read-only, requires approval, requires network, and requires write access. Completed result files are streamed into the managed artifact store; the original `--result-file` path is only an input. The current core does not persist inline handoff payloads yet, so completed job batches conservatively keep `requires_artifact_read=true` even for small artifacts.
 
 Daemon control commands:
 
@@ -78,7 +79,7 @@ cargo run --bin cbth -- daemon ping
 cargo run --bin cbth -- daemon stop
 ```
 
-`daemon ensure` starts `cbth daemon serve` on demand when no active daemon is reachable. The daemon listens on `~/.cbth/run/cbth.sock`, requires private `~/.cbth` / `run` directories, validates peer uid before serving requests, runs a startup maintenance sweep, and exits after an idle timeout. This is the shared IPC foundation; job/batch delivery adapters are still planned on top of it.
+`daemon ensure` starts `cbth daemon serve` on demand when no active daemon is reachable. The daemon listens on `~/.cbth/run/cbth.sock`, requires private `~/.cbth` / `run` directories, validates peer uid before serving requests, runs a startup maintenance sweep, and exits after an idle timeout. Mutating CLI commands use this IPC path by default and fail closed if the same-user socket proof cannot be established.
 
 ## Python Usage
 
@@ -102,10 +103,9 @@ The current CLI active-turn steering PoC is [scripts/cli_turn_steer_poc.mjs](scr
 
 This repo is expected to grow around one shared Rust core with thin per-surface entrypoints:
 
-1. Extend the daemon IPC from basic lifecycle commands into domain RPCs for job/batch delivery control.
-2. Add thread-scoped inbox snapshots and delivery adapter helpers on top of the existing batch/artifact model.
-3. Add thin CLI and Desktop integration entrypoints.
-4. Keep small reference probes for one-off Desktop or protocol experiments.
+1. Add thread-scoped inbox snapshots and delivery adapter helpers on top of the existing daemon-routed batch/artifact model.
+2. Add thin CLI and Desktop integration entrypoints.
+3. Keep small reference probes for one-off Desktop or protocol experiments.
 
 Rust is the preferred implementation language for the real sidecar because it keeps resource usage low and is a better fit for cross-platform deployment anywhere Codex itself can run.
 

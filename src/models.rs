@@ -162,7 +162,7 @@ pub struct BatchInspect {
     pub jobs: Vec<BatchJobRecord>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct SweepReport {
     pub expired_manual_batches_closed: usize,
     pub expired_automatic_batches_closed: usize,

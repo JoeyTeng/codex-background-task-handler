@@ -1,6 +1,8 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -69,11 +71,18 @@ impl FsLayout {
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
     let missing_dirs = missing_dirs(path)?;
-    fs::create_dir_all(path).with_context(|| format!("create directory {}", path.display()))?;
     if missing_dirs.is_empty() {
         set_private_dir_permissions(path)?;
     } else {
         for dir in missing_dirs {
+            match create_private_dir_single(&dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("create directory {}", dir.display()));
+                }
+            }
             set_private_dir_permissions(&dir)?;
             if let Some(parent) = dir.parent() {
                 sync_dir(parent)?;
@@ -81,6 +90,20 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_dir_single(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir_single(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
 }
 
 pub fn create_private_file(path: &Path) -> Result<File> {
@@ -208,7 +231,7 @@ fn missing_dirs(path: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     let mut current = Some(path);
     while let Some(dir) = current {
-        match fs::metadata(dir) {
+        match fs::symlink_metadata(dir) {
             Ok(metadata) if metadata.is_dir() => break,
             Ok(_) => bail!("path exists but is not a directory: {}", dir.display()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => dirs.push(dir.to_path_buf()),
@@ -238,9 +261,25 @@ pub fn validate_id_path_component(value: &str, name: &str) -> Result<()> {
 
 #[cfg(unix)]
 fn set_private_dir_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod 0700 {}", path.display()))
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open private directory {}", path.display()))?;
+    let metadata = dir
+        .metadata()
+        .with_context(|| format!("stat private directory {}", path.display()))?;
+    if !metadata.is_dir() {
+        bail!("path exists but is not a directory: {}", path.display());
+    }
+    let rc = unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error()).with_context(|| format!("chmod 0700 {}", path.display()))
+    }
 }
 
 #[cfg(not(unix))]
