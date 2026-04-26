@@ -15,6 +15,7 @@ import {
   parseStateCommentBody,
   reconcileStateWithMarkerComment,
   reactionIdentity,
+  stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
 } from "../src/core.mjs";
 
@@ -292,6 +293,56 @@ test("reconstructs an active marker when state was not patched after marker crea
   assert.equal(reconciled.changed, true);
   assert.equal(reconciled.state.activeMarker.id, "2");
   assert.equal(reconciled.state.activeMarker.headSha, "abc123");
+});
+
+test("does not reactivate a marker when the sticky state comment is missing", () => {
+  const markerBody = buildMarkerCommentBody({
+    headSha: "abc123",
+    runUrl: "https://example.invalid/runs/1",
+    runId: "1",
+    runAttempt: "1",
+    attempt: 1,
+    baseline: { plusOne: null, eyes: null },
+    state: "waiting_ack",
+  });
+  const state = stateFromRecoveredMarkerComment({
+    markerComment: {
+      id: 2,
+      body: markerBody,
+      html_url: "https://example.invalid/comments/2",
+      created_at: "2026-04-26T10:01:00Z",
+      user: { login: "github-actions[bot]" },
+    },
+    marker: {
+      headSha: "abc123",
+      runUrl: "https://example.invalid/runs/1",
+      runId: "1",
+      runAttempt: "1",
+      attempt: 1,
+      baseline: { plusOne: null, eyes: null },
+      state: "waiting_ack",
+    },
+    now: "2026-04-26T10:02:00Z",
+    statusHead: "abc123",
+    runUrl: "https://example.invalid/runs/2",
+    reactions: {
+      plusOne: {
+        id: "99",
+        content: "+1",
+        createdAt: "2026-04-26T10:01:30Z",
+        user: "chatgpt-codex-connector[bot]",
+      },
+      eyes: null,
+    },
+    findings: { ids: ["finding-1"] },
+  });
+
+  assert.equal(state.activeMarker, null);
+  assert.equal(state.history.length, 1);
+  assert.equal(state.history[0].id, "2");
+  assert.equal(state.history[0].outcome, "state_lost");
+  assert.equal(state.bootstrap.baseline.plusOne.id, "99");
+  assert.deepEqual(state.bootstrap.currentHeadFindingIds, ["finding-1"]);
 });
 
 test("fails closed when state and latest trusted marker disagree", () => {

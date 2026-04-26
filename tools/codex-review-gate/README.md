@@ -54,6 +54,8 @@ The checked-in runner implements the reaction-driven serialized marker design:
 - pass candidate 只来自 marker baseline 之后新出现或更新的 Codex PR-body `+1` reaction identity。
 - 这里的 “之后” 是严格晚于 marker comment timestamp；如果 reaction 和 marker 落在同一秒，runner 会按不可归因于当前 marker 处理。实际 Codex completion signal 预期会明显晚于 marker，通常不需要为同秒 timestamp 放宽通过条件。
 - 如果 push 发生时旧 marker 还没完成，runner 会立刻把旧 marker 标为 `obsolete_head`，然后为最新 head 重新 baseline / 发 marker；不会等旧 marker 的一小时 timeout。
+- 如果 sticky state comment 丢失，runner 不会把旧 marker comment 重新激活为可通过的 active marker；它会把该 marker 记为 `state_lost`，重新 baseline 后发新 marker。
+- 实测后触发的 Codex review 可能 supersede 早先 onflight review，且旧 marker comment 上的小眼睛不会被移除；这些旧 `eyes` 只作为历史 liveness，不作为必须等待 completion 的代数关系。
 - 通过前 workflow 会再次确认当前 head 没有 Codex inline review comments。
 - 如果旧 `+1` 已存在且不变化，gate 保持 pending；marker 一小时级 timeout 后标为 stalled 并重新 baseline / 重发。
 - 当前默认 overall timeout 是 2 小时，marker timeout 是 1 小时。

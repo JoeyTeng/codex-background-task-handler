@@ -33,7 +33,7 @@ The state should record at least:
 - marker state: `waiting_ack`, `waiting_result`, `pass_candidate`, `stalled`, `passed`, or `failed`
 - last status write head and run url
 
-The script should also be able to reconstruct enough state from PR comments, reactions, and review comments if the sticky comment is missing. If reconstruction is ambiguous, fail closed or stay pending instead of passing.
+The script should also be able to reconstruct enough state from PR comments, reactions, and review comments if the sticky comment is missing. If reconstruction is ambiguous, fail closed or stay pending instead of passing. In particular, if the sticky state comment is missing but a trusted marker comment is still visible, that marker must not be reactivated as an active pass candidate. The safe recovery path records the marker as `state_lost`, baselines the currently visible reactions, and issues a fresh marker for the current head.
 
 The current implementation trusts state and marker comments only from configured trusted authors. The default trusted author is `github-actions[bot]`, which matches the repository workflow's `GITHUB_TOKEN` path.
 
@@ -69,6 +69,8 @@ After bootstrap, the gate enforces a serialized marker relationship:
 If a push happens while a marker is outstanding, the new head should remain `pending`. The workflow should immediately close the old marker as `obsolete_head`, record the latest observed reaction identities, then baseline again and issue a fresh marker for the latest head. Later reactions attributable only to the obsolete marker must not pass the new head.
 
 `After the marker` means the Codex reaction timestamp must be strictly later than the marker comment timestamp. Even though GitHub exposes reaction timestamps with second-level granularity, the gate assumes a real Codex completion signal should arrive materially after the marker, on the order of at least several seconds and usually much longer. A reaction with the same timestamp second as the marker is therefore treated as not attributable to that marker instead of being accepted as a pass candidate.
+
+Observed Codex behavior suggests that newer `@codex review` triggers can supersede earlier onflight reviews. Older marker comments may keep their `eyes` reaction even when their review never produces a completion. The gate therefore treats stale marker `eyes` as non-terminal evidence and relies on current-head review comments, current-head `+1` transitions, and explicit marker state instead of assuming every `eyes` has a matching completion.
 
 ## Stalled Retry
 

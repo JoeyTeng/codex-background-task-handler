@@ -24,7 +24,7 @@ import {
   parseStateCommentBody,
   parseTimestamp,
   reconcileStateWithMarkerComment,
-  stateFromMarkerComment,
+  stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
   truncate,
   updateStateForStatus,
@@ -153,12 +153,14 @@ async function ensureState(snapshot, previousState, previousComment) {
   const markerComment = findLatestTrustedMarkerComment(snapshot.comments, config.trustedCommentLogins);
   const now = isoNow();
   const state = markerComment
-    ? stateFromMarkerComment({
+    ? stateFromRecoveredMarkerComment({
         markerComment,
         marker: markerFromComment(markerComment),
         now,
         statusHead: statusSha,
         runUrl,
+        reactions: snapshot.reactions,
+        findings: snapshot.findings,
       })
     : createInitialState({
         now,

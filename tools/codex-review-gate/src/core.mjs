@@ -178,7 +178,26 @@ export function createInitialState({ now, statusHead, runUrl, reactions, finding
   });
 }
 
-export function stateFromMarkerComment({ markerComment, marker, now, statusHead, runUrl }) {
+export function stateFromRecoveredMarkerComment({
+  markerComment,
+  marker,
+  now,
+  statusHead,
+  runUrl,
+  reactions,
+  findings,
+}) {
+  const recoveredMarker = {
+    ...marker,
+    id: String(markerComment.id),
+    url: markerComment.html_url || marker.url || null,
+    createdAt: markerComment.created_at || marker.createdAt,
+    state: "state_lost",
+    outcome: "state_lost",
+    closedAt: now,
+    recoveryReason: "missing_state_comment",
+  };
+
   return normalizeState({
     version: STATE_VERSION,
     createdAt: now,
@@ -186,20 +205,14 @@ export function stateFromMarkerComment({ markerComment, marker, now, statusHead,
     statusHead,
     bootstrap: {
       status: "closed",
-      startedAt: marker.createdAt,
-      closedAt: marker.createdAt,
-      closeReason: "reconstructed_from_marker",
-      baseline: marker.baseline || { plusOne: null, eyes: null },
-      currentHeadFindingIds: [],
+      startedAt: now,
+      closedAt: now,
+      closeReason: "state_lost_recovery",
+      baseline: reactions || { plusOne: null, eyes: null },
+      currentHeadFindingIds: findings?.ids || [],
     },
-    activeMarker: {
-      ...marker,
-      id: String(markerComment.id),
-      url: markerComment.html_url || marker.url || null,
-      createdAt: markerComment.created_at || marker.createdAt,
-      state: marker.state || "waiting_ack",
-    },
-    history: [],
+    activeMarker: null,
+    history: [recoveredMarker],
     lastStatus: {
       headSha: statusHead,
       state: "pending",
