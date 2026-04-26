@@ -66,7 +66,7 @@ After bootstrap, the gate enforces a serialized marker relationship:
 9. Re-check Codex inline findings for the current head. If any exist, set `codex/review-gate=failure`.
 10. If head is unchanged and current-head Codex inline findings are absent, set `codex/review-gate=success`, then close the active marker as `passed`.
 
-If a push happens while a marker is outstanding, the new head should remain `pending`. The workflow should wait for the outstanding marker to close or timeout, then baseline again and issue a fresh marker for the latest head.
+If a push happens while a marker is outstanding, the new head should remain `pending`. The workflow should immediately close the old marker as `obsolete_head`, record the latest observed reaction identities, then baseline again and issue a fresh marker for the latest head. Later reactions attributable only to the obsolete marker must not pass the new head.
 
 `After the marker` means the Codex reaction timestamp must be strictly later than the marker comment timestamp. Even though GitHub exposes reaction timestamps with second-level granularity, the gate assumes a real Codex completion signal should arrive materially after the marker, on the order of at least several seconds and usually much longer. A reaction with the same timestamp second as the marker is therefore treated as not attributable to that marker instead of being accepted as a pass candidate.
 

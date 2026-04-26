@@ -83,6 +83,10 @@ export function sameReactionIdentity(left, right) {
   return String(left.id) === String(right.id) && left.createdAt === right.createdAt;
 }
 
+export function activeMarkerIsObsolete(activeMarker, statusHead) {
+  return Boolean(activeMarker?.headSha && statusHead && activeMarker.headSha !== statusHead);
+}
+
 export function hasNewPlusOneTransition(baselinePlusOne, currentPlusOne, markerCreatedAt) {
   if (!currentPlusOne) {
     return false;

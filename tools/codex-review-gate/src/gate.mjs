@@ -5,6 +5,7 @@ import {
   DEFAULT_TRUSTED_COMMENT_LOGINS,
   GateFailure,
   STATUS_CONTEXT,
+  activeMarkerIsObsolete,
   addSeconds,
   buildMarkerCommentBody,
   buildStateCommentBody,
@@ -238,18 +239,26 @@ async function advanceMarker(state, stateComment, snapshot) {
   }
 
   let activeMarker = state.activeMarker;
-  if (activeMarker.state === "pass_candidate") {
-    if (activeMarker.headSha !== statusSha) {
-      state = closeActiveMarker(state, "plus_one_observed_obsolete_head", isoNow(), {
-        observedPlusOne: activeMarker.observedPlusOne || snapshot.reactions.plusOne,
-      });
-      stateComment = await saveState(state, stateComment);
-      console.log(
-        `Recovered Codex +1 for obsolete head ${activeMarker.headSha}; current head is ${statusSha}.`,
-      );
-      return { kind: "continue", state, stateComment };
+  if (activeMarkerIsObsolete(activeMarker, statusSha)) {
+    const closure = {
+      currentHeadSha: statusSha,
+      lastObservedPlusOne: snapshot.reactions.plusOne,
+      lastObservedEyes: snapshot.reactions.eyes,
+    };
+    if (activeMarker.observedPlusOne) {
+      closure.observedPlusOne = activeMarker.observedPlusOne;
     }
 
+    state = closeActiveMarker(state, "obsolete_head", isoNow(), closure);
+    stateComment = await saveState(state, stateComment);
+    await setCommitStatus("pending", "Previous Codex marker was for an obsolete head; retrying");
+    console.log(
+      `Closed obsolete Codex marker ${activeMarker.id} for ${activeMarker.headSha}; current head is ${statusSha}.`,
+    );
+    return { kind: "continue", state, stateComment };
+  }
+
+  if (activeMarker.state === "pass_candidate") {
     return { kind: "pass", state, stateComment };
   }
 
@@ -274,17 +283,6 @@ async function advanceMarker(state, stateComment, snapshot) {
       activeMarker.createdAt,
     )
   ) {
-    if (activeMarker.headSha !== statusSha) {
-      state = closeActiveMarker(state, "plus_one_observed_obsolete_head", isoNow(), {
-        observedPlusOne: snapshot.reactions.plusOne,
-      });
-      stateComment = await saveState(state, stateComment);
-      console.log(
-        `Codex +1 closed marker for obsolete head ${activeMarker.headSha}; current head is ${statusSha}.`,
-      );
-      return { kind: "continue", state, stateComment };
-    }
-
     state = normalizeState({
       ...state,
       updatedAt: isoNow(),

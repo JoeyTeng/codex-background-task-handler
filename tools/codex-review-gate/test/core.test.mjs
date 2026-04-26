@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  activeMarkerIsObsolete,
   buildMarkerCommentBody,
   buildStateCommentBody,
   codexAutoReviewLooksOngoing,
@@ -63,6 +64,12 @@ test("accepts a new +1 identity after the marker", () => {
     hasNewPlusOneTransition(baseline, current, "2026-04-26T10:01:00Z"),
     true,
   );
+});
+
+test("detects active markers from obsolete heads", () => {
+  assert.equal(activeMarkerIsObsolete({ headSha: "old" }, "new"), true);
+  assert.equal(activeMarkerIsObsolete({ headSha: "new" }, "new"), false);
+  assert.equal(activeMarkerIsObsolete(null, "new"), false);
 });
 
 test("treats eyes as liveness only after the marker", () => {
