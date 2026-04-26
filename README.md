@@ -30,16 +30,16 @@ Design docs:
 - `src/`
   - Rust `cbth` binary and shared core modules
 - `tests/`
-  - Rust integration tests for the phase 1 CLI
+  - Rust integration tests for the core CLI and daemon control surface
 - `scripts/`
   - lightweight Python probes and reference PoCs
 
 ## Rust CLI Usage
 
-Phase 1 provides a synchronous Rust CLI backed by a local SQLite store and managed artifact directory. It does not start a daemon yet.
+The Rust CLI currently provides synchronous store commands plus a first daemon control surface backed by a same-user Unix socket.
 
 State lives under `~/.cbth` by default. Use `--home <path>` or `CBTH_HOME` for tests and isolated runs.
-The phase 1 local-store file semantics are supported on macOS and Linux; pure Windows support is out of scope until the IPC, atomic-replace, and directory-sync contracts are designed separately.
+The local-store and daemon IPC semantics are supported on macOS and Linux; pure Windows support is out of scope until the IPC, atomic-replace, and directory-sync contracts are designed separately.
 
 ```bash
 cargo run --bin cbth -- \
@@ -69,6 +69,17 @@ cargo run --bin cbth -- \
 
 If delivery policy is omitted, the core records a fail-closed policy: not read-only, requires approval, requires network, and requires write access. Completed result files are streamed into the managed artifact store; the original `--result-file` path is only an input. Phase 1 does not persist inline handoff payloads yet, so completed job batches conservatively keep `requires_artifact_read=true` even for small artifacts.
 
+Daemon control commands:
+
+```bash
+cargo run --bin cbth -- daemon ensure
+cargo run --bin cbth -- daemon status
+cargo run --bin cbth -- daemon ping
+cargo run --bin cbth -- daemon stop
+```
+
+`daemon ensure` starts `cbth daemon serve` on demand when no active daemon is reachable. The daemon listens on `~/.cbth/run/cbth.sock`, requires private `~/.cbth` / `run` directories, validates peer uid before serving requests, runs a startup maintenance sweep, and exits after an idle timeout. This is the shared IPC foundation; job/batch delivery adapters are still planned on top of it.
+
 ## Python Usage
 
 Python is kept for small probes and reference scripts only. Run scripts in this repo with `uv`.
@@ -91,7 +102,7 @@ The current CLI active-turn steering PoC is [scripts/cli_turn_steer_poc.mjs](scr
 
 This repo is expected to grow around one shared Rust core with thin per-surface entrypoints:
 
-1. Extend the phase 1 Rust CLI/store core into an on-demand daemon and same-user IPC surface.
+1. Extend the daemon IPC from basic lifecycle commands into domain RPCs for job/batch delivery control.
 2. Add thread-scoped inbox snapshots and delivery adapter helpers on top of the existing batch/artifact model.
 3. Add thin CLI and Desktop integration entrypoints.
 4. Keep small reference probes for one-off Desktop or protocol experiments.

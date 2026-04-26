@@ -31,6 +31,22 @@ impl FsLayout {
         self.home.join("cbth.sqlite3")
     }
 
+    pub fn home_dir(&self) -> &Path {
+        &self.home
+    }
+
+    pub fn run_dir(&self) -> PathBuf {
+        self.home.join("run")
+    }
+
+    pub fn daemon_socket_path(&self) -> PathBuf {
+        self.run_dir().join("cbth.sock")
+    }
+
+    pub fn daemon_startup_lock_path(&self) -> PathBuf {
+        self.run_dir().join("startup.lock")
+    }
+
     pub fn artifacts_dir(&self) -> PathBuf {
         self.home.join("artifacts")
     }
@@ -43,6 +59,11 @@ impl FsLayout {
         ensure_private_dir(&self.home)?;
         ensure_private_dir(&self.artifacts_dir())?;
         Ok(())
+    }
+
+    pub fn ensure_run_dir(&self) -> Result<()> {
+        ensure_private_dir(&self.home)?;
+        ensure_private_dir(&self.run_dir())
     }
 }
 

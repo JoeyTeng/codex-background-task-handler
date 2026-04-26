@@ -19,19 +19,27 @@
 - [x] 单独沉淀 Desktop background-task bridge 技术方案文档。
 - [x] 单独沉淀共享核心架构文档，明确单 binary、多入口、按需启动 daemon 的生命周期方案。
 - [x] 用 Rust 实现主 binary 的共享 `job` CLI 子命令，替代单独的 `background-taskctl` helper。
-- [ ] 实现按需启动的本地 daemon：自动拉起、idle timeout，并把退出条件收紧为：
+- [x] 实现 Phase 2 第一批按需启动 daemon / IPC 基础：
+  - `cbth daemon serve`
+  - `cbth daemon ensure`
+  - `cbth daemon ping`
+  - `cbth daemon status`
+  - `cbth daemon stop`
+  - daemon 启动时先执行 maintenance sweep
+  - daemon 简单 idle timeout 后退出并清理 socket
+- [ ] 把 daemon 退出条件从简单 idle timeout 收紧为：
   - 无 active jobs
   - 无 active clients
   - 无需要在当前 idle timeout 内继续本地观察的近端 delivery work
   - open 但长窗口的 batch / attempt 不单独阻止退出；由下次启动时的 overdue sweep 收口
   - 唯一例外是 CLI accepted attempt 的 `delivery_observation_deadline`，它在 deadline 到期前必须常驻观察
-- [ ] 实现 `cbth` daemon IPC 的 same-user-only 合同：
+- [x] 实现 `cbth` daemon IPC 的 same-user-only 基础合同：
   - macOS / Linux 使用 `~/.cbth/run/cbth.sock` 或等价用户私有 Unix domain socket
   - parent directories 必须当前 uid owned 且不宽于 `0700`
   - socket 必须当前 uid owned 且不宽于 `0600`
   - daemon accept 后必须校验 peer uid
-  - 无法提供 same-user proof 时，mutating / recovery CLI 命令 fail closed
   - v1 不退回 unauthenticated TCP daemon IPC；纯 Windows IPC 暂不支持
+- [ ] 将 mutating / recovery CLI 命令接入 daemon IPC，并在无法提供 same-user proof 时 fail closed。
 - [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 bridge-side 所需的只读 inbox snapshot，且不会卡审批：
   - `current-snapshot.json`
   - `ready-threads.json`
