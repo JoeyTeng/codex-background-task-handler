@@ -1,0 +1,9 @@
+{
+  "name": "codex-review-gate",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check src/gate.mjs"
+  }
+}

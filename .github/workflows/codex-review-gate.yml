@@ -48,4 +48,4 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           MAX_WAIT_SECONDS: "1800"
           POLL_INTERVAL_SECONDS: "30"
-        run: node .github/scripts/codex-review-gate.mjs
+        run: node tools/codex-review-gate/src/gate.mjs
