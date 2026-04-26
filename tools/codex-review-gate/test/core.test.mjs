@@ -7,6 +7,7 @@ import {
   buildStateCommentBody,
   codexAutoReviewLooksOngoing,
   collectCurrentHeadCodexFindings,
+  decideBootstrapProgress,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
   hasNewEyesTransition,
@@ -255,6 +256,58 @@ test("treats +1 newer than eyes as closed bootstrap activity", () => {
       },
     }),
     false,
+  );
+});
+
+test("keeps bootstrap open only during the initial grace period", () => {
+  assert.deepEqual(
+    decideBootstrapProgress({
+      startedAt: "2026-04-26T10:00:00Z",
+      nowMs: Date.parse("2026-04-26T10:00:30Z"),
+      graceSeconds: 60,
+      reactions: {
+        plusOne: null,
+        eyes: {
+          id: "1",
+          content: "eyes",
+          createdAt: "2026-04-26T10:00:10Z",
+          user: "chatgpt-codex-connector[bot]",
+        },
+      },
+    }),
+    {
+      status: "open",
+      startedAt: "2026-04-26T10:00:00Z",
+      graceEndsAt: "2026-04-26T10:01:00.000Z",
+      autoReviewLooksOngoing: true,
+    },
+  );
+});
+
+test("closes bootstrap after grace even when an eyes reaction remains ongoing", () => {
+  assert.deepEqual(
+    decideBootstrapProgress({
+      startedAt: "2026-04-26T10:00:00Z",
+      nowMs: Date.parse("2026-04-26T10:01:01Z"),
+      graceSeconds: 60,
+      reactions: {
+        plusOne: null,
+        eyes: {
+          id: "1",
+          content: "eyes",
+          createdAt: "2026-04-26T10:00:10Z",
+          user: "chatgpt-codex-connector[bot]",
+        },
+      },
+    }),
+    {
+      status: "closed",
+      startedAt: "2026-04-26T10:00:00Z",
+      graceEndsAt: "2026-04-26T10:01:00.000Z",
+      closedAt: "2026-04-26T10:01:01.000Z",
+      closeReason: "bootstrap_superseded_ongoing",
+      autoReviewLooksOngoing: true,
+    },
   );
 });
 

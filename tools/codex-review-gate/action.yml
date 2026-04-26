@@ -29,7 +29,7 @@ inputs:
     required: false
     default: "60"
   bootstrap-timeout-seconds:
-    description: Maximum first-round wait for a visible PR-open automatic Codex review to settle.
+    description: Deprecated compatibility input. Bootstrap now closes after the grace period and starts a controlled marker.
     required: false
     default: "3600"
   codex-bot-logins:

@@ -6,13 +6,12 @@ import {
   GateFailure,
   STATUS_CONTEXT,
   activeMarkerIsObsolete,
-  addSeconds,
   buildMarkerCommentBody,
   buildStateCommentBody,
   closeActiveMarker,
   collectCurrentHeadCodexFindings,
-  codexAutoReviewLooksOngoing,
   createInitialState,
+  decideBootstrapProgress,
   findLatestTrustedMarkerComment,
   findLatestTrustedStateComment,
   hasNewEyesTransition,
@@ -181,31 +180,26 @@ async function advanceBootstrap(state, stateComment, snapshot) {
 
   const now = isoNow();
   const startedAt = state.bootstrap?.startedAt || now;
-  const graceEndsAt = addSeconds(startedAt, config.bootstrapGraceSeconds);
-  const timeoutAt = addSeconds(startedAt, config.bootstrapTimeoutSeconds);
-  const graceOpen = Date.now() < parseTimestamp(graceEndsAt, "bootstrap grace deadline");
-  const timeoutOpen = Date.now() < parseTimestamp(timeoutAt, "bootstrap timeout deadline");
-  const autoReviewLooksOngoing = codexAutoReviewLooksOngoing(snapshot.reactions);
+  const bootstrapProgress = decideBootstrapProgress({
+    startedAt,
+    nowMs: Date.now(),
+    graceSeconds: config.bootstrapGraceSeconds,
+    reactions: snapshot.reactions,
+  });
 
   state = normalizeState({
     ...state,
     updatedAt: now,
     bootstrap: {
       ...state.bootstrap,
-      status: graceOpen || (autoReviewLooksOngoing && timeoutOpen) ? "open" : "closed",
+      status: bootstrapProgress.status,
       startedAt,
-      graceEndsAt,
-      timeoutAt,
+      graceEndsAt: bootstrapProgress.graceEndsAt,
       baseline: snapshot.reactions,
       currentHeadFindingIds: snapshot.findings.ids,
-      closedAt: graceOpen || (autoReviewLooksOngoing && timeoutOpen) ? state.bootstrap?.closedAt : now,
-      closeReason: graceOpen
-        ? undefined
-        : autoReviewLooksOngoing && timeoutOpen
-          ? undefined
-          : autoReviewLooksOngoing
-            ? "bootstrap_timeout"
-            : "bootstrap_quiet",
+      closedAt: bootstrapProgress.closedAt || state.bootstrap?.closedAt,
+      closeReason: bootstrapProgress.closeReason,
+      autoReviewLooksOngoing: bootstrapProgress.autoReviewLooksOngoing,
     },
   });
 
@@ -216,10 +210,12 @@ async function advanceBootstrap(state, stateComment, snapshot) {
     return { kind: "continue", state, stateComment };
   }
 
-  const description = graceOpen
-    ? "Waiting for initial Codex auto-review baseline grace period"
-    : "Waiting for PR-open Codex auto-review to finish before gate marker";
-  return { kind: "wait", description, state, stateComment };
+  return {
+    kind: "wait",
+    description: "Waiting for initial Codex auto-review baseline grace period",
+    state,
+    stateComment,
+  };
 }
 
 async function advanceMarker(state, stateComment, snapshot) {
@@ -405,7 +401,6 @@ function readConfig() {
     markerTimeoutMs: secondsEnv("MARKER_TIMEOUT_SECONDS", 3600, { allowZero: false }) * 1000,
     pollIntervalMs: secondsEnv("POLL_INTERVAL_SECONDS", 30, { allowZero: false }) * 1000,
     bootstrapGraceSeconds: secondsEnv("BOOTSTRAP_GRACE_SECONDS", 60, { allowZero: true }),
-    bootstrapTimeoutSeconds: secondsEnv("BOOTSTRAP_TIMEOUT_SECONDS", 3600, { allowZero: false }),
     codexBotLogins: parseLoginSet(process.env.CODEX_BOT_LOGINS || "", DEFAULT_CODEX_BOT_LOGINS),
     trustedCommentLogins: parseLoginSet(
       process.env.TRUSTED_COMMENT_LOGINS || "",

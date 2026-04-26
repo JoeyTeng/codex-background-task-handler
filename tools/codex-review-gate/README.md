@@ -31,7 +31,7 @@ The checked-in runner implements the reaction-driven serialized marker design:
 - `.github/workflows/codex-review-gate.yml` 使用 `pull_request_target`，因此 gate 由默认分支上的可信 workflow 控制，不执行 PR 代码。
 - workflow 会把 `codex/review-gate` commit status 写到 PR head SHA。
 - 如果当前 head SHA 已经有 Codex inline review comments，status 直接失败。
-- 第一次运行会先记录 PR-open automatic review 已经产生的 Codex `eyes` / `+1` / inline comments，作为 bootstrap baseline。
+- 第一次运行会先记录 PR-open automatic review 已经产生的 Codex `eyes` / `+1` / inline comments，作为 bootstrap baseline；只等待一个短 bootstrap grace window，然后就进入 controlled marker。
 - 之后 workflow 同一时间只维护一条 controlled marker comment：
 
   ```text
@@ -56,9 +56,10 @@ The checked-in runner implements the reaction-driven serialized marker design:
 - 如果 push 发生时旧 marker 还没完成，runner 会立刻把旧 marker 标为 `obsolete_head`，然后为最新 head 重新 baseline / 发 marker；不会等旧 marker 的一小时 timeout。
 - 如果 sticky state comment 丢失，runner 不会把旧 marker comment 重新激活为可通过的 active marker；它会把该 marker 记为 `state_lost`，重新 baseline 后发新 marker。
 - 实测后触发的 Codex review 可能 supersede 早先 onflight review，且旧 marker comment 上的小眼睛不会被移除；这些旧 `eyes` 只作为历史 liveness，不作为必须等待 completion 的代数关系。
+- bootstrap 同样不等待旧 `eyes` 闭合；grace 结束后即使 auto review 看起来还在 ongoing，也会发 controlled marker 让当前 head review 接管。
 - 通过前 workflow 会再次确认当前 head 没有 Codex inline review comments。
 - 如果旧 `+1` 已存在且不变化，gate 保持 pending；marker 一小时级 timeout 后标为 stalled 并重新 baseline / 重发。
-- 当前默认 overall timeout 是 2 小时，marker timeout 是 1 小时。
+- 当前默认 overall timeout 是 2 小时，marker timeout 是 1 小时，bootstrap grace 是 60 秒。
 
 ## Composite Action Usage
 

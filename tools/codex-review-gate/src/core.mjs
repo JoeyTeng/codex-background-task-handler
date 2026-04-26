@@ -129,6 +129,30 @@ export function codexAutoReviewLooksOngoing(reactions) {
   );
 }
 
+export function decideBootstrapProgress({ startedAt, nowMs, graceSeconds, reactions }) {
+  const graceEndsAt = addSeconds(startedAt, graceSeconds);
+  const graceOpen = nowMs < parseTimestamp(graceEndsAt, "bootstrap grace deadline");
+  const autoReviewLooksOngoing = codexAutoReviewLooksOngoing(reactions);
+
+  if (graceOpen) {
+    return {
+      status: "open",
+      startedAt,
+      graceEndsAt,
+      autoReviewLooksOngoing,
+    };
+  }
+
+  return {
+    status: "closed",
+    startedAt,
+    graceEndsAt,
+    closedAt: isoNow(nowMs),
+    closeReason: autoReviewLooksOngoing ? "bootstrap_superseded_ongoing" : "bootstrap_quiet",
+    autoReviewLooksOngoing,
+  };
+}
+
 export function collectCurrentHeadCodexFindings(
   reviewComments,
   headSha,

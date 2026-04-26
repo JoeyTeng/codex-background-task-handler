@@ -46,8 +46,8 @@ On the first gate run for a PR:
 1. Collect current Codex reactions, top-level comments, PR reviews, and inline review comments.
 2. Record all existing Codex `eyes`, `+1`, and inline findings as bootstrap baseline.
 3. If current `HEAD_SHA` already has Codex inline findings, fail the current status.
-4. If the PR-open auto review appears to be ongoing, keep the gate pending until it produces a terminal visible signal or until a bounded bootstrap wait expires.
-5. After bootstrap is closed, create the first controlled `@codex review` marker for the current head.
+4. Keep the gate pending only during a short bootstrap grace period, so PR-open auto review signals that are already visible can be recorded.
+5. After the grace period, close bootstrap even if an old `eyes` reaction still looks ongoing, then create the first controlled `@codex review` marker for the current head. The controlled marker may supersede the out-of-band auto review.
 
 The first out-of-band `+1` or review comments are only baseline evidence. They do not pass `codex/review-gate`.
 
@@ -109,7 +109,7 @@ The thin parts are:
 
 - PR-body `+1` is not append-only. If GitHub keeps one active reaction per bot/content pair, there may be no new event for later clean reviews, so the gate can only stay pending and retry.
 - Timeout retry weakens strict attribution. A very delayed old review that deletes/re-adds or otherwise updates the `+1` after a new marker could be misattributed to the new marker. Long timeouts, serial markers, and fresh baselines reduce this risk but cannot eliminate it without a Codex-provided token, commit id, or per-marker reaction target.
-- Bootstrap is inherently weaker because PR-open auto review is not marker controlled. The first round must treat existing signals as baseline only, and may need a bootstrap quiet period before the first controlled marker.
+- Bootstrap is inherently weaker because PR-open auto review is not marker controlled. The first round treats existing signals as baseline only, waits for a short grace period, then starts a controlled marker even when a stale `eyes` reaction remains visible.
 - If Codex stops emitting PR-body `+1` for clean reviews, the gate should stall rather than pass. That is fail-closed but may block merges until the signal model is revised.
 - If Codex moves findings from inline review comments to top-level comments, the current script would not classify them as findings. This is accepted for now and partially covered by requiring conversation resolution, but it is not a full substitute for a first-class Codex verdict.
 - If GitHub review APIs omit or misreport commit ids, current-head finding detection becomes weaker. The implementation should prefer review/comment `commit_id` and treat ambiguous Codex findings conservatively when possible.
