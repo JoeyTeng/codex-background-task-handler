@@ -6,18 +6,24 @@
 
 ## Repo CI / review gate
 
-- 已新增一个外围 `codex/review-gate` commit status：
+- 已新增一个外围 `codex/review-gate` commit status，当前脚本仍是早期 token-echo 方案，但实测后设计已收口到新的 reaction-driven gate。详见 [Codex Review Gate Design](./CODEX_REVIEW_GATE_DESIGN.md)。
+- 当前设计结论：
   - workflow 使用 `pull_request_target` 运行默认分支上的可信脚本，不执行 PR 代码
-  - 脚本把 status 写到 PR 当前 head SHA
-  - 当前 head 上 Codex inline review comments 会使 gate fail
-  - 每个 workflow run 都创建新的 marker comment，用于触发 Codex 并建立等待起点
-  - pass signal 只接受 marker 后的 Codex top-level comment，且必须原样带回本次 marker 的 `codex-review-gate-token`
-  - 通过前会再次确认当前 head 没有 Codex inline review comments，不依赖 Codex clean summary 的自然语言文案
-  - 创建 marker 前和通过前会重新确认 PR head 没变；PR body reaction 不作为通过信号，因为它不能绑定到当前 head
+  - status 写到 PR 当前 head SHA
+  - 当前 head 上 Codex inline review comments 是确定性 failure signal
+  - pass 不再依赖 Codex clean comment 文案，也不再要求 Codex echo token
+  - gate 维护一条 sticky state comment，并串行管理 `@codex review` marker
+  - PR-open 自动 review 是 bootstrap baseline，不用于通过 gate
+  - `eyes` 只表示 ongoing，不能通过 gate
+  - `+1` 只有在 marker baseline 之后出现新的 reaction identity 或 `created_at` 变化时，才是 pass candidate
+  - 旧的、未变化的 `+1` 不能复用；一小时级 timeout 后只能把 marker 标成 stalled 并重发
+  - pass 前必须重新确认 PR head 未变，且当前 head 没有 Codex inline findings
+  - repository ruleset 还应额外要求所有 conversations resolved
 - workflow 落到默认分支后，还需要把 `codex/review-gate` 加进远端 ruleset 的 required status checks。
 - 2026-04-25 用临时非默认 base branch 测试过：PR 只触发普通 `pull_request` CI，没有触发 `Codex Review Gate`；真实 GitHub Actions bot 路径要等 workflow 进入 repository default branch 后再测。
 - 2026-04-25 在默认分支首次实测时，`Codex Review Gate` 成功触发并写入 `codex/review-gate` status，但 marker comment 创建失败：workflow 选择了 `CODEX_REVIEW_GATE_TOKEN` secret，导致 `POST /issues/8/comments` 返回 `403 Resource not accessible by integration`。当前修正方向是强制使用 `github.token`，保证 marker 身份是 `github-actions[bot]`。
 - 强制使用 `github.token` 后，`GITHUB_TOKEN` 日志显示 `Issues: write` / `PullRequests: read` 仍无法创建 PR conversation comment；下一步把 `pull-requests` 权限提升到 `write` 后复测。
+- `pull-requests: write` 后，GitHub Actions bot 已能创建 `@codex review` marker；Codex clean case 实测会发 top-level `Codex Review: Didn't find any major issues...`，但不会 echo gate token。#8 的 PR body 上只看到一条 Codex `+1` active reaction，说明 PR-body reaction 不能当作 append-only counter，只能按 reaction identity / timestamp transition 使用。
 
 ## 当前架构方向
 

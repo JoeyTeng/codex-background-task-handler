@@ -2,11 +2,15 @@
 
 当前仍有几条关键 capability / contract 没实证完成；在这些项完成前，不应把 v1 描述成端到端已验证。
 
-- [ ] `codex/review-gate` workflow 合入 repository default branch 后，把同名 commit status 加进远端 ruleset 的 required status checks，并用一个后续测试 PR 验证：
-  - gate comment 可以触发 Codex
-  - marker 后的 Codex top-level comment 会原样带回本次 `codex-review-gate-token`，并在当前 head 没有 Codex inline findings 时使 status 通过
-  - 当前 head 上的 Codex inline review comments 会使 status 失败
-  - 不能用临时非默认 base branch 自测 `pull_request_target`，因为 workflow source/reference 来自 repository default branch
+- [ ] 把 `codex/review-gate` 从 token-echo 方案改成 [reaction-driven serialized marker design](./CODEX_REVIEW_GATE_DESIGN.md)：
+  - sticky PR state comment 记录 bootstrap baseline、active marker、reaction identity 和 status head
+  - PR-open auto review 的第一轮 `+1` / inline comments 只记录为 baseline，不用于 pass
+  - 同一 PR 同时最多一条 controlled `@codex review` marker
+  - `eyes` 只表示 ongoing
+  - pass 只接受 marker baseline 之后新的 Codex `+1` transition，并且当前 head 没有 Codex inline findings
+  - 旧的未变化 `+1` 必须保持 pending / stalled，不能复用
+  - stalled marker 可在一小时级 timeout 后重新 baseline 并重发
+  - repository ruleset 还需要要求 `codex/review-gate` status check 和所有 conversations resolved
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
 - [x] 确认桌面端私有 `app-server` 当前正持有该 rollout 文件。
 - [x] 实现最小 PoC 脚本，通过外部独立 `codex app-server` 对该 thread 执行 `read` / `resume` / `inject_items`。
