@@ -4,6 +4,21 @@
 
 验证一套纯外围方案，分别覆盖 Codex Desktop 与 CLI 两条交互路径，让长时间后台任务可以在不修改上游 `codex` 仓库的前提下恢复或继续 caller thread。
 
+## Repo CI / review gate
+
+- 已新增一个外围 `codex/review-gate` commit status：
+  - workflow 使用 `pull_request_target` 运行默认分支上的可信脚本，不执行 PR 代码
+  - 脚本把 status 写到 PR 当前 head SHA
+  - 当前 head 上 Codex inline review comments 会使 gate fail
+  - 每个 workflow run 都创建新的 marker comment，用于触发 Codex 并建立等待起点
+  - pass signal 只接受 marker 后的 Codex top-level comment，且必须原样带回本次 marker 的 `codex-review-gate-token`
+  - 通过前会再次确认当前 head 没有 Codex inline review comments，不依赖 Codex clean summary 的自然语言文案
+  - 创建 marker 前和通过前会重新确认 PR head 没变；PR body reaction 不作为通过信号，因为它不能绑定到当前 head
+- workflow 落到默认分支后，还需要把 `codex/review-gate` 加进远端 ruleset 的 required status checks。
+- 2026-04-25 用临时非默认 base branch 测试过：PR 只触发普通 `pull_request` CI，没有触发 `Codex Review Gate`；真实 GitHub Actions bot 路径要等 workflow 进入 repository default branch 后再测。
+- 2026-04-25 在默认分支首次实测时，`Codex Review Gate` 成功触发并写入 `codex/review-gate` status，但 marker comment 创建失败：workflow 选择了 `CODEX_REVIEW_GATE_TOKEN` secret，导致 `POST /issues/8/comments` 返回 `403 Resource not accessible by integration`。当前修正方向是强制使用 `github.token`，保证 marker 身份是 `github-actions[bot]`。
+- 强制使用 `github.token` 后，`GITHUB_TOKEN` 日志显示 `Issues: write` / `PullRequests: read` 仍无法创建 PR conversation comment；下一步把 `pull-requests` 权限提升到 `write` 后复测。
+
 ## 当前架构方向
 
 - 双端方案现在共享一套更清晰的核心抽象：
