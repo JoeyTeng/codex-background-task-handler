@@ -6,52 +6,65 @@ The repository workflow stays in `.github/workflows/codex-review-gate.yml` becau
 
 ## Files
 
+- `action.yml`: composite action wrapper for the runner.
 - `src/gate.mjs`: the GitHub Actions runner script.
+- `src/core.mjs`: testable state and signal helpers.
 - `DESIGN.md`: target signal model and state machine.
 - `TODO.md`: implementation and validation backlog for this subproject.
 
 ## Current Status
 
-The checked-in runner is still the legacy token-echo implementation:
+The checked-in runner implements the reaction-driven serialized marker design:
 
 - It runs under `pull_request_target` from the repository default branch.
 - It writes the `codex/review-gate` commit status to the PR head SHA.
 - It fails when Codex inline review comments exist on the current head.
-- It creates a fresh `@codex review` marker comment.
-- It currently waits for Codex to echo a `codex-review-gate-token` in a top-level comment.
-
-Live testing showed that Codex clean comments do not echo the token, so the next implementation step is the reaction-driven serialized marker design in `DESIGN.md`.
+- It keeps a trusted sticky PR state comment with hidden metadata.
+- It treats PR-open automatic review output as first-round baseline only.
+- It serializes controlled `@codex review` marker comments.
+- It treats Codex `eyes` reactions as liveness only.
+- It passes only when a new Codex PR-body `+1` reaction identity appears after the active marker baseline and the current head has no Codex inline findings.
+- It marks unchanged old `+1` reactions as pending/stalled instead of reusing them.
 
 ## 工作方式
 
 - `.github/workflows/codex-review-gate.yml` 使用 `pull_request_target`，因此 gate 由默认分支上的可信 workflow 控制，不执行 PR 代码。
 - workflow 会把 `codex/review-gate` commit status 写到 PR head SHA。
 - 如果当前 head SHA 已经有 Codex inline review comments，status 直接失败。
-- 否则 workflow 会为当前 run 创建新的 marker comment：
+- 第一次运行会先记录 PR-open automatic review 已经产生的 Codex `eyes` / `+1` / inline comments，作为 bootstrap baseline。
+- 之后 workflow 同一时间只维护一条 controlled marker comment：
 
   ```text
   @codex review
 
-  If this review is clean, include this exact line in your top-level response:
-
-  codex-review-gate-token: <run-attempt-head-token>
-
-  <!-- codex-review-gate
-  head=<head-sha>
-  run=<workflow-run-url>
-  run_attempt=<workflow-run-attempt>
-  token=<run-attempt-head-token>
+  <!-- codex-review-gate-marker
+  {
+    "headSha": "<head-sha>",
+    "baseline": {
+      "plusOne": "<current Codex +1 reaction identity or null>",
+      "eyes": "<current Codex eyes reaction identity or null>"
+    }
+  }
   -->
   ```
 
-- marker comment 用来触发 Codex 并建立当前 head 的等待起点；它本身不代表通过。每次 run 都创建新的 marker comment，避免同一 head 的重跑复用旧 trigger 后继续超时。
-- workflow 只接受 marker comment 之后 `chatgpt-codex-connector` 发出的 top-level PR comment，且该 comment 必须原样带回本次 marker 的 `codex-review-gate-token`。
-- 通过前 workflow 会再次确认当前 head 没有 Codex inline review comments；因此不会依赖 Codex 的自然语言 clean summary 文案。
-- PR body `+1` reaction 不能作为当前 head 的通过信号，因为它没有 commit 绑定，也可能来自别的 run/head 的延迟结果。
-- 创建 marker comment 前和通过前，workflow 都会重新确认 PR head 仍然等于本次 run 的 head SHA。
-- gate 超时时间是 30 分钟。
+- marker comment 用来触发 Codex 并建立当前 head 的等待起点；它本身不代表通过。
+- workflow 不解析 Codex clean comment 文案，也不要求 Codex echo token。
+- `eyes` 只说明 Codex ongoing。
+- pass candidate 只来自 marker baseline 之后新出现或更新的 Codex PR-body `+1` reaction identity。
+- 通过前 workflow 会再次确认当前 head 没有 Codex inline review comments。
+- 如果旧 `+1` 已存在且不变化，gate 保持 pending；marker 一小时级 timeout 后标为 stalled 并重新 baseline / 重发。
+- 当前默认 overall timeout 是 2 小时，marker timeout 是 1 小时。
 
-The token-echo behavior above is retained only as the current implementation note. It should be replaced by the design in `DESIGN.md`.
+## Composite Action Usage
+
+```yaml
+- uses: ./tools/codex-review-gate
+  with:
+    github-token: ${{ github.token }}
+    pull-request: ${{ github.event.pull_request.number }}
+    head-sha: ${{ github.event.pull_request.head.sha }}
+```
 
 ## Repository Setup
 

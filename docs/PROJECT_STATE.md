@@ -7,7 +7,7 @@
 ## Repo CI / review gate
 
 - `codex/review-gate` 已抽成 repo 内部子项目：[tools/codex-review-gate](../tools/codex-review-gate/README.md)。顶层 workflow 只保留 `.github/workflows/codex-review-gate.yml` thin wrapper。
-- 当前 runner 仍是 token-echo 实现；目标 reaction-driven serialized marker design 和后续 TODO 都维护在子项目内。
+- 当前 runner 已改成 reaction-driven serialized marker design，并通过本地 composite action wrapper 调用；后续剩余项是 live PR 验证和 ruleset 配置。
 
 ## 当前架构方向
 

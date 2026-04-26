@@ -1,20 +1,33 @@
 #!/usr/bin/env node
 
-const STATUS_CONTEXT = "codex/review-gate";
-const CODEX_BOT_LOGINS = new Set([
-  "chatgpt-codex-connector",
-  "chatgpt-codex-connector[bot]",
-]);
-const GATE_MARKER = "codex-review-gate";
-
-class GateFailure extends Error {
-  constructor(state, description, message) {
-    super(message);
-    this.name = "GateFailure";
-    this.state = state;
-    this.description = description;
-  }
-}
+import {
+  DEFAULT_CODEX_BOT_LOGINS,
+  DEFAULT_TRUSTED_COMMENT_LOGINS,
+  GateFailure,
+  STATUS_CONTEXT,
+  addSeconds,
+  buildMarkerCommentBody,
+  buildStateCommentBody,
+  closeActiveMarker,
+  collectCurrentHeadCodexFindings,
+  codexAutoReviewLooksOngoing,
+  createInitialState,
+  findLatestTrustedMarkerComment,
+  findLatestTrustedStateComment,
+  hasNewEyesTransition,
+  hasNewPlusOneTransition,
+  isoNow,
+  markerFromComment,
+  normalizeState,
+  parseLoginSet,
+  parseStateCommentBody,
+  parseTimestamp,
+  reconcileStateWithMarkerComment,
+  stateFromMarkerComment,
+  summarizeCodexReactions,
+  truncate,
+  updateStateForStatus,
+} from "./core.mjs";
 
 const config = readConfig();
 const repo = parseRepo(config.repository);
@@ -55,15 +68,318 @@ async function main() {
     return;
   }
 
-  await failIfPullRequestHeadChanged("before checking Codex findings");
-  await failIfCurrentHeadHasCodexFindings();
-  await failIfPullRequestHeadChanged("before creating Codex review trigger");
-  const gateComment = await createGateComment();
-  console.log(`Watching gate comment ${gateComment.html_url || `#${gateComment.id}`} for ${statusSha}.`);
+  await driveGate();
+}
 
-  await waitForCodexResult(gateComment);
-  await setCommitStatus("success", "Codex reviewed current head without inline findings");
-  console.log(`${STATUS_CONTEXT} passed for ${statusSha}.`);
+async function driveGate() {
+  const deadline = Date.now() + config.maxWaitMs;
+  let stateComment = null;
+  let state = null;
+
+  while (true) {
+    await failIfPullRequestHeadChanged();
+    const snapshot = await loadSnapshot();
+    failIfCurrentHeadHasCodexFindings(snapshot.findings);
+
+    ({ state, stateComment } = await ensureState(snapshot, state, stateComment));
+    state = updateStateForStatus(state, {
+      now: isoNow(),
+      statusHead: statusSha,
+      runUrl,
+      status: "pending",
+    });
+
+    const bootstrapResult = await advanceBootstrap(state, stateComment, snapshot);
+    state = bootstrapResult.state;
+    stateComment = bootstrapResult.stateComment;
+    if (bootstrapResult.kind === "wait") {
+      await waitOrTimeout(deadline, bootstrapResult.description);
+      continue;
+    }
+
+    const markerResult = await advanceMarker(state, stateComment, snapshot);
+    state = markerResult.state;
+    stateComment = markerResult.stateComment;
+
+    if (markerResult.kind === "pass") {
+      await failIfPullRequestHeadChanged("before passing Codex review gate");
+      const finalSnapshot = await loadSnapshot();
+      failIfCurrentHeadHasCodexFindings(finalSnapshot.findings);
+      await setCommitStatus("success", "Codex +1 observed and current head has no inline findings");
+      state = closeActiveMarker(state, "passed", isoNow(), {
+        observedPlusOne: state.activeMarker?.observedPlusOne || snapshot.reactions.plusOne,
+      });
+      try {
+        stateComment = await saveState(state, stateComment);
+      } catch (stateError) {
+        console.error(`failed to close gate marker after success: ${stateError.message}`);
+      }
+      console.log(`${STATUS_CONTEXT} passed for ${statusSha}.`);
+      return;
+    }
+
+    if (markerResult.kind === "continue") {
+      continue;
+    }
+
+    await waitOrTimeout(deadline, markerResult.description);
+  }
+}
+
+async function ensureState(snapshot, previousState, previousComment) {
+  if (previousState && previousComment) {
+    return { state: previousState, stateComment: previousComment };
+  }
+
+  const stateComment = findLatestTrustedStateComment(snapshot.comments, config.trustedCommentLogins);
+  if (stateComment) {
+    const markerComment = findLatestTrustedMarkerComment(snapshot.comments, config.trustedCommentLogins);
+    const reconciled = reconcileStateWithMarkerComment(
+      parseStateCommentBody(stateComment.body || ""),
+      markerComment,
+      isoNow(),
+    );
+    const reconciledStateComment = reconciled.changed
+      ? await saveState(reconciled.state, stateComment)
+      : stateComment;
+
+    return {
+      state: reconciled.state,
+      stateComment: reconciledStateComment,
+    };
+  }
+
+  const markerComment = findLatestTrustedMarkerComment(snapshot.comments, config.trustedCommentLogins);
+  const now = isoNow();
+  const state = markerComment
+    ? stateFromMarkerComment({
+        markerComment,
+        marker: markerFromComment(markerComment),
+        now,
+        statusHead: statusSha,
+        runUrl,
+      })
+    : createInitialState({
+        now,
+        statusHead: statusSha,
+        runUrl,
+        reactions: snapshot.reactions,
+        findings: snapshot.findings,
+      });
+
+  const createdStateComment = await saveState(state, null);
+  return { state, stateComment: createdStateComment };
+}
+
+async function advanceBootstrap(state, stateComment, snapshot) {
+  if (state.bootstrap?.status === "closed") {
+    return { kind: "continue", state, stateComment };
+  }
+
+  const now = isoNow();
+  const startedAt = state.bootstrap?.startedAt || now;
+  const graceEndsAt = addSeconds(startedAt, config.bootstrapGraceSeconds);
+  const timeoutAt = addSeconds(startedAt, config.bootstrapTimeoutSeconds);
+  const graceOpen = Date.now() < parseTimestamp(graceEndsAt, "bootstrap grace deadline");
+  const timeoutOpen = Date.now() < parseTimestamp(timeoutAt, "bootstrap timeout deadline");
+  const autoReviewLooksOngoing = codexAutoReviewLooksOngoing(snapshot.reactions);
+
+  state = normalizeState({
+    ...state,
+    updatedAt: now,
+    bootstrap: {
+      ...state.bootstrap,
+      status: graceOpen || (autoReviewLooksOngoing && timeoutOpen) ? "open" : "closed",
+      startedAt,
+      graceEndsAt,
+      timeoutAt,
+      baseline: snapshot.reactions,
+      currentHeadFindingIds: snapshot.findings.ids,
+      closedAt: graceOpen || (autoReviewLooksOngoing && timeoutOpen) ? state.bootstrap?.closedAt : now,
+      closeReason: graceOpen
+        ? undefined
+        : autoReviewLooksOngoing && timeoutOpen
+          ? undefined
+          : autoReviewLooksOngoing
+            ? "bootstrap_timeout"
+            : "bootstrap_quiet",
+    },
+  });
+
+  stateComment = await saveState(state, stateComment);
+
+  if (state.bootstrap.status === "closed") {
+    console.log(`Bootstrap baseline closed: ${state.bootstrap.closeReason}.`);
+    return { kind: "continue", state, stateComment };
+  }
+
+  const description = graceOpen
+    ? "Waiting for initial Codex auto-review baseline grace period"
+    : "Waiting for PR-open Codex auto-review to finish before gate marker";
+  return { kind: "wait", description, state, stateComment };
+}
+
+async function advanceMarker(state, stateComment, snapshot) {
+  if (!state.activeMarker) {
+    const marker = await createGateMarker(snapshot.reactions, state);
+    state = normalizeState({
+      ...state,
+      updatedAt: isoNow(),
+      activeMarker: marker,
+    });
+    stateComment = await saveState(state, stateComment);
+    await setCommitStatus("pending", "Waiting for Codex +1 on controlled review marker");
+    return {
+      kind: "wait",
+      description: `Created controlled Codex marker ${marker.url || `#${marker.id}`}`,
+      state,
+      stateComment,
+    };
+  }
+
+  let activeMarker = state.activeMarker;
+  if (activeMarker.state === "pass_candidate") {
+    if (activeMarker.headSha !== statusSha) {
+      state = closeActiveMarker(state, "plus_one_observed_obsolete_head", isoNow(), {
+        observedPlusOne: activeMarker.observedPlusOne || snapshot.reactions.plusOne,
+      });
+      stateComment = await saveState(state, stateComment);
+      console.log(
+        `Recovered Codex +1 for obsolete head ${activeMarker.headSha}; current head is ${statusSha}.`,
+      );
+      return { kind: "continue", state, stateComment };
+    }
+
+    return { kind: "pass", state, stateComment };
+  }
+
+  if (hasNewEyesTransition(activeMarker.baseline?.eyes, snapshot.reactions.eyes, activeMarker.createdAt)) {
+    activeMarker = {
+      ...activeMarker,
+      state: "waiting_result",
+      observedEyes: snapshot.reactions.eyes,
+    };
+    state = normalizeState({
+      ...state,
+      updatedAt: isoNow(),
+      activeMarker,
+    });
+    stateComment = await saveState(state, stateComment);
+  }
+
+  if (
+    hasNewPlusOneTransition(
+      activeMarker.baseline?.plusOne,
+      snapshot.reactions.plusOne,
+      activeMarker.createdAt,
+    )
+  ) {
+    if (activeMarker.headSha !== statusSha) {
+      state = closeActiveMarker(state, "plus_one_observed_obsolete_head", isoNow(), {
+        observedPlusOne: snapshot.reactions.plusOne,
+      });
+      stateComment = await saveState(state, stateComment);
+      console.log(
+        `Codex +1 closed marker for obsolete head ${activeMarker.headSha}; current head is ${statusSha}.`,
+      );
+      return { kind: "continue", state, stateComment };
+    }
+
+    state = normalizeState({
+      ...state,
+      updatedAt: isoNow(),
+      activeMarker: {
+        ...activeMarker,
+        state: "pass_candidate",
+        passCandidateAt: isoNow(),
+        observedPlusOne: snapshot.reactions.plusOne,
+      },
+    });
+    stateComment = await saveState(state, stateComment);
+    return { kind: "pass", state, stateComment };
+  }
+
+  const markerAgeMs = Date.now() - parseTimestamp(activeMarker.createdAt, "marker creation time");
+  if (markerAgeMs >= config.markerTimeoutMs) {
+    state = closeActiveMarker(state, "stalled", isoNow(), {
+      stalledAfterSeconds: Math.round(config.markerTimeoutMs / 1000),
+      lastObservedPlusOne: snapshot.reactions.plusOne,
+      lastObservedEyes: snapshot.reactions.eyes,
+    });
+    stateComment = await saveState(state, stateComment);
+    await setCommitStatus("pending", "Codex review marker stalled; retrying with fresh baseline");
+    console.log(`Marker ${activeMarker.id} stalled; re-baselining before retry.`);
+    return { kind: "continue", state, stateComment };
+  }
+
+  const remainingSeconds = Math.round((config.markerTimeoutMs - markerAgeMs) / 1000);
+  return {
+    kind: "wait",
+    description: `Waiting for Codex +1 transition (${remainingSeconds}s before marker retry)`,
+    state,
+    stateComment,
+  };
+}
+
+async function createGateMarker(reactionBaseline, state) {
+  const attempt = (state.history || []).length + 1;
+  const marker = {
+    version: 1,
+    headSha: statusSha,
+    runUrl,
+    runId: config.runId,
+    runAttempt: config.runAttempt,
+    attempt,
+    baseline: reactionBaseline,
+    state: "waiting_ack",
+  };
+
+  const { data } = await request("POST", `${repoPath}/issues/${config.prNumber}/comments`, {
+    body: buildMarkerCommentBody(marker),
+  });
+
+  const created = {
+    ...marker,
+    id: String(data.id),
+    url: data.html_url || null,
+    createdAt: data.created_at,
+  };
+  console.log(`Created controlled Codex marker ${created.url || `#${created.id}`} for ${statusSha}.`);
+  return created;
+}
+
+async function saveState(state, stateComment) {
+  const body = buildStateCommentBody(state);
+  if (stateComment?.id) {
+    const { data } = await request("PATCH", `${repoPath}/issues/comments/${stateComment.id}`, { body });
+    return data;
+  }
+
+  const { data } = await request("POST", `${repoPath}/issues/${config.prNumber}/comments`, { body });
+  console.log(`Created gate state comment ${data.html_url || `#${data.id}`}.`);
+  return data;
+}
+
+async function loadSnapshot() {
+  const [comments, issueReactions, reviewComments] = await Promise.all([
+    paginate(`${repoPath}/issues/${config.prNumber}/comments`, { per_page: "100" }),
+    paginate(`${repoPath}/issues/${config.prNumber}/reactions`, { per_page: "100" }),
+    paginate(`${repoPath}/pulls/${config.prNumber}/comments`, { per_page: "100" }),
+  ]);
+
+  const findings = collectCurrentHeadCodexFindings(
+    reviewComments,
+    statusSha,
+    config.codexBotLogins,
+  );
+
+  return {
+    comments,
+    issueReactions,
+    reviewComments,
+    reactions: summarizeCodexReactions(issueReactions, config.codexBotLogins),
+    findings,
+  };
 }
 
 function readConfig() {
@@ -85,8 +401,16 @@ function readConfig() {
     serverUrl: stripTrailingSlash(process.env.GITHUB_SERVER_URL || "https://github.com"),
     runId: requiredEnv("GITHUB_RUN_ID"),
     runAttempt: process.env.GITHUB_RUN_ATTEMPT || "1",
-    maxWaitMs: secondsEnv("MAX_WAIT_SECONDS", 1800) * 1000,
-    pollIntervalMs: secondsEnv("POLL_INTERVAL_SECONDS", 30) * 1000,
+    maxWaitMs: secondsEnv("MAX_WAIT_SECONDS", 7200, { allowZero: false }) * 1000,
+    markerTimeoutMs: secondsEnv("MARKER_TIMEOUT_SECONDS", 3600, { allowZero: false }) * 1000,
+    pollIntervalMs: secondsEnv("POLL_INTERVAL_SECONDS", 30, { allowZero: false }) * 1000,
+    bootstrapGraceSeconds: secondsEnv("BOOTSTRAP_GRACE_SECONDS", 60, { allowZero: true }),
+    bootstrapTimeoutSeconds: secondsEnv("BOOTSTRAP_TIMEOUT_SECONDS", 3600, { allowZero: false }),
+    codexBotLogins: parseLoginSet(process.env.CODEX_BOT_LOGINS || "", DEFAULT_CODEX_BOT_LOGINS),
+    trustedCommentLogins: parseLoginSet(
+      process.env.TRUSTED_COMMENT_LOGINS || "",
+      DEFAULT_TRUSTED_COMMENT_LOGINS,
+    ),
   };
 }
 
@@ -98,14 +422,15 @@ function requiredEnv(name) {
   return value;
 }
 
-function secondsEnv(name, fallback) {
+function secondsEnv(name, fallback, { allowZero }) {
   const raw = process.env[name];
   if (!raw) {
     return fallback;
   }
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error(`${name} must be a positive number`);
+  const valid = Number.isFinite(parsed) && (allowZero ? parsed >= 0 : parsed > 0);
+  if (!valid) {
+    throw new Error(`${name} must be a ${allowZero ? "non-negative" : "positive"} number`);
   }
   return parsed;
 }
@@ -131,69 +456,6 @@ async function loadPullRequest() {
   return data;
 }
 
-async function createGateComment() {
-  const gateToken = createGateToken();
-  const body = [
-    "@codex review",
-    "",
-    "If this review is clean, include this exact line in your top-level response:",
-    "",
-    `codex-review-gate-token: ${gateToken}`,
-    "",
-    `<!-- ${GATE_MARKER}`,
-    `head=${statusSha}`,
-    `run=${runUrl}`,
-    `run_attempt=${config.runAttempt}`,
-    `token=${gateToken}`,
-    "-->",
-  ].join("\n");
-
-  const { data } = await request("POST", `${repoPath}/issues/${config.prNumber}/comments`, {
-    body,
-  });
-  console.log(`Created gate comment ${data.html_url || `#${data.id}`}.`);
-  data.gateToken = gateToken;
-  return data;
-}
-
-function createGateToken() {
-  return `${config.runId}.${config.runAttempt}.${statusSha}`;
-}
-
-async function waitForCodexResult(gateComment) {
-  const deadline = Date.now() + config.maxWaitMs;
-  const gateCreatedAt = parseTimestamp(gateComment.created_at, "gate comment creation time");
-  const gateToken = gateComment.gateToken || extractGateToken(gateComment.body || "");
-
-  while (true) {
-    await failIfPullRequestHeadChanged();
-    await failIfCurrentHeadHasCodexFindings();
-
-    const reviewSignal = await findCodexReviewSignal(gateCreatedAt, gateToken);
-    if (reviewSignal) {
-      await failIfPullRequestHeadChanged();
-      await failIfCurrentHeadHasCodexFindings();
-      console.log(`Codex ${reviewSignal.kind} observed at ${reviewSignal.createdAt}.`);
-      return;
-    }
-
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) {
-      throw new GateFailure(
-        "failure",
-        "Timed out waiting for Codex review response",
-        `Timed out after ${Math.round(config.maxWaitMs / 1000)}s waiting for Codex token echo on ${statusSha}.`,
-      );
-    }
-
-    console.log(
-      `No Codex review signal yet; sleeping ${Math.round(config.pollIntervalMs / 1000)}s ` +
-        `(${Math.round(remainingMs / 1000)}s remaining).`,
-    );
-    await sleep(Math.min(config.pollIntervalMs, remainingMs));
-  }
-}
-
 async function failIfPullRequestHeadChanged(phase = "while waiting for Codex") {
   const pullRequest = await loadPullRequest();
   failIfLoadedPullRequestHeadChanged(pullRequest, phase);
@@ -211,43 +473,7 @@ function failIfLoadedPullRequestHeadChanged(pullRequest, phase) {
   );
 }
 
-async function findCodexReviewSignal(gateCreatedAt, gateToken) {
-  const comments = await paginate(`${repoPath}/issues/${config.prNumber}/comments`, {
-    per_page: "100",
-  });
-  const reviewComment = comments.find((comment) => {
-    const createdAt = parseTimestamp(comment.created_at, "issue comment creation time");
-    return (
-      createdAt >= gateCreatedAt &&
-      isCodexBot(comment.user?.login) &&
-      hasGateToken(comment.body || "", gateToken)
-    );
-  });
-  if (reviewComment) {
-    return {
-      kind: "top-level token echo",
-      createdAt: reviewComment.created_at,
-      url: reviewComment.html_url,
-    };
-  }
-
-  return null;
-}
-
-function hasGateToken(body, gateToken) {
-  return body.includes(`codex-review-gate-token: ${gateToken}`);
-}
-
-function extractGateToken(body) {
-  const match = body.match(/^token=(.+)$/m);
-  if (!match) {
-    throw new Error("gate comment is missing correlation token");
-  }
-  return match[1].trim();
-}
-
-async function failIfCurrentHeadHasCodexFindings() {
-  const findings = await findCurrentHeadCodexFindings();
+function failIfCurrentHeadHasCodexFindings(findings) {
   if (findings.count === 0) {
     return;
   }
@@ -261,45 +487,22 @@ async function failIfCurrentHeadHasCodexFindings() {
   );
 }
 
-async function findCurrentHeadCodexFindings() {
-  const reviews = await paginate(`${repoPath}/pulls/${config.prNumber}/reviews`, {
-    per_page: "100",
-  });
-  const currentCodexReviews = reviews.filter(
-    (review) => isCodexBot(review.user?.login) && review.commit_id === statusSha,
-  );
-
-  const samples = [];
-  let count = 0;
-
-  for (const review of currentCodexReviews) {
-    const comments = await paginate(
-      `${repoPath}/pulls/${config.prNumber}/reviews/${review.id}/comments`,
-      { per_page: "100" },
+async function waitOrTimeout(deadline, description) {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    throw new GateFailure(
+      "failure",
+      "Timed out waiting for Codex review signal",
+      `Timed out after ${Math.round(config.maxWaitMs / 1000)}s. Last state: ${description}.`,
     );
-    count += comments.length;
-
-    for (const comment of comments.slice(0, 3)) {
-      const location = [comment.path, comment.line || comment.original_line]
-        .filter((part) => part !== null && part !== undefined)
-        .join(":");
-      samples.push(location || `review ${review.id}`);
-    }
   }
 
-  return { count, samples };
-}
-
-function isCodexBot(login) {
-  return CODEX_BOT_LOGINS.has(login || "");
-}
-
-function parseTimestamp(value, description) {
-  const parsed = Date.parse(value);
-  if (Number.isNaN(parsed)) {
-    throw new Error(`invalid ${description}: ${value}`);
-  }
-  return parsed;
+  const sleepMs = Math.min(config.pollIntervalMs, remainingMs);
+  console.log(
+    `${description}; sleeping ${Math.round(sleepMs / 1000)}s ` +
+      `(${Math.round(remainingMs / 1000)}s remaining).`,
+  );
+  await sleep(sleepMs);
 }
 
 async function setCommitStatus(state, description) {
@@ -310,10 +513,6 @@ async function setCommitStatus(state, description) {
     target_url: runUrl,
   });
   console.log(`Set ${STATUS_CONTEXT}=${state}: ${description}`);
-}
-
-function truncate(value, maxLength) {
-  return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
 }
 
 async function paginate(path, query) {

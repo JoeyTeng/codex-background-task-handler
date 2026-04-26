@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check src/gate.mjs"
+    "check": "node --check src/core.mjs && node --check src/gate.mjs && node --check test/core.test.mjs",
+    "test": "node --test"
   }
 }

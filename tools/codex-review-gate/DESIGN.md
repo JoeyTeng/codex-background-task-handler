@@ -6,6 +6,8 @@
 
 The gate should fail closed. If the current head cannot be confidently associated with a clean Codex result, the status stays `pending` until timeout or becomes `failure`; it must not reuse an old clean signal.
 
+The runner is packaged as a local composite action so this directory can later move to an independent repository with the same call shape.
+
 ## Observed Signals
 
 - Codex inline PR review comments are the strongest failure signal. They carry a reviewed commit through the PR review / review-comment APIs, so comments attached to the current `HEAD_SHA` should fail the gate.
@@ -28,10 +30,12 @@ The state should record at least:
 - known Codex inline review / review-comment ids already counted as baseline
 - outstanding marker comment id, marker head sha, marker creation time, and marker attempt number
 - marker baseline `+1` identity
-- marker state: `waiting_ack`, `waiting_result`, `stalled`, `passed`, or `failed`
+- marker state: `waiting_ack`, `waiting_result`, `pass_candidate`, `stalled`, `passed`, or `failed`
 - last status write head and run url
 
 The script should also be able to reconstruct enough state from PR comments, reactions, and review comments if the sticky comment is missing. If reconstruction is ambiguous, fail closed or stay pending instead of passing.
+
+The current implementation trusts state and marker comments only from configured trusted authors. The default trusted author is `github-actions[bot]`, which matches the repository workflow's `GITHUB_TOKEN` path.
 
 ## Bootstrap Round
 
@@ -57,9 +61,10 @@ After bootstrap, the gate enforces a serialized marker relationship:
 4. `eyes` after the marker moves the state to ongoing, but the status remains `pending`.
 5. A pass candidate exists only when the active Codex `+1` reaction is absent in the marker baseline and now present, or its `id` / `created_at` changed after the marker baseline.
 6. A pre-existing unchanged `+1` is never reused for pass.
-7. On a pass candidate, re-fetch the PR and fail closed if `HEAD_SHA` changed.
-8. Re-check Codex inline findings for the current head. If any exist, set `codex/review-gate=failure`.
-9. If head is unchanged and current-head Codex inline findings are absent, set `codex/review-gate=success`.
+7. On a pass candidate, persist `pass_candidate` on the active marker before final validation so a rerun can recover the observed `+1`.
+8. Re-fetch the PR and fail closed if `HEAD_SHA` changed.
+9. Re-check Codex inline findings for the current head. If any exist, set `codex/review-gate=failure`.
+10. If head is unchanged and current-head Codex inline findings are absent, set `codex/review-gate=success`, then close the active marker as `passed`.
 
 If a push happens while a marker is outstanding, the new head should remain `pending`. The workflow should wait for the outstanding marker to close or timeout, then baseline again and issue a fresh marker for the latest head.
 

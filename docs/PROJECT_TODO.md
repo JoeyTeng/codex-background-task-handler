@@ -2,7 +2,7 @@
 
 当前仍有几条关键 capability / contract 没实证完成；在这些项完成前，不应把 v1 描述成端到端已验证。
 
-- [ ] 继续推进 repo 内部子项目 [tools/codex-review-gate](../tools/codex-review-gate/README.md)，把 runner 从 token-echo 方案改成 reaction-driven serialized marker design。
+- [ ] 用 live PR 验证 repo 内部子项目 [tools/codex-review-gate](../tools/codex-review-gate/README.md) 的 reaction-driven gate，然后配置 required status check 和 conversations-resolved branch protection。
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
 - [x] 确认桌面端私有 `app-server` 当前正持有该 rollout 文件。
 - [x] 实现最小 PoC 脚本，通过外部独立 `codex app-server` 对该 thread 执行 `read` / `resume` / `inject_items`。
