@@ -312,6 +312,45 @@ fn daemon_ensure_timeout_is_not_extended_by_slow_trickle_socket() {
     handle.join().expect("dummy listener thread");
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_serve_refuses_to_replace_active_socket() {
+    let home = tempfile::tempdir().expect("temp home");
+    let run_dir = home.path().join("run");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("chmod home");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+
+    let socket_path = run_dir.join("cbth.sock");
+    let _listener = UnixListener::bind(&socket_path).expect("bind dummy socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+
+    let stderr = cbth_failure(&home, &["daemon", "serve", "--idle-timeout-seconds", "1"]);
+    assert!(stderr.contains("daemon socket is already active"));
+    assert!(socket_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_serve_replaces_connection_refused_stale_socket() {
+    let home = tempfile::tempdir().expect("temp home");
+    let run_dir = home.path().join("run");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("chmod home");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+
+    let socket_path = run_dir.join("cbth.sock");
+    {
+        let _listener = UnixListener::bind(&socket_path).expect("bind stale socket");
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    }
+    assert!(socket_path.exists());
+
+    let shutdown = cbth(&home, &["daemon", "serve", "--idle-timeout-seconds", "1"]);
+    assert_eq!(shutdown["shutdown_reason"], "idle_timeout");
+    assert!(!socket_path.exists());
+}
+
 #[test]
 fn daemon_exits_after_idle_timeout() {
     let home = tempfile::tempdir().expect("temp home");

@@ -23,6 +23,7 @@ const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SOCKET_LIVENESS_TIMEOUT: Duration = Duration::from_millis(250);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug)]
@@ -614,10 +615,6 @@ fn read_limited_nonblocking(
 }
 
 fn prepare_socket_path(path: &Path) -> Result<()> {
-    if UnixStream::connect(path).is_ok() {
-        bail!("daemon socket is already active: {}", path.display());
-    }
-
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -629,11 +626,26 @@ fn prepare_socket_path(path: &Path) -> Result<()> {
     if metadata.uid() != effective_uid() {
         bail!("refusing to replace socket not owned by current user");
     }
+    match connect_unix_stream_until(path, Instant::now() + SOCKET_LIVENESS_TIMEOUT) {
+        Ok(_) => bail!("daemon socket is already active: {}", path.display()),
+        Err(error) if error_chain_has_io_kind(&error, io::ErrorKind::ConnectionRefused) => {}
+        Err(error) => bail!(
+            "refusing to replace socket with inconclusive liveness at {}: {error:#}",
+            path.display()
+        ),
+    }
     fs::remove_file(path).with_context(|| format!("remove stale socket {}", path.display()))?;
     if let Some(parent) = path.parent() {
         sync_dir(parent)?;
     }
     Ok(())
+}
+
+fn error_chain_has_io_kind(error: &anyhow::Error, kind: io::ErrorKind) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<io::Error>())
+        .any(|io_error| io_error.kind() == kind)
 }
 
 fn cleanup_stale_socket_best_effort(layout: &FsLayout) {
