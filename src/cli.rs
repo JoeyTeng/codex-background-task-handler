@@ -281,14 +281,12 @@ fn dispatch(command: Commands, layout: &FsLayout, mode: DispatchMode) -> Result<
     {
         let startup_sweep_now = daemon_startup_sweep_for_command(&command)?;
         validate_daemon_autostart_endpoint(layout)?;
-        daemon_ensure(
-            layout,
-            DaemonEnsureOptions {
-                idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
-                startup_timeout_seconds,
-                startup_sweep_now,
-            },
-        )?;
+        let ensure_options = DaemonEnsureOptions {
+            idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
+            startup_timeout_seconds,
+            startup_sweep_now,
+        };
+        daemon_ensure(layout, ensure_options)?;
         return daemon_request_payload(layout, "dispatch", json!({ "argv": argv_payload(argv) }));
     }
 

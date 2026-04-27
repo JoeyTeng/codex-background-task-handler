@@ -140,6 +140,32 @@ fn mutating_commands_default_to_daemon_dispatch() {
 }
 
 #[test]
+fn routed_mutating_commands_accept_daemon_startup_timeout_override() {
+    let home = temp_home();
+
+    let submitted = cbth(
+        &home,
+        &[
+            "--auto-daemon-startup-timeout-seconds",
+            "6",
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-timeout-override",
+            "--summary",
+            "wait with custom startup timeout",
+        ],
+    );
+    assert_eq!(
+        submitted["job"]["source_thread_id"],
+        "thread-timeout-override"
+    );
+
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
 fn daemon_dispatch_resolves_file_paths_before_handoff() {
     let home = temp_home();
     let client_cwd = tempfile::tempdir().expect("client cwd");
