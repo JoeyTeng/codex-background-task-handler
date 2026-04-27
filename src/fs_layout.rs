@@ -3,6 +3,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -261,20 +263,30 @@ pub fn validate_id_path_component(value: &str, name: &str) -> Result<()> {
 
 #[cfg(unix)]
 fn set_private_dir_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let dir = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)
-        .with_context(|| format!("open private directory {}", path.display()))?;
-    let metadata = dir
-        .metadata()
+    let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("stat private directory {}", path.display()))?;
     if !metadata.is_dir() {
         bail!("path exists but is not a directory: {}", path.display());
     }
-    let rc = unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) };
+
+    let parent = path
+        .parent()
+        .with_context(|| format!("path {} has no parent", path.display()))?;
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("path {} has no file name", path.display()))?;
+    let file_name = std::ffi::CString::new(file_name.as_bytes())
+        .with_context(|| format!("path {} contains an interior NUL", path.display()))?;
+    let parent = File::open(parent)
+        .with_context(|| format!("open parent directory for {}", path.display()))?;
+    let rc = unsafe {
+        libc::fchmodat(
+            parent.as_raw_fd(),
+            file_name.as_ptr(),
+            0o700,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
     if rc == 0 {
         Ok(())
     } else {
@@ -302,6 +314,8 @@ fn set_private_file_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
@@ -320,5 +334,24 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(leftovers, vec!["manifest.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_repairs_directory_without_read_permission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("private");
+        fs::create_dir(&target).expect("create private dir");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o300))
+            .expect("restrict private dir");
+
+        ensure_private_dir(&target).expect("repair private dir");
+
+        let mode = fs::symlink_metadata(&target)
+            .expect("private dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 }

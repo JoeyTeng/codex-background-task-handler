@@ -33,6 +33,8 @@ const DAEMON_CAPABILITIES: &[&str] = &["dispatch"];
 const MAX_DISPATCH_WORKERS: usize = 32;
 const RESERVED_CONTROL_WORKERS: usize = 8;
 const MAX_CLIENT_WORKERS: usize = MAX_DISPATCH_WORKERS + RESERVED_CONTROL_WORKERS;
+const DAEMON_BUSY_ERROR: &str = "daemon is busy";
+const DAEMON_CONNECTION_LIMIT_ERROR: &str = "daemon connection limit reached";
 
 #[derive(Clone, Copy, Debug)]
 pub struct DaemonServeOptions {
@@ -190,7 +192,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
             Ok((mut stream, _addr)) => {
                 last_activity = Instant::now();
                 if client_worker_capacity_reached(workers.len()) {
-                    let _ = write_error_response(&mut stream, "daemon connection limit reached");
+                    let _ = write_error_response(&mut stream, DAEMON_CONNECTION_LIMIT_ERROR);
                     continue;
                 }
                 state.active_clients.fetch_add(1, Ordering::AcqRel);
@@ -601,14 +603,18 @@ fn probe_existing_daemon_for_ensure(
 }
 
 fn error_is_daemon_busy(error: &anyhow::Error) -> bool {
-    error.to_string() == "daemon is busy"
+    let message = error.to_string();
+    matches!(
+        message.as_str(),
+        DAEMON_BUSY_ERROR | DAEMON_CONNECTION_LIMIT_ERROR
+    )
 }
 
 fn try_acquire_dispatch_slot(state: &DaemonState) -> Result<DispatchGuard<'_>> {
     loop {
         let current = state.active_dispatches.load(Ordering::Acquire);
         if current >= MAX_DISPATCH_WORKERS {
-            bail!("daemon is busy");
+            bail!(DAEMON_BUSY_ERROR);
         }
         if state
             .active_dispatches

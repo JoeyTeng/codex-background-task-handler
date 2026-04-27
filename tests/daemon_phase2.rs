@@ -351,7 +351,7 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
     let busy_socket_path = socket_path.clone();
     let handle = thread::spawn(move || {
-        for index in 0..2 {
+        for index in 0..3 {
             let (mut stream, _addr) = listener.accept().expect("accept busy daemon request");
             let mut request = String::new();
             stream
@@ -360,6 +360,8 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
             assert!(request.contains("\"ping\""));
             let response = if index == 0 {
                 r#"{"ok":false,"error":"daemon is busy"}"#
+            } else if index == 1 {
+                r#"{"ok":false,"error":"daemon connection limit reached"}"#
             } else {
                 r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#
             };
