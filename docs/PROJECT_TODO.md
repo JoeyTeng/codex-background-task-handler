@@ -2,7 +2,8 @@
 
 当前仍有几条关键 capability / contract 没实证完成；在这些项完成前，不应把 v1 描述成端到端已验证。
 
-- [ ] 用 live PR 验证 repo 内部子项目 [tools/codex-review-gate](../tools/codex-review-gate/README.md) 的 reaction-driven gate，然后配置 required status check 和 conversations-resolved branch protection。
+- [x] 用 live PR 验证 repo 内部子项目 [tools/codex-review-gate](../tools/codex-review-gate/README.md) 的 reaction-driven gate，然后配置 required status check 和 conversations-resolved branch protection。
+- [ ] 合入 `codex/review-gate-review-body-findings` 后，在 #12 或后续测试 PR 上验证 Codex review-body findings 会让 `codex/review-gate` deterministic failure，而旧 commit 的 review-body findings 不会 block 新 head。
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
 - [x] 确认桌面端私有 `app-server` 当前正持有该 rollout 文件。
 - [x] 实现最小 PoC 脚本，通过外部独立 `codex app-server` 对该 thread 执行 `read` / `resume` / `inject_items`。

@@ -5,6 +5,7 @@ import {
   activeMarkerIsObsolete,
   buildMarkerCommentBody,
   buildStateCommentBody,
+  codexReviewBodyFindingSample,
   codexAutoReviewLooksOngoing,
   collectCurrentHeadCodexFindings,
   decideBootstrapProgress,
@@ -13,6 +14,7 @@ import {
   hasNewCompletionComment,
   hasNewEyesTransition,
   hasNewPlusOneTransition,
+  isCurrentHeadCodexReviewBodyFinding,
   issueCommentIdentity,
   markerFromComment,
   parseStateCommentBody,
@@ -268,10 +270,83 @@ test("collects only current-head Codex inline findings", () => {
     },
   ];
 
-  assert.deepEqual(collectCurrentHeadCodexFindings(comments, "head"), {
+  assert.deepEqual(collectCurrentHeadCodexFindings(comments, [], "head"), {
     count: 1,
     ids: ["10"],
     samples: ["src/lib.rs:7"],
+  });
+});
+
+test("collects current-head Codex review-body findings", () => {
+  const body = [
+    "### 💡 Codex Review",
+    "",
+    "https://github.com/owner/repo/blob/head/src/daemon.rs#L285-L290",
+    "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> Finding title**",
+  ].join("\n");
+  const reviews = [
+    {
+      id: 20,
+      state: "COMMENTED",
+      commit_id: "head",
+      body,
+      user: { login: "chatgpt-codex-connector[bot]" },
+    },
+    {
+      id: 21,
+      state: "COMMENTED",
+      commit_id: "old",
+      body: body.replace("/blob/head/", "/blob/old/"),
+      user: { login: "chatgpt-codex-connector[bot]" },
+    },
+    {
+      id: 22,
+      state: "COMMENTED",
+      commit_id: "head",
+      body: "Codex Review: Didn't find any major issues. :+1:",
+      user: { login: "chatgpt-codex-connector[bot]" },
+    },
+  ];
+
+  assert.equal(isCurrentHeadCodexReviewBodyFinding(reviews[0], "head"), true);
+  assert.equal(isCurrentHeadCodexReviewBodyFinding(reviews[1], "head"), false);
+  assert.equal(isCurrentHeadCodexReviewBodyFinding(reviews[2], "head"), false);
+  assert.equal(codexReviewBodyFindingSample(body, "head"), "src/daemon.rs:285");
+  assert.deepEqual(collectCurrentHeadCodexFindings([], reviews, "head"), {
+    count: 1,
+    ids: ["review:20"],
+    samples: ["src/daemon.rs:285"],
+  });
+});
+
+test("combines inline and review-body Codex findings", () => {
+  const comments = [
+    {
+      id: 10,
+      path: "src/lib.rs",
+      line: 7,
+      commit_id: "head",
+      user: { login: "chatgpt-codex-connector[bot]" },
+    },
+  ];
+  const reviews = [
+    {
+      id: 20,
+      state: "COMMENTED",
+      commit_id: "head",
+      body: [
+        "### 💡 Codex Review",
+        "",
+        "https://github.com/owner/repo/blob/head/src/daemon.rs#L285-L290",
+      ].join("\n"),
+      user: { login: "chatgpt-codex-connector[bot]" },
+    },
+  ];
+
+  assert.deepEqual(collectCurrentHeadCodexFindings(comments, reviews, "head"), {
+    count: 2,
+    ids: ["10", "review:20"],
+    samples: ["src/lib.rs:7", "src/daemon.rs:285"],
   });
 });
 
