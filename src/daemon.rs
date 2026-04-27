@@ -30,7 +30,9 @@ const SOCKET_LIVENESS_TIMEOUT: Duration = Duration::from_millis(250);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_PROTOCOL_VERSION: u64 = 1;
 const DAEMON_CAPABILITIES: &[&str] = &["dispatch"];
-const MAX_CLIENT_WORKERS: usize = 32;
+const MAX_DISPATCH_WORKERS: usize = 32;
+const RESERVED_CONTROL_WORKERS: usize = 8;
+const MAX_CLIENT_WORKERS: usize = MAX_DISPATCH_WORKERS + RESERVED_CONTROL_WORKERS;
 
 #[derive(Clone, Copy, Debug)]
 pub struct DaemonServeOptions {
@@ -121,6 +123,7 @@ struct DaemonState {
     startup_sweep: SweepReport,
     stop_requested: AtomicBool,
     active_clients: AtomicUsize,
+    active_dispatches: AtomicUsize,
 }
 
 struct ActiveClientGuard<'a> {
@@ -130,6 +133,16 @@ struct ActiveClientGuard<'a> {
 impl Drop for ActiveClientGuard<'_> {
     fn drop(&mut self) {
         self.active_clients.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct DispatchGuard<'a> {
+    active_dispatches: &'a AtomicUsize,
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        self.active_dispatches.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -161,6 +174,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         startup_sweep,
         stop_requested: AtomicBool::new(false),
         active_clients: AtomicUsize::new(0),
+        active_dispatches: AtomicUsize::new(0),
     });
     let mut last_activity = Instant::now();
     let mut workers = Vec::new();
@@ -176,7 +190,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
             Ok((mut stream, _addr)) => {
                 last_activity = Instant::now();
                 if workers.len() >= MAX_CLIENT_WORKERS {
-                    let _ = write_error_response(&mut stream, "daemon is busy");
+                    let _ = write_error_response(&mut stream, "daemon connection limit reached");
                     continue;
                 }
                 state.active_clients.fetch_add(1, Ordering::AcqRel);
@@ -590,6 +604,24 @@ fn error_is_daemon_busy(error: &anyhow::Error) -> bool {
     error.to_string() == "daemon is busy"
 }
 
+fn try_acquire_dispatch_slot(state: &DaemonState) -> Result<DispatchGuard<'_>> {
+    loop {
+        let current = state.active_dispatches.load(Ordering::Acquire);
+        if current >= MAX_DISPATCH_WORKERS {
+            bail!("daemon is busy");
+        }
+        if state
+            .active_dispatches
+            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(DispatchGuard {
+                active_dispatches: &state.active_dispatches,
+            });
+        }
+    }
+}
+
 fn daemon_response_is_compatible(response: &Value) -> bool {
     let has_protocol = response["protocol_version"].as_u64() == Some(DAEMON_PROTOCOL_VERSION);
     let has_dispatch = response["capabilities"]
@@ -682,6 +714,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "dispatch" => {
+            let _dispatch_slot = try_acquire_dispatch_slot(state)?;
             let payload: DispatchPayload =
                 serde_json::from_value(request.payload).context("parse dispatch payload")?;
             crate::cli::dispatch_daemon_argv(&state.layout, payload.argv)?
@@ -954,4 +987,75 @@ fn current_epoch_seconds() -> Result<i64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before unix epoch")?;
     i64::try_from(duration.as_secs()).context("epoch seconds overflow")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn test_state() -> (TempDir, DaemonState) {
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        (
+            home,
+            DaemonState {
+                layout,
+                started_instant: Instant::now(),
+                started_at: 0,
+                idle_timeout: Duration::from_secs(60),
+                startup_sweep: SweepReport::default(),
+                stop_requested: AtomicBool::new(false),
+                active_clients: AtomicUsize::new(0),
+                active_dispatches: AtomicUsize::new(0),
+            },
+        )
+    }
+
+    fn handle_test_request(state: &DaemonState, command: &str, payload: Value) -> Value {
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        let request = serde_json::to_vec(&json!({
+            "command": command,
+            "payload": payload,
+        }))
+        .expect("request json");
+        client.write_all(&request).expect("write request");
+        client.write_all(b"\n").expect("write request newline");
+        client.shutdown(Shutdown::Write).ok();
+
+        if let Err(error) = handle_client(&mut server, state) {
+            write_error_response(&mut server, &error.to_string()).expect("write error response");
+        }
+        drop(server);
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("read response");
+        serde_json::from_slice(&response).expect("response json")
+    }
+
+    #[test]
+    fn saturated_dispatch_slots_still_allow_control_requests() {
+        let (_home, state) = test_state();
+        let mut dispatch_slots = Vec::new();
+        for _ in 0..MAX_DISPATCH_WORKERS {
+            dispatch_slots.push(try_acquire_dispatch_slot(&state).expect("dispatch slot"));
+        }
+
+        let ping = handle_test_request(&state, "ping", Value::Null);
+        assert_eq!(ping["ok"], true);
+        assert_eq!(ping["response"]["message"], "pong");
+
+        let dispatch = handle_test_request(&state, "dispatch", Value::Null);
+        assert_eq!(dispatch["ok"], false);
+        assert_eq!(dispatch["error"], "daemon is busy");
+
+        drop(dispatch_slots);
+        let _slot = try_acquire_dispatch_slot(&state).expect("released dispatch slot");
+    }
 }
