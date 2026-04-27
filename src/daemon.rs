@@ -7,6 +7,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,24 +20,33 @@ use crate::fs_layout::{FsLayout, sync_dir};
 use crate::models::SweepReport;
 use crate::store::Store;
 
-const MAX_REQUEST_BYTES: usize = 16 * 1024;
-const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const DOMAIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SOCKET_LIVENESS_TIMEOUT: Duration = Duration::from_millis(250);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DAEMON_PROTOCOL_VERSION: u64 = 1;
+const DAEMON_CAPABILITIES: &[&str] = &["dispatch"];
+const MAX_DISPATCH_WORKERS: usize = 32;
+const RESERVED_CONTROL_WORKERS: usize = 8;
+const MAX_CLIENT_WORKERS: usize = MAX_DISPATCH_WORKERS + RESERVED_CONTROL_WORKERS;
+const DAEMON_BUSY_ERROR: &str = "daemon is busy";
+const DAEMON_CONNECTION_LIMIT_ERROR: &str = "daemon connection limit reached";
 
 #[derive(Clone, Copy, Debug)]
 pub struct DaemonServeOptions {
     pub idle_timeout_seconds: u64,
-    pub startup_sweep_now: i64,
+    pub startup_sweep_now: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct DaemonEnsureOptions {
     pub idle_timeout_seconds: u64,
     pub startup_timeout_seconds: u64,
+    pub startup_sweep_now: Option<i64>,
 }
 
 struct SocketCleanup<'a> {
@@ -87,6 +98,13 @@ impl Drop for FdGuard {
 #[serde(rename_all = "snake_case")]
 struct DaemonRequest {
     command: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct DispatchPayload {
+    argv: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,20 +117,44 @@ struct DaemonInfo {
     stop_requested: bool,
 }
 
-struct DaemonState<'a> {
-    layout: &'a FsLayout,
+struct DaemonState {
+    layout: FsLayout,
     started_instant: Instant,
     started_at: i64,
     idle_timeout: Duration,
     startup_sweep: SweepReport,
-    stop_requested: bool,
+    stop_requested: AtomicBool,
+    active_clients: AtomicUsize,
+    active_dispatches: AtomicUsize,
+}
+
+struct ActiveClientGuard<'a> {
+    active_clients: &'a AtomicUsize,
+}
+
+impl Drop for ActiveClientGuard<'_> {
+    fn drop(&mut self) {
+        self.active_clients.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct DispatchGuard<'a> {
+    active_dispatches: &'a AtomicUsize,
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        self.active_dispatches.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Value> {
     layout.ensure_run_dir()?;
-    let startup_sweep = {
+    let startup_sweep = if let Some(now) = options.startup_sweep_now {
         let mut store = Store::open(layout)?;
-        store.sweep(layout, options.startup_sweep_now)?
+        store.sweep(layout, now)?
+    } else {
+        SweepReport::default()
     };
 
     let socket_path = layout.daemon_socket_path();
@@ -126,31 +168,48 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         .set_nonblocking(true)
         .with_context(|| format!("set nonblocking {}", socket_path.display()))?;
 
-    let mut state = DaemonState {
-        layout,
+    let state = Arc::new(DaemonState {
+        layout: layout.clone(),
         started_instant: Instant::now(),
         started_at: current_epoch_seconds()?,
         idle_timeout: Duration::from_secs(options.idle_timeout_seconds),
         startup_sweep,
-        stop_requested: false,
-    };
+        stop_requested: AtomicBool::new(false),
+        active_clients: AtomicUsize::new(0),
+        active_dispatches: AtomicUsize::new(0),
+    });
     let mut last_activity = Instant::now();
+    let mut workers = Vec::new();
     let shutdown_reason;
 
     loop {
+        reap_finished_workers(&mut workers);
+        if state.stop_requested.load(Ordering::Acquire) {
+            shutdown_reason = "stop_requested";
+            break;
+        }
         match listener.accept() {
             Ok((mut stream, _addr)) => {
                 last_activity = Instant::now();
-                if let Err(error) = handle_client(&mut stream, &mut state) {
-                    let _ = write_error_response(&mut stream, &error.to_string());
+                if client_worker_capacity_reached(workers.len()) {
+                    let _ = write_error_response(&mut stream, DAEMON_CONNECTION_LIMIT_ERROR);
+                    continue;
                 }
-                if state.stop_requested {
-                    shutdown_reason = "stop_requested";
-                    break;
-                }
+                state.active_clients.fetch_add(1, Ordering::AcqRel);
+                let worker_state = Arc::clone(&state);
+                workers.push(thread::spawn(move || {
+                    let _active_client = ActiveClientGuard {
+                        active_clients: &worker_state.active_clients,
+                    };
+                    if let Err(error) = handle_client(&mut stream, &worker_state) {
+                        let _ = write_error_response(&mut stream, &error.to_string());
+                    }
+                }));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if last_activity.elapsed() >= state.idle_timeout {
+                if state.active_clients.load(Ordering::Acquire) == 0
+                    && last_activity.elapsed() >= state.idle_timeout
+                {
                     shutdown_reason = "idle_timeout";
                     break;
                 }
@@ -159,100 +218,102 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
             Err(error) => return Err(error).context("accept daemon connection"),
         }
     }
+    join_workers(workers);
 
     Ok(json!({
         "daemon": daemon_info(&state),
         "shutdown_reason": shutdown_reason,
-        "startup_sweep": state.startup_sweep,
+        "startup_sweep": &state.startup_sweep,
     }))
 }
 
 pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<Value> {
+    validate_daemon_autostart_endpoint(layout)?;
     let startup_deadline = Instant::now() + Duration::from_secs(options.startup_timeout_seconds);
-    match daemon_request_with_timeout(layout, "ping", remaining_budget(startup_deadline)?) {
-        Ok(response) => {
-            return Ok(json!({
-                "started": false,
-                "daemon": response["daemon"].clone(),
-            }));
-        }
-        Err(error) => {
-            if Instant::now() >= startup_deadline {
-                bail!("daemon did not become ready: {error}");
-            }
-        }
+    if let Some(response) = probe_existing_daemon_for_ensure(layout, startup_deadline)? {
+        return Ok(json!({
+            "started": false,
+            "daemon": response["daemon"].clone(),
+        }));
     }
 
     layout.ensure_run_dir()?;
     let _startup_lock = acquire_startup_lock(layout, remaining_budget(startup_deadline)?)?;
-    match daemon_request_with_timeout(layout, "ping", remaining_budget(startup_deadline)?) {
-        Ok(response) => {
-            return Ok(json!({
-                "started": false,
-                "daemon": response["daemon"].clone(),
-            }));
-        }
-        Err(error) => {
-            if Instant::now() >= startup_deadline {
-                bail!("daemon did not become ready: {error}");
-            }
-        }
+    if let Some(response) = probe_existing_daemon_for_ensure(layout, startup_deadline)? {
+        return Ok(json!({
+            "started": false,
+            "daemon": response["daemon"].clone(),
+        }));
     }
 
-    let mut child = Command::new(std::env::current_exe().context("locate current executable")?)
-        .arg("--home")
-        .arg(layout.home_dir())
-        .arg("daemon")
-        .arg("serve")
-        .arg("--idle-timeout-seconds")
-        .arg(options.idle_timeout_seconds.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawn cbth daemon")?;
-    let child_pid = child.id();
-
     loop {
-        let probe_budget = match remaining_budget(startup_deadline) {
-            Ok(duration) => duration,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                cleanup_stale_socket_best_effort(layout);
-                bail!("daemon did not become ready: {error}");
-            }
-        };
-        match daemon_request_with_timeout(layout, "ping", probe_budget) {
-            Ok(response) => {
-                return Ok(json!({
-                    "started": true,
-                    "spawned_pid": child_pid,
-                    "daemon": response["daemon"].clone(),
-                }));
-            }
-            Err(last_error) => {
-                if let Some(status) = child.try_wait().context("check daemon child status")? {
-                    if let Ok(response) = daemon_request_with_timeout(
-                        layout,
-                        "ping",
-                        remaining_budget(startup_deadline).unwrap_or(STARTUP_POLL_INTERVAL),
-                    ) {
-                        return Ok(json!({
-                            "started": false,
-                            "daemon": response["daemon"].clone(),
-                        }));
-                    }
-                    cleanup_stale_socket_best_effort(layout);
-                    bail!("daemon exited before accepting connections: {status}");
-                }
-                if Instant::now() >= startup_deadline {
+        let mut command =
+            Command::new(std::env::current_exe().context("locate current executable")?);
+        command
+            .arg("--home")
+            .arg(layout.home_dir())
+            .arg("daemon")
+            .arg("serve")
+            .arg("--idle-timeout-seconds")
+            .arg(options.idle_timeout_seconds.to_string());
+        if let Some(startup_sweep_now) = options.startup_sweep_now {
+            command.arg("--now").arg(startup_sweep_now.to_string());
+        } else {
+            command.arg("--skip-startup-sweep");
+        }
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn cbth daemon")?;
+        let child_pid = child.id();
+
+        loop {
+            let probe_budget = match remaining_budget(startup_deadline) {
+                Ok(duration) => duration,
+                Err(error) => {
                     let _ = child.kill();
                     let _ = child.wait();
                     cleanup_stale_socket_best_effort(layout);
-                    bail!("daemon did not become ready: {last_error}");
+                    bail!("daemon did not become ready: {error}");
                 }
-                thread::sleep(STARTUP_POLL_INTERVAL);
+            };
+            match daemon_request_with_timeout(layout, "ping", probe_budget) {
+                Ok(response) if daemon_response_is_compatible(&response) => {
+                    return Ok(json!({
+                        "started": true,
+                        "spawned_pid": child_pid,
+                        "daemon": response["daemon"].clone(),
+                    }));
+                }
+                Ok(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    stop_incompatible_daemon(layout, startup_deadline)?;
+                    break;
+                }
+                Err(last_error) => {
+                    if let Some(status) = child.try_wait().context("check daemon child status")? {
+                        if let Some(response) =
+                            probe_existing_daemon_for_ensure(layout, startup_deadline)?
+                        {
+                            return Ok(json!({
+                                "started": false,
+                                "daemon": response["daemon"].clone(),
+                            }));
+                        }
+                        cleanup_stale_socket_best_effort(layout);
+                        bail!("daemon exited before accepting connections: {status}");
+                    }
+                    if Instant::now() >= startup_deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        cleanup_stale_socket_best_effort(layout);
+                        bail!("daemon did not become ready: {last_error}");
+                    }
+                    thread::sleep(STARTUP_POLL_INTERVAL);
+                }
             }
         }
     }
@@ -299,7 +360,11 @@ fn acquire_startup_lock(layout: &FsLayout, timeout: Duration) -> Result<StartupL
 }
 
 pub fn daemon_request(layout: &FsLayout, command: &str) -> Result<Value> {
-    daemon_request_with_timeout(layout, command, CLIENT_READ_TIMEOUT)
+    daemon_request_payload_with_timeout(layout, command, Value::Null, CLIENT_READ_TIMEOUT)
+}
+
+pub fn daemon_request_payload(layout: &FsLayout, command: &str, payload: Value) -> Result<Value> {
+    daemon_request_payload_with_timeout(layout, command, payload, DOMAIN_REQUEST_TIMEOUT)
 }
 
 fn daemon_request_with_timeout(
@@ -307,13 +372,27 @@ fn daemon_request_with_timeout(
     command: &str,
     timeout: Duration,
 ) -> Result<Value> {
+    daemon_request_payload_with_timeout(layout, command, Value::Null, timeout)
+}
+
+fn daemon_request_payload_with_timeout(
+    layout: &FsLayout,
+    command: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<Value> {
     if timeout.is_zero() {
         bail!("daemon request timeout is exhausted");
     }
-    daemon_request_until(layout, command, Instant::now() + timeout)
+    daemon_request_until(layout, command, payload, Instant::now() + timeout)
 }
 
-fn daemon_request_until(layout: &FsLayout, command: &str, deadline: Instant) -> Result<Value> {
+fn daemon_request_until(
+    layout: &FsLayout,
+    command: &str,
+    payload: Value,
+    deadline: Instant,
+) -> Result<Value> {
     validate_socket_endpoint(layout)?;
     let socket_path = layout.daemon_socket_path();
     let mut stream = connect_unix_stream_until(&socket_path, deadline)
@@ -322,7 +401,10 @@ fn daemon_request_until(layout: &FsLayout, command: &str, deadline: Instant) -> 
         .set_nonblocking(true)
         .context("set daemon client nonblocking")?;
 
-    let request = serde_json::to_vec(&json!({ "command": command }))?;
+    let request = serde_json::to_vec(&json!({
+        "command": command,
+        "payload": payload,
+    }))?;
     write_all_until(&mut stream, &request, deadline).context("write daemon request")?;
     write_all_until(&mut stream, b"\n", deadline).context("write daemon request")?;
     stream.shutdown(std::net::Shutdown::Write).ok();
@@ -496,7 +578,120 @@ fn remaining_budget(deadline: Instant) -> Result<Duration> {
         .ok_or_else(|| anyhow::anyhow!("startup timeout is exhausted"))
 }
 
-fn handle_client(stream: &mut UnixStream, state: &mut DaemonState<'_>) -> Result<()> {
+fn probe_existing_daemon_for_ensure(
+    layout: &FsLayout,
+    startup_deadline: Instant,
+) -> Result<Option<Value>> {
+    loop {
+        match daemon_request_with_timeout(layout, "ping", remaining_budget(startup_deadline)?) {
+            Ok(response) if daemon_response_is_compatible(&response) => return Ok(Some(response)),
+            Ok(_) => {
+                stop_incompatible_daemon(layout, startup_deadline)?;
+                return Ok(None);
+            }
+            Err(error) if error_is_daemon_busy(&error) => {
+                thread::sleep(STARTUP_POLL_INTERVAL);
+            }
+            Err(error) => {
+                if Instant::now() >= startup_deadline {
+                    bail!("daemon did not become ready: {error}");
+                }
+                return Ok(None);
+            }
+        }
+    }
+}
+
+fn error_is_daemon_busy(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    matches!(
+        message.as_str(),
+        DAEMON_BUSY_ERROR | DAEMON_CONNECTION_LIMIT_ERROR
+    )
+}
+
+fn try_acquire_dispatch_slot(state: &DaemonState) -> Result<DispatchGuard<'_>> {
+    loop {
+        let current = state.active_dispatches.load(Ordering::Acquire);
+        if current >= MAX_DISPATCH_WORKERS {
+            bail!(DAEMON_BUSY_ERROR);
+        }
+        if state
+            .active_dispatches
+            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(DispatchGuard {
+                active_dispatches: &state.active_dispatches,
+            });
+        }
+    }
+}
+
+fn daemon_response_is_compatible(response: &Value) -> bool {
+    let has_protocol = response["protocol_version"].as_u64() == Some(DAEMON_PROTOCOL_VERSION);
+    let has_dispatch = response["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability.as_str() == Some("dispatch"))
+        });
+    has_protocol && has_dispatch
+}
+
+fn stop_incompatible_daemon(layout: &FsLayout, startup_deadline: Instant) -> Result<()> {
+    daemon_request_with_timeout(layout, "stop", remaining_budget(startup_deadline)?)
+        .context("stop incompatible daemon")?;
+    wait_for_incompatible_daemon_replaced_or_removed_until(layout, startup_deadline)
+}
+
+fn wait_for_incompatible_daemon_replaced_or_removed_until(
+    layout: &FsLayout,
+    deadline: Instant,
+) -> Result<()> {
+    let socket_path = layout.daemon_socket_path();
+    loop {
+        if !socket_path.exists() {
+            return Ok(());
+        }
+        let probe_budget = remaining_budget(deadline).unwrap_or(STARTUP_POLL_INTERVAL);
+        match daemon_request_with_timeout(layout, "ping", probe_budget.min(STARTUP_POLL_INTERVAL)) {
+            Ok(response) if daemon_response_is_compatible(&response) => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error_is_daemon_busy(&error) => return Ok(()),
+            Err(_) => {}
+        }
+        if Instant::now() >= deadline {
+            bail!("incompatible daemon did not stop before startup timeout");
+        }
+        thread::sleep(STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn reap_finished_workers(workers: &mut Vec<thread::JoinHandle<()>>) {
+    let mut index = 0;
+    while index < workers.len() {
+        if workers[index].is_finished() {
+            let worker = workers.swap_remove(index);
+            let _ = worker.join();
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn join_workers(workers: Vec<thread::JoinHandle<()>>) {
+    for worker in workers {
+        let _ = worker.join();
+    }
+}
+
+fn client_worker_capacity_reached(active_workers: usize) -> bool {
+    active_workers >= MAX_CLIENT_WORKERS
+}
+
+fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
     ensure_peer_is_current_user(stream)?;
     stream
         .set_write_timeout(Some(CLIENT_READ_TIMEOUT))
@@ -511,32 +706,42 @@ fn handle_client(stream: &mut UnixStream, state: &mut DaemonState<'_>) -> Result
     let response = match request.command.as_str() {
         "ping" => json!({
             "daemon": daemon_info(state),
+            "protocol_version": DAEMON_PROTOCOL_VERSION,
+            "capabilities": DAEMON_CAPABILITIES,
             "message": "pong",
         }),
         "status" => json!({
             "daemon": daemon_info(state),
-            "startup_sweep": state.startup_sweep,
+            "protocol_version": DAEMON_PROTOCOL_VERSION,
+            "capabilities": DAEMON_CAPABILITIES,
+            "startup_sweep": &state.startup_sweep,
         }),
         "stop" => {
-            state.stop_requested = true;
+            state.stop_requested.store(true, Ordering::Release);
             json!({
                 "daemon": daemon_info(state),
                 "stopping": true,
             })
+        }
+        "dispatch" => {
+            let _dispatch_slot = try_acquire_dispatch_slot(state)?;
+            let payload: DispatchPayload =
+                serde_json::from_value(request.payload).context("parse dispatch payload")?;
+            crate::cli::dispatch_daemon_argv(&state.layout, payload.argv)?
         }
         other => bail!("unknown daemon command: {other}"),
     };
     write_ok_response(stream, response)
 }
 
-fn daemon_info(state: &DaemonState<'_>) -> DaemonInfo {
+fn daemon_info(state: &DaemonState) -> DaemonInfo {
     DaemonInfo {
         pid: std::process::id(),
         started_at: state.started_at,
         uptime_seconds: state.started_instant.elapsed().as_secs(),
         socket_path: state.layout.daemon_socket_path().display().to_string(),
         idle_timeout_seconds: state.idle_timeout.as_secs(),
-        stop_requested: state.stop_requested,
+        stop_requested: state.stop_requested.load(Ordering::Acquire),
     }
 }
 
@@ -652,12 +857,28 @@ fn cleanup_stale_socket_best_effort(layout: &FsLayout) {
     let _ = prepare_socket_path(&layout.daemon_socket_path());
 }
 
+pub fn validate_daemon_autostart_endpoint(layout: &FsLayout) -> Result<()> {
+    validate_existing_private_dir(layout.home_dir(), "cbth home")?;
+    validate_existing_private_dir(&layout.run_dir(), "cbth run directory")?;
+    let socket_path = layout.daemon_socket_path();
+    let metadata = match fs::symlink_metadata(&socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("stat {}", socket_path.display())),
+    };
+    validate_socket_metadata(&socket_path, &metadata)
+}
+
 fn validate_socket_endpoint(layout: &FsLayout) -> Result<()> {
     validate_private_dir(layout.home_dir(), "cbth home")?;
     validate_private_dir(&layout.run_dir(), "cbth run directory")?;
     let socket_path = layout.daemon_socket_path();
     let metadata = fs::symlink_metadata(&socket_path)
         .with_context(|| format!("stat {}", socket_path.display()))?;
+    validate_socket_metadata(&socket_path, &metadata)
+}
+
+fn validate_socket_metadata(socket_path: &Path, metadata: &fs::Metadata) -> Result<()> {
     if !metadata.file_type().is_socket() {
         bail!("daemon endpoint is not a socket: {}", socket_path.display());
     }
@@ -670,9 +891,22 @@ fn validate_socket_endpoint(layout: &FsLayout) -> Result<()> {
     Ok(())
 }
 
+fn validate_existing_private_dir(path: &Path, name: &str) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
+    };
+    validate_private_dir_metadata(path, name, &metadata)
+}
+
 fn validate_private_dir(path: &Path, name: &str) -> Result<()> {
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    validate_private_dir_metadata(path, name, &metadata)
+}
+
+fn validate_private_dir_metadata(path: &Path, name: &str, metadata: &fs::Metadata) -> Result<()> {
     if !metadata.is_dir() {
         bail!("{name} is not a directory: {}", path.display());
     }
@@ -763,4 +997,75 @@ fn current_epoch_seconds() -> Result<i64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before unix epoch")?;
     i64::try_from(duration.as_secs()).context("epoch seconds overflow")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn test_state() -> (TempDir, DaemonState) {
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        (
+            home,
+            DaemonState {
+                layout,
+                started_instant: Instant::now(),
+                started_at: 0,
+                idle_timeout: Duration::from_secs(60),
+                startup_sweep: SweepReport::default(),
+                stop_requested: AtomicBool::new(false),
+                active_clients: AtomicUsize::new(0),
+                active_dispatches: AtomicUsize::new(0),
+            },
+        )
+    }
+
+    fn handle_test_request(state: &DaemonState, command: &str, payload: Value) -> Value {
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        let request = serde_json::to_vec(&json!({
+            "command": command,
+            "payload": payload,
+        }))
+        .expect("request json");
+        client.write_all(&request).expect("write request");
+        client.write_all(b"\n").expect("write request newline");
+        client.shutdown(Shutdown::Write).ok();
+
+        if let Err(error) = handle_client(&mut server, state) {
+            write_error_response(&mut server, &error.to_string()).expect("write error response");
+        }
+        drop(server);
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("read response");
+        serde_json::from_slice(&response).expect("response json")
+    }
+
+    #[test]
+    fn saturated_dispatch_slots_still_allow_control_requests() {
+        let (_home, state) = test_state();
+        let mut dispatch_slots = Vec::new();
+        for _ in 0..MAX_DISPATCH_WORKERS {
+            dispatch_slots.push(try_acquire_dispatch_slot(&state).expect("dispatch slot"));
+        }
+
+        let ping = handle_test_request(&state, "ping", Value::Null);
+        assert_eq!(ping["ok"], true);
+        assert_eq!(ping["response"]["message"], "pong");
+
+        let dispatch = handle_test_request(&state, "dispatch", Value::Null);
+        assert_eq!(dispatch["ok"], false);
+        assert_eq!(dispatch["error"], "daemon is busy");
+
+        drop(dispatch_slots);
+        let _slot = try_acquire_dispatch_slot(&state).expect("released dispatch slot");
+    }
 }

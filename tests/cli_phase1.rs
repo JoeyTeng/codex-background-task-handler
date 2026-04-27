@@ -13,6 +13,8 @@ use std::os::unix::fs::PermissionsExt;
 
 fn cbth(home: &TempDir, args: &[&str]) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env("CBTH_ALLOW_DIRECT_STORE", "1")
+        .arg("--direct-store")
         .arg("--home")
         .arg(home.path())
         .args(args)
@@ -32,6 +34,8 @@ fn cbth(home: &TempDir, args: &[&str]) -> Value {
 
 fn cbth_failure(home: &TempDir, args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env("CBTH_ALLOW_DIRECT_STORE", "1")
+        .arg("--direct-store")
         .arg("--home")
         .arg(home.path())
         .args(args)
@@ -45,6 +49,26 @@ fn cbth_failure(home: &TempDir, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn direct_store_requires_explicit_test_gate() {
+    let home = tempfile::tempdir().expect("temp home");
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--direct-store")
+        .arg("--home")
+        .arg(home.path())
+        .args(["job", "list"])
+        .output()
+        .expect("run cbth");
+
+    assert!(
+        !output.status.success(),
+        "cbth unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CBTH_ALLOW_DIRECT_STORE=1"));
 }
 
 #[test]
@@ -546,6 +570,8 @@ fn concurrent_submits_share_fresh_home() {
         handles.push(thread::spawn(move || {
             barrier.wait();
             Command::new(env!("CARGO_BIN_EXE_cbth"))
+                .env("CBTH_ALLOW_DIRECT_STORE", "1")
+                .arg("--direct-store")
                 .arg("--home")
                 .arg(home_path)
                 .args([

@@ -41,7 +41,7 @@
   - socket 必须当前 uid owned 且不宽于 `0600`
   - daemon accept 后必须校验 peer uid
   - v1 不退回 unauthenticated TCP daemon IPC；纯 Windows IPC 暂不支持
-- [ ] 将 mutating / recovery CLI 命令接入 daemon IPC，并在无法提供 same-user proof 时 fail closed。
+- [x] 将 mutating / recovery CLI 命令接入 daemon IPC，并在无法提供 same-user proof 时 fail closed。
 - [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 bridge-side 所需的只读 inbox snapshot，且不会卡审批：
   - `current-snapshot.json`
   - `ready-threads.json`

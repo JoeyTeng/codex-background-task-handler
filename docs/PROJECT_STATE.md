@@ -452,7 +452,8 @@ scripts/desktop_thread_inject_poc.py
 ## 当前实现进展
 
 - Phase 1 已经通过 PR #2 squash merge 到 `master`，merge commit 为 `6678f25a591208d09d53546dc78a1e9f22b83767`。
-- Phase 2 当前分支为 `codex/phase-2-daemon-ipc`，第一批实现范围限定在共享 daemon / IPC 基础，不接入 CLI `app-server` 或 Desktop heartbeat：
+- Phase 2 已经通过 PR #5 squash merge 到 `master`，merge commit 为 `1d66ad95ca25599e178fab34791d400a8ace6225`。
+- Phase 2 第一批实现范围限定在共享 daemon / IPC 基础，不接入 CLI `app-server` 或 Desktop heartbeat：
   - `cbth daemon serve`
   - `cbth daemon ensure`
   - `cbth daemon ping`
@@ -466,8 +467,19 @@ scripts/desktop_thread_inject_poc.py
   - `daemon ensure` 会按需拉起 foreground `daemon serve`
   - daemon 启动时先跑一次 maintenance sweep
   - daemon 在简单 idle timeout 后退出并清理 socket
-- 当前 daemon 仍只是共享 IPC foundation：
-  - job/batch commands 还没有默认通过 daemon RPC 执行
+- Phase 3 当前分支为 `codex/phase-3-daemon-domain-rpc`，范围限定在把既有核心 CLI mutating/recovery 命令接入 daemon domain RPC，不接入 CLI `app-server` 或 Desktop heartbeat：
+  - 默认 `job submit` / `job complete` / `job fail` 会先 `daemon ensure`，再通过 daemon 的 `dispatch` RPC 执行
+  - 默认 `batch close-head` 与 `maintenance sweep` 同样走 daemon `dispatch` RPC
+  - 自动 daemon routing 的启动等待默认 5 秒，但用户可通过全局 `--auto-daemon-startup-timeout-seconds <seconds>` 为慢磁盘或大 startup sweep 场景显式放宽
+  - `job inspect` / `job list` / `batch inspect-head` / `batch inspect` 仍然直接只读打开 store，避免把普通检查绑定到 daemon lifecycle
+  - client 在提交 RPC 前把 `--metadata-file` / `--result-file` 转成绝对路径，避免 daemon 当前工作目录与调用者不同导致读取错位
+  - daemon-side `dispatch` 拒绝 `--home` 与 `daemon ...` 子命令，避免通过 domain RPC 改写目标 home 或递归控制 daemon
+  - `maintenance sweep` 触发 autostart 时会跳过 daemon startup sweep，避免 startup sweep 抢先消耗待返回的 sweep report；普通 daemon ensure / serve 仍保留 startup sweep
+  - daemon accept loop 使用有上限的 per-client worker，避免长 artifact ingest 阻塞 `status` / `stop`；active client 未结束前 idle shutdown 不会触发，worker slot 上限防止无限制线程增长
+  - 测试内部保留隐藏 `--direct-store` 路径，用于固定旧的本地 store 语义与 daemon lifecycle 单元测试；该路径需要显式 `CBTH_ALLOW_DIRECT_STORE=1` 环境门控，不作为普通用户入口
+  - mutating CLI 复用 daemon socket endpoint 校验；当 private run dir / socket ownership / peer uid proof 不能成立时 fail closed，不回退到 direct store 或 unauthenticated TCP
+  - 私有目录创建在 Unix 下使用 `0700` creation mode，并对 chmod 路径使用 no-follow fd 操作，避免 autostart 并发窗口和 symlink race 扩大权限边界
+- 当前 daemon 仍未接入完整 delivery lifecycle：
   - active delivery work / active clients / `delivery_observation_deadline` 尚未接入 daemon 退出条件
   - CLI managed session 与 Desktop bridge adapters 尚未实现
 

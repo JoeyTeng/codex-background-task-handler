@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,8 +13,17 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 
+fn temp_home() -> TempDir {
+    let home = tempfile::tempdir().expect("temp home");
+    #[cfg(unix)]
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("chmod temp home");
+    home
+}
+
 fn cbth(home: &TempDir, args: &[&str]) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env("CBTH_ALLOW_DIRECT_STORE", "1")
+        .arg("--direct-store")
         .arg("--home")
         .arg(home.path())
         .args(args)
@@ -34,6 +43,8 @@ fn cbth(home: &TempDir, args: &[&str]) -> Value {
 
 fn cbth_failure(home: &TempDir, args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env("CBTH_ALLOW_DIRECT_STORE", "1")
+        .arg("--direct-store")
         .arg("--home")
         .arg(home.path())
         .args(args)
@@ -51,6 +62,8 @@ fn cbth_failure(home: &TempDir, args: &[&str]) -> String {
 
 fn try_cbth(home: &TempDir, args: &[&str]) -> Option<Value> {
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env("CBTH_ALLOW_DIRECT_STORE", "1")
+        .arg("--direct-store")
         .arg("--home")
         .arg(home.path())
         .args(args)
@@ -101,7 +114,7 @@ fn wait_for_socket_removed(home: &TempDir) {
 
 #[test]
 fn concurrent_daemon_ensure_uses_one_daemon() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = temp_home();
     let mut children = Vec::new();
     for _ in 0..6 {
         children.push(
@@ -150,7 +163,7 @@ fn concurrent_daemon_ensure_uses_one_daemon() {
 
 #[test]
 fn daemon_ensure_starts_ping_status_and_stop() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = temp_home();
 
     let ensured = cbth(
         &home,
@@ -168,10 +181,14 @@ fn daemon_ensure_starts_ping_status_and_stop() {
 
     let ping = cbth(&home, &["daemon", "ping"]);
     assert_eq!(ping["message"], "pong");
+    assert_eq!(ping["protocol_version"], 1);
+    assert_eq!(ping["capabilities"][0], "dispatch");
     assert_eq!(ping["daemon"]["idle_timeout_seconds"], 10);
 
     let status = cbth(&home, &["daemon", "status"]);
     assert_eq!(status["daemon"]["stop_requested"], false);
+    assert_eq!(status["protocol_version"], 1);
+    assert_eq!(status["capabilities"][0], "dispatch");
     assert!(status["startup_sweep"].is_object());
 
     #[cfg(unix)]
@@ -190,9 +207,192 @@ fn daemon_ensure_starts_ping_status_and_stop() {
     wait_for_socket_removed(&home);
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_restarts_incompatible_daemon() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind legacy daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    let legacy_socket_path = socket_path.clone();
+    let handle = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _addr) = listener.accept().expect("accept legacy request");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("read legacy request");
+            let response = if request.contains("\"stop\"") {
+                r#"{"ok":true,"response":{"stopping":true}}"#
+            } else {
+                r#"{"ok":true,"response":{"daemon":{"pid":1},"message":"pong"}}"#
+            };
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.write_all(b"\n").expect("write response newline");
+            if request.contains("\"stop\"") {
+                break;
+            }
+        }
+        drop(listener);
+        fs::remove_file(&legacy_socket_path).expect("remove legacy socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert_eq!(ensured["started"], true);
+    assert!(ensured["daemon"]["pid"].as_u64().expect("pid") > 1);
+    handle.join().expect("legacy daemon thread");
+
+    let ping = cbth(&home, &["daemon", "ping"]);
+    assert_eq!(ping["protocol_version"], 1);
+    assert_eq!(ping["capabilities"][0], "dispatch");
+
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_accepts_concurrent_compatible_replacement() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let legacy_listener = UnixListener::bind(&socket_path).expect("bind legacy daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    let replacement_socket_path = socket_path.clone();
+    let handle = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _addr) = legacy_listener.accept().expect("accept legacy request");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("read legacy request");
+            let response = if request.contains("\"stop\"") {
+                r#"{"ok":true,"response":{"stopping":true}}"#
+            } else {
+                r#"{"ok":true,"response":{"daemon":{"pid":1},"message":"pong"}}"#
+            };
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.write_all(b"\n").expect("write response newline");
+            if request.contains("\"stop\"") {
+                break;
+            }
+        }
+        drop(legacy_listener);
+        fs::remove_file(&replacement_socket_path).expect("remove legacy socket");
+
+        let replacement_listener =
+            UnixListener::bind(&replacement_socket_path).expect("bind replacement socket");
+        fs::set_permissions(&replacement_socket_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod replacement socket");
+        for _ in 0..2 {
+            let (mut stream, _addr) = replacement_listener
+                .accept()
+                .expect("accept replacement request");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("read replacement request");
+            assert!(request.contains("\"ping\""));
+            stream
+                .write_all(
+                    br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#,
+                )
+                .expect("write replacement response");
+            stream.write_all(b"\n").expect("write response newline");
+        }
+        drop(replacement_listener);
+        fs::remove_file(&replacement_socket_path).expect("remove replacement socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert_eq!(ensured["started"], false);
+    assert_eq!(ensured["daemon"]["pid"], 5151);
+    handle.join().expect("replacement daemon thread");
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_retries_busy_daemon_without_spawning() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind busy daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    let busy_socket_path = socket_path.clone();
+    let handle = thread::spawn(move || {
+        for index in 0..3 {
+            let (mut stream, _addr) = listener.accept().expect("accept busy daemon request");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("read busy daemon request");
+            assert!(request.contains("\"ping\""));
+            let response = if index == 0 {
+                r#"{"ok":false,"error":"daemon is busy"}"#
+            } else if index == 1 {
+                r#"{"ok":false,"error":"daemon connection limit reached"}"#
+            } else {
+                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#
+            };
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.write_all(b"\n").expect("write response newline");
+        }
+        drop(listener);
+        fs::remove_file(&busy_socket_path).expect("remove busy socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert_eq!(ensured["started"], false);
+    assert_eq!(ensured["daemon"]["pid"], 4242);
+    handle.join().expect("busy daemon thread");
+}
+
 #[test]
 fn daemon_ensure_timeout_does_not_publish_socket_when_startup_is_blocked() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = temp_home();
     cbth(
         &home,
         &[
@@ -230,7 +430,7 @@ fn daemon_ensure_timeout_does_not_publish_socket_when_startup_is_blocked() {
 #[cfg(unix)]
 #[test]
 fn daemon_ensure_timeout_is_not_extended_by_unresponsive_socket() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = temp_home();
     let run_dir = home.path().join("run");
     fs::create_dir_all(&run_dir).expect("create run dir");
     fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("chmod home");
@@ -270,7 +470,7 @@ fn daemon_ensure_timeout_is_not_extended_by_unresponsive_socket() {
 #[cfg(unix)]
 #[test]
 fn daemon_ensure_timeout_is_not_extended_by_slow_trickle_socket() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = temp_home();
     let run_dir = home.path().join("run");
     fs::create_dir_all(&run_dir).expect("create run dir");
     fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("chmod home");
@@ -315,7 +515,7 @@ fn daemon_ensure_timeout_is_not_extended_by_slow_trickle_socket() {
 #[cfg(unix)]
 #[test]
 fn daemon_serve_refuses_to_replace_active_socket() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = temp_home();
     let run_dir = home.path().join("run");
     fs::create_dir_all(&run_dir).expect("create run dir");
     fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("chmod home");
@@ -333,7 +533,7 @@ fn daemon_serve_refuses_to_replace_active_socket() {
 #[cfg(unix)]
 #[test]
 fn daemon_serve_replaces_connection_refused_stale_socket() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = temp_home();
     let run_dir = home.path().join("run");
     fs::create_dir_all(&run_dir).expect("create run dir");
     fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("chmod home");
@@ -353,7 +553,7 @@ fn daemon_serve_replaces_connection_refused_stale_socket() {
 
 #[test]
 fn daemon_exits_after_idle_timeout() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = temp_home();
     let mut child = spawn_daemon(&home, "1", &[]);
 
     let ping = wait_for_ping(&home);
@@ -380,7 +580,7 @@ fn daemon_exits_after_idle_timeout() {
 
 #[test]
 fn daemon_startup_sweep_closes_expired_batches() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = temp_home();
     let submitted = cbth(
         &home,
         &[
@@ -446,7 +646,7 @@ fn daemon_startup_sweep_closes_expired_batches() {
 #[cfg(unix)]
 #[test]
 fn daemon_client_fails_closed_when_run_dir_is_too_permissive() {
-    let home = tempfile::tempdir().expect("temp home");
+    let home = temp_home();
     cbth(
         &home,
         &[
@@ -467,4 +667,27 @@ fn daemon_client_fails_closed_when_run_dir_is_too_permissive() {
     fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("restore run dir");
     cbth(&home, &["daemon", "stop"]);
     wait_for_socket_removed(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_fails_closed_before_autostart_with_permissive_run_dir() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o755)).expect("chmod run dir");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert!(stderr.contains("cbth run directory permissions are wider than 0700"));
+    assert!(!run_dir.join("cbth.sock").exists());
 }
