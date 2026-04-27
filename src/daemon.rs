@@ -613,7 +613,10 @@ fn wait_for_incompatible_daemon_replaced_or_removed_until(
     deadline: Instant,
 ) -> Result<()> {
     let socket_path = layout.daemon_socket_path();
-    while socket_path.exists() {
+    loop {
+        if !socket_path.exists() {
+            return Ok(());
+        }
         let probe_budget = remaining_budget(deadline).unwrap_or(STARTUP_POLL_INTERVAL);
         match daemon_request_with_timeout(layout, "ping", probe_budget.min(STARTUP_POLL_INTERVAL)) {
             Ok(response) if daemon_response_is_compatible(&response) => return Ok(()),
@@ -626,7 +629,6 @@ fn wait_for_incompatible_daemon_replaced_or_removed_until(
         }
         thread::sleep(STARTUP_POLL_INTERVAL);
     }
-    Ok(())
 }
 
 fn reap_finished_workers(workers: &mut Vec<thread::JoinHandle<()>>) {
