@@ -8,7 +8,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::fs_layout::{FsLayout, sync_dir};
-use crate::models::SweepReport;
+use crate::models::{DaemonLifecycleStatus, SweepReport};
 use crate::store::Store;
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -28,6 +28,8 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SOCKET_LIVENESS_TIMEOUT: Duration = Duration::from_millis(250);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DAEMON_LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const DAEMON_MAINTENANCE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMON_PROTOCOL_VERSION: u64 = 1;
 const DAEMON_CAPABILITIES: &[&str] = &["dispatch"];
 const MAX_DISPATCH_WORKERS: usize = 32;
@@ -124,16 +126,20 @@ struct DaemonState {
     idle_timeout: Duration,
     startup_sweep: SweepReport,
     stop_requested: AtomicBool,
+    lifecycle_maintenance_suppressed: AtomicBool,
+    activity_generation: AtomicU64,
     active_clients: AtomicUsize,
     active_dispatches: AtomicUsize,
 }
 
 struct ActiveClientGuard<'a> {
     active_clients: &'a AtomicUsize,
+    activity_generation: &'a AtomicU64,
 }
 
 impl Drop for ActiveClientGuard<'_> {
     fn drop(&mut self) {
+        self.activity_generation.fetch_add(1, Ordering::AcqRel);
         self.active_clients.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -145,6 +151,21 @@ struct DispatchGuard<'a> {
 impl Drop for DispatchGuard<'_> {
     fn drop(&mut self) {
         self.active_dispatches.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Default)]
+struct DaemonLifecycleCache {
+    refreshed_at: Option<Instant>,
+    refresh_failed: bool,
+    status: DaemonLifecycleStatus,
+}
+
+impl DaemonLifecycleCache {
+    fn has_exit_blockers(&self, maintenance_suppressed: bool) -> bool {
+        self.refresh_failed
+            || self.status.active_jobs > 0
+            || (!maintenance_suppressed && self.status.open_batches_due_within_idle > 0)
     }
 }
 
@@ -168,22 +189,37 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         .set_nonblocking(true)
         .with_context(|| format!("set nonblocking {}", socket_path.display()))?;
 
+    let started_at = current_epoch_seconds()?;
     let state = Arc::new(DaemonState {
         layout: layout.clone(),
         started_instant: Instant::now(),
-        started_at: current_epoch_seconds()?,
+        started_at,
         idle_timeout: Duration::from_secs(options.idle_timeout_seconds),
         startup_sweep,
         stop_requested: AtomicBool::new(false),
+        lifecycle_maintenance_suppressed: AtomicBool::new(options.startup_sweep_now.is_none()),
+        activity_generation: AtomicU64::new(0),
         active_clients: AtomicUsize::new(0),
         active_dispatches: AtomicUsize::new(0),
     });
     let mut last_activity = Instant::now();
+    let mut last_activity_epoch = started_at;
+    let mut observed_activity_generation = 0;
     let mut workers = Vec::new();
+    let mut lifecycle_cache = DaemonLifecycleCache::default();
+    let mut lifecycle_maintenance_worker = None;
+    let mut next_lifecycle_maintenance_at = Instant::now();
     let shutdown_reason;
 
     loop {
         reap_finished_workers(&mut workers);
+        reap_finished_lifecycle_maintenance(&mut lifecycle_maintenance_worker);
+        let activity_generation = state.activity_generation.load(Ordering::Acquire);
+        if activity_generation != observed_activity_generation {
+            observed_activity_generation = activity_generation;
+            last_activity = Instant::now();
+            last_activity_epoch = current_epoch_seconds()?;
+        }
         if state.stop_requested.load(Ordering::Acquire) {
             shutdown_reason = "stop_requested";
             break;
@@ -191,6 +227,9 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         match listener.accept() {
             Ok((mut stream, _addr)) => {
                 last_activity = Instant::now();
+                last_activity_epoch = current_epoch_seconds()?;
+                observed_activity_generation =
+                    state.activity_generation.fetch_add(1, Ordering::AcqRel) + 1;
                 if client_worker_capacity_reached(workers.len()) {
                     let _ = write_error_response(&mut stream, DAEMON_CONNECTION_LIMIT_ERROR);
                     continue;
@@ -200,6 +239,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
                 workers.push(thread::spawn(move || {
                     let _active_client = ActiveClientGuard {
                         active_clients: &worker_state.active_clients,
+                        activity_generation: &worker_state.activity_generation,
                     };
                     if let Err(error) = handle_client(&mut stream, &worker_state) {
                         let _ = write_error_response(&mut stream, &error.to_string());
@@ -207,11 +247,49 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
                 }));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if state.active_clients.load(Ordering::Acquire) == 0
-                    && last_activity.elapsed() >= state.idle_timeout
-                {
-                    shutdown_reason = "idle_timeout";
-                    break;
+                if state.active_clients.load(Ordering::Acquire) == 0 {
+                    let activity_generation = state.activity_generation.load(Ordering::Acquire);
+                    if activity_generation != observed_activity_generation {
+                        observed_activity_generation = activity_generation;
+                        last_activity = Instant::now();
+                        last_activity_epoch = current_epoch_seconds()?;
+                    }
+                    let idle_elapsed = last_activity.elapsed() >= state.idle_timeout;
+                    let idle_deadline = last_activity
+                        .checked_add(state.idle_timeout)
+                        .unwrap_or(last_activity);
+                    let force_refresh = idle_elapsed
+                        && lifecycle_cache
+                            .refreshed_at
+                            .is_none_or(|at| at < idle_deadline);
+                    let idle_horizon_at = checked_epoch_add(
+                        last_activity_epoch,
+                        state.idle_timeout.as_secs(),
+                        "idle_timeout",
+                    )?;
+                    refresh_lifecycle_cache_if_due(
+                        &state,
+                        &mut lifecycle_cache,
+                        force_refresh,
+                        idle_horizon_at,
+                    );
+                    maybe_spawn_lifecycle_maintenance(
+                        &state,
+                        &lifecycle_cache,
+                        &mut lifecycle_maintenance_worker,
+                        &mut next_lifecycle_maintenance_at,
+                    );
+                    if idle_elapsed
+                        && lifecycle_maintenance_worker.is_none()
+                        && !lifecycle_cache.has_exit_blockers(
+                            state
+                                .lifecycle_maintenance_suppressed
+                                .load(Ordering::Acquire),
+                        )
+                    {
+                        shutdown_reason = "idle_timeout";
+                        break;
+                    }
                 }
                 thread::sleep(IDLE_POLL_INTERVAL);
             }
@@ -219,6 +297,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         }
     }
     join_workers(workers);
+    join_lifecycle_maintenance(lifecycle_maintenance_worker);
 
     Ok(json!({
         "daemon": daemon_info(&state),
@@ -681,6 +760,93 @@ fn reap_finished_workers(workers: &mut Vec<thread::JoinHandle<()>>) {
     }
 }
 
+fn reap_finished_lifecycle_maintenance(worker: &mut Option<thread::JoinHandle<()>>) {
+    if worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+        let worker = worker.take().expect("worker exists");
+        let _ = worker.join();
+    }
+}
+
+fn join_lifecycle_maintenance(worker: Option<thread::JoinHandle<()>>) {
+    if let Some(worker) = worker {
+        let _ = worker.join();
+    }
+}
+
+fn refresh_lifecycle_cache_if_due(
+    state: &DaemonState,
+    cache: &mut DaemonLifecycleCache,
+    force: bool,
+    idle_horizon_at: i64,
+) {
+    if !force
+        && cache
+            .refreshed_at
+            .is_some_and(|refreshed_at| refreshed_at.elapsed() < DAEMON_LIFECYCLE_POLL_INTERVAL)
+    {
+        return;
+    }
+
+    cache.refreshed_at = Some(Instant::now());
+    match refresh_lifecycle_status(state, idle_horizon_at) {
+        Ok(status) => {
+            cache.refresh_failed = false;
+            cache.status = status;
+        }
+        Err(_error) => {
+            // Lifecycle refresh is advisory for shutdown. Keep control RPCs responsive
+            // and fail closed by blocking idle exit until a later refresh succeeds.
+            cache.refresh_failed = true;
+        }
+    }
+}
+
+fn refresh_lifecycle_status(
+    state: &DaemonState,
+    idle_horizon_at: i64,
+) -> Result<DaemonLifecycleStatus> {
+    let now = current_epoch_seconds()?;
+    let store = Store::open_for_daemon_lifecycle(&state.layout)?;
+    store.daemon_lifecycle_status(now, idle_horizon_at)
+}
+
+fn maybe_spawn_lifecycle_maintenance(
+    state: &Arc<DaemonState>,
+    cache: &DaemonLifecycleCache,
+    worker: &mut Option<thread::JoinHandle<()>>,
+    next_attempt_at: &mut Instant,
+) {
+    let now = Instant::now();
+    if worker.is_some()
+        || state
+            .lifecycle_maintenance_suppressed
+            .load(Ordering::Acquire)
+        || cache.refresh_failed
+        || !cache.status.has_due_maintenance()
+        || now < *next_attempt_at
+    {
+        return;
+    }
+
+    let layout = state.layout.clone();
+    *next_attempt_at = now + DAEMON_MAINTENANCE_RETRY_INTERVAL;
+    *worker = Some(thread::spawn(move || {
+        let Ok(now) = current_epoch_seconds() else {
+            return;
+        };
+        let Ok(mut store) = Store::open(&layout) else {
+            return;
+        };
+        let _ = store.sweep(&layout, now);
+    }));
+}
+
+fn checked_epoch_add(now: i64, seconds: u64, name: &str) -> Result<i64> {
+    let seconds = i64::try_from(seconds).with_context(|| format!("{name} exceeds i64"))?;
+    now.checked_add(seconds)
+        .with_context(|| format!("{name} overflows epoch seconds"))
+}
+
 fn join_workers(workers: Vec<thread::JoinHandle<()>>) {
     for worker in workers {
         let _ = worker.join();
@@ -724,6 +890,9 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "dispatch" => {
+            state
+                .lifecycle_maintenance_suppressed
+                .store(false, Ordering::Release);
             let _dispatch_slot = try_acquire_dispatch_slot(state)?;
             let payload: DispatchPayload =
                 serde_json::from_value(request.payload).context("parse dispatch payload")?;
@@ -1022,6 +1191,8 @@ mod tests {
                 idle_timeout: Duration::from_secs(60),
                 startup_sweep: SweepReport::default(),
                 stop_requested: AtomicBool::new(false),
+                lifecycle_maintenance_suppressed: AtomicBool::new(false),
+                activity_generation: AtomicU64::new(0),
                 active_clients: AtomicUsize::new(0),
                 active_dispatches: AtomicUsize::new(0),
             },

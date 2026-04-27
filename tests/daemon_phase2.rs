@@ -427,6 +427,118 @@ fn daemon_ensure_timeout_does_not_publish_socket_when_startup_is_blocked() {
     drop(conn);
 }
 
+#[test]
+fn daemon_lifecycle_refresh_does_not_block_control_requests_when_db_is_locked() {
+    let home = temp_home();
+    cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-control-while-locked",
+            "--summary",
+            "initialize db before daemon starts",
+        ],
+    );
+    let mut child = spawn_daemon(&home, "1", &[]);
+
+    let ping = wait_for_ping(&home);
+    assert_eq!(ping["message"], "pong");
+
+    let db_path = home.path().join("cbth.sqlite3");
+    let conn = Connection::open(&db_path).expect("open db");
+    conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+        .expect("hold exclusive db lock");
+
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        child.try_wait().expect("check daemon status").is_none(),
+        "daemon exited while lifecycle status could not be refreshed"
+    );
+
+    let ping_started = Instant::now();
+    let ping = cbth(&home, &["daemon", "ping"]);
+    assert_eq!(ping["message"], "pong");
+    assert!(
+        ping_started.elapsed() < Duration::from_secs(2),
+        "daemon ping was blocked by lifecycle refresh"
+    );
+
+    let stopped = cbth(&home, &["daemon", "stop"]);
+    assert_eq!(stopped["stopping"], true);
+    drop(conn);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().expect("check daemon status") {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not exit after stop request"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_skip_startup_sweep_exits_when_due_batch_waits_for_explicit_dispatch() {
+    let home = temp_home();
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-skip-startup-sweep",
+            "--summary",
+            "preserve explicit sweep report",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready for explicit sweep",
+            "--redelivery-window-seconds",
+            "1",
+        ],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    thread::sleep(Duration::from_secs(2));
+
+    let mut child = spawn_daemon(&home, "1", &["--skip-startup-sweep"]);
+    let ping = wait_for_ping(&home);
+    assert_eq!(ping["message"], "pong");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().expect("check daemon status") {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not exit while lifecycle maintenance was suppressed"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let inspected = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "open");
+    wait_for_socket_removed(&home);
+}
+
 #[cfg(unix)]
 #[test]
 fn daemon_ensure_timeout_is_not_extended_by_unresponsive_socket() {
@@ -575,6 +687,181 @@ fn daemon_exits_after_idle_timeout() {
     let output = child.wait_with_output().expect("daemon output");
     let shutdown: Value = serde_json::from_slice(&output.stdout).expect("daemon shutdown json");
     assert_eq!(shutdown["shutdown_reason"], "idle_timeout");
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_does_not_idle_exit_while_job_is_pending() {
+    let home = temp_home();
+    let mut child = spawn_daemon(&home, "1", &[]);
+
+    let ping = wait_for_ping(&home);
+    assert_eq!(ping["message"], "pong");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-pending-job-keeps-daemon",
+            "--summary",
+            "wait for long external task",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        child.try_wait().expect("check daemon status").is_none(),
+        "daemon exited while a job was still pending"
+    );
+
+    cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "operator cancelled",
+            "--redelivery-window-seconds",
+            "60",
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().expect("check daemon status") {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not exit after pending job cleared"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().expect("daemon output");
+    let shutdown: Value = serde_json::from_slice(&output.stdout).expect("daemon shutdown json");
+    assert_eq!(shutdown["shutdown_reason"], "idle_timeout");
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_sweeps_batches_due_within_idle_window_before_exit() {
+    let home = temp_home();
+    let mut child = spawn_daemon(&home, "3", &[]);
+
+    let ping = wait_for_ping(&home);
+    assert_eq!(ping["message"], "pong");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-near-term-batch",
+            "--summary",
+            "near term notification",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready for caller",
+            "--redelivery-window-seconds",
+            "1",
+        ],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(status) = child.try_wait().expect("check daemon status") {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not exit after sweeping near-term batch"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().expect("daemon output");
+    let shutdown: Value = serde_json::from_slice(&output.stdout).expect("daemon shutdown json");
+    assert_eq!(shutdown["shutdown_reason"], "idle_timeout");
+
+    let inspected = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "closed");
+    assert_eq!(
+        inspected["batch"]["batch"]["close_reason"],
+        "redelivery_window_exhausted"
+    );
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_exits_when_open_batch_is_due_after_current_idle_window() {
+    let home = temp_home();
+    let mut child = spawn_daemon(&home, "2", &[]);
+
+    let ping = wait_for_ping(&home);
+    assert_eq!(ping["message"], "pong");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-future-batch",
+            "--summary",
+            "future notification",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready later",
+            "--redelivery-window-seconds",
+            "10",
+        ],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        if let Some(status) = child.try_wait().expect("check daemon status") {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not exit before future batch became due"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().expect("daemon output");
+    let shutdown: Value = serde_json::from_slice(&output.stdout).expect("daemon shutdown json");
+    assert_eq!(shutdown["shutdown_reason"], "idle_timeout");
+
+    let inspected = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "open");
     wait_for_socket_removed(&home);
 }
 

@@ -14,9 +14,9 @@ use crate::fs_layout::{
     set_private_file_permissions_if_exists, validate_id_path_component,
 };
 use crate::models::{
-    ArtifactRecord, BatchInspect, BatchJobRecord, BatchRecord, DeliveryPolicy, JobRecord,
-    NewArtifact, NewBatch, NewJob, ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS,
-    SweepReport,
+    ArtifactRecord, BatchInspect, BatchJobRecord, BatchRecord, DaemonLifecycleStatus,
+    DeliveryPolicy, JobRecord, NewArtifact, NewBatch, NewJob, ORPHAN_ARTIFACT_GRACE_SECONDS,
+    POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
 };
 
 const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
@@ -24,6 +24,7 @@ const MAX_EXPIRED_BATCHES_PER_SWEEP: i64 = 100;
 const MAX_DELETABLE_ARTIFACTS_PER_SWEEP: i64 = 100;
 const MAX_MANIFEST_SYNCS_PER_SWEEP: i64 = 100;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const SQLITE_DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(100);
 const SQLITE_OPEN_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const SQLITE_OPEN_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
 
@@ -44,16 +45,26 @@ struct ManifestSyncReport {
 
 impl Store {
     pub fn open(layout: &FsLayout) -> Result<Self> {
+        Self::open_with_timeout(layout, SQLITE_BUSY_TIMEOUT)
+    }
+
+    pub fn open_for_daemon_lifecycle(layout: &FsLayout) -> Result<Self> {
+        Self::open_with_timeout(layout, SQLITE_DAEMON_LIFECYCLE_TIMEOUT)
+    }
+
+    fn open_with_timeout(layout: &FsLayout, busy_timeout: Duration) -> Result<Self> {
         let retry_started = SystemTime::now();
         let mut retry_delay = SQLITE_OPEN_RETRY_INITIAL_DELAY;
         loop {
-            match Self::open_once(layout) {
+            match Self::open_once(layout, busy_timeout) {
                 Ok(store) => return Ok(store),
                 Err(error) if is_sqlite_busy_or_locked(&error) => {
-                    if retry_started.elapsed().unwrap_or_default() >= SQLITE_BUSY_TIMEOUT {
+                    let elapsed = retry_started.elapsed().unwrap_or_default();
+                    if elapsed >= busy_timeout {
                         return Err(error);
                     }
-                    thread::sleep(retry_delay);
+                    let remaining = busy_timeout.saturating_sub(elapsed);
+                    thread::sleep(retry_delay.min(remaining));
                     retry_delay = retry_delay
                         .saturating_mul(2)
                         .min(SQLITE_OPEN_RETRY_MAX_DELAY);
@@ -63,13 +74,13 @@ impl Store {
         }
     }
 
-    fn open_once(layout: &FsLayout) -> Result<Self> {
+    fn open_once(layout: &FsLayout, busy_timeout: Duration) -> Result<Self> {
         layout.ensure()?;
         let db_path = layout.db_path();
         ensure_private_file_exists(&db_path)?;
         let conn = Connection::open(&db_path)
             .with_context(|| format!("open sqlite database {}", db_path.display()))?;
-        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        conn.busy_timeout(busy_timeout)?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("enable sqlite foreign_keys")?;
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -323,6 +334,25 @@ impl Store {
         batch_id
             .map(|id| query_batch_inspect(&self.conn, &id))
             .transpose()
+    }
+
+    pub fn daemon_lifecycle_status(
+        &self,
+        now: i64,
+        idle_horizon_at: i64,
+    ) -> Result<DaemonLifecycleStatus> {
+        let active_jobs = self.conn.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'pending'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
+        let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
+        Ok(DaemonLifecycleStatus {
+            active_jobs,
+            open_batches_due_now,
+            open_batches_due_within_idle,
+        })
     }
 
     pub fn close_head(
@@ -900,6 +930,17 @@ fn close_expired_manual_batches_tx(
         )?);
     }
     Ok((batch_ids.len(), artifacts_to_sync))
+}
+
+fn count_open_batches_due_at(conn: &Connection, due_at: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM batches
+         WHERE state = 'open'
+           AND redelivery_window_ends_at <= ?",
+        params![due_at],
+        |row| row.get::<_, i64>(0),
+    )
+    .context("count open batches due for daemon lifecycle")
 }
 
 fn close_expired_automatic_batches_tx(
