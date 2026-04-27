@@ -10,7 +10,7 @@ The runner is packaged as a local composite action so this directory can later m
 
 ## Observed Signals
 
-- Codex inline PR review comments and Codex review-body findings are the strongest failure signals. They carry a reviewed commit through the PR review / review-comment APIs, so findings attached to the current `HEAD_SHA` should fail the gate.
+- Codex inline PR review comments and Codex review-body findings are the strongest failure signals. Review-body findings carry a reviewed commit through the PR review API. Inline comments carry review-comment commit identity, but GitHub can remap REST `commit_id` on old comments that still appear in later diffs, so inline comments are active findings only when their GraphQL review thread is not `isResolved` and not `isOutdated`.
 - Codex `eyes` reactions are liveness only. They mean Codex has likely accepted or started work, but they are not a pass signal.
 - Codex `+1` reactions can be used as a clean/pass candidate only when the active reaction is new relative to the gate baseline. A pre-existing unchanged `+1` is not enough.
 - Codex top-level comments after the active marker can be used as review-completion evidence. Their natural language wording is not authoritative and should not be parsed for pass/fail; the pass/fail decision still comes from whether current-head Codex findings exist.
@@ -44,7 +44,7 @@ The first round has special handling because PR-open auto review may already be 
 
 On the first gate run for a PR:
 
-1. Collect current Codex reactions, top-level comments, PR reviews, and inline review comments.
+1. Collect current Codex reactions, top-level comments, PR reviews, inline review comments, and GraphQL review-thread state.
 2. Record all existing Codex `eyes`, `+1`, inline findings, and review-body findings as bootstrap baseline.
 3. If current `HEAD_SHA` already has Codex findings, fail the current status.
 4. Keep the gate pending only during a short bootstrap grace period, so PR-open auto review signals that are already visible can be recorded.
@@ -100,7 +100,7 @@ Conversation resolution is intentionally separate from the status script. The st
 
 The strong parts are:
 
-- Current-head Codex findings are deterministic enough to fail on when they are inline review comments or review-body findings with a commit-specific code link, because Codex review objects and review comments expose commit identity.
+- Current-head Codex findings are deterministic enough to fail on when they are unresolved, non-outdated inline review threads or review-body findings with a commit-specific code link. The inline path cross-checks GraphQL thread state and paginates thread comment IDs to avoid treating resolved or outdated discussions as new current-head findings when REST `commit_id` is remapped.
 - The pass path no longer depends on clean-summary wording.
 - Old `+1` reactions are not reused.
 - Serial markers avoid two controlled requests racing for the same visible `+1` transition.
@@ -113,5 +113,5 @@ The thin parts are:
 - Bootstrap is inherently weaker because PR-open auto review is not marker controlled. The first round treats existing signals as baseline only, waits for a short grace period, then starts a controlled marker even when a stale `eyes` reaction remains visible.
 - If Codex stops emitting PR-body `+1` for clean reviews, the gate should stall rather than pass. That is fail-closed but may block merges until the signal model is revised.
 - If Codex moves findings from review comments/review bodies to top-level issue comments, the current script would not classify them as findings. This is accepted for now and partially covered by requiring conversation resolution, but it is not a full substitute for a first-class Codex verdict.
-- If GitHub review APIs omit or misreport commit ids, current-head finding detection becomes weaker. The implementation should prefer review/comment `commit_id` and treat ambiguous Codex findings conservatively when possible.
+- If GitHub review APIs omit or misreport commit ids, current-head finding detection becomes weaker. The implementation should prefer review/comment `commit_id` plus GraphQL review-thread state for inline comments, and treat ambiguous Codex findings conservatively when possible. If a current-head REST inline comment cannot be mapped to GraphQL thread metadata, it remains a finding.
 - The sticky state comment can be edited or deleted. The implementation must reconstruct from GitHub state or fail closed, not silently restart and reuse old signals.

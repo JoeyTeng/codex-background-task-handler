@@ -209,13 +209,12 @@ export function collectCurrentHeadCodexFindings(
   reviews,
   headSha,
   botLogins = DEFAULT_CODEX_BOT_LOGINS,
+  reviewThreads = [],
 ) {
-  const comments = reviewComments.filter((comment) => {
-    if (!isCodexBot(comment.user?.login, botLogins)) {
-      return false;
-    }
-    return comment.commit_id === headSha || comment.original_commit_id === headSha;
-  });
+  const reviewThreadByCommentId = buildReviewThreadIndex(reviewThreads);
+  const comments = reviewComments.filter((comment) =>
+    isCurrentHeadCodexInlineFinding(comment, headSha, botLogins, reviewThreadByCommentId),
+  );
 
   const reviewBodyFindings = reviews
     .filter((review) => isCurrentHeadCodexReviewBodyFinding(review, headSha, botLogins))
@@ -245,6 +244,41 @@ export function collectCurrentHeadCodexFindings(
     ids,
     samples,
   };
+}
+
+export function buildReviewThreadIndex(reviewThreads = []) {
+  const byCommentId = new Map();
+  for (const thread of reviewThreads || []) {
+    const comments = thread.comments?.nodes || [];
+    for (const comment of comments) {
+      const id = comment.databaseId ?? comment.id;
+      if (id !== null && id !== undefined) {
+        byCommentId.set(String(id), thread);
+      }
+    }
+  }
+  return byCommentId;
+}
+
+export function isCurrentHeadCodexInlineFinding(
+  comment,
+  headSha,
+  botLogins = DEFAULT_CODEX_BOT_LOGINS,
+  reviewThreadByCommentId = new Map(),
+) {
+  if (!isCodexBot(comment.user?.login, botLogins)) {
+    return false;
+  }
+  if (comment.commit_id !== headSha && comment.original_commit_id !== headSha) {
+    return false;
+  }
+
+  const thread = reviewThreadByCommentId.get(String(comment.id));
+  if (thread?.isResolved || thread?.isOutdated) {
+    return false;
+  }
+
+  return true;
 }
 
 export function isCurrentHeadCodexReviewBodyFinding(

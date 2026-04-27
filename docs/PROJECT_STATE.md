@@ -9,7 +9,7 @@
 - `codex/review-gate` 已抽成 repo 内部子项目：[tools/codex-review-gate](../tools/codex-review-gate/README.md)。顶层 workflow 只保留 `.github/workflows/codex-review-gate.yml` thin wrapper。
 - 当前 runner 已改成 reaction-driven serialized marker design，并通过本地 composite action wrapper 调用；ruleset 已要求 `codex/review-gate`、Rust CI 和 resolved conversations。
 - #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
-- 当前修复分支 `codex/review-gate-review-body-findings` 正在补兼容：Codex 有时会把 finding 放在 `PullRequestReview.body`，而不是 inline review comment；gate 现在会把 current-head review-body findings 也纳入失败条件。
+- 当前修复分支 `codex/review-gate-resolved-threads` 正在补兼容：GitHub REST 可能把已 resolved / outdated 的旧 inline review comment `commit_id` 映射到后续 head；gate 现在会额外读取 GraphQL `reviewThreads`，只把未 resolved、未 outdated 的 current-head Codex inline threads 算作 blocker。Codex review-body findings 仍按 `PullRequestReview.commit_id` 和 current-head blob link 判定，因为它们没有可 resolve 的 thread。
 
 ## 当前架构方向
 

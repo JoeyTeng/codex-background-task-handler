@@ -277,6 +277,81 @@ test("collects only current-head Codex inline findings", () => {
   });
 });
 
+test("ignores resolved and outdated current-head Codex inline threads", () => {
+  const comments = [
+    {
+      id: 10,
+      path: "src/resolved.rs",
+      line: null,
+      original_line: 7,
+      commit_id: "head",
+      original_commit_id: "old",
+      user: { login: "chatgpt-codex-connector[bot]" },
+    },
+    {
+      id: 11,
+      path: "src/outdated.rs",
+      line: null,
+      original_line: 8,
+      commit_id: "head",
+      original_commit_id: "old",
+      user: { login: "chatgpt-codex-connector[bot]" },
+    },
+    {
+      id: 12,
+      path: "src/active.rs",
+      line: 9,
+      commit_id: "head",
+      original_commit_id: "head",
+      user: { login: "chatgpt-codex-connector[bot]" },
+    },
+  ];
+  const reviewThreads = [
+    {
+      id: "resolved-thread",
+      isResolved: true,
+      isOutdated: true,
+      comments: { nodes: [{ databaseId: 10 }] },
+    },
+    {
+      id: "outdated-thread",
+      isResolved: false,
+      isOutdated: true,
+      comments: { nodes: [{ databaseId: 11 }] },
+    },
+    {
+      id: "active-thread",
+      isResolved: false,
+      isOutdated: false,
+      comments: { nodes: [{ databaseId: 12 }] },
+    },
+  ];
+
+  assert.deepEqual(collectCurrentHeadCodexFindings(comments, [], "head", undefined, reviewThreads), {
+    count: 1,
+    ids: ["12"],
+    samples: ["src/active.rs:9"],
+  });
+});
+
+test("treats unmapped current-head Codex inline comments as findings", () => {
+  const comments = [
+    {
+      id: 10,
+      path: "src/lib.rs",
+      line: 7,
+      commit_id: "head",
+      user: { login: "chatgpt-codex-connector[bot]" },
+    },
+  ];
+
+  assert.deepEqual(collectCurrentHeadCodexFindings(comments, [], "head", undefined, []), {
+    count: 1,
+    ids: ["10"],
+    samples: ["src/lib.rs:7"],
+  });
+});
+
 test("collects current-head Codex review-body findings", () => {
   const body = [
     "### 💡 Codex Review",
