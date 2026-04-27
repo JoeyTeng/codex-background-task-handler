@@ -38,6 +38,9 @@ pub struct Cli {
     #[arg(long, global = true, hide = true)]
     direct_store: bool,
 
+    #[arg(long, global = true, default_value_t = DEFAULT_DAEMON_STARTUP_TIMEOUT_SECONDS)]
+    auto_daemon_startup_timeout_seconds: u64,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -245,25 +248,34 @@ pub fn run() -> Result<()> {
     if cli.direct_store {
         require_direct_store_env()?;
     }
+    validate_nonzero_u64(
+        "auto_daemon_startup_timeout_seconds",
+        cli.auto_daemon_startup_timeout_seconds,
+    )?;
     let layout = FsLayout::resolve(cli.home)?;
     let output = dispatch(
         cli.command,
         &layout,
         DispatchMode::Client {
             direct_store: cli.direct_store,
+            startup_timeout_seconds: cli.auto_daemon_startup_timeout_seconds,
         },
     )?;
     write_json(&output)
 }
 
 enum DispatchMode {
-    Client { direct_store: bool },
+    Client {
+        direct_store: bool,
+        startup_timeout_seconds: u64,
+    },
     Direct,
 }
 
 fn dispatch(command: Commands, layout: &FsLayout, mode: DispatchMode) -> Result<Value> {
     if let DispatchMode::Client {
         direct_store: false,
+        startup_timeout_seconds,
     } = mode
         && let Some(argv) = daemon_argv_for_mutating_command(&command)?
     {
@@ -273,7 +285,7 @@ fn dispatch(command: Commands, layout: &FsLayout, mode: DispatchMode) -> Result<
             layout,
             DaemonEnsureOptions {
                 idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
-                startup_timeout_seconds: DEFAULT_DAEMON_STARTUP_TIMEOUT_SECONDS,
+                startup_timeout_seconds,
                 startup_sweep_now,
             },
         )?;

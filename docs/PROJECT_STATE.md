@@ -468,6 +468,7 @@ scripts/desktop_thread_inject_poc.py
 - Phase 3 当前分支为 `codex/phase-3-daemon-domain-rpc`，范围限定在把既有核心 CLI mutating/recovery 命令接入 daemon domain RPC，不接入 CLI `app-server` 或 Desktop heartbeat：
   - 默认 `job submit` / `job complete` / `job fail` 会先 `daemon ensure`，再通过 daemon 的 `dispatch` RPC 执行
   - 默认 `batch close-head` 与 `maintenance sweep` 同样走 daemon `dispatch` RPC
+  - 自动 daemon routing 的启动等待默认 5 秒，但用户可通过全局 `--auto-daemon-startup-timeout-seconds <seconds>` 为慢磁盘或大 startup sweep 场景显式放宽
   - `job inspect` / `job list` / `batch inspect-head` / `batch inspect` 仍然直接只读打开 store，避免把普通检查绑定到 daemon lifecycle
   - client 在提交 RPC 前把 `--metadata-file` / `--result-file` 转成绝对路径，避免 daemon 当前工作目录与调用者不同导致读取错位
   - daemon-side `dispatch` 拒绝 `--home` 与 `daemon ...` 子命令，避免通过 domain RPC 改写目标 home 或递归控制 daemon
