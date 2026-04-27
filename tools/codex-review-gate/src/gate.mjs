@@ -35,6 +35,37 @@ const config = readConfig();
 const repo = parseRepo(config.repository);
 const repoPath = `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
 const runUrl = `${config.serverUrl}/${repo.owner}/${repo.name}/actions/runs/${config.runId}`;
+const REVIEW_THREADS_QUERY = `
+  query CodexReviewGateReviewThreads(
+    $owner: String!
+    $repo: String!
+    $number: Int!
+    $after: String
+  ) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        reviewThreads(first: 100, after: $after) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          nodes {
+            id
+            isResolved
+            isOutdated
+            path
+            line
+            comments(first: 100) {
+              nodes {
+                databaseId
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
 
 let statusSha = config.headSha;
 let statusReady = false;
@@ -384,11 +415,12 @@ async function saveState(state, stateComment) {
 }
 
 async function loadSnapshot() {
-  const [comments, issueReactions, reviewComments, reviews] = await Promise.all([
+  const [comments, issueReactions, reviewComments, reviews, reviewThreads] = await Promise.all([
     paginate(`${repoPath}/issues/${config.prNumber}/comments`, { per_page: "100" }),
     paginate(`${repoPath}/issues/${config.prNumber}/reactions`, { per_page: "100" }),
     paginate(`${repoPath}/pulls/${config.prNumber}/comments`, { per_page: "100" }),
     paginate(`${repoPath}/pulls/${config.prNumber}/reviews`, { per_page: "100" }),
+    loadReviewThreads(),
   ]);
 
   const findings = collectCurrentHeadCodexFindings(
@@ -396,6 +428,7 @@ async function loadSnapshot() {
     reviews,
     statusSha,
     config.codexBotLogins,
+    reviewThreads,
   );
   const reactions = summarizeCodexReactions(issueReactions, config.codexBotLogins);
   const completionComment = selectLatestCodexCompletionComment(comments, config.codexBotLogins);
@@ -405,6 +438,7 @@ async function loadSnapshot() {
     issueReactions,
     reviewComments,
     reviews,
+    reviewThreads,
     reactions,
     completionComment,
     baseline: {
@@ -425,13 +459,17 @@ function readConfig() {
     throw new Error("PR_NUMBER must be a positive integer");
   }
 
+  const apiUrl = stripTrailingSlash(process.env.GITHUB_API_URL || "https://api.github.com");
+  const serverUrl = stripTrailingSlash(process.env.GITHUB_SERVER_URL || "https://github.com");
+
   return {
     token,
     repository,
     prNumber,
     headSha,
-    apiUrl: stripTrailingSlash(process.env.GITHUB_API_URL || "https://api.github.com"),
-    serverUrl: stripTrailingSlash(process.env.GITHUB_SERVER_URL || "https://github.com"),
+    apiUrl,
+    serverUrl,
+    graphqlUrl: graphqlEndpoint(apiUrl, serverUrl),
     runId: requiredEnv("GITHUB_RUN_ID"),
     runAttempt: process.env.GITHUB_RUN_ATTEMPT || "1",
     maxWaitMs: secondsEnv("MAX_WAIT_SECONDS", 7200, { allowZero: false }) * 1000,
@@ -564,6 +602,30 @@ async function paginate(path, query) {
   }
 }
 
+async function loadReviewThreads() {
+  const threads = [];
+  let after = null;
+
+  while (true) {
+    const { data } = await graphqlRequest(REVIEW_THREADS_QUERY, {
+      owner: repo.owner,
+      repo: repo.name,
+      number: config.prNumber,
+      after,
+    });
+    const connection = data?.repository?.pullRequest?.reviewThreads;
+    if (!connection) {
+      throw new Error("GraphQL reviewThreads query did not return a connection");
+    }
+
+    threads.push(...(connection.nodes || []));
+    if (!connection.pageInfo?.hasNextPage) {
+      return threads;
+    }
+    after = connection.pageInfo.endCursor;
+  }
+}
+
 async function request(method, path, bodyOrQuery) {
   const url = new URL(`${config.apiUrl}${path}`);
   const options = {
@@ -595,6 +657,40 @@ async function request(method, path, bodyOrQuery) {
   }
 
   return { data, headers: response.headers };
+}
+
+async function graphqlRequest(query, variables) {
+  const response = await fetch(config.graphqlUrl, {
+    method: "POST",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${config.token}`,
+      "Content-Type": "application/json",
+      "User-Agent": "codex-review-gate",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const text = await response.text();
+  const payload = text ? JSON.parse(text) : null;
+
+  if (!response.ok) {
+    const message = payload?.message || response.statusText;
+    throw new Error(`POST ${new URL(config.graphqlUrl).pathname} failed with ${response.status}: ${message}`);
+  }
+  if (payload?.errors?.length) {
+    const message = payload.errors.map((error) => error.message).join("; ");
+    throw new Error(`GraphQL reviewThreads query failed: ${message}`);
+  }
+
+  return { data: payload?.data };
+}
+
+function graphqlEndpoint(apiUrl, serverUrl) {
+  if (apiUrl.endsWith("/api/v3")) {
+    return `${serverUrl}/api/graphql`;
+  }
+  return `${apiUrl}/graphql`;
 }
 
 function sleep(ms) {
