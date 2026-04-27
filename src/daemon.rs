@@ -189,7 +189,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         match listener.accept() {
             Ok((mut stream, _addr)) => {
                 last_activity = Instant::now();
-                if workers.len() >= MAX_CLIENT_WORKERS {
+                if client_worker_capacity_reached(workers.len()) {
                     let _ = write_error_response(&mut stream, "daemon connection limit reached");
                     continue;
                 }
@@ -679,6 +679,10 @@ fn join_workers(workers: Vec<thread::JoinHandle<()>>) {
     for worker in workers {
         let _ = worker.join();
     }
+}
+
+fn client_worker_capacity_reached(active_workers: usize) -> bool {
+    active_workers >= MAX_CLIENT_WORKERS
 }
 
 fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
