@@ -173,3 +173,16 @@ pub struct SweepReport {
     pub artifact_manifests_synced: usize,
     pub artifact_manifest_sync_failures: usize,
 }
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DaemonLifecycleStatus {
+    pub active_jobs: i64,
+    pub open_batches_due_now: i64,
+    pub open_batches_due_within_idle: i64,
+}
+
+impl DaemonLifecycleStatus {
+    pub fn has_due_maintenance(&self) -> bool {
+        self.open_batches_due_now > 0
+    }
+}
