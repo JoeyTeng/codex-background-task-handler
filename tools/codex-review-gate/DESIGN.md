@@ -100,7 +100,7 @@ Conversation resolution is intentionally separate from the status script. The st
 
 The strong parts are:
 
-- Current-head Codex findings are deterministic enough to fail on when they are unresolved, non-outdated inline review threads or review-body findings with a commit-specific code link. The inline path cross-checks GraphQL thread state to avoid treating resolved or outdated discussions as new current-head findings when REST `commit_id` is remapped.
+- Current-head Codex findings are deterministic enough to fail on when they are unresolved, non-outdated inline review threads or review-body findings with a commit-specific code link. The inline path cross-checks GraphQL thread state and paginates thread comment IDs to avoid treating resolved or outdated discussions as new current-head findings when REST `commit_id` is remapped.
 - The pass path no longer depends on clean-summary wording.
 - Old `+1` reactions are not reused.
 - Serial markers avoid two controlled requests racing for the same visible `+1` transition.

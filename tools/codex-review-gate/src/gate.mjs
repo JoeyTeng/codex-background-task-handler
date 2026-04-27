@@ -56,10 +56,31 @@ const REVIEW_THREADS_QUERY = `
             path
             line
             comments(first: 100) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
               nodes {
                 databaseId
               }
             }
+          }
+        }
+      }
+    }
+  }
+`;
+const REVIEW_THREAD_COMMENTS_QUERY = `
+  query CodexReviewGateReviewThreadComments($threadId: ID!, $after: String) {
+    node(id: $threadId) {
+      ... on PullRequestReviewThread {
+        comments(first: 100, after: $after) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          nodes {
+            databaseId
           }
         }
       }
@@ -620,10 +641,42 @@ async function loadReviewThreads() {
 
     threads.push(...(connection.nodes || []));
     if (!connection.pageInfo?.hasNextPage) {
-      return threads;
+      return Promise.all(threads.map((thread) => loadAllReviewThreadComments(thread)));
     }
     after = connection.pageInfo.endCursor;
   }
+}
+
+async function loadAllReviewThreadComments(thread) {
+  let connection = thread.comments || { nodes: [] };
+  const nodes = [...(connection.nodes || [])];
+  let after = connection.pageInfo?.endCursor || null;
+
+  while (connection.pageInfo?.hasNextPage) {
+    const { data } = await graphqlRequest(REVIEW_THREAD_COMMENTS_QUERY, {
+      threadId: thread.id,
+      after,
+    });
+    connection = data?.node?.comments;
+    if (!connection) {
+      throw new Error(`GraphQL comments query did not return a connection for thread ${thread.id}`);
+    }
+
+    nodes.push(...(connection.nodes || []));
+    after = connection.pageInfo?.endCursor || null;
+  }
+
+  return {
+    ...thread,
+    comments: {
+      ...(thread.comments || {}),
+      nodes,
+      pageInfo: {
+        hasNextPage: false,
+        endCursor: after,
+      },
+    },
+  };
 }
 
 async function request(method, path, bodyOrQuery) {

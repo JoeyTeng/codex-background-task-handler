@@ -59,7 +59,7 @@ The checked-in runner implements the reaction-driven serialized marker design:
 - 实测后触发的 Codex review 可能 supersede 早先 onflight review，且旧 marker comment 上的小眼睛不会被移除；这些旧 `eyes` 只作为历史 liveness，不作为必须等待 completion 的代数关系。
 - bootstrap 同样不等待旧 `eyes` 闭合；grace 结束后即使 auto review 看起来还在 ongoing，也会发 controlled marker 让当前 head review 接管。
 - 通过前 workflow 会再次确认当前 head 没有未 resolved、未 outdated 的 Codex inline review threads 或 review body findings。
-- inline review comments 来自 REST `/pulls/{number}/comments`，但 runner 会额外用 GraphQL `reviewThreads` 确认 thread 是否 `isResolved` / `isOutdated`。这是必要的，因为 GitHub REST 可能把一个已解决旧 thread 的 `commit_id` 映射到后续 head；没有 GraphQL thread metadata 的 current-head Codex inline comment 会保守地继续算作 finding。
+- inline review comments 来自 REST `/pulls/{number}/comments`，但 runner 会额外用 GraphQL `reviewThreads` 确认 thread 是否 `isResolved` / `isOutdated`，并分页补齐每个 thread 的 comment ID 映射。这样做是必要的，因为 GitHub REST 可能把一个已解决旧 thread 的 `commit_id` 映射到后续 head；没有 GraphQL thread metadata 的 current-head Codex inline comment 会保守地继续算作 finding。
 - review-body findings 没有可 resolve 的 review thread；runner 只能按 `PullRequestReview.commit_id` 和 body 中的 current-head blob link 判断它是否属于当前 head。
 - 如果旧 `+1` 已存在且不变化，gate 保持 pending；marker 一小时级 timeout 后标为 stalled 并重新 baseline / 重发。
 - 当前默认 overall timeout 是 2 小时，marker timeout 是 1 小时，bootstrap grace 是 60 秒。
