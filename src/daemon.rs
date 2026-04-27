@@ -605,12 +605,22 @@ fn daemon_response_is_compatible(response: &Value) -> bool {
 fn stop_incompatible_daemon(layout: &FsLayout, startup_deadline: Instant) -> Result<()> {
     daemon_request_with_timeout(layout, "stop", remaining_budget(startup_deadline)?)
         .context("stop incompatible daemon")?;
-    wait_for_socket_removed_until(layout, startup_deadline)
+    wait_for_incompatible_daemon_replaced_or_removed_until(layout, startup_deadline)
 }
 
-fn wait_for_socket_removed_until(layout: &FsLayout, deadline: Instant) -> Result<()> {
+fn wait_for_incompatible_daemon_replaced_or_removed_until(
+    layout: &FsLayout,
+    deadline: Instant,
+) -> Result<()> {
     let socket_path = layout.daemon_socket_path();
     while socket_path.exists() {
+        let probe_budget = remaining_budget(deadline).unwrap_or(STARTUP_POLL_INTERVAL);
+        match daemon_request_with_timeout(layout, "ping", probe_budget.min(STARTUP_POLL_INTERVAL)) {
+            Ok(response) if daemon_response_is_compatible(&response) => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error_is_daemon_busy(&error) => return Ok(()),
+            Err(_) => {}
+        }
         if Instant::now() >= deadline {
             bail!("incompatible daemon did not stop before startup timeout");
         }
