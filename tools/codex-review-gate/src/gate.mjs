@@ -107,7 +107,7 @@ async function driveGate() {
       await failIfPullRequestHeadChanged("before passing Codex review gate");
       const finalSnapshot = await loadSnapshot();
       failIfCurrentHeadHasCodexFindings(finalSnapshot.findings);
-      await setCommitStatus("success", "Codex completion observed and current head has no inline findings");
+      await setCommitStatus("success", "Codex completion observed and current head has no Codex findings");
       state = closeActiveMarker(state, "passed", isoNow(), {
         observedPlusOne: state.activeMarker?.observedPlusOne || snapshot.reactions.plusOne,
         observedCompletionComment:
@@ -384,14 +384,16 @@ async function saveState(state, stateComment) {
 }
 
 async function loadSnapshot() {
-  const [comments, issueReactions, reviewComments] = await Promise.all([
+  const [comments, issueReactions, reviewComments, reviews] = await Promise.all([
     paginate(`${repoPath}/issues/${config.prNumber}/comments`, { per_page: "100" }),
     paginate(`${repoPath}/issues/${config.prNumber}/reactions`, { per_page: "100" }),
     paginate(`${repoPath}/pulls/${config.prNumber}/comments`, { per_page: "100" }),
+    paginate(`${repoPath}/pulls/${config.prNumber}/reviews`, { per_page: "100" }),
   ]);
 
   const findings = collectCurrentHeadCodexFindings(
     reviewComments,
+    reviews,
     statusSha,
     config.codexBotLogins,
   );
@@ -402,6 +404,7 @@ async function loadSnapshot() {
     comments,
     issueReactions,
     reviewComments,
+    reviews,
     reactions,
     completionComment,
     baseline: {
@@ -512,7 +515,7 @@ function failIfCurrentHeadHasCodexFindings(findings) {
   throw new GateFailure(
     "failure",
     `Codex posted ${findings.count} finding(s) on current head`,
-    `Codex review found ${findings.count} inline comment(s) for ${statusSha}.${suffix}`,
+    `Codex review found ${findings.count} finding(s) for ${statusSha}.${suffix}`,
   );
 }
 

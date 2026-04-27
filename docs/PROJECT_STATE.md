@@ -7,7 +7,9 @@
 ## Repo CI / review gate
 
 - `codex/review-gate` 已抽成 repo 内部子项目：[tools/codex-review-gate](../tools/codex-review-gate/README.md)。顶层 workflow 只保留 `.github/workflows/codex-review-gate.yml` thin wrapper。
-- 当前 runner 已改成 reaction-driven serialized marker design，并通过本地 composite action wrapper 调用；后续剩余项是 live PR 验证和 ruleset 配置。
+- 当前 runner 已改成 reaction-driven serialized marker design，并通过本地 composite action wrapper 调用；ruleset 已要求 `codex/review-gate`、Rust CI 和 resolved conversations。
+- #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
+- 当前修复分支 `codex/review-gate-review-body-findings` 正在补兼容：Codex 有时会把 finding 放在 `PullRequestReview.body`，而不是 inline review comment；gate 现在会把 current-head review-body findings 也纳入失败条件。
 
 ## 当前架构方向
 
