@@ -30,11 +30,18 @@
   - daemon 启动时先执行 maintenance sweep
   - daemon 简单 idle timeout 后退出并清理 socket
 - [ ] 把 daemon 退出条件从简单 idle timeout 收紧为：
-  - 无 active jobs
-  - 无 active clients
-  - 无需要在当前 idle timeout 内继续本地观察的近端 delivery work
-  - open 但长窗口的 batch / attempt 不单独阻止退出；由下次启动时的 overdue sweep 收口
-  - 唯一例外是 CLI accepted attempt 的 `delivery_observation_deadline`，它在 deadline 到期前必须常驻观察
+  - [x] 当前 store 已存在的 `pending` jobs 阻止 daemon idle exit
+  - [x] 最近 activity 后的当前 idle timeout window 内会到期的 open batches 阻止 daemon 直接退出，并在到期后由 daemon sweep 收口；该 horizon 不随后续 lifecycle refresh 滑动
+  - [x] active clients 已由 daemon worker guard 覆盖
+  - [x] lifecycle refresh 使用短 SQLite timeout；刷新失败时不阻塞 control RPC，且保守阻止 idle exit
+  - [x] idle timeout 判定在 idle deadline 之后至少强制刷新一次 lifecycle 状态，避免用 deadline 前缓存退出；client 完成也会刷新 activity generation，避免长 dispatch 结束后使用 accept-time horizon
+  - [x] due maintenance sweep 由单个后台 worker 执行，listener accept loop 只做短状态刷新
+  - [x] 显式 `maintenance sweep` autostart 的 skip-startup-sweep 路径会抑制后台 lifecycle maintenance，直到第一个 `dispatch` 请求进入，避免抢先消费显式 sweep report；抑制期间 due batches 不单独阻止 idle exit
+  - [x] shutdown 会等待已启动的 lifecycle maintenance worker 到达一致点后再返回
+  - [x] open 但长窗口的 batch / attempt 不单独阻止退出；由下次启动时的 overdue sweep 收口
+  - [ ] 后续 CLI accepted attempt schema 落地后，把 `delivery_observation_deadline` 接入 daemon 保活
+  - [ ] 后续 Desktop binding / attempt schema 落地后，把 `arm_pending_deadline` / `pause_deadline` 接入 daemon 保活
+  - [ ] 如果未来有 daemon-owned supervised child processes，把 active supervised jobs 与普通 externally-reported pending jobs 进一步拆开
 - [x] 实现 `cbth` daemon IPC 的 same-user-only 基础合同：
   - macOS / Linux 使用 `~/.cbth/run/cbth.sock` 或等价用户私有 Unix domain socket
   - parent directories 必须当前 uid owned 且不宽于 `0700`

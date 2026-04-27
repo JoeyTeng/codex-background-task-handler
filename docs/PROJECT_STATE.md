@@ -467,7 +467,8 @@ scripts/desktop_thread_inject_poc.py
   - `daemon ensure` 会按需拉起 foreground `daemon serve`
   - daemon 启动时先跑一次 maintenance sweep
   - daemon 在简单 idle timeout 后退出并清理 socket
-- Phase 3 当前分支为 `codex/phase-3-daemon-domain-rpc`，范围限定在把既有核心 CLI mutating/recovery 命令接入 daemon domain RPC，不接入 CLI `app-server` 或 Desktop heartbeat：
+- Phase 3 已经通过 PR #12 squash merge 到 `master`，merge commit 为 `8a692920f0e79ce1692b86f3a23d6ce0c0ae062e`。
+- Phase 3 范围限定在把既有核心 CLI mutating/recovery 命令接入 daemon domain RPC，不接入 CLI `app-server` 或 Desktop heartbeat：
   - 默认 `job submit` / `job complete` / `job fail` 会先 `daemon ensure`，再通过 daemon 的 `dispatch` RPC 执行
   - 默认 `batch close-head` 与 `maintenance sweep` 同样走 daemon `dispatch` RPC
   - 自动 daemon routing 的启动等待默认 5 秒，但用户可通过全局 `--auto-daemon-startup-timeout-seconds <seconds>` 为慢磁盘或大 startup sweep 场景显式放宽
@@ -479,8 +480,18 @@ scripts/desktop_thread_inject_poc.py
   - 测试内部保留隐藏 `--direct-store` 路径，用于固定旧的本地 store 语义与 daemon lifecycle 单元测试；该路径需要显式 `CBTH_ALLOW_DIRECT_STORE=1` 环境门控，不作为普通用户入口
   - mutating CLI 复用 daemon socket endpoint 校验；当 private run dir / socket ownership / peer uid proof 不能成立时 fail closed，不回退到 direct store 或 unauthenticated TCP
   - 私有目录创建在 Unix 下使用 `0700` creation mode，并对 chmod 路径使用 no-follow fd 操作，避免 autostart 并发窗口和 symlink race 扩大权限边界
+- Phase 4 当前分支为 `codex/phase-4-daemon-lifecycle`，范围限定在 daemon lifecycle guard 的第一层实现：
+  - 当前 store 已存在的 `pending` jobs 会阻止 daemon idle exit
+  - 最近 activity 后的当前 idle timeout window 内会到期的 open batches 会阻止 daemon 直接退出，并由 daemon 在到期后先执行 sweep；该 horizon 不随后续 lifecycle refresh 滑动
+  - 超出当前 idle timeout window 的 open batches 仍不阻止退出，继续依赖 next-start / explicit sweep 收口
+  - lifecycle refresh 使用短 SQLite timeout；刷新失败时保守阻止 idle exit，但不会让 listener accept loop 长时间阻塞 control RPC
+  - idle timeout 判定在 idle deadline 之后至少强制刷新一次 lifecycle 状态，避免 deadline 前缓存导致误退出；client 完成也会刷新 activity generation，避免长 dispatch 结束后使用 accept-time horizon
+  - due maintenance sweep 不在 listener accept loop 同步执行；daemon 只启动单个后台 maintenance worker，并在 worker 运行期间阻止 idle exit
+  - 当 daemon 因显式 `maintenance sweep` autostart 而 skip startup sweep 时，后台 lifecycle maintenance 会抑制到第一个 `dispatch` 请求进入后，避免抢先消费显式 sweep report；抑制期间 due batches 不单独阻止 idle exit
+  - shutdown 会等待已启动的 lifecycle maintenance worker 到达一致点后再返回
 - 当前 daemon 仍未接入完整 delivery lifecycle：
-  - active delivery work / active clients / `delivery_observation_deadline` 尚未接入 daemon 退出条件
+  - CLI accepted attempt 的 `delivery_observation_deadline` 尚未有 schema / adapter，因此尚未接入 daemon 保活
+  - Desktop arm / pause / boundary deadlines 尚未有 schema / adapter，因此尚未接入 daemon 保活
   - CLI managed session 与 Desktop bridge adapters 尚未实现
 
 ## Phase 1 Implementation Priority
