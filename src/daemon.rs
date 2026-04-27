@@ -214,103 +214,90 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
 pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<Value> {
     validate_daemon_autostart_endpoint(layout)?;
     let startup_deadline = Instant::now() + Duration::from_secs(options.startup_timeout_seconds);
-    match daemon_request_with_timeout(layout, "ping", remaining_budget(startup_deadline)?) {
-        Ok(response) if daemon_response_is_compatible(&response) => {
-            return Ok(json!({
-                "started": false,
-                "daemon": response["daemon"].clone(),
-            }));
-        }
-        Ok(_) => {
-            stop_incompatible_daemon(layout, startup_deadline)?;
-        }
-        Err(error) => {
-            if Instant::now() >= startup_deadline {
-                bail!("daemon did not become ready: {error}");
-            }
-        }
+    if let Some(response) = probe_existing_daemon_for_ensure(layout, startup_deadline)? {
+        return Ok(json!({
+            "started": false,
+            "daemon": response["daemon"].clone(),
+        }));
     }
 
     layout.ensure_run_dir()?;
     let _startup_lock = acquire_startup_lock(layout, remaining_budget(startup_deadline)?)?;
-    match daemon_request_with_timeout(layout, "ping", remaining_budget(startup_deadline)?) {
-        Ok(response) if daemon_response_is_compatible(&response) => {
-            return Ok(json!({
-                "started": false,
-                "daemon": response["daemon"].clone(),
-            }));
-        }
-        Ok(_) => {
-            stop_incompatible_daemon(layout, startup_deadline)?;
-        }
-        Err(error) => {
-            if Instant::now() >= startup_deadline {
-                bail!("daemon did not become ready: {error}");
-            }
-        }
+    if let Some(response) = probe_existing_daemon_for_ensure(layout, startup_deadline)? {
+        return Ok(json!({
+            "started": false,
+            "daemon": response["daemon"].clone(),
+        }));
     }
-
-    let mut command = Command::new(std::env::current_exe().context("locate current executable")?);
-    command
-        .arg("--home")
-        .arg(layout.home_dir())
-        .arg("daemon")
-        .arg("serve")
-        .arg("--idle-timeout-seconds")
-        .arg(options.idle_timeout_seconds.to_string());
-    if let Some(startup_sweep_now) = options.startup_sweep_now {
-        command.arg("--now").arg(startup_sweep_now.to_string());
-    } else {
-        command.arg("--skip-startup-sweep");
-    }
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawn cbth daemon")?;
-    let child_pid = child.id();
 
     loop {
-        let probe_budget = match remaining_budget(startup_deadline) {
-            Ok(duration) => duration,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                cleanup_stale_socket_best_effort(layout);
-                bail!("daemon did not become ready: {error}");
-            }
-        };
-        match daemon_request_with_timeout(layout, "ping", probe_budget) {
-            Ok(response) => {
-                return Ok(json!({
-                    "started": true,
-                    "spawned_pid": child_pid,
-                    "daemon": response["daemon"].clone(),
-                }));
-            }
-            Err(last_error) => {
-                if let Some(status) = child.try_wait().context("check daemon child status")? {
-                    if let Ok(response) = daemon_request_with_timeout(
-                        layout,
-                        "ping",
-                        remaining_budget(startup_deadline).unwrap_or(STARTUP_POLL_INTERVAL),
-                    ) {
-                        return Ok(json!({
-                            "started": false,
-                            "daemon": response["daemon"].clone(),
-                        }));
-                    }
-                    cleanup_stale_socket_best_effort(layout);
-                    bail!("daemon exited before accepting connections: {status}");
-                }
-                if Instant::now() >= startup_deadline {
+        let mut command =
+            Command::new(std::env::current_exe().context("locate current executable")?);
+        command
+            .arg("--home")
+            .arg(layout.home_dir())
+            .arg("daemon")
+            .arg("serve")
+            .arg("--idle-timeout-seconds")
+            .arg(options.idle_timeout_seconds.to_string());
+        if let Some(startup_sweep_now) = options.startup_sweep_now {
+            command.arg("--now").arg(startup_sweep_now.to_string());
+        } else {
+            command.arg("--skip-startup-sweep");
+        }
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn cbth daemon")?;
+        let child_pid = child.id();
+
+        loop {
+            let probe_budget = match remaining_budget(startup_deadline) {
+                Ok(duration) => duration,
+                Err(error) => {
                     let _ = child.kill();
                     let _ = child.wait();
                     cleanup_stale_socket_best_effort(layout);
-                    bail!("daemon did not become ready: {last_error}");
+                    bail!("daemon did not become ready: {error}");
                 }
-                thread::sleep(STARTUP_POLL_INTERVAL);
+            };
+            match daemon_request_with_timeout(layout, "ping", probe_budget) {
+                Ok(response) if daemon_response_is_compatible(&response) => {
+                    return Ok(json!({
+                        "started": true,
+                        "spawned_pid": child_pid,
+                        "daemon": response["daemon"].clone(),
+                    }));
+                }
+                Ok(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    stop_incompatible_daemon(layout, startup_deadline)?;
+                    break;
+                }
+                Err(last_error) => {
+                    if let Some(status) = child.try_wait().context("check daemon child status")? {
+                        if let Some(response) =
+                            probe_existing_daemon_for_ensure(layout, startup_deadline)?
+                        {
+                            return Ok(json!({
+                                "started": false,
+                                "daemon": response["daemon"].clone(),
+                            }));
+                        }
+                        cleanup_stale_socket_best_effort(layout);
+                        bail!("daemon exited before accepting connections: {status}");
+                    }
+                    if Instant::now() >= startup_deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        cleanup_stale_socket_best_effort(layout);
+                        bail!("daemon did not become ready: {last_error}");
+                    }
+                    thread::sleep(STARTUP_POLL_INTERVAL);
+                }
             }
         }
     }
@@ -573,6 +560,34 @@ fn remaining_budget(deadline: Instant) -> Result<Duration> {
         .checked_duration_since(Instant::now())
         .filter(|duration| !duration.is_zero())
         .ok_or_else(|| anyhow::anyhow!("startup timeout is exhausted"))
+}
+
+fn probe_existing_daemon_for_ensure(
+    layout: &FsLayout,
+    startup_deadline: Instant,
+) -> Result<Option<Value>> {
+    loop {
+        match daemon_request_with_timeout(layout, "ping", remaining_budget(startup_deadline)?) {
+            Ok(response) if daemon_response_is_compatible(&response) => return Ok(Some(response)),
+            Ok(_) => {
+                stop_incompatible_daemon(layout, startup_deadline)?;
+                return Ok(None);
+            }
+            Err(error) if error_is_daemon_busy(&error) => {
+                thread::sleep(STARTUP_POLL_INTERVAL);
+            }
+            Err(error) => {
+                if Instant::now() >= startup_deadline {
+                    bail!("daemon did not become ready: {error}");
+                }
+                return Ok(None);
+            }
+        }
+    }
+}
+
+fn error_is_daemon_busy(error: &anyhow::Error) -> bool {
+    error.to_string() == "daemon is busy"
 }
 
 fn daemon_response_is_compatible(response: &Value) -> bool {

@@ -265,6 +265,55 @@ fn daemon_ensure_restarts_incompatible_daemon() {
     wait_for_socket_removed(&home);
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_retries_busy_daemon_without_spawning() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind busy daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    let busy_socket_path = socket_path.clone();
+    let handle = thread::spawn(move || {
+        for index in 0..2 {
+            let (mut stream, _addr) = listener.accept().expect("accept busy daemon request");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("read busy daemon request");
+            assert!(request.contains("\"ping\""));
+            let response = if index == 0 {
+                r#"{"ok":false,"error":"daemon is busy"}"#
+            } else {
+                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#
+            };
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.write_all(b"\n").expect("write response newline");
+        }
+        drop(listener);
+        fs::remove_file(&busy_socket_path).expect("remove busy socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert_eq!(ensured["started"], false);
+    assert_eq!(ensured["daemon"]["pid"], 4242);
+    handle.join().expect("busy daemon thread");
+}
+
 #[test]
 fn daemon_ensure_timeout_does_not_publish_socket_when_startup_is_blocked() {
     let home = temp_home();
