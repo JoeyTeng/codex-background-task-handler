@@ -206,6 +206,7 @@ export function decideBootstrapProgress({ startedAt, nowMs, graceSeconds, reacti
 
 export function collectCurrentHeadCodexFindings(
   reviewComments,
+  reviews,
   headSha,
   botLogins = DEFAULT_CODEX_BOT_LOGINS,
 ) {
@@ -216,18 +217,75 @@ export function collectCurrentHeadCodexFindings(
     return comment.commit_id === headSha || comment.original_commit_id === headSha;
   });
 
-  const samples = comments.slice(0, 3).map((comment) => {
-    const location = [comment.path, comment.line || comment.original_line]
-      .filter((part) => part !== null && part !== undefined)
-      .join(":");
-    return location || `review comment ${comment.id}`;
-  });
+  const reviewBodyFindings = reviews
+    .filter((review) => isCurrentHeadCodexReviewBodyFinding(review, headSha, botLogins))
+    .map((review) => ({
+      id: String(review.id),
+      sample: codexReviewBodyFindingSample(review.body || "", headSha) ||
+        `review ${review.id}`,
+    }));
+
+  const samples = [
+    ...comments.map((comment) => {
+      const location = [comment.path, comment.line || comment.original_line]
+        .filter((part) => part !== null && part !== undefined)
+        .join(":");
+      return location || `review comment ${comment.id}`;
+    }),
+    ...reviewBodyFindings.map((finding) => finding.sample),
+  ].slice(0, 3);
+
+  const ids = [
+    ...comments.map((comment) => String(comment.id)),
+    ...reviewBodyFindings.map((finding) => `review:${finding.id}`),
+  ];
 
   return {
-    count: comments.length,
-    ids: comments.map((comment) => String(comment.id)),
+    count: ids.length,
+    ids,
     samples,
   };
+}
+
+export function isCurrentHeadCodexReviewBodyFinding(
+  review,
+  headSha,
+  botLogins = DEFAULT_CODEX_BOT_LOGINS,
+) {
+  if (!isCodexBot(review.user?.login, botLogins)) {
+    return false;
+  }
+  if (review.state !== "COMMENTED") {
+    return false;
+  }
+  if (review.commit_id !== headSha) {
+    return false;
+  }
+
+  const body = review.body || "";
+  return body.includes("### 💡 Codex Review") && Boolean(codexReviewBodyFindingSample(body, headSha));
+}
+
+export function codexReviewBodyFindingSample(body, headSha) {
+  const blobPattern = new RegExp(
+    `/blob/${escapeRegExp(headSha)}/([^\\s)#]+)#L(\\d+)(?:-L\\d+)?`,
+  );
+  const match = body.match(blobPattern);
+  if (!match) {
+    return null;
+  }
+
+  const path = safeDecodeURIComponent(match[1]);
+  const line = match[2];
+  return `${path}:${line}`;
+}
+
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
 export function createInitialState({ now, statusHead, runUrl, reactions, findings }) {
