@@ -15,11 +15,14 @@ import {
   hasNewEyesTransition,
   hasNewPlusOneTransition,
   isCurrentHeadCodexReviewBodyFinding,
+  isRetryableHttpStatus,
   issueCommentIdentity,
   markerFromComment,
   parseStateCommentBody,
   reconcileStateWithMarkerComment,
   reactionIdentity,
+  restRequestRetryAllowed,
+  retryAfterDelayMs,
   selectLatestCodexCompletionComment,
   stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
@@ -164,6 +167,24 @@ test("selects only Codex bot top-level completion comments", () => {
   ];
 
   assert.deepEqual(selectLatestCodexCompletionComment(comments), issueCommentIdentity(comments[1]));
+});
+
+test("retries only transient HTTP statuses", () => {
+  assert.equal(isRetryableHttpStatus(504), true);
+  assert.equal(isRetryableHttpStatus(502), true);
+  assert.equal(isRetryableHttpStatus(422), false);
+});
+
+test("does not retry marker comment creation requests", () => {
+  assert.equal(restRequestRetryAllowed("PATCH", "/repos/o/r/issues/comments/1", 504), true);
+  assert.equal(restRequestRetryAllowed("GET", "/repos/o/r/pulls/1", 504), true);
+  assert.equal(restRequestRetryAllowed("POST", "/repos/o/r/statuses/abc", 504), true);
+  assert.equal(restRequestRetryAllowed("POST", "/repos/o/r/issues/1/comments", 504), false);
+});
+
+test("honors Retry-After response delays", () => {
+  assert.equal(retryAfterDelayMs("2", 100), 2000);
+  assert.equal(retryAfterDelayMs("invalid", 100), 100);
 });
 
 test("round-trips hidden state metadata", () => {
