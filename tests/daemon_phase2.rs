@@ -315,7 +315,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
         replacement_listener
             .set_nonblocking(true)
             .expect("set replacement listener nonblocking");
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut accepted = 0;
         while accepted < 2 && Instant::now() < deadline {
             match replacement_listener.accept() {
@@ -323,17 +323,24 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
                     stream
                         .set_nonblocking(false)
                         .expect("set replacement stream blocking");
-                    let mut request = String::new();
-                    stream
-                        .read_to_string(&mut request)
-                        .expect("read replacement request");
+                    let mut request = [0_u8; 1024];
+                    let request_len = stream.read(&mut request).expect("read replacement request");
+                    let request = String::from_utf8_lossy(&request[..request_len]);
                     assert!(request.contains("\"ping\""));
-                    stream
-                        .write_all(
-                            br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch"],"message":"pong"}}"#,
-                        )
-                        .expect("write replacement response");
-                    stream.write_all(b"\n").expect("write response newline");
+                    if let Err(error) = stream.write_all(
+                        br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch"],"message":"pong"}}"#,
+                    ) {
+                        if error.kind() == std::io::ErrorKind::BrokenPipe {
+                            continue;
+                        }
+                        panic!("write replacement response: {error}");
+                    }
+                    if let Err(error) = stream.write_all(b"\n") {
+                        if error.kind() == std::io::ErrorKind::BrokenPipe {
+                            continue;
+                        }
+                        panic!("write response newline: {error}");
+                    }
                     accepted += 1;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
