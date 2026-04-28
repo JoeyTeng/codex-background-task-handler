@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 #[cfg(unix)]
@@ -182,13 +182,19 @@ fn daemon_ensure_starts_ping_status_and_stop() {
     let ping = cbth(&home, &["daemon", "ping"]);
     assert_eq!(ping["message"], "pong");
     assert_eq!(ping["protocol_version"], 1);
-    assert_eq!(ping["capabilities"][0], "dispatch");
+    assert_eq!(
+        ping["capabilities"],
+        json!(["dispatch", "attempt-dispatch"])
+    );
     assert_eq!(ping["daemon"]["idle_timeout_seconds"], 10);
 
     let status = cbth(&home, &["daemon", "status"]);
     assert_eq!(status["daemon"]["stop_requested"], false);
     assert_eq!(status["protocol_version"], 1);
-    assert_eq!(status["capabilities"][0], "dispatch");
+    assert_eq!(
+        status["capabilities"],
+        json!(["dispatch", "attempt-dispatch"])
+    );
     assert!(status["startup_sweep"].is_object());
 
     #[cfg(unix)]
@@ -259,7 +265,10 @@ fn daemon_ensure_restarts_incompatible_daemon() {
 
     let ping = cbth(&home, &["daemon", "ping"]);
     assert_eq!(ping["protocol_version"], 1);
-    assert_eq!(ping["capabilities"][0], "dispatch");
+    assert_eq!(
+        ping["capabilities"],
+        json!(["dispatch", "attempt-dispatch"])
+    );
 
     cbth(&home, &["daemon", "stop"]);
     wait_for_socket_removed(&home);
@@ -276,6 +285,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
     let legacy_listener = UnixListener::bind(&socket_path).expect("bind legacy daemon socket");
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
     let replacement_socket_path = socket_path.clone();
+    let replacement_temp_socket_path = run_dir.join("replacement.sock");
     let handle = thread::spawn(move || {
         for _ in 0..2 {
             let (mut stream, _addr) = legacy_listener.accept().expect("accept legacy request");
@@ -297,28 +307,54 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
             }
         }
         drop(legacy_listener);
-        fs::remove_file(&replacement_socket_path).expect("remove legacy socket");
 
         let replacement_listener =
-            UnixListener::bind(&replacement_socket_path).expect("bind replacement socket");
-        fs::set_permissions(&replacement_socket_path, fs::Permissions::from_mode(0o600))
-            .expect("chmod replacement socket");
-        for _ in 0..2 {
-            let (mut stream, _addr) = replacement_listener
-                .accept()
-                .expect("accept replacement request");
-            let mut request = String::new();
-            stream
-                .read_to_string(&mut request)
-                .expect("read replacement request");
-            assert!(request.contains("\"ping\""));
-            stream
-                .write_all(
-                    br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#,
-                )
-                .expect("write replacement response");
-            stream.write_all(b"\n").expect("write response newline");
+            UnixListener::bind(&replacement_temp_socket_path).expect("bind replacement socket");
+        fs::set_permissions(
+            &replacement_temp_socket_path,
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod replacement socket");
+        fs::rename(&replacement_temp_socket_path, &replacement_socket_path)
+            .expect("publish replacement socket");
+        replacement_listener
+            .set_nonblocking(true)
+            .expect("set replacement listener nonblocking");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut accepted = 0;
+        while accepted < 2 && Instant::now() < deadline {
+            match replacement_listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("set replacement stream blocking");
+                    let mut request = [0_u8; 1024];
+                    let request_len = stream.read(&mut request).expect("read replacement request");
+                    let request = String::from_utf8_lossy(&request[..request_len]);
+                    assert!(request.contains("\"ping\""));
+                    if let Err(error) = stream.write_all(
+                        br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch"],"message":"pong"}}"#,
+                    ) {
+                        if error.kind() == std::io::ErrorKind::BrokenPipe {
+                            continue;
+                        }
+                        panic!("write replacement response: {error}");
+                    }
+                    if let Err(error) = stream.write_all(b"\n") {
+                        if error.kind() == std::io::ErrorKind::BrokenPipe {
+                            continue;
+                        }
+                        panic!("write response newline: {error}");
+                    }
+                    accepted += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept replacement request: {error}"),
+            }
         }
+        assert!(accepted >= 1, "replacement daemon was not probed");
         drop(replacement_listener);
         fs::remove_file(&replacement_socket_path).expect("remove replacement socket");
     });
@@ -363,7 +399,7 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
             } else if index == 1 {
                 r#"{"ok":false,"error":"daemon connection limit reached"}"#
             } else {
-                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#
+                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())
@@ -536,6 +572,108 @@ fn daemon_skip_startup_sweep_exits_when_due_batch_waits_for_explicit_dispatch() 
 
     let inspected = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
     assert_eq!(inspected["batch"]["batch"]["state"], "open");
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_skip_startup_sweep_exits_when_due_cli_observation_waits_for_explicit_dispatch() {
+    let home = temp_home();
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-skip-cli-observation",
+            "--summary",
+            "preserve explicit CLI observation sweep",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready for explicit sweep",
+            "--redelivery-window-seconds",
+            "60",
+        ],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let pending = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            "managed-skip-cli",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-skip-cli",
+            "--now",
+            "100",
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id");
+    cbth(
+        &home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            attempt_id,
+            "--delivery-turn-id",
+            "turn-skip-cli",
+            "--observation-window-seconds",
+            "1",
+            "--now",
+            "101",
+        ],
+    );
+
+    let mut child = spawn_daemon(&home, "1", &["--skip-startup-sweep"]);
+    let ping = wait_for_ping(&home);
+    assert_eq!(ping["message"], "pong");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().expect("check daemon status") {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not exit while lifecycle maintenance was suppressed"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let attempt = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
+    assert_eq!(attempt["attempt"]["state"], "cooldown");
+    assert_eq!(attempt["attempt"]["delivery_observation_state"], "tracking");
+    let inspected = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["replay_policy"], "automatic");
     wait_for_socket_removed(&home);
 }
 
@@ -862,6 +1000,116 @@ fn daemon_exits_when_open_batch_is_due_after_current_idle_window() {
 
     let inspected = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
     assert_eq!(inspected["batch"]["batch"]["state"], "open");
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_keeps_alive_for_active_cli_observation_then_expires_it() {
+    let home = temp_home();
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-active-cli-observation",
+            "--summary",
+            "wait for accepted CLI turn",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready for CLI",
+            "--redelivery-window-seconds",
+            "60",
+        ],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let pending = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            "managed-cli-daemon",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-daemon-observed",
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id");
+    cbth(
+        &home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            attempt_id,
+            "--delivery-turn-id",
+            "turn-daemon-observed",
+            "--observation-window-seconds",
+            "5",
+        ],
+    );
+
+    let mut child = spawn_daemon(&home, "1", &[]);
+    let ping = wait_for_ping(&home);
+    assert_eq!(ping["message"], "pong");
+
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        child.try_wait().expect("check daemon status").is_none(),
+        "daemon exited while a CLI observation was still active"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("check daemon status") {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not exit after expiring the CLI observation"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().expect("daemon output");
+    let shutdown: Value = serde_json::from_slice(&output.stdout).expect("daemon shutdown json");
+    assert_eq!(shutdown["shutdown_reason"], "idle_timeout");
+
+    let attempt = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
+    assert_eq!(attempt["attempt"]["state"], "abandoned");
+    assert_eq!(attempt["attempt"]["delivery_observation_state"], "expired");
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
     wait_for_socket_removed(&home);
 }
 

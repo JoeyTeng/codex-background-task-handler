@@ -18,12 +18,15 @@ import {
   hasNewEyesTransition,
   hasNewPlusOneTransition,
   isoNow,
+  isRetryableHttpStatus,
   markerFromComment,
   normalizeState,
   parseLoginSet,
   parseStateCommentBody,
   parseTimestamp,
   reconcileStateWithMarkerComment,
+  restRequestRetryAllowed,
+  retryAfterDelayMs,
   selectLatestCodexCompletionComment,
   stateFromRecoveredMarkerComment,
   summarizeCodexReactions,
@@ -90,6 +93,7 @@ const REVIEW_THREAD_COMMENTS_QUERY = `
 
 let statusSha = config.headSha;
 let statusReady = false;
+const MAX_REQUEST_ATTEMPTS = 4;
 
 main().catch(async (error) => {
   const gateError =
@@ -680,63 +684,110 @@ async function loadAllReviewThreadComments(thread) {
 }
 
 async function request(method, path, bodyOrQuery) {
-  const url = new URL(`${config.apiUrl}${path}`);
-  const options = {
-    method,
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${config.token}`,
-      "User-Agent": "codex-review-gate",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-  };
+  for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt += 1) {
+    const url = new URL(`${config.apiUrl}${path}`);
+    const options = {
+      method,
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${config.token}`,
+        "User-Agent": "codex-review-gate",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    };
 
-  if (method === "GET") {
-    for (const [key, value] of Object.entries(bodyOrQuery || {})) {
-      url.searchParams.set(key, value);
+    if (method === "GET") {
+      for (const [key, value] of Object.entries(bodyOrQuery || {})) {
+        url.searchParams.set(key, value);
+      }
+    } else if (bodyOrQuery) {
+      options.headers["Content-Type"] = "application/json";
+      options.body = JSON.stringify(bodyOrQuery);
     }
-  } else if (bodyOrQuery) {
-    options.headers["Content-Type"] = "application/json";
-    options.body = JSON.stringify(bodyOrQuery);
+
+    let response;
+    try {
+      response = await fetch(url, options);
+    } catch (error) {
+      if (attempt < MAX_REQUEST_ATTEMPTS && restRequestRetryAllowed(method, path, 503)) {
+        await sleepBeforeRetry(`retrying ${method} ${url.pathname} after fetch error: ${error.message}`, attempt);
+        continue;
+      }
+      throw error;
+    }
+
+    const text = await response.text();
+    const data = text ? JSON.parse(text) : null;
+
+    if (!response.ok) {
+      const message = data?.message || response.statusText;
+      if (
+        attempt < MAX_REQUEST_ATTEMPTS &&
+        restRequestRetryAllowed(method, path, response.status)
+      ) {
+        await sleepBeforeRetry(
+          `retrying ${method} ${url.pathname} after ${response.status}: ${message}`,
+          attempt,
+          response.headers.get("retry-after"),
+        );
+        continue;
+      }
+      throw new Error(`${method} ${url.pathname} failed with ${response.status}: ${message}`);
+    }
+
+    return { data, headers: response.headers };
   }
 
-  const response = await fetch(url, options);
-  const text = await response.text();
-  const data = text ? JSON.parse(text) : null;
-
-  if (!response.ok) {
-    const message = data?.message || response.statusText;
-    throw new Error(`${method} ${url.pathname} failed with ${response.status}: ${message}`);
-  }
-
-  return { data, headers: response.headers };
+  throw new Error(`${method} ${path} exceeded retry budget`);
 }
 
 async function graphqlRequest(query, variables) {
-  const response = await fetch(config.graphqlUrl, {
-    method: "POST",
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${config.token}`,
-      "Content-Type": "application/json",
-      "User-Agent": "codex-review-gate",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-  const text = await response.text();
-  const payload = text ? JSON.parse(text) : null;
+  for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt += 1) {
+    let response;
+    try {
+      response = await fetch(config.graphqlUrl, {
+        method: "POST",
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${config.token}`,
+          "Content-Type": "application/json",
+          "User-Agent": "codex-review-gate",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        body: JSON.stringify({ query, variables }),
+      });
+    } catch (error) {
+      if (attempt < MAX_REQUEST_ATTEMPTS) {
+        await sleepBeforeRetry(`retrying GraphQL request after fetch error: ${error.message}`, attempt);
+        continue;
+      }
+      throw error;
+    }
 
-  if (!response.ok) {
-    const message = payload?.message || response.statusText;
-    throw new Error(`POST ${new URL(config.graphqlUrl).pathname} failed with ${response.status}: ${message}`);
-  }
-  if (payload?.errors?.length) {
-    const message = payload.errors.map((error) => error.message).join("; ");
-    throw new Error(`GraphQL reviewThreads query failed: ${message}`);
+    const text = await response.text();
+    const payload = text ? JSON.parse(text) : null;
+
+    if (!response.ok) {
+      const message = payload?.message || response.statusText;
+      if (attempt < MAX_REQUEST_ATTEMPTS && isRetryableHttpStatus(response.status)) {
+        await sleepBeforeRetry(
+          `retrying GraphQL request after ${response.status}: ${message}`,
+          attempt,
+          response.headers.get("retry-after"),
+        );
+        continue;
+      }
+      throw new Error(`POST ${new URL(config.graphqlUrl).pathname} failed with ${response.status}: ${message}`);
+    }
+    if (payload?.errors?.length) {
+      const message = payload.errors.map((error) => error.message).join("; ");
+      throw new Error(`GraphQL reviewThreads query failed: ${message}`);
+    }
+
+    return { data: payload?.data };
   }
 
-  return { data: payload?.data };
+  throw new Error("GraphQL request exceeded retry budget");
 }
 
 function graphqlEndpoint(apiUrl, serverUrl) {
@@ -748,4 +799,11 @@ function graphqlEndpoint(apiUrl, serverUrl) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sleepBeforeRetry(message, attempt, retryAfter = null) {
+  const fallbackMs = Math.min(1000 * 2 ** (attempt - 1), 10_000);
+  const delayMs = retryAfterDelayMs(retryAfter, fallbackMs);
+  console.warn(`${message}; retrying in ${Math.round(delayMs / 1000)}s`);
+  await sleep(delayMs);
 }

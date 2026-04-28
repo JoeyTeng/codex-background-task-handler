@@ -31,7 +31,7 @@ const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_MAINTENANCE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMON_PROTOCOL_VERSION: u64 = 1;
-const DAEMON_CAPABILITIES: &[&str] = &["dispatch"];
+const DAEMON_CAPABILITIES: &[&str] = &["dispatch", "attempt-dispatch"];
 const MAX_DISPATCH_WORKERS: usize = 32;
 const RESERVED_CONTROL_WORKERS: usize = 8;
 const MAX_CLIENT_WORKERS: usize = MAX_DISPATCH_WORKERS + RESERVED_CONTROL_WORKERS;
@@ -165,6 +165,10 @@ impl DaemonLifecycleCache {
     fn has_exit_blockers(&self, maintenance_suppressed: bool) -> bool {
         self.refresh_failed
             || self.status.active_jobs > 0
+            || self.status.active_cli_acceptances > 0
+            || self.status.active_cli_observations > 0
+            || (!maintenance_suppressed && self.status.cli_acceptances_stale_now > 0)
+            || (!maintenance_suppressed && self.status.cli_observations_due_now > 0)
             || (!maintenance_suppressed && self.status.open_batches_due_within_idle > 0)
     }
 }
@@ -709,14 +713,17 @@ fn try_acquire_dispatch_slot(state: &DaemonState) -> Result<DispatchGuard<'_>> {
 
 fn daemon_response_is_compatible(response: &Value) -> bool {
     let has_protocol = response["protocol_version"].as_u64() == Some(DAEMON_PROTOCOL_VERSION);
-    let has_dispatch = response["capabilities"]
-        .as_array()
-        .is_some_and(|capabilities| {
-            capabilities
-                .iter()
-                .any(|capability| capability.as_str() == Some("dispatch"))
-        });
-    has_protocol && has_dispatch
+    let has_capabilities =
+        response["capabilities"]
+            .as_array()
+            .is_some_and(|reported_capabilities| {
+                DAEMON_CAPABILITIES.iter().all(|required_capability| {
+                    reported_capabilities
+                        .iter()
+                        .any(|capability| capability.as_str() == Some(required_capability))
+                })
+            });
+    has_protocol && has_capabilities
 }
 
 fn stop_incompatible_daemon(layout: &FsLayout, startup_deadline: Instant) -> Result<()> {

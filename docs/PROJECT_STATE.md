@@ -480,7 +480,7 @@ scripts/desktop_thread_inject_poc.py
   - 测试内部保留隐藏 `--direct-store` 路径，用于固定旧的本地 store 语义与 daemon lifecycle 单元测试；该路径需要显式 `CBTH_ALLOW_DIRECT_STORE=1` 环境门控，不作为普通用户入口
   - mutating CLI 复用 daemon socket endpoint 校验；当 private run dir / socket ownership / peer uid proof 不能成立时 fail closed，不回退到 direct store 或 unauthenticated TCP
   - 私有目录创建在 Unix 下使用 `0700` creation mode，并对 chmod 路径使用 no-follow fd 操作，避免 autostart 并发窗口和 symlink race 扩大权限边界
-- Phase 4 当前分支为 `codex/phase-4-daemon-lifecycle`，范围限定在 daemon lifecycle guard 的第一层实现：
+- Phase 4 已经通过 PR #15 squash merge 到 `master`，merge commit 为 `dca6424b7a740bf5da44bd90e4f528f988942bd6`。范围限定在 daemon lifecycle guard 的第一层实现：
   - 当前 store 已存在的 `pending` jobs 会阻止 daemon idle exit
   - 最近 activity 后的当前 idle timeout window 内会到期的 open batches 会阻止 daemon 直接退出，并由 daemon 在到期后先执行 sweep；该 horizon 不随后续 lifecycle refresh 滑动
   - 超出当前 idle timeout window 的 open batches 仍不阻止退出，继续依赖 next-start / explicit sweep 收口
@@ -489,8 +489,25 @@ scripts/desktop_thread_inject_poc.py
   - due maintenance sweep 不在 listener accept loop 同步执行；daemon 只启动单个后台 maintenance worker，并在 worker 运行期间阻止 idle exit
   - 当 daemon 因显式 `maintenance sweep` autostart 而 skip startup sweep 时，后台 lifecycle maintenance 会抑制到第一个 `dispatch` 请求进入后，避免抢先消费显式 sweep report；抑制期间 due batches 不单独阻止 idle exit
   - shutdown 会等待已启动的 lifecycle maintenance worker 到达一致点后再返回
+- Phase 5 当前分支为 `codex/phase-5-cli-attempt-state`，范围限定在 CLI accepted-attempt durable state 与 daemon observation deadline 集成：
+  - 新增 `delivery_attempts` schema，覆盖 CLI `accept_pending -> cooldown -> abandoned` 的最小 accepted-observation slice
+  - adapter-internal 隐藏命令 `cbth attempt begin-cli-accept` / `accept-cli` / `inspect` 只用于后续 CLI adapter 与测试，不作为稳定外部用户接口
+  - `begin-cli-accept` 要求 adapter 先提供稳定 `--rpc-request-id`，并 durable 记录 `delivery_rpc_request_id`、`delivery_rpc_kind`、`delivery_rpc_state=pending_acceptance`、`delivery_rpc_correlation_marker`、`managed_session_id` 与 `session_epoch`
+  - `begin-cli-accept` 按 adapter-provided `delivery_rpc_request_id` 幂等：如果 DB 写入已提交但 JSON response 丢失，adapter 重试同一个 request id 会拿回原 attempt，而不是创建第二个 attempt 或卡到 manual timeout
+  - `accept-cli` 记录 `delivery_turn_id`、`delivery_accepted_at`、`delivery_observation_state=tracking` 与 `delivery_observation_deadline`，并只在 accepted 后递增 `delivery_attempt_count`
+  - Store 层拒绝对 fail-closed、需要 approval/network/write、或 `requires_artifact_read=true` 的 batch 进入 detached CLI delivery
+  - `accept_pending` 现在有 bounded sweep 收敛：若 pending acceptance 超过当前 5 分钟内部窗口仍无法证明 accepted/rejected，attempt 会进入 `abandoned`，RPC state 记为 `unknown`，head batch 进入 `manual_resolution_only`
+  - daemon lifecycle 会在 `accept_pending` timeout 前保持 active acceptance live window，并在 stale 后触发 maintenance sweep；显式 `maintenance sweep` autostart 的 suppressed lifecycle 例外仍保留，避免抢先消费显式 sweep report
+  - `maintenance sweep` 会把过期 accepted CLI observation 收敛到 `attempt.state=abandoned`、`delivery_observation_state=expired`，并把 head batch fail-closed 到 `replay_policy=manual_resolution_only`
+  - CLI fail-closed 到 manual 时会重新打开默认 manual resolution window，避免同一轮 sweep 把刚 manualized 的 batch 立即 `manual_resolution_expired`
+  - daemon lifecycle 的 due-batch 计数会排除仍有 active attempt 的 batch，避免在 attempt deadline 前反复触发无进展 sweep
+  - `batch close-head` 会同步把当前 batch 上仍未终态的 delivery attempt 标为 `closed`，避免 operator close 后的旧 attempt 阻塞同 thread 后续 head batch
+  - daemon lifecycle 会在 active `delivery_observation_deadline` 前阻止 idle exit；deadline 到期后由后台 sweep 收口，再允许退出
+  - CLI accepted observation window 第一版固定上限为 6 小时，避免错误 adapter 输入把 daemon idle-exit blocker 持久化到天级或无限远
+  - 显式 `maintenance sweep` autostart 的 skip-startup-sweep suppression 仍会保留：due CLI observation 与 due batch 一样不会抢先消费显式 sweep report；active 未到期 observation 仍保活到 deadline
 - 当前 daemon 仍未接入完整 delivery lifecycle：
-  - CLI accepted attempt 的 `delivery_observation_deadline` 尚未有 schema / adapter，因此尚未接入 daemon 保活
+  - CLI attempt mutation 通过 daemon dispatch 时要求 daemon 暴露 `attempt-dispatch` capability；旧 daemon 不满足该 capability 会被 ensure path 判定为 incompatible 并替换
+  - CLI accepted attempt 的 durable schema 与 daemon 保活已经落地，但真实 shared `app-server` adapter、managed session runtime、event/current-state observation、turn terminal-event reconciliation 尚未实现
   - Desktop arm / pause / boundary deadlines 尚未有 schema / adapter，因此尚未接入 daemon 保活
   - CLI managed session 与 Desktop bridge adapters 尚未实现
 

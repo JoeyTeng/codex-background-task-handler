@@ -396,6 +396,779 @@ fn maintenance_sweep_closes_expired_automatic_batches() {
 }
 
 #[test]
+fn cli_attempt_acceptance_tracks_deadline_and_attempt_count() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-attempt",
+            "--summary",
+            "wait for CLI continuation",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready for CLI",
+            "--max-delivery-attempts",
+            "2",
+        ],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+
+    let pending = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            "managed-cli-1",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-1",
+            "--rpc-correlation-marker",
+            "cbth:test-marker-1",
+            "--now",
+            "1000",
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id");
+    assert_eq!(pending["attempt"]["state"], "accept_pending");
+    assert_eq!(pending["attempt"]["generation"], 1);
+    assert_eq!(
+        pending["attempt"]["delivery_rpc_state"],
+        "pending_acceptance"
+    );
+    let retried_pending = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            "managed-cli-1",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-1",
+            "--rpc-correlation-marker",
+            "cbth:test-marker-1",
+            "--now",
+            "1001",
+        ],
+    );
+    assert_eq!(
+        retried_pending["attempt"]["attempt_id"],
+        pending["attempt"]["attempt_id"]
+    );
+    assert_eq!(retried_pending["attempt"]["created_at"], 1000);
+
+    let accepted = cbth(
+        &home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            attempt_id,
+            "--delivery-turn-id",
+            "turn-1",
+            "--observation-window-seconds",
+            "60",
+            "--now",
+            "1005",
+        ],
+    );
+    assert_eq!(accepted["attempt"]["state"], "cooldown");
+    assert_eq!(accepted["attempt"]["delivery_rpc_state"], "accepted");
+    assert_eq!(accepted["attempt"]["delivery_turn_id"], "turn-1");
+    assert_eq!(
+        accepted["attempt"]["delivery_observation_state"],
+        "tracking"
+    );
+    assert_eq!(accepted["attempt"]["delivery_observation_deadline"], 1065);
+
+    cbth(
+        &home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            attempt_id,
+            "--delivery-turn-id",
+            "turn-1",
+            "--observation-window-seconds",
+            "60",
+            "--now",
+            "1006",
+        ],
+    );
+
+    let inspected = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
+    assert_eq!(inspected["attempt"]["delivery_observation_deadline"], 1065);
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
+    assert_eq!(batch["batch"]["batch"]["delivery_attempt_count"], 1);
+}
+
+#[test]
+fn cli_attempt_acceptance_rejects_oversized_observation_window() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-observation-bound",
+            "--summary",
+            "bound CLI observation",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let pending = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            "managed-cli-observation-bound",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-observation-bound",
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            attempt_id,
+            "--delivery-turn-id",
+            "turn-observation-bound",
+            "--observation-window-seconds",
+            "21601",
+        ],
+    );
+    assert!(stderr.contains("observation_window_seconds must be <= 21600"));
+}
+
+#[test]
+fn cli_attempt_begin_requires_rpc_request_id() {
+    let home = tempfile::tempdir().expect("temp home");
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            "batch-missing-rpc-id",
+            "--managed-session-id",
+            "managed-cli-missing-rpc-id",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+        ],
+    );
+    assert!(stderr.contains("--rpc-request-id"));
+}
+
+#[test]
+fn cli_attempt_begin_rejects_fail_closed_batch_policy() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-policy",
+            "--summary",
+            "fail closed delivery",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            "managed-cli-policy",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-policy",
+        ],
+    );
+    assert!(stderr.contains("not eligible for detached CLI delivery"));
+}
+
+#[test]
+fn cli_attempt_begin_requires_thread_head_batch() {
+    let home = tempfile::tempdir().expect("temp home");
+    let first = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-fifo",
+            "--summary",
+            "first",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let second = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-fifo",
+            "--summary",
+            "second",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let first_job_id = first["job"]["job_id"].as_str().expect("first job id");
+    let second_job_id = second["job"]["job_id"].as_str().expect("second job id");
+    cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            first_job_id,
+            "--reason",
+            "first ready",
+        ],
+    );
+    let second_failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            second_job_id,
+            "--reason",
+            "second ready",
+        ],
+    );
+    let second_batch_id = second_failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("second batch id");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            second_batch_id,
+            "--managed-session-id",
+            "managed-cli-fifo",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-fifo",
+        ],
+    );
+    assert!(stderr.contains("is not the head batch"));
+}
+
+#[test]
+fn maintenance_sweep_does_not_close_active_cli_observation_before_deadline() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-window",
+            "--summary",
+            "accepted observation beats redelivery window",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready for CLI",
+            "--redelivery-window-seconds",
+            "1",
+        ],
+    );
+    let batch = &failed["batch"]["batch"];
+    let batch_id = batch["batch_id"].as_str().expect("batch id");
+    let sweep_now = (batch["redelivery_window_ends_at"]
+        .as_i64()
+        .expect("redelivery window")
+        + 1)
+    .to_string();
+    let pending = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            "managed-cli-window",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-window",
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id");
+    cbth(
+        &home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            attempt_id,
+            "--delivery-turn-id",
+            "turn-window",
+            "--observation-window-seconds",
+            "60",
+        ],
+    );
+
+    let sweep = cbth(&home, &["maintenance", "sweep", "--now", &sweep_now]);
+    assert_eq!(sweep["sweep"]["expired_automatic_batches_closed"], 0);
+    assert_eq!(sweep["sweep"]["expired_cli_observations_abandoned"], 0);
+
+    let attempt = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
+    assert_eq!(attempt["attempt"]["state"], "cooldown");
+    assert_eq!(attempt["attempt"]["delivery_observation_state"], "tracking");
+    let inspected = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "open");
+    assert_eq!(inspected["batch"]["batch"]["replay_policy"], "automatic");
+}
+
+#[test]
+fn maintenance_sweep_abandons_stale_cli_accept_pending_attempt() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-stale-accept",
+            "--summary",
+            "stale accept pending",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready for CLI",
+            "--redelivery-window-seconds",
+            "3600",
+        ],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let pending = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            "managed-cli-stale",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-stale",
+            "--now",
+            "100",
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id");
+
+    let sweep = cbth(&home, &["maintenance", "sweep", "--now", "401"]);
+    assert_eq!(sweep["sweep"]["stale_cli_acceptances_abandoned"], 1);
+
+    let attempt = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
+    assert_eq!(attempt["attempt"]["state"], "abandoned");
+    assert_eq!(attempt["attempt"]["delivery_rpc_state"], "unknown");
+    assert_eq!(
+        attempt["attempt"]["delivery_observation_state"],
+        "abandoned"
+    );
+    let inspected = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
+    assert_eq!(
+        inspected["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    assert_eq!(inspected["batch"]["batch"]["state"], "open");
+}
+
+#[test]
+fn operator_close_releases_active_cli_attempt_for_next_head_batch() {
+    let home = tempfile::tempdir().expect("temp home");
+    let first = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-close-release",
+            "--summary",
+            "first",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let second = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-close-release",
+            "--summary",
+            "second",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let first_job_id = first["job"]["job_id"].as_str().expect("first job id");
+    let second_job_id = second["job"]["job_id"].as_str().expect("second job id");
+    let first_failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            first_job_id,
+            "--reason",
+            "first ready",
+        ],
+    );
+    let second_failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            second_job_id,
+            "--reason",
+            "second ready",
+        ],
+    );
+    let first_batch_id = first_failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("first batch id");
+    let second_batch_id = second_failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("second batch id");
+    let first_attempt = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            first_batch_id,
+            "--managed-session-id",
+            "managed-cli-close-release",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-close-release-1",
+        ],
+    );
+    let first_attempt_id = first_attempt["attempt"]["attempt_id"]
+        .as_str()
+        .expect("first attempt id");
+
+    cbth(
+        &home,
+        &[
+            "batch",
+            "close-head",
+            "--source-thread-id",
+            "thread-cli-close-release",
+            "--reason",
+            "operator-closed-unconfirmed",
+        ],
+    );
+    let first_attempt = cbth(
+        &home,
+        &["attempt", "inspect", "--attempt-id", first_attempt_id],
+    );
+    assert_eq!(first_attempt["attempt"]["state"], "closed");
+
+    let second_attempt = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            second_batch_id,
+            "--managed-session-id",
+            "managed-cli-close-release",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-close-release-2",
+        ],
+    );
+    assert_eq!(second_attempt["attempt"]["state"], "accept_pending");
+}
+
+#[test]
+fn maintenance_sweep_expires_cli_observation_to_manual_resolution() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-expiry",
+            "--summary",
+            "wait for CLI observation expiry",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready for CLI",
+            "--redelivery-window-seconds",
+            "1",
+        ],
+    );
+    let failed_batch = &failed["batch"]["batch"];
+    let batch_id = failed_batch["batch_id"].as_str().expect("batch id");
+    let redelivery_window_ends_at = failed_batch["redelivery_window_ends_at"]
+        .as_i64()
+        .expect("redelivery window");
+    let begin_now = redelivery_window_ends_at + 1;
+    let accept_now = begin_now + 1;
+    let sweep_now = accept_now + 6;
+    let begin_now = begin_now.to_string();
+    let accept_now = accept_now.to_string();
+    let sweep_now = sweep_now.to_string();
+    let pending = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            "managed-cli-2",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-expiry",
+            "--now",
+            &begin_now,
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id");
+    cbth(
+        &home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            attempt_id,
+            "--delivery-turn-id",
+            "turn-expired",
+            "--observation-window-seconds",
+            "5",
+            "--now",
+            &accept_now,
+        ],
+    );
+
+    let sweep = cbth(&home, &["maintenance", "sweep", "--now", &sweep_now]);
+    assert_eq!(sweep["sweep"]["expired_cli_observations_abandoned"], 1);
+    assert_eq!(sweep["sweep"]["expired_manual_batches_closed"], 0);
+
+    let attempt = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
+    assert_eq!(attempt["attempt"]["state"], "abandoned");
+    assert_eq!(attempt["attempt"]["delivery_observation_state"], "expired");
+    assert_eq!(
+        attempt["attempt"]["abandoned_at"],
+        sweep_now.parse::<i64>().expect("sweep now")
+    );
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    assert_eq!(batch["batch"]["batch"]["delivery_attempt_count"], 1);
+    assert!(
+        batch["batch"]["batch"]["redelivery_window_ends_at"]
+            .as_i64()
+            .expect("manual window")
+            > sweep_now.parse::<i64>().expect("sweep now")
+    );
+}
+
+#[test]
 fn maintenance_sweep_cleans_old_orphan_artifact_dirs() {
     let home = tempfile::tempdir().expect("temp home");
     let submit = cbth(

@@ -2,6 +2,7 @@ export const STATUS_CONTEXT = "codex/review-gate";
 export const STATE_MARKER = "codex-review-gate-state";
 export const MARKER_COMMENT = "codex-review-gate-marker";
 export const STATE_VERSION = 1;
+export const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
 export const DEFAULT_CODEX_BOT_LOGINS = new Set([
   "chatgpt-codex-connector",
@@ -29,6 +30,41 @@ export function parseLoginSet(raw, fallback) {
       .map((part) => part.trim())
       .filter(Boolean),
   );
+}
+
+export function isRetryableHttpStatus(status) {
+  return RETRYABLE_HTTP_STATUSES.has(Number(status));
+}
+
+export function restRequestRetryAllowed(method, path, status) {
+  if (!isRetryableHttpStatus(status)) {
+    return false;
+  }
+
+  const normalizedMethod = method.toUpperCase();
+  if (normalizedMethod === "GET" || normalizedMethod === "PATCH") {
+    return true;
+  }
+
+  return normalizedMethod === "POST" && path.includes("/statuses/");
+}
+
+export function retryAfterDelayMs(retryAfter, fallbackMs) {
+  if (!retryAfter) {
+    return fallbackMs;
+  }
+
+  const retryAfterSeconds = Number(retryAfter);
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+    return retryAfterSeconds * 1000;
+  }
+
+  const retryAt = Date.parse(retryAfter);
+  if (!Number.isNaN(retryAt)) {
+    return Math.max(0, retryAt - Date.now());
+  }
+
+  return fallbackMs;
 }
 
 export function isCodexBot(login, botLogins = DEFAULT_CODEX_BOT_LOGINS) {
