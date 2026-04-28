@@ -539,6 +539,73 @@ fn cli_attempt_acceptance_tracks_deadline_and_attempt_count() {
 }
 
 #[test]
+fn cli_attempt_acceptance_rejects_oversized_observation_window() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-observation-bound",
+            "--summary",
+            "bound CLI observation",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let pending = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            "managed-cli-observation-bound",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-observation-bound",
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            attempt_id,
+            "--delivery-turn-id",
+            "turn-observation-bound",
+            "--observation-window-seconds",
+            "21601",
+        ],
+    );
+    assert!(stderr.contains("observation_window_seconds must be <= 21600"));
+}
+
+#[test]
 fn cli_attempt_begin_requires_rpc_request_id() {
     let home = tempfile::tempdir().expect("temp home");
     let stderr = cbth_failure(

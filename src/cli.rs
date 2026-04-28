@@ -27,6 +27,7 @@ const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 const DIRECT_STORE_ENV: &str = "CBTH_ALLOW_DIRECT_STORE";
 const DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS: u64 = 300;
 const DEFAULT_DAEMON_STARTUP_TIMEOUT_SECONDS: u64 = 5;
+const MAX_CLI_OBSERVATION_WINDOW_SECONDS: i64 = 6 * 60 * 60;
 
 #[derive(Debug, Parser)]
 #[command(name = "cbth")]
@@ -752,9 +753,10 @@ fn dispatch_attempt(command: AttemptCommand, layout: &FsLayout) -> Result<Value>
             Ok(json!({ "attempt": attempt }))
         }
         AttemptCommand::AcceptCli(args) => {
-            validate_positive(
+            validate_positive_max(
                 "observation_window_seconds",
                 args.observation_window_seconds,
+                MAX_CLI_OBSERVATION_WINDOW_SECONDS,
             )?;
             let now = match args.now {
                 Some(value) => value,
@@ -883,6 +885,15 @@ fn validate_positive(name: &str, value: i64) -> Result<()> {
         Ok(())
     } else {
         bail!("{name} must be positive")
+    }
+}
+
+fn validate_positive_max(name: &str, value: i64, max: i64) -> Result<()> {
+    validate_positive(name, value)?;
+    if value <= max {
+        Ok(())
+    } else {
+        bail!("{name} must be <= {max}")
     }
 }
 

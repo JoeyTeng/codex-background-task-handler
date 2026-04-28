@@ -503,6 +503,7 @@ scripts/desktop_thread_inject_poc.py
   - daemon lifecycle 的 due-batch 计数会排除仍有 active attempt 的 batch，避免在 attempt deadline 前反复触发无进展 sweep
   - `batch close-head` 会同步把当前 batch 上仍未终态的 delivery attempt 标为 `closed`，避免 operator close 后的旧 attempt 阻塞同 thread 后续 head batch
   - daemon lifecycle 会在 active `delivery_observation_deadline` 前阻止 idle exit；deadline 到期后由后台 sweep 收口，再允许退出
+  - CLI accepted observation window 第一版固定上限为 6 小时，避免错误 adapter 输入把 daemon idle-exit blocker 持久化到天级或无限远
   - 显式 `maintenance sweep` autostart 的 skip-startup-sweep suppression 仍会保留：due CLI observation 与 due batch 一样不会抢先消费显式 sweep report；active 未到期 observation 仍保活到 deadline
 - 当前 daemon 仍未接入完整 delivery lifecycle：
   - CLI attempt mutation 通过 daemon dispatch 时要求 daemon 暴露 `attempt-dispatch` capability；旧 daemon 不满足该 capability 会被 ensure path 判定为 incompatible 并替换
