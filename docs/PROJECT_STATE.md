@@ -490,7 +490,7 @@ scripts/desktop_thread_inject_poc.py
   - due maintenance sweep 不在 listener accept loop 同步执行；daemon 只启动单个后台 maintenance worker，并在 worker 运行期间阻止 idle exit
   - 当 daemon 因显式 `maintenance sweep` autostart 而 skip startup sweep 时，后台 lifecycle maintenance 会抑制到第一个 `dispatch` 请求进入后，避免抢先消费显式 sweep report；抑制期间 due batches 不单独阻止 idle exit
   - shutdown 会等待已启动的 lifecycle maintenance worker 到达一致点后再返回
-- Phase 5 当前分支为 `codex/phase-5-cli-attempt-state`，范围限定在 CLI accepted-attempt durable state 与 daemon observation deadline 集成：
+- Phase 5 已经通过 PR #16 squash merge 到 `master`，merge commit 为 `3e452caa6f874b1ec54464d152838900ba4dce7d`。范围限定在 CLI accepted-attempt durable state 与 daemon observation deadline 集成：
   - 新增 `delivery_attempts` schema，覆盖 CLI `accept_pending -> cooldown -> abandoned` 的最小 accepted-observation slice
   - adapter-internal 隐藏命令 `cbth attempt begin-cli-accept` / `accept-cli` / `inspect` 只用于后续 CLI adapter 与测试，不作为稳定外部用户接口
   - `begin-cli-accept` 要求 adapter 先提供稳定 `--rpc-request-id`，并 durable 记录 `delivery_rpc_request_id`、`delivery_rpc_kind`、`delivery_rpc_state=pending_acceptance`、`delivery_rpc_correlation_marker`、`managed_session_id` 与 `session_epoch`
@@ -506,11 +506,32 @@ scripts/desktop_thread_inject_poc.py
   - daemon lifecycle 会在 active `delivery_observation_deadline` 前阻止 idle exit；deadline 到期后由后台 sweep 收口，再允许退出
   - CLI accepted observation window 第一版固定上限为 6 小时，避免错误 adapter 输入把 daemon idle-exit blocker 持久化到天级或无限远
   - 显式 `maintenance sweep` autostart 的 skip-startup-sweep suppression 仍会保留：due CLI observation 与 due batch 一样不会抢先消费显式 sweep report；active 未到期 observation 仍保活到 deadline
+- Phase 6 当前分支为 `codex/phase-6-cli-managed-sessions`，范围限定在 CLI managed-session durable bookkeeping 与 accepted-attempt 前置校验：
+  - 新增 `cli_managed_sessions` schema，durable 记录 `managed_session_id`、`bound_thread_id`、`session_epoch`、`session_state`、`activity_state`、`activity_revision`、session-scoped risk profile 和 timestamps
+  - 同一个 `bound_thread_id` 当前最多只允许一个 non-retired managed session；unique partial index 直接约束这一点
+  - 新增 hidden adapter-internal `cbth cli session bind` / `note-activity` / `inspect`：
+    - `bind` 是现阶段的 attach-or-create building block，不是稳定最终用户入口
+    - `bind` 必须显式传入三项 session risk profile；缺失 profile 不会默认成低风险
+    - 对 `live` / `detached` session 复用同一个 `managed_session_id`
+    - attach 时递增 `session_epoch`、把 `activity_state` 重置为 `unknown`、把 epoch-local `activity_revision` 重置为 0，后续仍必须通过更新的 current-state sync 才能判定 idle
+    - `note-activity` 是 current-state sync 的临时 durable 写入面；当前只允许把同 epoch 的 `live` / `detached` session 通过严格顺序递增的 `activity_revision` 标成 `active` 或 `idle`，同 revision 只允许完全相同状态的幂等重放
+    - requested profile drift、`stale`、`parked` 或 `retired` session 都 fail closed
+  - `begin-cli-accept` 不再接受任意字符串形式的 `managed_session_id`：
+    - session 必须存在
+    - `bound_thread_id` 必须等于 batch 的 `source_thread_id`
+    - `session_epoch` 必须匹配
+    - session 必须处于 `live` 或 `detached`
+    - session risk profile 必须是 no-approval / no-network / no-write
+    - `turn_start` 目前还要求 `activity_state=idle`
+    - `turn_steer` 仍 fail-closed，直到后续 phase 落地 active-turn risk proof
+    - 同一 `delivery_rpc_request_id` 的幂等重试会先恢复已有 attempt，但仍要求 stored attempt 绑定当前有效 managed session；它不再受后续 activity 状态漂移影响，但 session epoch 失效、缺失 session、profile drift 或 thread mismatch 都会 fail-closed
+    - stale `accept_pending`、expired `cooldown` observation、以及 `batch close-head` 关闭仍未终态 CLI attempt 时，当前实现都会推进对应 managed session 的 `session_epoch` 并清空 activity proof，避免旧 idle 证明继续打开下一次自动投递
+  - daemon capability 列表新增 `cli-session-dispatch`，避免新 CLI 把 session mutation 路由给旧 daemon
 - 当前 daemon 仍未接入完整 delivery lifecycle：
-  - CLI attempt mutation 通过 daemon dispatch 时要求 daemon 暴露 `attempt-dispatch` capability；旧 daemon 不满足该 capability 会被 ensure path 判定为 incompatible 并替换
-  - CLI accepted attempt 的 durable schema 与 daemon 保活已经落地，但真实 shared `app-server` adapter、managed session runtime、event/current-state observation、turn terminal-event reconciliation 尚未实现
+  - CLI attempt / session mutation 通过 daemon dispatch 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
+  - CLI accepted attempt durable schema、daemon 保活、以及 managed-session durable record / fixed-thread gate 已经落地，但真实 shared `app-server` runtime、event/current-state observation、turn terminal-event reconciliation 尚未实现
   - Desktop arm / pause / boundary deadlines 尚未有 schema / adapter，因此尚未接入 daemon 保活
-  - CLI managed session 与 Desktop bridge adapters 尚未实现
+  - CLI `cbth cli run` 进程模型、shared app-server lifecycle 与 Desktop bridge adapters 尚未实现
 
 ## Phase 1 Implementation Priority
 

@@ -652,12 +652,12 @@ cbth cli run
      - 再把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
      - 同时仍适用同一 `bound_thread_id` 最多一个 non-retired managed session 的唯一性合同
 6. attach/create 成功后再启动前台 `codex --remote ...`
-6. sidecar 从共享核心读取 per-thread `delivery batch`
-7. 任务 ready 后：
+7. sidecar 从共享核心读取 per-thread `delivery batch`
+8. 任务 ready 后：
    - 默认只在 caller thread idle 时：`thread/resume + turn/start`
    - 只有显式打开 steer feature flag，且 `turn/steer` 能力存在并满足只读/低风险策略时：允许 steer
-8. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
-9. 如果用户手动让前台停留在 `bound_thread_id`，TUI 就会通过该 thread 的已有订阅自然感知新 turn
+9. 如果能力不足或协议形状漂移：fail-closed，不做自动续跑
+10. 如果用户手动让前台停留在 `bound_thread_id`，TUI 就会通过该 thread 的已有订阅自然感知新 turn
    - 但 v1 不负责证明或强制这件事始终成立
 
 v1 范围外：
@@ -665,6 +665,17 @@ v1 范围外：
 - 通过后续 `cbth cli bind ...` 对已有 session 做 late-bind
 - 通过 `managed_session_id` 外部发现/回填一个尚未 fixed-thread bootstrap 的 session
 - 在同一 managed session 里自动重绑定到新的 caller thread
+
+## 当前实现状态
+
+- durable `cli_managed_sessions` schema 已落地，记录 `managed_session_id`、`bound_thread_id`、`session_epoch`、`session_state`、`activity_state`、`activity_revision`、session-scoped risk profile 和 timestamps。
+- hidden adapter-internal `cbth cli session bind` 已作为 existing-thread attach-or-create building block 落地；它要求调用方显式传入完整 risk profile，会复用同一 `bound_thread_id` 上的 `live` / `detached` session，并在 attach 时递增 `session_epoch`、把 `activity_state` 重置为 `unknown`、把 epoch-local `activity_revision` 重置为 0。
+- hidden adapter-internal `cbth cli session note-activity` 已作为 current-state sync 的临时 durable 写入面落地；当前只允许同 epoch 的 `live` / `detached` session 通过严格顺序递增的 `activity_revision` 被标成 `active` 或 `idle`，同 revision 只允许完全相同状态的幂等重放。
+- `begin-cli-accept` 已经要求引用一个匹配当前 batch `source_thread_id`、`session_epoch`、state、no-approval / no-network / no-write profile 且 `turn_start` 时 `activity_state=idle` 的 managed session；不再接受任意字符串形式的 `managed_session_id`。
+- 同一 `delivery_rpc_request_id` 的幂等重试会先恢复已有 attempt，但仍要求该 stored attempt 绑定当前有效 managed session；它不再受后续 activity 漂移影响，但 session epoch 失效、缺失 session、profile drift 或 thread mismatch 都会 fail-closed。
+- stale `accept_pending`、expired `cooldown` observation、以及 operator close 仍未终态的 CLI attempt 时，当前实现都会推进对应 managed session 的 `session_epoch` 并清空 activity proof，避免旧 idle 证明继续打开下一次自动投递。
+- `turn_steer` 当前仍 fail-closed，直到后续 phase 落地 active-turn risk proof。
+- 这些实现仍不等价于完整 `cbth cli run`：daemon-owned shared `app-server` 进程、capability probe、真实 current-state sync、foreground TUI attachment 和 terminal event reconciliation 仍待后续 phase 实现。
 
 ## 仍待实现的边界
 
