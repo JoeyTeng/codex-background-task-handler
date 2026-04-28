@@ -285,6 +285,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
     let legacy_listener = UnixListener::bind(&socket_path).expect("bind legacy daemon socket");
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
     let replacement_socket_path = socket_path.clone();
+    let replacement_temp_socket_path = run_dir.join("replacement.sock");
     let handle = thread::spawn(move || {
         for _ in 0..2 {
             let (mut stream, _addr) = legacy_listener.accept().expect("accept legacy request");
@@ -306,12 +307,16 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
             }
         }
         drop(legacy_listener);
-        fs::remove_file(&replacement_socket_path).expect("remove legacy socket");
 
         let replacement_listener =
-            UnixListener::bind(&replacement_socket_path).expect("bind replacement socket");
-        fs::set_permissions(&replacement_socket_path, fs::Permissions::from_mode(0o600))
-            .expect("chmod replacement socket");
+            UnixListener::bind(&replacement_temp_socket_path).expect("bind replacement socket");
+        fs::set_permissions(
+            &replacement_temp_socket_path,
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod replacement socket");
+        fs::rename(&replacement_temp_socket_path, &replacement_socket_path)
+            .expect("publish replacement socket");
         replacement_listener
             .set_nonblocking(true)
             .expect("set replacement listener nonblocking");
