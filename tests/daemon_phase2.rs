@@ -60,6 +60,50 @@ fn cbth_failure(home: &TempDir, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+fn bind_cli_session(home: &TempDir, bound_thread_id: &str) -> String {
+    let session = cbth(
+        home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            bound_thread_id,
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+        ],
+    );
+    session["cli_session"]["session"]["managed_session_id"]
+        .as_str()
+        .expect("managed session id")
+        .to_owned()
+}
+
+fn bind_idle_cli_session(home: &TempDir, bound_thread_id: &str) -> String {
+    let managed_session_id = bind_cli_session(home, bound_thread_id);
+    cbth(
+        home,
+        &[
+            "cli",
+            "session",
+            "note-activity",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--activity-state",
+            "idle",
+            "--activity-revision",
+            "1",
+        ],
+    );
+    managed_session_id
+}
+
 fn try_cbth(home: &TempDir, args: &[&str]) -> Option<Value> {
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .env("CBTH_ALLOW_DIRECT_STORE", "1")
@@ -184,7 +228,7 @@ fn daemon_ensure_starts_ping_status_and_stop() {
     assert_eq!(ping["protocol_version"], 1);
     assert_eq!(
         ping["capabilities"],
-        json!(["dispatch", "attempt-dispatch"])
+        json!(["dispatch", "attempt-dispatch", "cli-session-dispatch"])
     );
     assert_eq!(ping["daemon"]["idle_timeout_seconds"], 10);
 
@@ -193,7 +237,7 @@ fn daemon_ensure_starts_ping_status_and_stop() {
     assert_eq!(status["protocol_version"], 1);
     assert_eq!(
         status["capabilities"],
-        json!(["dispatch", "attempt-dispatch"])
+        json!(["dispatch", "attempt-dispatch", "cli-session-dispatch"])
     );
     assert!(status["startup_sweep"].is_object());
 
@@ -267,7 +311,7 @@ fn daemon_ensure_restarts_incompatible_daemon() {
     assert_eq!(ping["protocol_version"], 1);
     assert_eq!(
         ping["capabilities"],
-        json!(["dispatch", "attempt-dispatch"])
+        json!(["dispatch", "attempt-dispatch", "cli-session-dispatch"])
     );
 
     cbth(&home, &["daemon", "stop"]);
@@ -333,7 +377,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
                     let request = String::from_utf8_lossy(&request[..request_len]);
                     assert!(request.contains("\"ping\""));
                     if let Err(error) = stream.write_all(
-                        br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch"],"message":"pong"}}"#,
+                        br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch"],"message":"pong"}}"#,
                     ) {
                         if error.kind() == std::io::ErrorKind::BrokenPipe {
                             continue;
@@ -399,7 +443,7 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
             } else if index == 1 {
                 r#"{"ok":false,"error":"daemon connection limit reached"}"#
             } else {
-                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch"],"message":"pong"}}"#
+                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())
@@ -614,6 +658,7 @@ fn daemon_skip_startup_sweep_exits_when_due_cli_observation_waits_for_explicit_d
     let batch_id = failed["batch"]["batch"]["batch_id"]
         .as_str()
         .expect("batch id");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-skip-cli-observation");
     let pending = cbth(
         &home,
         &[
@@ -622,7 +667,7 @@ fn daemon_skip_startup_sweep_exits_when_due_cli_observation_waits_for_explicit_d
             "--batch-id",
             batch_id,
             "--managed-session-id",
-            "managed-skip-cli",
+            &managed_session_id,
             "--session-epoch",
             "1",
             "--rpc-kind",
@@ -1042,6 +1087,7 @@ fn daemon_keeps_alive_for_active_cli_observation_then_expires_it() {
     let batch_id = failed["batch"]["batch"]["batch_id"]
         .as_str()
         .expect("batch id");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-active-cli-observation");
     let pending = cbth(
         &home,
         &[
@@ -1050,7 +1096,7 @@ fn daemon_keeps_alive_for_active_cli_observation_then_expires_it() {
             "--batch-id",
             batch_id,
             "--managed-session-id",
-            "managed-cli-daemon",
+            &managed_session_id,
             "--session-epoch",
             "1",
             "--rpc-kind",

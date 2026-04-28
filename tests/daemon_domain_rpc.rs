@@ -95,6 +95,24 @@ fn mutating_commands_default_to_daemon_dispatch() {
     let status = cbth(&home, &["daemon", "status"]);
     assert_eq!(status["daemon"]["stop_requested"], false);
 
+    let session = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-domain-rpc",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+        ],
+    );
+    assert_eq!(session["cli_session"]["outcome"], "created");
+
     let failed = cbth(
         &home,
         &[

@@ -189,6 +189,40 @@ pub struct DeliveryAttemptRecord {
     pub closed_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct CliManagedSessionRecord {
+    pub managed_session_id: String,
+    pub bound_thread_id: String,
+    pub session_epoch: i64,
+    pub session_state: String,
+    pub activity_state: String,
+    pub activity_revision: i64,
+    pub session_allows_approval: bool,
+    pub session_allows_network: bool,
+    pub session_allows_write_access: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub retired_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CliManagedSessionAttach {
+    pub outcome: String,
+    pub session: CliManagedSessionRecord,
+}
+
+#[derive(Clone, Debug)]
+pub struct CliManagedSessionProfile {
+    pub session_allows_approval: bool,
+    pub session_allows_network: bool,
+    pub session_allows_write_access: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CliManagedSessionActivityUpdate {
+    pub session: CliManagedSessionRecord,
+}
+
 #[derive(Clone, Debug)]
 pub struct NewCliAcceptPendingAttempt {
     pub attempt_id: String,

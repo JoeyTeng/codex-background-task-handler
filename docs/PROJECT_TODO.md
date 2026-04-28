@@ -346,46 +346,56 @@
   - 单机 / 单用户 trust-domain 假设
   - 如上游未来支持 loopback auth，再单独补更强本地 auth 设计
 - [ ] 为 CLI 的 daemon-owned managed session 设计并实现：
+  - [x] 落地 durable `cli_managed_sessions` 记录，用于固定 `managed_session_id` / `bound_thread_id` / `session_epoch` / `session_state` / `activity_state` / `activity_revision` / risk profile
+  - [x] 增加 hidden adapter-internal `cbth cli session bind` / `note-activity` / `inspect`，作为未来 `cbth cli run` 的 attach-or-create / monotonic current-state-sync building block
+  - [x] daemon capability 增加 `cli-session-dispatch`，避免新 CLI 把 session mutation 路由给旧 daemon
   - shared `app-server` 归 daemon 持有
   - 前台退出但 active jobs 未结束时继续保活
   - 后续重连 / resume contract
   - 如果上游未来支持 loopback auth，再补对应 auth contract validation
 - [ ] 按已定稿合同实现 CLI managed session 的 fixed-thread contract：
-  - durable `managed_session_id + bound_thread_id`
-  - durable `session_allows_approval + session_allows_network + session_allows_write_access`
-  - durable `session_state`
-    - include `parked` for live-part torn down while manual batch still waits operator resolution
+  - [x] durable `managed_session_id + bound_thread_id`
+  - [x] durable `session_allows_approval + session_allows_network + session_allows_write_access`
+  - [x] durable `session_state`
+    - [x] include `parked` for live-part torn down while manual batch still waits operator resolution
   - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
   - 通过显式 bootstrap 建立 `bound_thread_id`，而不是靠前台事件流自动归因：
     - `cbth cli run --bind-thread-id <thread_id>`
     - 或 `thread/start` 可用时的 `cbth cli run --new-thread`
   - v1 不提供 late-bind 或 `managed_session_id` 外部发现/回填的 stable surface
   - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点
-  - 同一个 `bound_thread_id` 最多只允许一个 non-retired managed session
-  - existing-thread bootstrap 的 `cbth cli run --bind-thread-id` 必须是 attach-or-create
-  - `parked` session 且 manual batch 未终态时，attach 必须 fail-closed 为 `session_pending_manual_resolution`
-  - attach 遇到 requested session profile drift 时，不得原地改写；只能 fail-closed 或 retire-and-recreate
-  - stale session 只有在已满足 retirement 条件时才允许被替换；否则必须 fail-closed
+  - [x] 同一个 `bound_thread_id` 最多只允许一个 non-retired managed session
+  - [x] existing-thread bootstrap 的 durable building block 是 attach-or-create；当前实现表现为 hidden `cbth cli session bind`
+  - [x] `cbth cli session bind` 必须显式传入完整 risk profile，缺失 profile 不会默认成低风险
+  - [x] `parked` session attach 当前 fail-closed；后续还需接入 unresolved manual batch 终态判断后再允许 retirement / replace
+  - [x] attach 遇到 requested session profile drift 时，不得原地改写；当前实现 fail-closed
+  - [x] stale session 当前 fail-closed；后续还需接入 retirement 条件判断后再允许替换
   - 第一版不做前台 thread-switch 的自动观测或自动 retarget
   - 如需把自动续跑目标换到别的 thread，必须显式开新 session 或等待未来 rebind contract
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
-  - `turn/start` / `turn/steer` 前必须先进入 `accept_pending`
-  - `accept_pending` 必须 durable 记录 `delivery_rpc_request_id + delivery_rpc_correlation_marker`
+  - [x] `turn/start` / `turn/steer` 前必须先进入 `accept_pending`
+  - [x] `accept_pending` 必须 durable 记录 `delivery_rpc_request_id + delivery_rpc_correlation_marker`
+  - [x] `accept_pending` 现在要求 `managed_session_id` 存在、绑定当前 batch `source_thread_id`、`session_epoch` 匹配、session 处于 `live` / `detached`、`turn_start` 时 `activity_state=idle`，且 risk profile 为 no-approval / no-network / no-write
   - response 丢失后只能通过同一连续 event/current-state 面正向证明 marker 已接入 exactly one caller turn；否则 fail-closed，不得自动重发
   - proven-before-accept benign reject 才允许 `accept_pending -> prepared`
   - `accept_pending -> prepared` 必须写入 `delivery_rpc_state=rejected_before_accept`，且不得递增 `delivery_attempt_count`
-  - accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
-  - accepted attempt 必须 durable 记录 `delivery_accepted_at`
+  - [x] accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
+  - [x] accepted attempt 必须 durable 记录 `delivery_accepted_at`
   - accepted attempt 必须 durable 记录 `last_observed_turn_event + last_observed_turn_event_at`
-  - accepted attempt 必须 durable 记录 `delivery_observation_deadline`
-  - `delivery_observation_deadline` 的计算基准必须统一为 `delivery_accepted_at`
-  - detached auto-delivery 只允许在 session-scoped risk profile 三项都为 `false` 时开启
-  - `delivery_observation_deadline` 到期仍未看到可信 `turn/completed` 时：
-    - 当前 attempt -> `abandoned`
-    - `delivery_observation_state=expired`
-    - 当前 head batch -> `replay_policy=manual_resolution_only`
+  - [x] accepted attempt 必须 durable 记录 `delivery_observation_deadline`
+  - [x] `delivery_observation_deadline` 的计算基准必须统一为 `delivery_accepted_at`
+  - [x] detached auto-delivery 只允许在 session-scoped risk profile 三项都为 `false` 时开启
+  - [x] session attach / stale accept / expired observation / operator-close active attempt 会推进 `session_epoch` 并清空 activity proof，避免旧 idle 证明继续打开自动投递
+  - [x] `note-activity` 只能在当前 epoch 内按 `activity_revision + 1` 顺序推进，或做完全相同状态的幂等重放
+  - [x] 同一 `delivery_rpc_request_id` 的 begin/accept 幂等路径仍必须引用当前有效 managed session，legacy / missing / stale session 不能绕过 Phase 6 gate
+  - [x] `delivery_observation_deadline` 到期仍未看到可信 `turn/completed` 时：
+    - [x] 当前 attempt -> `abandoned`
+    - [x] `delivery_observation_state=expired`
+    - [x] 当前 head batch -> `replay_policy=manual_resolution_only`
   - 如果 `delivery_turn_id` 的观察连续性丢失，则当前 head batch 进入 `manual_resolution_only`
-  - 落地 `session_epoch` 的生成、递增与 continuity 判定规则
+  - [x] 落地 store-level `session_epoch` 的生成、递增与 fail-closed 判定规则
+  - 真实 app-server event stream 的 continuity 判定与 terminal-event reconciliation 仍待 CLI adapter phase 落地
+  - 落地 `turn_steer` 所需的 active-turn risk proof 后，再允许 `begin-cli-accept --rpc-kind turn-steer` 从 fail-closed 变成受控可用
   - 按当前合同实现 continuity-loss 场景的 `inspect-head -> close-head(reason=...)` operator-resolution flow
 - [ ] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
   - 基于 `turn/started` / `turn/completed` / `thread/status/changed`

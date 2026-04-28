@@ -18,8 +18,8 @@ use crate::daemon::{
 };
 use crate::fs_layout::{FsLayout, remove_dir_all_durable};
 use crate::models::{
-    DEFAULT_MAX_DELIVERY_ATTEMPTS, DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy,
-    NewCliAcceptPendingAttempt, NewJob, PartialDeliveryPolicy, SubmitMetadata,
+    CliManagedSessionProfile, DEFAULT_MAX_DELIVERY_ATTEMPTS, DEFAULT_REDELIVERY_WINDOW_SECONDS,
+    DeliveryPolicy, NewCliAcceptPendingAttempt, NewJob, PartialDeliveryPolicy, SubmitMetadata,
 };
 use crate::store::{Store, new_id};
 
@@ -60,6 +60,11 @@ enum Commands {
     Attempt {
         #[command(subcommand)]
         command: AttemptCommand,
+    },
+    #[command(hide = true)]
+    Cli {
+        #[command(subcommand)]
+        command: CliCommand,
     },
     Maintenance {
         #[command(subcommand)]
@@ -167,6 +172,21 @@ enum AttemptCommand {
     BeginCliAccept(AttemptBeginCliAcceptArgs),
     AcceptCli(AttemptAcceptCliArgs),
     Inspect(AttemptInspectArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    Session {
+        #[command(subcommand)]
+        command: CliSessionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CliSessionCommand {
+    Bind(CliSessionBindArgs),
+    NoteActivity(CliSessionNoteActivityArgs),
+    Inspect(CliSessionInspectArgs),
 }
 
 #[derive(Debug, Args)]
@@ -282,6 +302,70 @@ struct AttemptInspectArgs {
     attempt_id: String,
 }
 
+#[derive(Debug, Args)]
+struct CliSessionBindArgs {
+    #[arg(long)]
+    bound_thread_id: String,
+
+    #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    session_allows_approval: bool,
+
+    #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    session_allows_network: bool,
+
+    #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    session_allows_write_access: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum CliSessionActivityState {
+    Active,
+    Idle,
+}
+
+impl CliSessionActivityState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Idle => "idle",
+        }
+    }
+
+    fn cli_value(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Idle => "idle",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct CliSessionNoteActivityArgs {
+    #[arg(long)]
+    managed_session_id: String,
+
+    #[arg(long)]
+    session_epoch: i64,
+
+    #[arg(long, value_enum)]
+    activity_state: CliSessionActivityState,
+
+    #[arg(long)]
+    activity_revision: i64,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct CliSessionInspectArgs {
+    #[arg(long)]
+    managed_session_id: String,
+}
+
 #[derive(Debug, Subcommand)]
 enum MaintenanceCommand {
     Sweep(MaintenanceSweepArgs),
@@ -395,6 +479,7 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
         Commands::Job { command } => dispatch_job(command, layout),
         Commands::Batch { command } => dispatch_batch(command, layout),
         Commands::Attempt { command } => dispatch_attempt(command, layout),
+        Commands::Cli { command } => dispatch_cli(command, layout),
         Commands::Maintenance { command } => dispatch_maintenance(command, layout),
         Commands::Daemon { command } => dispatch_daemon(command, layout),
     }
@@ -517,6 +602,62 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             }
             argv
         }
+        Commands::Cli {
+            command:
+                CliCommand::Session {
+                    command: CliSessionCommand::Bind(args),
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("cli"),
+                OsString::from("session"),
+                OsString::from("bind"),
+            ];
+            push_string_arg(&mut argv, "--bound-thread-id", &args.bound_thread_id);
+            push_bool_arg(
+                &mut argv,
+                "--session-allows-approval",
+                args.session_allows_approval,
+            );
+            push_bool_arg(
+                &mut argv,
+                "--session-allows-network",
+                args.session_allows_network,
+            );
+            push_bool_arg(
+                &mut argv,
+                "--session-allows-write-access",
+                args.session_allows_write_access,
+            );
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Cli {
+            command:
+                CliCommand::Session {
+                    command: CliSessionCommand::NoteActivity(args),
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("cli"),
+                OsString::from("session"),
+                OsString::from("note-activity"),
+            ];
+            push_string_arg(&mut argv, "--managed-session-id", &args.managed_session_id);
+            push_i64_arg(&mut argv, "--session-epoch", args.session_epoch);
+            push_string_arg(
+                &mut argv,
+                "--activity-state",
+                args.activity_state.cli_value(),
+            );
+            push_i64_arg(&mut argv, "--activity-revision", args.activity_revision);
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
         Commands::Maintenance {
             command: MaintenanceCommand::Sweep(args),
         } => {
@@ -534,6 +675,12 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
         }
         | Commands::Attempt {
             command: AttemptCommand::Inspect(_),
+        }
+        | Commands::Cli {
+            command:
+                CliCommand::Session {
+                    command: CliSessionCommand::Inspect(_),
+                },
         }
         | Commands::Daemon { .. } => return Ok(None),
     };
@@ -562,8 +709,12 @@ fn argv_payload(argv: Vec<OsString>) -> Vec<Vec<u8>> {
 
 fn push_optional_bool_arg(argv: &mut Vec<OsString>, flag: &str, value: Option<bool>) {
     if let Some(value) = value {
-        push_string_arg(argv, flag, &value.to_string());
+        push_bool_arg(argv, flag, value);
     }
+}
+
+fn push_bool_arg(argv: &mut Vec<OsString>, flag: &str, value: bool) {
+    push_string_arg(argv, flag, &value.to_string());
 }
 
 fn push_optional_string_arg(argv: &mut Vec<OsString>, flag: &str, value: Option<&str>) {
@@ -779,6 +930,51 @@ fn dispatch_attempt(command: AttemptCommand, layout: &FsLayout) -> Result<Value>
             let attempt = store.inspect_attempt(&args.attempt_id)?;
             Ok(json!({ "attempt": attempt }))
         }
+    }
+}
+
+fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
+    let mut store = Store::open(layout)?;
+    match command {
+        CliCommand::Session { command } => match command {
+            CliSessionCommand::Bind(args) => {
+                validate_nonempty("bound_thread_id", &args.bound_thread_id)?;
+                let now = match args.now {
+                    Some(value) => value,
+                    None => now_epoch_seconds()?,
+                };
+                let session = store.attach_or_create_cli_managed_session(
+                    &args.bound_thread_id,
+                    CliManagedSessionProfile {
+                        session_allows_approval: args.session_allows_approval,
+                        session_allows_network: args.session_allows_network,
+                        session_allows_write_access: args.session_allows_write_access,
+                    },
+                    now,
+                )?;
+                Ok(json!({ "cli_session": session }))
+            }
+            CliSessionCommand::NoteActivity(args) => {
+                validate_positive("session_epoch", args.session_epoch)?;
+                validate_positive("activity_revision", args.activity_revision)?;
+                let now = match args.now {
+                    Some(value) => value,
+                    None => now_epoch_seconds()?,
+                };
+                let session = store.note_cli_managed_session_activity(
+                    &args.managed_session_id,
+                    args.session_epoch,
+                    args.activity_state.as_str(),
+                    args.activity_revision,
+                    now,
+                )?;
+                Ok(json!({ "cli_session": session }))
+            }
+            CliSessionCommand::Inspect(args) => {
+                let session = store.inspect_cli_managed_session(&args.managed_session_id)?;
+                Ok(json!({ "cli_session": session }))
+            }
+        },
     }
 }
 

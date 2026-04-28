@@ -51,6 +51,78 @@ fn cbth_failure(home: &TempDir, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+fn bind_cli_session(home: &TempDir, bound_thread_id: &str) -> String {
+    let session = cbth(
+        home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            bound_thread_id,
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+        ],
+    );
+    assert!(matches!(
+        session["cli_session"]["outcome"].as_str(),
+        Some("created") | Some("attached")
+    ));
+    session["cli_session"]["session"]["managed_session_id"]
+        .as_str()
+        .expect("managed session id")
+        .to_owned()
+}
+
+fn note_cli_session_idle(home: &TempDir, managed_session_id: &str) {
+    let inspected = cbth(
+        home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            managed_session_id,
+        ],
+    );
+    let next_revision = inspected["cli_session"]["activity_revision"]
+        .as_i64()
+        .expect("activity revision")
+        + 1;
+    let next_revision = next_revision.to_string();
+    let session_epoch = inspected["cli_session"]["session_epoch"]
+        .as_i64()
+        .expect("session epoch")
+        .to_string();
+    let session = cbth(
+        home,
+        &[
+            "cli",
+            "session",
+            "note-activity",
+            "--managed-session-id",
+            managed_session_id,
+            "--session-epoch",
+            &session_epoch,
+            "--activity-state",
+            "idle",
+            "--activity-revision",
+            &next_revision,
+        ],
+    );
+    assert_eq!(session["cli_session"]["session"]["activity_state"], "idle");
+}
+
+fn bind_idle_cli_session(home: &TempDir, bound_thread_id: &str) -> String {
+    let managed_session_id = bind_cli_session(home, bound_thread_id);
+    note_cli_session_idle(home, &managed_session_id);
+    managed_session_id
+}
+
 #[test]
 fn direct_store_requires_explicit_test_gate() {
     let home = tempfile::tempdir().expect("temp home");
@@ -69,6 +141,278 @@ fn direct_store_requires_explicit_test_gate() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("CBTH_ALLOW_DIRECT_STORE=1"));
+}
+
+#[test]
+fn cli_session_bind_creates_and_attaches_matching_profile() {
+    let home = tempfile::tempdir().expect("temp home");
+    let created = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-session",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+            "--now",
+            "100",
+        ],
+    );
+    assert_eq!(created["cli_session"]["outcome"], "created");
+    let managed_session_id = created["cli_session"]["session"]["managed_session_id"]
+        .as_str()
+        .expect("managed session id");
+    assert_eq!(
+        created["cli_session"]["session"]["bound_thread_id"],
+        "thread-cli-session"
+    );
+    assert_eq!(created["cli_session"]["session"]["session_epoch"], 1);
+    assert_eq!(created["cli_session"]["session"]["session_state"], "live");
+    assert_eq!(
+        created["cli_session"]["session"]["activity_state"],
+        "unknown"
+    );
+    assert_eq!(created["cli_session"]["session"]["activity_revision"], 0);
+
+    let attached = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-session",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+            "--now",
+            "200",
+        ],
+    );
+    assert_eq!(attached["cli_session"]["outcome"], "attached");
+    assert_eq!(
+        attached["cli_session"]["session"]["managed_session_id"],
+        managed_session_id
+    );
+    assert_eq!(attached["cli_session"]["session"]["session_epoch"], 2);
+    assert_eq!(attached["cli_session"]["session"]["updated_at"], 200);
+    assert_eq!(attached["cli_session"]["session"]["activity_revision"], 0);
+    assert_eq!(
+        attached["cli_session"]["session"]["activity_state"],
+        "unknown"
+    );
+
+    let inspected = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            managed_session_id,
+        ],
+    );
+    assert_eq!(
+        inspected["cli_session"]["managed_session_id"],
+        managed_session_id
+    );
+}
+
+#[test]
+fn cli_session_bind_requires_explicit_profile() {
+    let home = tempfile::tempdir().expect("temp home");
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-missing-profile",
+        ],
+    );
+    assert!(stderr.contains("session-allows-approval"));
+}
+
+#[test]
+fn cli_session_bind_rejects_profile_drift() {
+    let home = tempfile::tempdir().expect("temp home");
+    bind_cli_session(&home, "thread-cli-profile-drift");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-profile-drift",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "true",
+            "--session-allows-write-access",
+            "false",
+        ],
+    );
+    assert!(stderr.contains("profile does not match requested profile"));
+}
+
+#[test]
+fn cli_session_note_activity_rejects_stale_revision() {
+    let home = tempfile::tempdir().expect("temp home");
+    let managed_session_id = bind_cli_session(&home, "thread-cli-activity-revision");
+
+    cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "note-activity",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--activity-state",
+            "active",
+            "--activity-revision",
+            "1",
+        ],
+    );
+    let stale_idle = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "note-activity",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--activity-state",
+            "idle",
+            "--activity-revision",
+            "1",
+        ],
+    );
+    assert!(stale_idle.contains("activity revision"));
+    let inspected = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(inspected["cli_session"]["activity_state"], "active");
+    assert_eq!(inspected["cli_session"]["activity_revision"], 1);
+
+    let jumped_revision = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "note-activity",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--activity-state",
+            "idle",
+            "--activity-revision",
+            "3",
+        ],
+    );
+    assert!(jumped_revision.contains("not the next revision"));
+}
+
+#[test]
+fn cli_session_rebind_fences_old_activity_writer() {
+    let home = tempfile::tempdir().expect("temp home");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-activity-fence");
+
+    let reattached = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-activity-fence",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+        ],
+    );
+    assert_eq!(reattached["cli_session"]["session"]["session_epoch"], 2);
+    assert_eq!(
+        reattached["cli_session"]["session"]["activity_state"],
+        "unknown"
+    );
+
+    let old_epoch = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "note-activity",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--activity-state",
+            "idle",
+            "--activity-revision",
+            "2",
+        ],
+    );
+    assert!(old_epoch.contains("is at epoch 2, not 1"));
+
+    let jumped_revision = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "note-activity",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "2",
+            "--activity-state",
+            "idle",
+            "--activity-revision",
+            "100",
+        ],
+    );
+    assert!(jumped_revision.contains("not the next revision"));
+
+    note_cli_session_idle(&home, &managed_session_id);
+    let inspected = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(inspected["cli_session"]["activity_state"], "idle");
+    assert_eq!(inspected["cli_session"]["activity_revision"], 1);
 }
 
 #[test]
@@ -434,6 +778,7 @@ fn cli_attempt_acceptance_tracks_deadline_and_attempt_count() {
     let batch_id = failed["batch"]["batch"]["batch_id"]
         .as_str()
         .expect("batch id");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-attempt");
 
     let pending = cbth(
         &home,
@@ -443,7 +788,7 @@ fn cli_attempt_acceptance_tracks_deadline_and_attempt_count() {
             "--batch-id",
             batch_id,
             "--managed-session-id",
-            "managed-cli-1",
+            &managed_session_id,
             "--session-epoch",
             "1",
             "--rpc-kind",
@@ -465,6 +810,28 @@ fn cli_attempt_acceptance_tracks_deadline_and_attempt_count() {
         pending["attempt"]["delivery_rpc_state"],
         "pending_acceptance"
     );
+    let active_activity = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "note-activity",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--activity-state",
+            "active",
+            "--activity-revision",
+            "2",
+            "--now",
+            "1000",
+        ],
+    );
+    assert_eq!(
+        active_activity["cli_session"]["session"]["activity_state"],
+        "active"
+    );
     let retried_pending = cbth(
         &home,
         &[
@@ -473,7 +840,7 @@ fn cli_attempt_acceptance_tracks_deadline_and_attempt_count() {
             "--batch-id",
             batch_id,
             "--managed-session-id",
-            "managed-cli-1",
+            &managed_session_id,
             "--session-epoch",
             "1",
             "--rpc-kind",
@@ -491,6 +858,28 @@ fn cli_attempt_acceptance_tracks_deadline_and_attempt_count() {
         pending["attempt"]["attempt_id"]
     );
     assert_eq!(retried_pending["attempt"]["created_at"], 1000);
+    let retry_wrong_epoch = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "2",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-1",
+            "--rpc-correlation-marker",
+            "cbth:test-marker-1",
+            "--now",
+            "1002",
+        ],
+    );
+    assert!(retry_wrong_epoch.contains("different session epoch"));
 
     let accepted = cbth(
         &home,
@@ -568,6 +957,7 @@ fn cli_attempt_acceptance_rejects_oversized_observation_window() {
     let batch_id = failed["batch"]["batch"]["batch_id"]
         .as_str()
         .expect("batch id");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-observation-bound");
     let pending = cbth(
         &home,
         &[
@@ -576,7 +966,7 @@ fn cli_attempt_acceptance_rejects_oversized_observation_window() {
             "--batch-id",
             batch_id,
             "--managed-session-id",
-            "managed-cli-observation-bound",
+            &managed_session_id,
             "--session-epoch",
             "1",
             "--rpc-kind",
@@ -624,6 +1014,192 @@ fn cli_attempt_begin_requires_rpc_request_id() {
         ],
     );
     assert!(stderr.contains("--rpc-request-id"));
+}
+
+#[test]
+fn cli_attempt_begin_requires_bound_managed_session() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-session-required",
+            "--summary",
+            "session required",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            "missing-managed-session",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-session-required",
+        ],
+    );
+    assert!(stderr.contains("CLI managed session not found"));
+}
+
+#[test]
+fn cli_attempt_idempotent_paths_require_current_managed_session() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-legacy-attempt",
+            "--summary",
+            "legacy pending attempt",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "INSERT INTO delivery_attempts (
+            attempt_id, batch_id, source_thread_id, adapter_kind, state,
+            generation, delivery_rpc_request_id, delivery_rpc_kind,
+            delivery_rpc_state, delivery_rpc_started_at, managed_session_id,
+            session_epoch, created_at, updated_at
+        ) VALUES (
+            'legacy-cli-attempt', ?, 'thread-cli-legacy-attempt', 'cli',
+            'accept_pending', 1, 'rpc-request-legacy', 'turn_start',
+            'pending_acceptance', 100, 'missing-managed-session', 1, 100, 100
+        )",
+        params![batch_id],
+    )
+    .expect("insert legacy attempt");
+    drop(conn);
+
+    let retry = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            "missing-managed-session",
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-legacy",
+        ],
+    );
+    assert!(retry.contains("CLI managed session not found"));
+
+    let accept = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            "legacy-cli-attempt",
+            "--delivery-turn-id",
+            "turn-legacy",
+            "--observation-window-seconds",
+            "60",
+        ],
+    );
+    assert!(accept.contains("CLI managed session not found"));
+}
+
+#[test]
+fn cli_attempt_begin_requires_idle_managed_session() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-idle-required",
+            "--summary",
+            "idle required",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let managed_session_id = bind_cli_session(&home, "thread-cli-idle-required");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-idle-required",
+        ],
+    );
+    assert!(stderr.contains("activity state is unknown, not idle"));
 }
 
 #[test]
@@ -801,6 +1377,7 @@ fn maintenance_sweep_does_not_close_active_cli_observation_before_deadline() {
         .expect("redelivery window")
         + 1)
     .to_string();
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-window");
     let pending = cbth(
         &home,
         &[
@@ -809,7 +1386,7 @@ fn maintenance_sweep_does_not_close_active_cli_observation_before_deadline() {
             "--batch-id",
             batch_id,
             "--managed-session-id",
-            "managed-cli-window",
+            &managed_session_id,
             "--session-epoch",
             "1",
             "--rpc-kind",
@@ -886,6 +1463,7 @@ fn maintenance_sweep_abandons_stale_cli_accept_pending_attempt() {
     let batch_id = failed["batch"]["batch"]["batch_id"]
         .as_str()
         .expect("batch id");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-stale-accept");
     let pending = cbth(
         &home,
         &[
@@ -894,7 +1472,7 @@ fn maintenance_sweep_abandons_stale_cli_accept_pending_attempt() {
             "--batch-id",
             batch_id,
             "--managed-session-id",
-            "managed-cli-stale",
+            &managed_session_id,
             "--session-epoch",
             "1",
             "--rpc-kind",
@@ -925,6 +1503,101 @@ fn maintenance_sweep_abandons_stale_cli_accept_pending_attempt() {
         "manual_resolution_only"
     );
     assert_eq!(inspected["batch"]["batch"]["state"], "open");
+    let session = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(session["cli_session"]["session_epoch"], 2);
+    assert_eq!(session["cli_session"]["activity_state"], "unknown");
+
+    let second = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-stale-accept",
+            "--summary",
+            "second after stale accept",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let second_job_id = second["job"]["job_id"].as_str().expect("second job id");
+    let second_failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            second_job_id,
+            "--reason",
+            "second ready",
+        ],
+    );
+    let second_batch_id = second_failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("second batch id");
+    cbth(
+        &home,
+        &[
+            "batch",
+            "close-head",
+            "--source-thread-id",
+            "thread-cli-stale-accept",
+            "--reason",
+            "operator-closed-unconfirmed",
+        ],
+    );
+    let not_idle = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            second_batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "2",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-stale-next-before-proof",
+        ],
+    );
+    assert!(not_idle.contains("not idle"));
+    note_cli_session_idle(&home, &managed_session_id);
+    let second_attempt = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            second_batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "2",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-stale-next-after-proof",
+        ],
+    );
+    assert_eq!(second_attempt["attempt"]["state"], "accept_pending");
 }
 
 #[test]
@@ -998,6 +1671,7 @@ fn operator_close_releases_active_cli_attempt_for_next_head_batch() {
     let second_batch_id = second_failed["batch"]["batch"]["batch_id"]
         .as_str()
         .expect("second batch id");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-close-release");
     let first_attempt = cbth(
         &home,
         &[
@@ -1006,7 +1680,7 @@ fn operator_close_releases_active_cli_attempt_for_next_head_batch() {
             "--batch-id",
             first_batch_id,
             "--managed-session-id",
-            "managed-cli-close-release",
+            &managed_session_id,
             "--session-epoch",
             "1",
             "--rpc-kind",
@@ -1036,6 +1710,55 @@ fn operator_close_releases_active_cli_attempt_for_next_head_batch() {
     );
     assert_eq!(first_attempt["attempt"]["state"], "closed");
 
+    let session = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(session["cli_session"]["session_epoch"], 2);
+    assert_eq!(session["cli_session"]["activity_state"], "unknown");
+    let old_epoch = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            second_batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-close-release-old-epoch",
+        ],
+    );
+    assert!(old_epoch.contains("is at epoch 2, not 1"));
+    let not_idle = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            second_batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "2",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-close-release-before-proof",
+        ],
+    );
+    assert!(not_idle.contains("not idle"));
+    note_cli_session_idle(&home, &managed_session_id);
     let second_attempt = cbth(
         &home,
         &[
@@ -1044,9 +1767,9 @@ fn operator_close_releases_active_cli_attempt_for_next_head_batch() {
             "--batch-id",
             second_batch_id,
             "--managed-session-id",
-            "managed-cli-close-release",
+            &managed_session_id,
             "--session-epoch",
-            "1",
+            "2",
             "--rpc-kind",
             "turn-start",
             "--rpc-request-id",
@@ -1103,6 +1826,7 @@ fn maintenance_sweep_expires_cli_observation_to_manual_resolution() {
     let begin_now = begin_now.to_string();
     let accept_now = accept_now.to_string();
     let sweep_now = sweep_now.to_string();
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-expiry");
     let pending = cbth(
         &home,
         &[
@@ -1111,7 +1835,7 @@ fn maintenance_sweep_expires_cli_observation_to_manual_resolution() {
             "--batch-id",
             batch_id,
             "--managed-session-id",
-            "managed-cli-2",
+            &managed_session_id,
             "--session-epoch",
             "1",
             "--rpc-kind",
@@ -1166,6 +1890,18 @@ fn maintenance_sweep_expires_cli_observation_to_manual_resolution() {
             .expect("manual window")
             > sweep_now.parse::<i64>().expect("sweep now")
     );
+    let session = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(session["cli_session"]["session_epoch"], 2);
+    assert_eq!(session["cli_session"]["activity_state"], "unknown");
 }
 
 #[test]
