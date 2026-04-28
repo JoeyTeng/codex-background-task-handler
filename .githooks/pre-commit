@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+info() {
+  printf 'cbth pre-commit: %s\n' "$*"
+}
+
+fail() {
+  printf 'cbth pre-commit: %s\n' "$*" >&2
+  exit 1
+}
+
+is_rust_relevant() {
+  case "$1" in
+    *.rs | Cargo.toml | */Cargo.toml | Cargo.lock | */Cargo.lock | rust-toolchain | rust-toolchain.toml | rustfmt.toml | */rustfmt.toml | .rustfmt.toml | */.rustfmt.toml | .cargo/config | .cargo/config.toml | .cargo/*.toml)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+filter_relevant() {
+  while IFS= read -r path; do
+    if is_rust_relevant "$path"; then
+      printf '%s\n' "$path"
+    fi
+  done
+}
+
+print_file_list() {
+  sed 's/^/  - /' "$1"
+}
+
+if [ "${CBTH_SKIP_PRECOMMIT:-}" = "1" ]; then
+  info "skipped because CBTH_SKIP_PRECOMMIT=1"
+  exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || fail "not inside a Git worktree"
+cd "$repo_root"
+
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cbth-precommit.XXXXXX")
+cleanup() {
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT HUP INT TERM
+
+staged_relevant="$tmp_dir/staged-relevant"
+unstaged_relevant="$tmp_dir/unstaged-relevant"
+untracked_relevant="$tmp_dir/untracked-relevant"
+format_changed="$tmp_dir/format-changed"
+
+git diff --cached --name-only --diff-filter=ACMRD -- | filter_relevant >"$staged_relevant"
+
+if [ ! -s "$staged_relevant" ]; then
+  info "no staged Rust/Cargo changes; skipping Rust gate"
+  exit 0
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  fail "cargo is required for Rust pre-commit checks"
+fi
+
+git diff --name-only --diff-filter=ACMRD -- | filter_relevant >"$unstaged_relevant"
+
+if [ -s "$unstaged_relevant" ]; then
+  {
+    printf 'cbth pre-commit: tracked unstaged Rust/Cargo changes are present.\n'
+    printf 'cbth pre-commit: stage, stash, or commit these separately before auto-formatting:\n'
+    print_file_list "$unstaged_relevant"
+  } >&2
+  exit 1
+fi
+
+git ls-files --others --exclude-standard -- | filter_relevant >"$untracked_relevant"
+
+if [ -s "$untracked_relevant" ]; then
+  {
+    printf 'cbth pre-commit: untracked Rust/Cargo files are present.\n'
+    printf 'cbth pre-commit: add, stash, or remove these files before running the Rust gate:\n'
+    print_file_list "$untracked_relevant"
+  } >&2
+  exit 1
+fi
+
+info "running cargo fmt --all"
+cargo fmt --all
+
+git diff --name-only --diff-filter=ACMRD -- | filter_relevant >"$format_changed"
+
+if [ -s "$format_changed" ]; then
+  {
+    printf 'cbth pre-commit: cargo fmt updated files; review and stage them, then commit again:\n'
+    print_file_list "$format_changed"
+  } >&2
+  exit 1
+fi
+
+info "running cargo clippy --locked --all-targets -- -D warnings"
+cargo clippy --locked --all-targets -- -D warnings
+
+info "running cargo test --locked"
+cargo test --locked
+
+info "Rust gate passed"
