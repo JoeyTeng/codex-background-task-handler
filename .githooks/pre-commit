@@ -52,7 +52,7 @@ unstaged_relevant="$tmp_dir/unstaged-relevant"
 untracked_relevant="$tmp_dir/untracked-relevant"
 format_changed="$tmp_dir/format-changed"
 
-git diff --cached --name-only --diff-filter=ACMRD -- | filter_relevant >"$staged_relevant"
+git diff --cached --no-renames --name-only --diff-filter=ACMRD -- | filter_relevant >"$staged_relevant"
 
 if [ ! -s "$staged_relevant" ]; then
   info "no staged Rust/Cargo changes; skipping Rust gate"
@@ -63,7 +63,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   fail "cargo is required for Rust pre-commit checks"
 fi
 
-git diff --name-only --diff-filter=ACMRD -- | filter_relevant >"$unstaged_relevant"
+git diff --no-renames --name-only --diff-filter=ACMRD -- | filter_relevant >"$unstaged_relevant"
 
 if [ -s "$unstaged_relevant" ]; then
   {
@@ -88,7 +88,7 @@ fi
 info "running cargo fmt --all"
 cargo fmt --all
 
-git diff --name-only --diff-filter=ACMRD -- | filter_relevant >"$format_changed"
+git diff --no-renames --name-only --diff-filter=ACMRD -- | filter_relevant >"$format_changed"
 
 if [ -s "$format_changed" ]; then
   {
