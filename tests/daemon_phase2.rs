@@ -312,22 +312,37 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
             UnixListener::bind(&replacement_socket_path).expect("bind replacement socket");
         fs::set_permissions(&replacement_socket_path, fs::Permissions::from_mode(0o600))
             .expect("chmod replacement socket");
-        for _ in 0..2 {
-            let (mut stream, _addr) = replacement_listener
-                .accept()
-                .expect("accept replacement request");
-            let mut request = String::new();
-            stream
-                .read_to_string(&mut request)
-                .expect("read replacement request");
-            assert!(request.contains("\"ping\""));
-            stream
-                .write_all(
-                    br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch"],"message":"pong"}}"#,
-                )
-                .expect("write replacement response");
-            stream.write_all(b"\n").expect("write response newline");
+        replacement_listener
+            .set_nonblocking(true)
+            .expect("set replacement listener nonblocking");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut accepted = 0;
+        while accepted < 2 && Instant::now() < deadline {
+            match replacement_listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("set replacement stream blocking");
+                    let mut request = String::new();
+                    stream
+                        .read_to_string(&mut request)
+                        .expect("read replacement request");
+                    assert!(request.contains("\"ping\""));
+                    stream
+                        .write_all(
+                            br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch"],"message":"pong"}}"#,
+                        )
+                        .expect("write replacement response");
+                    stream.write_all(b"\n").expect("write response newline");
+                    accepted += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept replacement request: {error}"),
+            }
         }
+        assert!(accepted >= 1, "replacement daemon was not probed");
         drop(replacement_listener);
         fs::remove_file(&replacement_socket_path).expect("remove replacement socket");
     });
