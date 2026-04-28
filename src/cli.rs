@@ -18,8 +18,8 @@ use crate::daemon::{
 };
 use crate::fs_layout::{FsLayout, remove_dir_all_durable};
 use crate::models::{
-    DEFAULT_MAX_DELIVERY_ATTEMPTS, DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, NewJob,
-    PartialDeliveryPolicy, SubmitMetadata,
+    DEFAULT_MAX_DELIVERY_ATTEMPTS, DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy,
+    NewCliAcceptPendingAttempt, NewJob, PartialDeliveryPolicy, SubmitMetadata,
 };
 use crate::store::{Store, new_id};
 
@@ -54,6 +54,11 @@ enum Commands {
     Batch {
         #[command(subcommand)]
         command: BatchCommand,
+    },
+    #[command(hide = true)]
+    Attempt {
+        #[command(subcommand)]
+        command: AttemptCommand,
     },
     Maintenance {
         #[command(subcommand)]
@@ -156,6 +161,13 @@ enum BatchCommand {
     CloseHead(BatchCloseHeadArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum AttemptCommand {
+    BeginCliAccept(AttemptBeginCliAcceptArgs),
+    AcceptCli(AttemptAcceptCliArgs),
+    Inspect(AttemptInspectArgs),
+}
+
 #[derive(Debug, Args)]
 struct BatchInspectHeadArgs {
     #[arg(long)]
@@ -200,6 +212,73 @@ impl CloseReason {
             Self::OperatorConfirmedDelivery => "operator-confirmed-delivery",
         }
     }
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum AttemptRpcKind {
+    TurnStart,
+    TurnSteer,
+}
+
+impl AttemptRpcKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::TurnStart => "turn_start",
+            Self::TurnSteer => "turn_steer",
+        }
+    }
+
+    fn cli_value(&self) -> &'static str {
+        match self {
+            Self::TurnStart => "turn-start",
+            Self::TurnSteer => "turn-steer",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct AttemptBeginCliAcceptArgs {
+    #[arg(long)]
+    batch_id: String,
+
+    #[arg(long)]
+    managed_session_id: String,
+
+    #[arg(long)]
+    session_epoch: i64,
+
+    #[arg(long, value_enum)]
+    rpc_kind: AttemptRpcKind,
+
+    #[arg(long)]
+    rpc_request_id: String,
+
+    #[arg(long)]
+    rpc_correlation_marker: Option<String>,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct AttemptAcceptCliArgs {
+    #[arg(long)]
+    attempt_id: String,
+
+    #[arg(long)]
+    delivery_turn_id: String,
+
+    #[arg(long)]
+    observation_window_seconds: i64,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct AttemptInspectArgs {
+    #[arg(long)]
+    attempt_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -314,6 +393,7 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
     match command {
         Commands::Job { command } => dispatch_job(command, layout),
         Commands::Batch { command } => dispatch_batch(command, layout),
+        Commands::Attempt { command } => dispatch_attempt(command, layout),
         Commands::Maintenance { command } => dispatch_maintenance(command, layout),
         Commands::Daemon { command } => dispatch_daemon(command, layout),
     }
@@ -398,6 +478,44 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             push_optional_string_arg(&mut argv, "--note", args.note.as_deref());
             argv
         }
+        Commands::Attempt {
+            command: AttemptCommand::BeginCliAccept(args),
+        } => {
+            let mut argv = vec![
+                OsString::from("attempt"),
+                OsString::from("begin-cli-accept"),
+            ];
+            push_string_arg(&mut argv, "--batch-id", &args.batch_id);
+            push_string_arg(&mut argv, "--managed-session-id", &args.managed_session_id);
+            push_i64_arg(&mut argv, "--session-epoch", args.session_epoch);
+            push_string_arg(&mut argv, "--rpc-kind", args.rpc_kind.cli_value());
+            push_string_arg(&mut argv, "--rpc-request-id", &args.rpc_request_id);
+            push_optional_string_arg(
+                &mut argv,
+                "--rpc-correlation-marker",
+                args.rpc_correlation_marker.as_deref(),
+            );
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Attempt {
+            command: AttemptCommand::AcceptCli(args),
+        } => {
+            let mut argv = vec![OsString::from("attempt"), OsString::from("accept-cli")];
+            push_string_arg(&mut argv, "--attempt-id", &args.attempt_id);
+            push_string_arg(&mut argv, "--delivery-turn-id", &args.delivery_turn_id);
+            push_i64_arg(
+                &mut argv,
+                "--observation-window-seconds",
+                args.observation_window_seconds,
+            );
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
         Commands::Maintenance {
             command: MaintenanceCommand::Sweep(args),
         } => {
@@ -412,6 +530,9 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
         }
         | Commands::Batch {
             command: BatchCommand::InspectHead(_) | BatchCommand::Inspect(_),
+        }
+        | Commands::Attempt {
+            command: AttemptCommand::Inspect(_),
         }
         | Commands::Daemon { .. } => return Ok(None),
     };
@@ -605,6 +726,60 @@ fn dispatch_batch(command: BatchCommand, layout: &FsLayout) -> Result<Value> {
     }
 }
 
+fn dispatch_attempt(command: AttemptCommand, layout: &FsLayout) -> Result<Value> {
+    let mut store = Store::open(layout)?;
+    match command {
+        AttemptCommand::BeginCliAccept(args) => {
+            validate_positive("session_epoch", args.session_epoch)?;
+            validate_nonempty("rpc_request_id", &args.rpc_request_id)?;
+            let now = match args.now {
+                Some(value) => value,
+                None => now_epoch_seconds()?,
+            };
+            let marker = args
+                .rpc_correlation_marker
+                .unwrap_or_else(|| format!("cbth:{}", new_id()));
+            let attempt = store.begin_cli_accept_pending_attempt(NewCliAcceptPendingAttempt {
+                attempt_id: new_id(),
+                batch_id: args.batch_id,
+                managed_session_id: args.managed_session_id,
+                session_epoch: args.session_epoch,
+                delivery_rpc_request_id: args.rpc_request_id,
+                delivery_rpc_kind: args.rpc_kind.as_str().to_owned(),
+                delivery_rpc_correlation_marker: marker,
+                delivery_rpc_started_at: now,
+            })?;
+            Ok(json!({ "attempt": attempt }))
+        }
+        AttemptCommand::AcceptCli(args) => {
+            validate_positive(
+                "observation_window_seconds",
+                args.observation_window_seconds,
+            )?;
+            let now = match args.now {
+                Some(value) => value,
+                None => now_epoch_seconds()?,
+            };
+            let deadline = validate_timestamp_add(
+                now,
+                args.observation_window_seconds,
+                "observation_window_seconds",
+            )?;
+            let attempt = store.accept_cli_attempt(
+                &args.attempt_id,
+                &args.delivery_turn_id,
+                now,
+                deadline,
+            )?;
+            Ok(json!({ "attempt": attempt }))
+        }
+        AttemptCommand::Inspect(args) => {
+            let attempt = store.inspect_attempt(&args.attempt_id)?;
+            Ok(json!({ "attempt": attempt }))
+        }
+    }
+}
+
 fn dispatch_maintenance(command: MaintenanceCommand, layout: &FsLayout) -> Result<Value> {
     let mut store = Store::open(layout)?;
     match command {
@@ -719,9 +894,15 @@ fn validate_nonzero_u64(name: &str, value: u64) -> Result<()> {
     }
 }
 
-fn validate_timestamp_add(now: i64, delta: i64, name: &str) -> Result<()> {
+fn validate_nonempty(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("{name} must not be empty")
+    }
+    Ok(())
+}
+
+fn validate_timestamp_add(now: i64, delta: i64, name: &str) -> Result<i64> {
     now.checked_add(delta)
-        .map(|_| ())
         .ok_or_else(|| anyhow::anyhow!("{name} overflows timestamp range"))
 }
 

@@ -162,8 +162,49 @@ pub struct BatchInspect {
     pub jobs: Vec<BatchJobRecord>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct DeliveryAttemptRecord {
+    pub attempt_id: String,
+    pub batch_id: String,
+    pub source_thread_id: String,
+    pub adapter_kind: String,
+    pub state: String,
+    pub generation: i64,
+    pub delivery_rpc_request_id: Option<String>,
+    pub delivery_rpc_kind: Option<String>,
+    pub delivery_rpc_state: Option<String>,
+    pub delivery_rpc_correlation_marker: Option<String>,
+    pub delivery_rpc_started_at: Option<i64>,
+    pub managed_session_id: Option<String>,
+    pub session_epoch: Option<i64>,
+    pub delivery_turn_id: Option<String>,
+    pub delivery_accepted_at: Option<i64>,
+    pub delivery_observation_state: Option<String>,
+    pub delivery_observation_deadline: Option<i64>,
+    pub last_observed_turn_event: Option<String>,
+    pub last_observed_turn_event_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub abandoned_at: Option<i64>,
+    pub closed_at: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewCliAcceptPendingAttempt {
+    pub attempt_id: String,
+    pub batch_id: String,
+    pub managed_session_id: String,
+    pub session_epoch: i64,
+    pub delivery_rpc_request_id: String,
+    pub delivery_rpc_kind: String,
+    pub delivery_rpc_correlation_marker: String,
+    pub delivery_rpc_started_at: i64,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct SweepReport {
+    pub stale_cli_acceptances_abandoned: usize,
+    pub expired_cli_observations_abandoned: usize,
     pub expired_manual_batches_closed: usize,
     pub expired_automatic_batches_closed: usize,
     pub artifacts_deleted: usize,
@@ -177,12 +218,18 @@ pub struct SweepReport {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct DaemonLifecycleStatus {
     pub active_jobs: i64,
+    pub active_cli_acceptances: i64,
+    pub cli_acceptances_stale_now: i64,
+    pub active_cli_observations: i64,
+    pub cli_observations_due_now: i64,
     pub open_batches_due_now: i64,
     pub open_batches_due_within_idle: i64,
 }
 
 impl DaemonLifecycleStatus {
     pub fn has_due_maintenance(&self) -> bool {
-        self.open_batches_due_now > 0
+        self.cli_acceptances_stale_now > 0
+            || self.cli_observations_due_now > 0
+            || self.open_batches_due_now > 0
     }
 }

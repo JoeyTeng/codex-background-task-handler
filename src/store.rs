@@ -14,8 +14,9 @@ use crate::fs_layout::{
     set_private_file_permissions_if_exists, validate_id_path_component,
 };
 use crate::models::{
-    ArtifactRecord, BatchInspect, BatchJobRecord, BatchRecord, DaemonLifecycleStatus,
-    DeliveryPolicy, JobRecord, NewArtifact, NewBatch, NewJob, ORPHAN_ARTIFACT_GRACE_SECONDS,
+    ArtifactRecord, BatchInspect, BatchJobRecord, BatchRecord, DEFAULT_REDELIVERY_WINDOW_SECONDS,
+    DaemonLifecycleStatus, DeliveryAttemptRecord, DeliveryPolicy, JobRecord, NewArtifact, NewBatch,
+    NewCliAcceptPendingAttempt, NewJob, ORPHAN_ARTIFACT_GRACE_SECONDS,
     POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
 };
 
@@ -23,6 +24,7 @@ const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
 const MAX_EXPIRED_BATCHES_PER_SWEEP: i64 = 100;
 const MAX_DELETABLE_ARTIFACTS_PER_SWEEP: i64 = 100;
 const MAX_MANIFEST_SYNCS_PER_SWEEP: i64 = 100;
+const CLI_ACCEPT_PENDING_TIMEOUT_SECONDS: i64 = 5 * 60;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(100);
 const SQLITE_OPEN_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
@@ -336,6 +338,134 @@ impl Store {
             .transpose()
     }
 
+    pub fn begin_cli_accept_pending_attempt(
+        &mut self,
+        attempt: NewCliAcceptPendingAttempt,
+    ) -> Result<DeliveryAttemptRecord> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) =
+            query_delivery_attempt_by_rpc_request_id_tx(&tx, &attempt.delivery_rpc_request_id)?
+        {
+            if existing.batch_id != attempt.batch_id {
+                bail!(
+                    "delivery RPC request {} already belongs to batch {}",
+                    attempt.delivery_rpc_request_id,
+                    existing.batch_id
+                );
+            }
+            tx.commit()?;
+            return Ok(existing);
+        }
+        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
+        ensure_batch_open(&batch)?;
+        ensure_batch_is_thread_head_tx(&tx, &batch)?;
+        ensure_batch_allows_automatic_delivery(&batch)?;
+        ensure_batch_allows_detached_cli_delivery(&batch)?;
+        ensure_attempt_budget_remaining(&batch)?;
+        ensure_no_active_attempt_for_thread_tx(&tx, &batch.source_thread_id)?;
+        let generation = next_attempt_generation_tx(&tx, &attempt.batch_id)?;
+
+        tx.execute(
+            "INSERT INTO delivery_attempts (
+                attempt_id, batch_id, source_thread_id, adapter_kind, state,
+                generation, delivery_rpc_request_id, delivery_rpc_kind,
+                delivery_rpc_state, delivery_rpc_correlation_marker,
+                delivery_rpc_started_at, managed_session_id, session_epoch,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, 'cli', 'accept_pending', ?, ?, ?, 'pending_acceptance', ?, ?, ?, ?, ?, ?)",
+            params![
+                attempt.attempt_id,
+                attempt.batch_id,
+                batch.source_thread_id,
+                generation,
+                attempt.delivery_rpc_request_id,
+                attempt.delivery_rpc_kind,
+                attempt.delivery_rpc_correlation_marker,
+                attempt.delivery_rpc_started_at,
+                attempt.managed_session_id,
+                attempt.session_epoch,
+                attempt.delivery_rpc_started_at,
+                attempt.delivery_rpc_started_at,
+            ],
+        )?;
+        let record = query_delivery_attempt_tx(&tx, &attempt.attempt_id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn accept_cli_attempt(
+        &mut self,
+        attempt_id: &str,
+        delivery_turn_id: &str,
+        delivery_accepted_at: i64,
+        delivery_observation_deadline: i64,
+    ) -> Result<DeliveryAttemptRecord> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
+        if attempt.state == "cooldown"
+            && attempt.delivery_rpc_state.as_deref() == Some("accepted")
+            && attempt.delivery_turn_id.as_deref() == Some(delivery_turn_id)
+        {
+            tx.commit()?;
+            return Ok(attempt);
+        }
+        ensure_attempt_accept_pending(&attempt)?;
+        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
+        ensure_batch_open(&batch)?;
+        ensure_batch_is_thread_head_tx(&tx, &batch)?;
+        ensure_batch_allows_automatic_delivery(&batch)?;
+        ensure_batch_allows_detached_cli_delivery(&batch)?;
+        ensure_attempt_budget_remaining(&batch)?;
+        ensure_attempt_is_current_generation_tx(&tx, &attempt)?;
+
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'cooldown',
+                 delivery_rpc_state = 'accepted',
+                 delivery_turn_id = ?,
+                 delivery_accepted_at = ?,
+                 delivery_observation_state = 'tracking',
+                 delivery_observation_deadline = ?,
+                 updated_at = ?
+             WHERE attempt_id = ?
+               AND state = 'accept_pending'
+               AND delivery_rpc_state = 'pending_acceptance'",
+            params![
+                delivery_turn_id,
+                delivery_accepted_at,
+                delivery_observation_deadline,
+                delivery_accepted_at,
+                attempt_id,
+            ],
+        )?;
+        let changed = tx.execute(
+            "UPDATE batches
+             SET delivery_attempt_count = delivery_attempt_count + 1,
+                 updated_at = ?
+             WHERE batch_id = ?
+               AND state = 'open'
+               AND delivery_attempt_count < max_delivery_attempts",
+            params![delivery_accepted_at, attempt.batch_id],
+        )?;
+        if changed != 1 {
+            bail!(
+                "batch {} has no remaining delivery attempts",
+                attempt.batch_id
+            );
+        }
+        let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn inspect_attempt(&self, attempt_id: &str) -> Result<DeliveryAttemptRecord> {
+        query_delivery_attempt(&self.conn, attempt_id)
+    }
+
     pub fn daemon_lifecycle_status(
         &self,
         now: i64,
@@ -346,10 +476,18 @@ impl Store {
             [],
             |row| row.get::<_, i64>(0),
         )?;
+        let active_cli_acceptances = count_active_cli_acceptances(&self.conn, now)?;
+        let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
+        let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
+        let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
         let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
         let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
         Ok(DaemonLifecycleStatus {
             active_jobs,
+            active_cli_acceptances,
+            cli_acceptances_stale_now,
+            active_cli_observations,
+            cli_observations_due_now,
             open_batches_due_now,
             open_batches_due_within_idle,
         })
@@ -386,6 +524,8 @@ impl Store {
 
     pub fn sweep(&mut self, layout: &FsLayout, now: i64) -> Result<SweepReport> {
         let tx = self.conn.transaction()?;
+        let stale_cli_acceptances_abandoned = expire_stale_cli_acceptances_tx(&tx, now)?;
+        let expired_cli_observations_abandoned = expire_due_cli_observations_tx(&tx, now)?;
         let (expired_manual_batches_closed, artifacts_to_sync) =
             close_expired_manual_batches_tx(&tx, now)?;
         let (expired_automatic_batches_closed, automatic_artifacts_to_sync) =
@@ -431,6 +571,8 @@ impl Store {
         }
 
         Ok(SweepReport {
+            stale_cli_acceptances_abandoned,
+            expired_cli_observations_abandoned,
             expired_manual_batches_closed,
             expired_automatic_batches_closed,
             artifacts_deleted: deleted_artifact_ids.len(),
@@ -767,6 +909,38 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_batches_manual_expiry
             ON batches(state, replay_policy, redelivery_window_ends_at);
 
+        CREATE TABLE IF NOT EXISTS delivery_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+            source_thread_id TEXT NOT NULL,
+            adapter_kind TEXT NOT NULL CHECK (adapter_kind IN ('cli', 'desktop')),
+            state TEXT NOT NULL CHECK (state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown', 'abandoned', 'superseded', 'closed')),
+            generation INTEGER NOT NULL,
+            delivery_rpc_request_id TEXT UNIQUE,
+            delivery_rpc_kind TEXT CHECK (delivery_rpc_kind IS NULL OR delivery_rpc_kind IN ('turn_start', 'turn_steer')),
+            delivery_rpc_state TEXT CHECK (delivery_rpc_state IS NULL OR delivery_rpc_state IN ('pending_acceptance', 'accepted', 'rejected_before_accept', 'unknown')),
+            delivery_rpc_correlation_marker TEXT,
+            delivery_rpc_started_at INTEGER,
+            managed_session_id TEXT,
+            session_epoch INTEGER,
+            delivery_turn_id TEXT,
+            delivery_accepted_at INTEGER,
+            delivery_observation_state TEXT CHECK (delivery_observation_state IS NULL OR delivery_observation_state IN ('tracking', 'completed', 'expired', 'abandoned')),
+            delivery_observation_deadline INTEGER,
+            last_observed_turn_event TEXT CHECK (last_observed_turn_event IS NULL OR last_observed_turn_event IN ('turn_started', 'turn_completed', 'turn_failed', 'turn_interrupted', 'turn_replaced')),
+            last_observed_turn_event_at INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            abandoned_at INTEGER,
+            closed_at INTEGER,
+            UNIQUE(batch_id, generation)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_delivery_attempts_batch_state
+            ON delivery_attempts(batch_id, state, generation);
+        CREATE INDEX IF NOT EXISTS idx_delivery_attempts_cli_observation
+            ON delivery_attempts(adapter_kind, delivery_observation_state, delivery_observation_deadline);
+
         CREATE TABLE IF NOT EXISTS batch_jobs (
             batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
             job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
@@ -873,6 +1047,15 @@ fn close_batch_tx(
     if changed == 0 {
         bail!("batch {batch_id} is not open");
     }
+    tx.execute(
+        "UPDATE delivery_attempts
+         SET state = 'closed',
+             updated_at = ?,
+             closed_at = ?
+         WHERE batch_id = ?
+           AND state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown')",
+        params![now, now, batch_id],
+    )?;
     Ok(())
 }
 
@@ -906,6 +1089,11 @@ fn close_expired_manual_batches_tx(
          WHERE state = 'open'
            AND replay_policy = 'manual_resolution_only'
            AND redelivery_window_ends_at <= ?
+           AND NOT EXISTS (
+             SELECT 1 FROM delivery_attempts
+             WHERE delivery_attempts.batch_id = batches.batch_id
+               AND delivery_attempts.state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown')
+           )
          ORDER BY redelivery_window_ends_at ASC, batch_id ASC
          LIMIT ?",
     )?;
@@ -936,11 +1124,183 @@ fn count_open_batches_due_at(conn: &Connection, due_at: i64) -> Result<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM batches
          WHERE state = 'open'
-           AND redelivery_window_ends_at <= ?",
+           AND redelivery_window_ends_at <= ?
+           AND NOT EXISTS (
+             SELECT 1 FROM delivery_attempts
+             WHERE delivery_attempts.batch_id = batches.batch_id
+               AND delivery_attempts.state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown')
+           )",
         params![due_at],
         |row| row.get::<_, i64>(0),
     )
     .context("count open batches due for daemon lifecycle")
+}
+
+fn count_active_cli_acceptances(conn: &Connection, now: i64) -> Result<i64> {
+    let stale_started_at = now.saturating_sub(CLI_ACCEPT_PENDING_TIMEOUT_SECONDS);
+    conn.query_row(
+        "SELECT COUNT(*) FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'cli'
+           AND delivery_attempts.state = 'accept_pending'
+           AND delivery_attempts.delivery_rpc_state = 'pending_acceptance'
+           AND delivery_attempts.delivery_rpc_started_at > ?
+           AND batches.state = 'open'",
+        params![stale_started_at],
+        |row| row.get::<_, i64>(0),
+    )
+    .context("count active CLI accept-pending attempts for daemon lifecycle")
+}
+
+fn count_stale_cli_acceptances(conn: &Connection, now: i64) -> Result<i64> {
+    let stale_started_at = now.saturating_sub(CLI_ACCEPT_PENDING_TIMEOUT_SECONDS);
+    conn.query_row(
+        "SELECT COUNT(*) FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'cli'
+           AND delivery_attempts.state = 'accept_pending'
+           AND delivery_attempts.delivery_rpc_state = 'pending_acceptance'
+           AND delivery_attempts.delivery_rpc_started_at <= ?
+           AND batches.state = 'open'",
+        params![stale_started_at],
+        |row| row.get::<_, i64>(0),
+    )
+    .context("count stale CLI accept-pending attempts for daemon lifecycle")
+}
+
+fn count_active_cli_observations(conn: &Connection, now: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'cli'
+           AND delivery_attempts.state = 'cooldown'
+           AND delivery_attempts.delivery_observation_state = 'tracking'
+           AND delivery_attempts.delivery_observation_deadline > ?
+           AND batches.state = 'open'",
+        params![now],
+        |row| row.get::<_, i64>(0),
+    )
+    .context("count active CLI delivery observations for daemon lifecycle")
+}
+
+fn count_cli_observations_due_now(conn: &Connection, now: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'cli'
+           AND delivery_attempts.state = 'cooldown'
+           AND delivery_attempts.delivery_observation_state = 'tracking'
+           AND delivery_attempts.delivery_observation_deadline <= ?
+           AND batches.state = 'open'",
+        params![now],
+        |row| row.get::<_, i64>(0),
+    )
+    .context("count due CLI delivery observations for daemon lifecycle")
+}
+
+fn expire_stale_cli_acceptances_tx(tx: &Transaction<'_>, now: i64) -> Result<usize> {
+    let stale_started_at = now.saturating_sub(CLI_ACCEPT_PENDING_TIMEOUT_SECONDS);
+    let manual_resolution_window_ends_at = checked_timestamp_add(
+        now,
+        DEFAULT_REDELIVERY_WINDOW_SECONDS,
+        "manual_resolution_window_seconds",
+    )?;
+    let mut stmt = tx.prepare(
+        "SELECT delivery_attempts.attempt_id, delivery_attempts.batch_id
+         FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'cli'
+           AND delivery_attempts.state = 'accept_pending'
+           AND delivery_attempts.delivery_rpc_state = 'pending_acceptance'
+           AND delivery_attempts.delivery_rpc_started_at <= ?
+           AND batches.state = 'open'
+         ORDER BY delivery_attempts.delivery_rpc_started_at ASC,
+                  delivery_attempts.attempt_id ASC
+         LIMIT ?",
+    )?;
+    let attempts = stmt
+        .query_map(
+            params![stale_started_at, MAX_EXPIRED_BATCHES_PER_SWEEP],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for (attempt_id, batch_id) in &attempts {
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'abandoned',
+                 delivery_rpc_state = 'unknown',
+                 delivery_observation_state = 'abandoned',
+                 updated_at = ?,
+                 abandoned_at = ?
+             WHERE attempt_id = ?
+               AND state = 'accept_pending'
+               AND delivery_rpc_state = 'pending_acceptance'",
+            params![now, now, attempt_id],
+        )?;
+        tx.execute(
+            "UPDATE batches
+             SET replay_policy = 'manual_resolution_only',
+                 redelivery_window_ends_at = max(redelivery_window_ends_at, ?),
+                 updated_at = ?
+             WHERE batch_id = ?
+               AND state = 'open'",
+            params![manual_resolution_window_ends_at, now, batch_id],
+        )?;
+    }
+    Ok(attempts.len())
+}
+
+fn expire_due_cli_observations_tx(tx: &Transaction<'_>, now: i64) -> Result<usize> {
+    let manual_resolution_window_ends_at = checked_timestamp_add(
+        now,
+        DEFAULT_REDELIVERY_WINDOW_SECONDS,
+        "manual_resolution_window_seconds",
+    )?;
+    let mut stmt = tx.prepare(
+        "SELECT delivery_attempts.attempt_id, delivery_attempts.batch_id
+         FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'cli'
+           AND delivery_attempts.state = 'cooldown'
+           AND delivery_attempts.delivery_observation_state = 'tracking'
+           AND delivery_attempts.delivery_observation_deadline <= ?
+           AND batches.state = 'open'
+         ORDER BY delivery_attempts.delivery_observation_deadline ASC,
+                  delivery_attempts.attempt_id ASC
+         LIMIT ?",
+    )?;
+    let attempts = stmt
+        .query_map(params![now, MAX_EXPIRED_BATCHES_PER_SWEEP], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for (attempt_id, batch_id) in &attempts {
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'abandoned',
+                 delivery_observation_state = 'expired',
+                 updated_at = ?,
+                 abandoned_at = ?
+             WHERE attempt_id = ?
+               AND state = 'cooldown'
+               AND delivery_observation_state = 'tracking'",
+            params![now, now, attempt_id],
+        )?;
+        tx.execute(
+            "UPDATE batches
+             SET replay_policy = 'manual_resolution_only',
+                 redelivery_window_ends_at = max(redelivery_window_ends_at, ?),
+                 updated_at = ?
+             WHERE batch_id = ?
+               AND state = 'open'",
+            params![manual_resolution_window_ends_at, now, batch_id],
+        )?;
+    }
+    Ok(attempts.len())
 }
 
 fn close_expired_automatic_batches_tx(
@@ -952,6 +1312,11 @@ fn close_expired_automatic_batches_tx(
          WHERE state = 'open'
            AND replay_policy = 'automatic'
            AND redelivery_window_ends_at <= ?
+           AND NOT EXISTS (
+             SELECT 1 FROM delivery_attempts
+             WHERE delivery_attempts.batch_id = batches.batch_id
+               AND delivery_attempts.state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown')
+           )
          ORDER BY redelivery_window_ends_at ASC, batch_id ASC
          LIMIT ?",
     )?;
@@ -1066,6 +1431,121 @@ fn query_batch_tx(tx: &Transaction<'_>, batch_id: &str) -> Result<BatchRecord> {
     )
     .optional()?
     .ok_or_else(|| anyhow!("batch not found: {batch_id}"))
+}
+
+fn query_delivery_attempt(conn: &Connection, attempt_id: &str) -> Result<DeliveryAttemptRecord> {
+    conn.query_row(
+        "SELECT * FROM delivery_attempts WHERE attempt_id = ?",
+        params![attempt_id],
+        delivery_attempt_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("delivery attempt not found: {attempt_id}"))
+}
+
+fn query_delivery_attempt_tx(
+    tx: &Transaction<'_>,
+    attempt_id: &str,
+) -> Result<DeliveryAttemptRecord> {
+    tx.query_row(
+        "SELECT * FROM delivery_attempts WHERE attempt_id = ?",
+        params![attempt_id],
+        delivery_attempt_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("delivery attempt not found: {attempt_id}"))
+}
+
+fn query_delivery_attempt_by_rpc_request_id_tx(
+    tx: &Transaction<'_>,
+    delivery_rpc_request_id: &str,
+) -> Result<Option<DeliveryAttemptRecord>> {
+    tx.query_row(
+        "SELECT * FROM delivery_attempts WHERE delivery_rpc_request_id = ?",
+        params![delivery_rpc_request_id],
+        delivery_attempt_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn ensure_no_active_attempt_for_thread_tx(
+    tx: &Transaction<'_>,
+    source_thread_id: &str,
+) -> Result<()> {
+    let active: Option<String> = tx
+        .query_row(
+            "SELECT delivery_attempts.attempt_id
+             FROM delivery_attempts
+             JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+             WHERE delivery_attempts.source_thread_id = ?
+               AND delivery_attempts.state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown')
+               AND batches.state = 'open'
+             ORDER BY delivery_attempts.generation DESC, delivery_attempts.attempt_id DESC
+             LIMIT 1",
+            params![source_thread_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(attempt_id) = active {
+        bail!("thread {source_thread_id} already has active delivery attempt {attempt_id}");
+    }
+    Ok(())
+}
+
+fn ensure_batch_is_thread_head_tx(tx: &Transaction<'_>, batch: &BatchRecord) -> Result<()> {
+    let head_batch_id: Option<String> = tx
+        .query_row(
+            "SELECT batch_id FROM batches
+             WHERE source_thread_id = ?
+               AND state = 'open'
+             ORDER BY created_at ASC, batch_id ASC
+             LIMIT 1",
+            params![batch.source_thread_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if head_batch_id.as_deref() == Some(batch.batch_id.as_str()) {
+        Ok(())
+    } else {
+        bail!(
+            "batch {} is not the head batch for thread {}",
+            batch.batch_id,
+            batch.source_thread_id
+        )
+    }
+}
+
+fn next_attempt_generation_tx(tx: &Transaction<'_>, batch_id: &str) -> Result<i64> {
+    let generation: Option<i64> = tx.query_row(
+        "SELECT MAX(generation) FROM delivery_attempts WHERE batch_id = ?",
+        params![batch_id],
+        |row| row.get(0),
+    )?;
+    generation
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("delivery attempt generation overflow for batch {batch_id}"))
+}
+
+fn ensure_attempt_is_current_generation_tx(
+    tx: &Transaction<'_>,
+    attempt: &DeliveryAttemptRecord,
+) -> Result<()> {
+    let current = tx.query_row(
+        "SELECT MAX(generation) FROM delivery_attempts WHERE batch_id = ?",
+        params![attempt.batch_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    if current == Some(attempt.generation) {
+        Ok(())
+    } else {
+        bail!(
+            "delivery attempt {} is not current for batch {}",
+            attempt.attempt_id,
+            attempt.batch_id
+        )
+    }
 }
 
 fn query_batch_jobs(conn: &Connection, batch_id: &str) -> Result<Vec<BatchJobRecord>> {
@@ -1234,11 +1714,98 @@ fn batch_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BatchRecord> {
     })
 }
 
+fn delivery_attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryAttemptRecord> {
+    Ok(DeliveryAttemptRecord {
+        attempt_id: row.get("attempt_id")?,
+        batch_id: row.get("batch_id")?,
+        source_thread_id: row.get("source_thread_id")?,
+        adapter_kind: row.get("adapter_kind")?,
+        state: row.get("state")?,
+        generation: row.get("generation")?,
+        delivery_rpc_request_id: row.get("delivery_rpc_request_id")?,
+        delivery_rpc_kind: row.get("delivery_rpc_kind")?,
+        delivery_rpc_state: row.get("delivery_rpc_state")?,
+        delivery_rpc_correlation_marker: row.get("delivery_rpc_correlation_marker")?,
+        delivery_rpc_started_at: row.get("delivery_rpc_started_at")?,
+        managed_session_id: row.get("managed_session_id")?,
+        session_epoch: row.get("session_epoch")?,
+        delivery_turn_id: row.get("delivery_turn_id")?,
+        delivery_accepted_at: row.get("delivery_accepted_at")?,
+        delivery_observation_state: row.get("delivery_observation_state")?,
+        delivery_observation_deadline: row.get("delivery_observation_deadline")?,
+        last_observed_turn_event: row.get("last_observed_turn_event")?,
+        last_observed_turn_event_at: row.get("last_observed_turn_event_at")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        abandoned_at: row.get("abandoned_at")?,
+        closed_at: row.get("closed_at")?,
+    })
+}
+
 fn ensure_job_pending(job: &JobRecord) -> Result<()> {
     if job.status == "pending" {
         Ok(())
     } else {
         bail!("job {} is already {}", job.job_id, job.status)
+    }
+}
+
+fn ensure_batch_open(batch: &BatchRecord) -> Result<()> {
+    if batch.state == "open" {
+        Ok(())
+    } else {
+        bail!("batch {} is already {}", batch.batch_id, batch.state)
+    }
+}
+
+fn ensure_batch_allows_automatic_delivery(batch: &BatchRecord) -> Result<()> {
+    if batch.replay_policy == "automatic" {
+        Ok(())
+    } else {
+        bail!(
+            "batch {} replay policy is {}",
+            batch.batch_id,
+            batch.replay_policy
+        )
+    }
+}
+
+fn ensure_batch_allows_detached_cli_delivery(batch: &BatchRecord) -> Result<()> {
+    let policy = &batch.delivery_policy;
+    if policy.delivery_read_only
+        && !policy.delivery_requires_approval
+        && !policy.delivery_requires_network
+        && !policy.delivery_requires_write_access
+        && !batch.requires_artifact_read
+    {
+        Ok(())
+    } else {
+        bail!(
+            "batch {} is not eligible for detached CLI delivery",
+            batch.batch_id
+        )
+    }
+}
+
+fn ensure_attempt_budget_remaining(batch: &BatchRecord) -> Result<()> {
+    if batch.delivery_attempt_count < batch.max_delivery_attempts {
+        Ok(())
+    } else {
+        bail!("batch {} has exhausted delivery attempts", batch.batch_id)
+    }
+}
+
+fn ensure_attempt_accept_pending(attempt: &DeliveryAttemptRecord) -> Result<()> {
+    if attempt.adapter_kind == "cli"
+        && attempt.state == "accept_pending"
+        && attempt.delivery_rpc_state.as_deref() == Some("pending_acceptance")
+    {
+        Ok(())
+    } else {
+        bail!(
+            "delivery attempt {} is not a pending CLI acceptance",
+            attempt.attempt_id
+        )
     }
 }
 
@@ -1322,6 +1889,57 @@ mod tests {
         let second = store.sweep(&layout, 0).expect("second sweep");
         assert_eq!(second.artifact_manifests_synced, 1);
         assert_eq!(pending_manifest_sync_count(&store.conn), 0);
+    }
+
+    #[test]
+    fn daemon_lifecycle_reports_active_and_stale_cli_acceptances() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let policy = DeliveryPolicy {
+            delivery_read_only: true,
+            delivery_requires_approval: false,
+            delivery_requires_network: false,
+            delivery_requires_write_access: false,
+        };
+        store
+            .submit_job(NewJob {
+                job_id: "job-cli-accept-lifecycle".to_owned(),
+                source_thread_id: "thread-cli-accept-lifecycle".to_owned(),
+                summary: "lifecycle".to_owned(),
+                metadata_json: "{}".to_owned(),
+                policy,
+                created_at: 0,
+            })
+            .expect("submit job");
+        let batch = store
+            .fail_job("job-cli-accept-lifecycle", "ready", 0, 3, 10)
+            .expect("fail job");
+        let batch_id = batch.batch.batch_id;
+        store
+            .begin_cli_accept_pending_attempt(NewCliAcceptPendingAttempt {
+                attempt_id: "attempt-cli-accept-lifecycle".to_owned(),
+                batch_id,
+                managed_session_id: "managed-cli-accept-lifecycle".to_owned(),
+                session_epoch: 1,
+                delivery_rpc_request_id: "rpc-cli-accept-lifecycle".to_owned(),
+                delivery_rpc_kind: "turn_start".to_owned(),
+                delivery_rpc_correlation_marker: "cbth:lifecycle".to_owned(),
+                delivery_rpc_started_at: 100,
+            })
+            .expect("begin CLI accept");
+
+        let active = store.daemon_lifecycle_status(399, 400).expect("active");
+        assert_eq!(active.active_cli_acceptances, 1);
+        assert_eq!(active.cli_acceptances_stale_now, 0);
+        assert_eq!(active.open_batches_due_now, 0);
+        assert!(!active.has_due_maintenance());
+
+        let stale = store.daemon_lifecycle_status(400, 401).expect("stale");
+        assert_eq!(stale.active_cli_acceptances, 0);
+        assert_eq!(stale.cli_acceptances_stale_now, 1);
+        assert_eq!(stale.open_batches_due_now, 0);
+        assert!(stale.has_due_maintenance());
     }
 
     #[test]

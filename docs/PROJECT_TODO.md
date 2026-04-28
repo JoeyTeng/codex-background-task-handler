@@ -38,7 +38,7 @@
   - [x] 显式 `maintenance sweep` autostart 的 skip-startup-sweep 路径会抑制后台 lifecycle maintenance，直到第一个 `dispatch` 请求进入，避免抢先消费显式 sweep report；抑制期间 due batches 不单独阻止 idle exit
   - [x] shutdown 会等待已启动的 lifecycle maintenance worker 到达一致点后再返回
   - [x] open 但长窗口的 batch / attempt 不单独阻止退出；由下次启动时的 overdue sweep 收口
-  - [ ] 后续 CLI accepted attempt schema 落地后，把 `delivery_observation_deadline` 接入 daemon 保活
+  - [x] CLI accepted attempt schema 已落地，并已把 `delivery_observation_deadline` 接入 daemon 保活 / expiry sweep
   - [ ] 后续 Desktop binding / attempt schema 落地后，把 `arm_pending_deadline` / `pause_deadline` 接入 daemon 保活
   - [ ] 如果未来有 daemon-owned supervised child processes，把 active supervised jobs 与普通 externally-reported pending jobs 进一步拆开
 - [x] 实现 `cbth` daemon IPC 的 same-user-only 基础合同：
@@ -228,6 +228,23 @@
   - 如果更换 `caller_automation_id`，必须优先证明旧 automation 已 quiesced / deleted
   - 如果旧 automation 无法被证明 quiesced，则不得复用当前 attempt / generation
   - 必须先强制切到新的 fresh attempt / generation，再允许恢复自动 delivery
+- [x] 为 CLI accepted delivery 的核心 durable slice 落地实现：
+  - `delivery_attempts` schema
+  - `accept_pending -> cooldown` accepted barrier
+  - `begin-cli-accept` idempotency by adapter-provided `delivery_rpc_request_id`; `--rpc-request-id` is required so lost JSON responses can be recovered by retrying the same key
+  - daemon compatibility requires `attempt-dispatch` capability before routing hidden attempt mutations through domain RPC
+  - accepted attempt 的 `delivery_turn_id`
+  - `managed_session_id + session_epoch`
+  - `delivery_accepted_at + delivery_observation_deadline`
+  - `delivery_observation_state=tracking`
+  - stale `accept_pending` bounded expiry to `abandoned + unknown`
+  - 过期后 `abandoned + expired`
+  - head batch fail-closed 到 `manual_resolution_only`
+  - fail-closed 时重新打开默认 manual resolution window，避免同轮 sweep 立即关闭刚 manualized 的 batch
+  - daemon lifecycle 跟踪 active/stale `accept_pending`，并在 stale 后触发 maintenance sweep
+  - daemon lifecycle 的 due-batch 计数排除 active-attempt-blocked batch，避免 deadline 前反复无进展 sweep
+  - daemon 在 deadline 前保持 active observation live window
+  - hidden adapter-internal `cbth attempt ...` 命令仅用于后续 CLI adapter / tests，不是稳定外部用户接口
 - [ ] 把 CLI attach/recovery 的 `activity_state=unknown -> current-state sync -> active/idle` 合同落进实现：
   - 未完成 current-state sync 前不得自动把 thread 判成 idle
   - continuity-loss 后只能 fail-closed，直到恢复到权威 current-state 或新的本地 regular turn lifecycle
