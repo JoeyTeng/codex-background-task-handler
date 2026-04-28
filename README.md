@@ -34,6 +34,16 @@ Design docs:
 - `scripts/`
   - lightweight Python probes and reference PoCs
 
+## Local Git Hooks
+
+本仓库提供 tracked pre-commit hook，用来在提交前运行本地确定性 Rust gate：`cargo fmt --all`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked`。
+
+```bash
+bash scripts/install-git-hooks.sh
+```
+
+详细设计、工作树安全策略和后续跟踪见 [docs/GIT_HOOKS.md](docs/GIT_HOOKS.md)。
+
 ## Rust CLI Usage
 
 The Rust CLI currently provides read-only store inspection commands, daemon-routed mutating job/batch/maintenance commands, hidden adapter-internal attempt commands, and a daemon control surface backed by a same-user Unix socket. The hidden `attempt begin-cli-accept` command requires the adapter to provide a stable `--rpc-request-id`; daemon compatibility also requires the `attempt-dispatch` capability so upgraded CLIs do not hand new attempt commands to an older daemon.
