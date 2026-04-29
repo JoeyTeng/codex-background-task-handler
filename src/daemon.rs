@@ -38,7 +38,6 @@ const DAEMON_MAINTENANCE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const CLI_APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_APP_SERVER_TERM_GRACE: Duration = Duration::from_secs(2);
 const CLI_APP_SERVER_KILL_GRACE: Duration = Duration::from_secs(2);
-const CLI_APP_SERVER_JOIN_GRACE: Duration = Duration::from_secs(2);
 const CLI_APP_SERVER_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CLI_APP_SERVER_STDOUT_SCAN_BYTES: usize = 8 * 1024;
 const CLI_APP_SERVER_DRAIN_CHUNK_BYTES: usize = 4 * 1024;
@@ -219,6 +218,13 @@ struct ManagedCliAppServer {
     drain_running: Arc<AtomicBool>,
     stdout_worker: Option<thread::JoinHandle<()>>,
     stderr_worker: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChildStatusWithoutReaping {
+    Running,
+    Exited,
+    NotWaitable,
 }
 
 struct CliAppServerReservation {
@@ -1345,16 +1351,16 @@ fn spawn_cli_app_server(
         Err(error) => {
             drain_running.store(false, Ordering::Release);
             stop_cli_app_server_process(&mut child);
-            join_worker_until(stdout_worker, Instant::now() + CLI_APP_SERVER_JOIN_GRACE);
-            join_worker_until(stderr_worker, Instant::now() + CLI_APP_SERVER_JOIN_GRACE);
+            join_worker(stdout_worker);
+            join_worker(stderr_worker);
             bail!("codex app-server did not report a websocket listener: {error}");
         }
     };
     if !app_server_listener_url_is_loopback(&url) {
         drain_running.store(false, Ordering::Release);
         stop_cli_app_server_process(&mut child);
-        join_worker_until(stdout_worker, Instant::now() + CLI_APP_SERVER_JOIN_GRACE);
-        join_worker_until(stderr_worker, Instant::now() + CLI_APP_SERVER_JOIN_GRACE);
+        join_worker(stdout_worker);
+        join_worker(stderr_worker);
         bail!("codex app-server reported non-loopback listener {url}");
     }
     let started_at = current_epoch_seconds()?;
@@ -1381,6 +1387,9 @@ fn drain_app_server_stdout<R: Read>(
     let mut scan_buffer = Vec::with_capacity(CLI_APP_SERVER_STDOUT_SCAN_BYTES);
     let mut buffer = [0_u8; CLI_APP_SERVER_DRAIN_CHUNK_BYTES];
     loop {
+        if !running.load(Ordering::Acquire) {
+            break;
+        }
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => {
@@ -1412,6 +1421,9 @@ fn drain_app_server_stdout<R: Read>(
 fn drain_reader<R: Read>(mut reader: R, running: Arc<AtomicBool>) {
     let mut buffer = [0_u8; CLI_APP_SERVER_DRAIN_CHUNK_BYTES];
     loop {
+        if !running.load(Ordering::Acquire) {
+            break;
+        }
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(_) => {}
@@ -1587,9 +1599,9 @@ fn ensure_cli_app_server_lease_is_reentrant(
 }
 
 fn cli_app_server_child_is_running(server: &mut ManagedCliAppServer) -> Result<bool> {
-    match server.child.try_wait().context("check codex app-server")? {
-        Some(_status) => Ok(false),
-        None => Ok(true),
+    match child_status_without_reaping(server.child.id()).context("check codex app-server")? {
+        ChildStatusWithoutReaping::Running => Ok(true),
+        ChildStatusWithoutReaping::Exited | ChildStatusWithoutReaping::NotWaitable => Ok(false),
     }
 }
 
@@ -1687,25 +1699,71 @@ fn stop_managed_cli_app_server(mut server: ManagedCliAppServer) {
     server.drain_running.store(false, Ordering::Release);
     stop_cli_app_server_process(&mut server.child);
     if let Some(worker) = server.stdout_worker.take() {
-        join_worker_until(worker, Instant::now() + CLI_APP_SERVER_JOIN_GRACE);
+        join_worker(worker);
     }
     if let Some(worker) = server.stderr_worker.take() {
-        join_worker_until(worker, Instant::now() + CLI_APP_SERVER_JOIN_GRACE);
+        join_worker(worker);
     }
 }
 
 fn stop_cli_app_server_process(child: &mut Child) {
     let pid = child.id();
-    if child.try_wait().ok().flatten().is_some() {
-        signal_process_group(pid, libc::SIGKILL);
+    if child_status_without_reaping(pid)
+        .is_ok_and(|status| status == ChildStatusWithoutReaping::NotWaitable)
+    {
+        let _ = wait_child_until(child, Instant::now() + CLI_APP_SERVER_KILL_GRACE);
         return;
     }
     signal_process_group(pid, libc::SIGTERM);
-    let child_exited = wait_child_until(child, Instant::now() + CLI_APP_SERVER_TERM_GRACE);
-    signal_process_group(pid, libc::SIGKILL);
+    let status_after_term =
+        wait_child_observed_until(pid, Instant::now() + CLI_APP_SERVER_TERM_GRACE);
+    if status_after_term != ChildStatusWithoutReaping::NotWaitable {
+        signal_process_group(pid, libc::SIGKILL);
+        let _ = child.kill();
+    }
+    let child_exited = wait_child_until(child, Instant::now() + CLI_APP_SERVER_KILL_GRACE);
     if !child_exited {
         let _ = child.kill();
         let _ = wait_child_until(child, Instant::now() + CLI_APP_SERVER_KILL_GRACE);
+    }
+}
+
+fn wait_child_observed_until(pid: u32, deadline: Instant) -> ChildStatusWithoutReaping {
+    loop {
+        match child_status_without_reaping(pid) {
+            Ok(ChildStatusWithoutReaping::Running) => {}
+            Ok(status) => return status,
+            Err(_) => return ChildStatusWithoutReaping::NotWaitable,
+        }
+        if Instant::now() >= deadline {
+            return ChildStatusWithoutReaping::Running;
+        }
+        thread::sleep(READ_POLL_INTERVAL);
+    }
+}
+
+fn child_status_without_reaping(pid: u32) -> io::Result<ChildStatusWithoutReaping> {
+    let mut info = mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(ChildStatusWithoutReaping::NotWaitable);
+        }
+        return Err(error);
+    }
+    let info = unsafe { info.assume_init() };
+    if unsafe { info.si_pid() } == 0 {
+        Ok(ChildStatusWithoutReaping::Running)
+    } else {
+        Ok(ChildStatusWithoutReaping::Exited)
     }
 }
 
@@ -1728,13 +1786,7 @@ fn wait_child_until(child: &mut Child, deadline: Instant) -> bool {
     }
 }
 
-fn join_worker_until(worker: thread::JoinHandle<()>, deadline: Instant) {
-    while !worker.is_finished() {
-        if Instant::now() >= deadline {
-            return;
-        }
-        thread::sleep(READ_POLL_INTERVAL);
-    }
+fn join_worker(worker: thread::JoinHandle<()>) {
     let _ = worker.join();
 }
 
@@ -2015,6 +2067,15 @@ mod tests {
 
     use super::*;
 
+    struct ContinuouslyReadable;
+
+    impl Read for ContinuouslyReadable {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            buffer.fill(b'x');
+            Ok(buffer.len())
+        }
+    }
+
     fn test_state() -> (TempDir, DaemonState) {
         let home = tempfile::tempdir().expect("temp home");
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
@@ -2108,5 +2169,24 @@ mod tests {
             parse_app_server_listener_url(b"  listening on: ws://127.0.0.1:1234\n"),
             Some("ws://127.0.0.1:1234".to_owned())
         );
+    }
+
+    #[test]
+    fn drain_reader_stops_even_when_pipe_is_continuously_readable() {
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let worker = thread::spawn(move || drain_reader(ContinuouslyReadable, worker_running));
+
+        running.store(false, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !worker.is_finished() && Instant::now() < deadline {
+            thread::sleep(READ_POLL_INTERVAL);
+        }
+
+        assert!(
+            worker.is_finished(),
+            "drain worker did not observe stop flag"
+        );
+        worker.join().expect("join drain worker");
     }
 }
