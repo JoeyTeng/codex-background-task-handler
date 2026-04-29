@@ -742,10 +742,24 @@ fn wait_for_incompatible_daemon_replaced_or_removed_until(
     deadline: Instant,
 ) -> Result<()> {
     let socket_path = layout.daemon_socket_path();
+    let mut saw_socket_absent = false;
     loop {
         if !socket_path.exists() {
-            return Ok(());
+            if saw_socket_absent {
+                return Ok(());
+            }
+            saw_socket_absent = true;
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            thread::sleep(
+                remaining_budget(deadline)
+                    .unwrap_or(STARTUP_POLL_INTERVAL)
+                    .min(STARTUP_POLL_INTERVAL),
+            );
+            continue;
         }
+        saw_socket_absent = false;
         let probe_budget = remaining_budget(deadline).unwrap_or(STARTUP_POLL_INTERVAL);
         match daemon_request_with_timeout(layout, "ping", probe_budget.min(STARTUP_POLL_INTERVAL)) {
             Ok(response) if daemon_response_is_compatible(&response) => return Ok(()),
