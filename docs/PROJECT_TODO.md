@@ -349,6 +349,7 @@
   - [x] 落地 durable `cli_managed_sessions` 记录，用于固定 `managed_session_id` / `bound_thread_id` / `session_epoch` / `session_state` / `activity_state` / `activity_revision` / risk profile
   - [x] 增加 hidden adapter-internal `cbth cli session bind` / `note-activity` / `inspect`，作为未来 `cbth cli run` 的 attach-or-create / monotonic current-state-sync building block
   - [x] daemon capability 增加 `cli-session-dispatch`，避免新 CLI 把 session mutation 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给旧 daemon
   - shared `app-server` 归 daemon 持有
   - 前台退出但 active jobs 未结束时继续保活
   - 后续重连 / resume contract
@@ -381,7 +382,7 @@
   - `accept_pending -> prepared` 必须写入 `delivery_rpc_state=rejected_before_accept`，且不得递增 `delivery_attempt_count`
   - [x] accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
   - [x] accepted attempt 必须 durable 记录 `delivery_accepted_at`
-  - accepted attempt 必须 durable 记录 `last_observed_turn_event + last_observed_turn_event_at`
+  - [x] accepted attempt 必须 durable 记录 `last_observed_turn_event + last_observed_turn_event_at`
   - [x] accepted attempt 必须 durable 记录 `delivery_observation_deadline`
   - [x] `delivery_observation_deadline` 的计算基准必须统一为 `delivery_accepted_at`
   - [x] detached auto-delivery 只允许在 session-scoped risk profile 三项都为 `false` 时开启
@@ -404,7 +405,10 @@
 - [ ] 为 CLI adapter 明确定义实验 RPC 的最小能力集、capability probe 和 fail-closed 策略。
 - [ ] 把 `turn/steer` 维持为默认关闭的 gated optimization，并明确不满足条件时的 idle-only fallback。
 - [ ] 为 CLI adapter 落实 delivery completion contract：
-  - accepted `turn/start` / `turn/steer` 只记录 `delivery_turn_id`
-  - 只有匹配的 `turn/completed` 才允许 close batch
+  - [x] accepted `turn/start` 只记录 `delivery_turn_id`
+  - accepted `turn/steer` 仍待 active-turn risk proof 落地后开放；当前 `begin-cli-accept --rpc-kind turn-steer` 仍 fail-closed
+  - [x] 只有匹配的 `turn/completed` 才允许 close batch
   - pre-accept 的 benign race / non-steerable reject 可以回退到 retry-on-idle
-  - 但 accepted 之后的 interrupted / replaced / failed turn 必须 fail-closed 到 `manual_resolution_only`
+  - [x] 但 accepted 之后的 interrupted / replaced / failed turn 必须 fail-closed 到 `manual_resolution_only`
+  - [x] `observed_at >= delivery_observation_deadline` 的 `turn/completed` 不得关闭 batch，只能作为 late evidence 记录并 fail-closed 到 manual resolution；startup sweep 先过期但事件实际 `observed_at` 仍早于 deadline 的 completion 可以修正为 delivered
+  - 真实 shared `app-server` websocket event loop 仍待实现；当前完成的是 hidden adapter-internal store/CLI 写入面

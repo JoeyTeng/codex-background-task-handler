@@ -31,7 +31,12 @@ const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_MAINTENANCE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMON_PROTOCOL_VERSION: u64 = 1;
-const DAEMON_CAPABILITIES: &[&str] = &["dispatch", "attempt-dispatch", "cli-session-dispatch"];
+const DAEMON_CAPABILITIES: &[&str] = &[
+    "dispatch",
+    "attempt-dispatch",
+    "cli-session-dispatch",
+    "cli-turn-observation-dispatch",
+];
 const MAX_DISPATCH_WORKERS: usize = 32;
 const RESERVED_CONTROL_WORKERS: usize = 8;
 const MAX_CLIENT_WORKERS: usize = MAX_DISPATCH_WORKERS + RESERVED_CONTROL_WORKERS;
@@ -737,10 +742,24 @@ fn wait_for_incompatible_daemon_replaced_or_removed_until(
     deadline: Instant,
 ) -> Result<()> {
     let socket_path = layout.daemon_socket_path();
+    let mut saw_socket_absent = false;
     loop {
         if !socket_path.exists() {
-            return Ok(());
+            if saw_socket_absent {
+                return Ok(());
+            }
+            saw_socket_absent = true;
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            thread::sleep(
+                remaining_budget(deadline)
+                    .unwrap_or(STARTUP_POLL_INTERVAL)
+                    .min(STARTUP_POLL_INTERVAL),
+            );
+            continue;
         }
+        saw_socket_absent = false;
         let probe_budget = remaining_budget(deadline).unwrap_or(STARTUP_POLL_INTERVAL);
         match daemon_request_with_timeout(layout, "ping", probe_budget.min(STARTUP_POLL_INTERVAL)) {
             Ok(response) if daemon_response_is_compatible(&response) => return Ok(()),

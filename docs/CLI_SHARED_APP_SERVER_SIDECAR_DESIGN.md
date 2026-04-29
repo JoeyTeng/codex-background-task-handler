@@ -525,17 +525,18 @@ thread/resume + turn/start
   - `turn/start` 被接受时：只记录 `delivery_turn_id`，attempt 进入 `cooldown`
   - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且以下条件同时满足时，batch 才允许关闭为 `close_reason=delivered`
     - 该 attempt 仍然是当前 generation/head delivery
-    - `delivery_observation_state=tracking`
-    - `replay_policy=automatic`
-    - `now <= delivery_observation_deadline`
-  - 一旦 attempt 已 `abandoned`、`delivery_observation_state != tracking`、或 batch 已进入 `replay_policy=manual_resolution_only`：
-    - 迟到的 `turn/completed` 只能记录为 operator/debug 证据
+    - 事件自身的 `observed_at < delivery_observation_deadline`
+    - 正常路径要求 `delivery_observation_state=tracking` 且 `replay_policy=automatic`
+    - 如果 daemon startup sweep 先在 session continuity 仍有效时把同一 attempt 过期，但随后收到的 `turn/completed` 事件证明实际完成时间仍早于原 deadline，允许按 delayed on-time evidence 修正为 `delivered`
+    - 如果后续 `cli session bind` / re-attach 已经把同一 managed session 的仍 open attempt 收敛到 `abandoned`，不得再按 delayed on-time evidence 修正为 `delivered`
+  - 一旦事件自身 `observed_at >= delivery_observation_deadline`：
+    - `turn/completed` 只能记录为 operator/debug 证据
     - 不得再自动关闭为 `delivered`
   - 如果该 turn 在被接受之后又失败、中断、被替换，或 batch 已被 supersede，则不得因为早先的 `turn/start` 接受而关闭 batch
   - 对这类“accepted 后又变得不可信”的 turn，第一版不得自动 replay；当前 attempt 必须收敛到 `abandoned`，当前 head batch 必须进入 `replay_policy=manual_resolution_only`
 - 如果 websocket / daemon / app-server continuity 在 accepted 之后丢失：
   - 且无法再证明自己回到了同一个 `managed_session_id + session_epoch`
-  - 当前 attempt 必须切到 `delivery_observation_state=lost`
+  - 当前 attempt 必须切到 `delivery_observation_state=abandoned`
   - 当前 head batch 必须进入 `replay_policy=manual_resolution_only`
   - 第一版不得靠“重投一次看看”来猜原 turn 是否已经产生副作用
 - continuity-loss 之后的最小 operator-resolution flow 必须是：
@@ -593,11 +594,12 @@ cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_un
   - `turn/steer` 被接受时：只记录当前 `delivery_turn_id = active_turn_id`，attempt 进入 `cooldown`
   - 只有当同一个 `delivery_turn_id` 之后出现 `turn/completed`，且以下条件同时满足时，batch 才允许关闭
     - 该 attempt 仍是当前 head delivery
-    - `delivery_observation_state=tracking`
-    - `replay_policy=automatic`
-    - `now <= delivery_observation_deadline`
-  - 一旦 attempt 已 `abandoned`、`delivery_observation_state != tracking`、或 batch 已进入 `replay_policy=manual_resolution_only`：
-    - 迟到的 `turn/completed` 只能记录为 operator/debug 证据
+    - 事件自身的 `observed_at < delivery_observation_deadline`
+    - 正常路径要求 `delivery_observation_state=tracking` 且 `replay_policy=automatic`
+    - 如果 daemon startup sweep 先在 session continuity 仍有效时把同一 attempt 过期，但随后收到的 `turn/completed` 事件证明实际完成时间仍早于原 deadline，允许按 delayed on-time evidence 修正为 `delivered`
+    - 如果后续 `cli session bind` / re-attach 已经把同一 managed session 的仍 open attempt 收敛到 `abandoned`，不得再按 delayed on-time evidence 修正为 `delivered`
+  - 一旦事件自身 `observed_at >= delivery_observation_deadline`：
+    - `turn/completed` 只能记录为 operator/debug 证据
     - 不得再自动关闭为 `delivered`
   - 如果 steer 在被接受之前就被拒绝为 non-steerable，batch 不得关闭，必须继续走 queued / retry-on-idle 流程
   - 如果 steer 已被接受，但当前 turn 之后失败、中断、被替换，或观察连续性丢失，则 batch 同样不得关闭，且必须 fail-closed 到 `replay_policy=manual_resolution_only`
@@ -674,8 +676,10 @@ v1 范围外：
 - `begin-cli-accept` 已经要求引用一个匹配当前 batch `source_thread_id`、`session_epoch`、state、no-approval / no-network / no-write profile 且 `turn_start` 时 `activity_state=idle` 的 managed session；不再接受任意字符串形式的 `managed_session_id`。
 - 同一 `delivery_rpc_request_id` 的幂等重试会先恢复已有 attempt，但仍要求该 stored attempt 绑定当前有效 managed session；它不再受后续 activity 漂移影响，但 session epoch 失效、缺失 session、profile drift 或 thread mismatch 都会 fail-closed。
 - stale `accept_pending`、expired `cooldown` observation、以及 operator close 仍未终态的 CLI attempt 时，当前实现都会推进对应 managed session 的 `session_epoch` 并清空 activity proof，避免旧 idle 证明继续打开下一次自动投递。
+- hidden adapter-internal `cbth attempt observe-cli-turn` 已作为 terminal-event 写入面落地；它只接受 stored `delivery_turn_id` 的事件，`observed_at < delivery_observation_deadline` 的 `turn_completed` 才关闭 batch 为 `delivered`，负终态和 late observation 都会 fail-closed 到 `manual_resolution_only`。
+- daemon capability 列表已包含 `cli-turn-observation-dispatch`，避免新 CLI 把 terminal-event 写入路由给不支持该 subcommand 的旧 daemon。
 - `turn_steer` 当前仍 fail-closed，直到后续 phase 落地 active-turn risk proof。
-- 这些实现仍不等价于完整 `cbth cli run`：daemon-owned shared `app-server` 进程、capability probe、真实 current-state sync、foreground TUI attachment 和 terminal event reconciliation 仍待后续 phase 实现。
+- 这些实现仍不等价于完整 `cbth cli run`：daemon-owned shared `app-server` 进程、capability probe、真实 current-state sync、foreground TUI attachment 和 websocket event loop 仍待后续 phase 实现。
 
 ## 仍待实现的边界
 

@@ -216,12 +216,12 @@
     - 当前 attempt 收敛到 `abandoned`
     - `delivery_observation_state=expired`
     - 当前 head batch 必须 fail-closed 到 `manual_resolution_only`
-  - 这之后任何迟到的 `turn/completed` 都只能保留为 operator/debug 证据，不得再自动 close 为 `delivered`
+  - 这之后任何实际发生在 deadline 上或 deadline 之后的 `turn/completed` 都只能保留为 operator/debug 证据，不得再自动 close 为 `delivered`
   - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且以下条件同时满足时，batch 才允许关闭：
     - 该 attempt 仍是当前 head delivery
-    - `delivery_observation_state=tracking`
-    - `replay_policy=automatic`
-    - `now <= delivery_observation_deadline`
+    - 事件自身的 `observed_at < delivery_observation_deadline`
+    - 正常路径要求 `delivery_observation_state=tracking` 且 `replay_policy=automatic`
+    - 如果 daemon startup sweep 已先在 session continuity 仍有效时把同一 attempt 过期到 `abandoned/expired`，但随后收到的 `turn_completed` 事件自带的 `observed_at` 仍早于原 deadline，允许按 delayed on-time evidence 修正为 `delivered`
   - 如果某次 accepted attempt 已经带有 `delivery_turn_id`，即使前台 UI 临时切到别的 thread，它也仍可等待匹配的 `turn/completed` 正常收口
   - 因此 daemon 退出条件只需要在 `delivery_observation_deadline` 窗口内覆盖这些未收口的 `delivery_turn_id` 观察
   - 但只要 `managed_session_id + session_epoch` 的观察连续性丢失，就不得自动 replay；当前 head batch 必须进入 `manual_resolution_only`
@@ -527,9 +527,20 @@ scripts/desktop_thread_inject_poc.py
     - 同一 `delivery_rpc_request_id` 的幂等重试会先恢复已有 attempt，但仍要求 stored attempt 绑定当前有效 managed session；它不再受后续 activity 状态漂移影响，但 session epoch 失效、缺失 session、profile drift 或 thread mismatch 都会 fail-closed
     - stale `accept_pending`、expired `cooldown` observation、以及 `batch close-head` 关闭仍未终态 CLI attempt 时，当前实现都会推进对应 managed session 的 `session_epoch` 并清空 activity proof，避免旧 idle 证明继续打开下一次自动投递
   - daemon capability 列表新增 `cli-session-dispatch`，避免新 CLI 把 session mutation 路由给旧 daemon
+- Phase 7 当前分支为 `codex/phase-7-cli-turn-observation`，范围限定在 accepted CLI turn 的 adapter-internal terminal-event 写入面：
+  - 新增 hidden `cbth attempt observe-cli-turn`
+  - 同一 `delivery_turn_id` 的 `turn_started` 只 durable 更新 `last_observed_turn_event + last_observed_turn_event_at`，attempt 保持 `tracking`
+  - `observed_at < delivery_observation_deadline` 的匹配 `turn_completed` 才会把 `delivery_observation_state` 标为 `completed` 并关闭当前 head batch 为 `close_reason=delivered`
+  - 如果 daemon startup sweep 先按 wall clock 把 attempt 过期，且 sweep 当时仍能证明 session continuity，但随后 dispatcher 带来的 `turn_completed` 事件证明实际完成时间仍早于原 deadline，当前实现会把这个 delayed on-time observation 修正为 `delivered`
+  - 但任何后续 `cli session bind` / re-attach 都会把同一 managed session 仍 open 的 tracking/expired attempts 收敛到 `abandoned`，撤销 delayed-deliver 资格并保持 manual resolution
+  - `turn_failed` / `turn_interrupted` / `turn_replaced` 会把 attempt 标为 `abandoned`，并把当前 head batch fail-closed 到 `manual_resolution_only`
+  - `observed_at >= delivery_observation_deadline` 的事件不会关闭 batch；即使是 `turn_completed` 也只作为 late evidence 记录，并 fail-closed 到 manual resolution
+  - observed turn id 必须匹配 stored `delivery_turn_id`，否则拒绝写入
+  - daemon capability 列表新增 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给 Phase 6 旧 daemon
+  - 本地验证已覆盖 full Rust/JS gate、shared `app-server` e2e、以及 fresh `gpt-5.5` reviewer pass；最终 review 结果为 no findings
 - 当前 daemon 仍未接入完整 delivery lifecycle：
-  - CLI attempt / session mutation 通过 daemon dispatch 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
-  - CLI accepted attempt durable schema、daemon 保活、以及 managed-session durable record / fixed-thread gate 已经落地，但真实 shared `app-server` runtime、event/current-state observation、turn terminal-event reconciliation 尚未实现
+  - CLI attempt / session mutation / turn observation 通过 daemon dispatch 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-turn-observation-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
+  - CLI accepted attempt durable schema、daemon 保活、managed-session durable record / fixed-thread gate、以及 accepted turn observation store surface 已经落地，但真实 shared `app-server` runtime、event/current-state observation loop 尚未实现
   - Desktop arm / pause / boundary deadlines 尚未有 schema / adapter，因此尚未接入 daemon 保活
   - CLI `cbth cli run` 进程模型、shared app-server lifecycle 与 Desktop bridge adapters 尚未实现
 
