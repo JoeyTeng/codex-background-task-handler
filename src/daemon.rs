@@ -1446,6 +1446,8 @@ fn append_bounded(buffer: &mut Vec<u8>, bytes: &[u8], limit: usize) {
 fn parse_app_server_listener_url(buffer: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(buffer);
     let (_, value) = text.split_once("listening on:")?;
+    let line_end = value.find('\n')?;
+    let value = &value[..line_end];
     let url = value.split_whitespace().next()?;
     if url.starts_with("ws://") {
         Some(url.to_owned())
@@ -2094,5 +2096,17 @@ mod tests {
         ));
         assert!(!app_server_listener_url_is_loopback("wss://127.0.0.1:1234"));
         assert!(!app_server_listener_url_is_loopback("ws://127.0.0.1:0"));
+    }
+
+    #[test]
+    fn app_server_listener_parser_waits_for_complete_line() {
+        assert_eq!(
+            parse_app_server_listener_url(b"  listening on: ws://127.0.0.1:"),
+            None
+        );
+        assert_eq!(
+            parse_app_server_listener_url(b"  listening on: ws://127.0.0.1:1234\n"),
+            Some("ws://127.0.0.1:1234".to_owned())
+        );
     }
 }
