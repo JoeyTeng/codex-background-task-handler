@@ -48,6 +48,126 @@ fn cbth_in_dir(home: &TempDir, args: &[&str], cwd: Option<&Path>, direct_store: 
     serde_json::from_slice(&output.stdout).expect("valid json output")
 }
 
+fn bind_idle_cli_session_direct(home: &TempDir, bound_thread_id: &str) -> String {
+    let session = cbth_direct(
+        home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            bound_thread_id,
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+            "--now",
+            "1000",
+        ],
+    );
+    let managed_session_id = session["cli_session"]["session"]["managed_session_id"]
+        .as_str()
+        .expect("managed session id")
+        .to_owned();
+    cbth_direct(
+        home,
+        &[
+            "cli",
+            "session",
+            "note-activity",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--activity-state",
+            "idle",
+            "--activity-revision",
+            "1",
+            "--now",
+            "1000",
+        ],
+    );
+    managed_session_id
+}
+
+fn create_accepted_cli_attempt_direct(
+    home: &TempDir,
+    source_thread_id: &str,
+    delivery_turn_id: &str,
+    rpc_request_id: &str,
+) -> (String, String) {
+    let submitted = cbth_direct(
+        home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            source_thread_id,
+            "--summary",
+            "accepted CLI observation",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth_direct(
+        home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id")
+        .to_owned();
+    let managed_session_id = bind_idle_cli_session_direct(home, source_thread_id);
+    let pending = cbth_direct(
+        home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            &batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            rpc_request_id,
+            "--now",
+            "1000",
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id")
+        .to_owned();
+    cbth_direct(
+        home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            delivery_turn_id,
+            "--observation-window-seconds",
+            "60",
+            "--now",
+            "1001",
+        ],
+    );
+    (batch_id, attempt_id)
+}
+
 #[cfg(unix)]
 fn cbth_failure(home: &TempDir, args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
@@ -370,6 +490,199 @@ fn maintenance_sweep_autostart_returns_requested_sweep_report() {
         status["startup_sweep"]["expired_automatic_batches_closed"],
         0
     );
+
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_routed_late_cli_turn_observation_survives_startup_sweep() {
+    let home = temp_home();
+    let (batch_id, attempt_id) = create_accepted_cli_attempt_direct(
+        &home,
+        "thread-late-observation-startup-sweep",
+        "turn-late-startup-sweep",
+        "rpc-request-late-observation-startup-sweep",
+    );
+    cbth_direct(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-late-startup-sweep",
+            "--turn-event",
+            "turn-started",
+            "--now",
+            "1002",
+        ],
+    );
+
+    let observed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-late-startup-sweep",
+            "--turn-event",
+            "turn-completed",
+            "--now",
+            "1062",
+        ],
+    );
+    assert_eq!(observed["attempt"]["state"], "abandoned");
+    assert_eq!(observed["attempt"]["delivery_observation_state"], "expired");
+    assert_eq!(
+        observed["attempt"]["last_observed_turn_event"],
+        "turn_completed"
+    );
+    assert_eq!(observed["attempt"]["last_observed_turn_event_at"], 1062);
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_routed_on_time_cli_turn_completion_survives_startup_sweep() {
+    let home = temp_home();
+    let (batch_id, attempt_id) = create_accepted_cli_attempt_direct(
+        &home,
+        "thread-on-time-observation-startup-sweep",
+        "turn-on-time-startup-sweep",
+        "rpc-request-on-time-observation-startup-sweep",
+    );
+    cbth_direct(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-on-time-startup-sweep",
+            "--turn-event",
+            "turn-started",
+            "--now",
+            "1002",
+        ],
+    );
+
+    let observed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-on-time-startup-sweep",
+            "--turn-event",
+            "turn-completed",
+            "--now",
+            "1060",
+        ],
+    );
+    assert_eq!(observed["attempt"]["state"], "closed");
+    assert_eq!(
+        observed["attempt"]["delivery_observation_state"],
+        "completed"
+    );
+    assert_eq!(
+        observed["attempt"]["last_observed_turn_event"],
+        "turn_completed"
+    );
+    assert_eq!(observed["attempt"]["last_observed_turn_event_at"], 1060);
+    assert!(observed["attempt"]["abandoned_at"].is_null());
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "closed");
+    assert_eq!(batch["batch"]["batch"]["close_reason"], "delivered");
+
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_routed_bind_after_startup_sweep_blocks_delayed_completion() {
+    let home = temp_home();
+    let (batch_id, attempt_id) = create_accepted_cli_attempt_direct(
+        &home,
+        "thread-bind-after-startup-sweep",
+        "turn-bind-after-startup-sweep",
+        "rpc-request-bind-after-startup-sweep",
+    );
+
+    let attached = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-bind-after-startup-sweep",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+            "--now",
+            "1062",
+        ],
+    );
+    assert_eq!(attached["cli_session"]["outcome"], "attached");
+
+    let expired = cbth(&home, &["attempt", "inspect", "--attempt-id", &attempt_id]);
+    assert_eq!(expired["attempt"]["state"], "abandoned");
+    assert_eq!(
+        expired["attempt"]["delivery_observation_state"],
+        "abandoned"
+    );
+
+    let observed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-bind-after-startup-sweep",
+            "--turn-event",
+            "turn-completed",
+            "--now",
+            "1060",
+        ],
+    );
+    assert_eq!(observed["attempt"]["state"], "abandoned");
+    assert_eq!(
+        observed["attempt"]["delivery_observation_state"],
+        "abandoned"
+    );
+    assert_eq!(
+        observed["attempt"]["last_observed_turn_event"],
+        "turn_completed"
+    );
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    assert!(batch["batch"]["batch"]["close_reason"].is_null());
 
     cbth(&home, &["daemon", "stop"]);
     wait_for_socket_removed(&home);

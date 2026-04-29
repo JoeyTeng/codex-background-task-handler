@@ -353,6 +353,11 @@ impl Store {
         {
             ensure_cli_session_profile_matches(&existing, &profile)?;
             ensure_cli_session_attachable(&existing)?;
+            abandon_cli_observations_for_session_epoch_loss_tx(
+                &tx,
+                &existing.managed_session_id,
+                now,
+            )?;
             tx.execute(
                 "UPDATE cli_managed_sessions
                  SET session_state = 'live',
@@ -507,6 +512,7 @@ impl Store {
         delivery_accepted_at: i64,
         delivery_observation_deadline: i64,
     ) -> Result<DeliveryAttemptRecord> {
+        ensure_nonempty_value("delivery_turn_id", delivery_turn_id)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -566,6 +572,125 @@ impl Store {
         }
         let record = query_delivery_attempt_tx(&tx, attempt_id)?;
         tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn observe_cli_turn_event(
+        &mut self,
+        layout: &FsLayout,
+        attempt_id: &str,
+        delivery_turn_id: &str,
+        turn_event: &str,
+        observed_at: i64,
+    ) -> Result<DeliveryAttemptRecord> {
+        ensure_nonempty_value("delivery_turn_id", delivery_turn_id)?;
+        ensure_cli_turn_event_value(turn_event)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
+        if attempt.adapter_kind != "cli" {
+            bail!(
+                "delivery attempt {} is not a CLI attempt",
+                attempt.attempt_id
+            );
+        }
+        ensure_cli_turn_observation_matches_attempt(&attempt, delivery_turn_id)?;
+        if is_idempotent_terminal_cli_turn_observation(&attempt, turn_event) {
+            tx.commit()?;
+            return Ok(attempt);
+        }
+        if can_complete_delayed_cli_turn_after_expiry(&attempt, turn_event, observed_at)? {
+            let artifacts_to_sync =
+                complete_delayed_cli_turn_after_expiry_tx(&tx, &attempt, observed_at)?;
+            let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+            tx.commit()?;
+            let _ =
+                sync_artifact_manifests(&mut self.conn, layout, &artifacts_to_sync, observed_at);
+            return Ok(record);
+        }
+        if can_record_late_cli_turn_evidence(&attempt, turn_event) {
+            record_late_cli_turn_evidence_tx(&tx, &attempt, turn_event, observed_at)?;
+            let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+            tx.commit()?;
+            return Ok(record);
+        }
+        ensure_attempt_tracking_cli_turn_observation(&attempt)?;
+        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
+        ensure_batch_open(&batch)?;
+        ensure_batch_is_thread_head_tx(&tx, &batch)?;
+        ensure_attempt_is_current_generation_tx(&tx, &attempt)?;
+        if ensure_cli_attempt_has_current_managed_session_for_batch_tx(&tx, &attempt, &batch)
+            .is_err()
+        {
+            abandon_cli_turn_observation_tx(&tx, &attempt, turn_event, "abandoned", observed_at)?;
+            manualize_cli_batch_after_observation_loss_tx(&tx, &attempt, observed_at)?;
+            let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+            tx.commit()?;
+            return Ok(record);
+        }
+
+        let mut artifacts_to_sync = Vec::new();
+        if cli_turn_observation_is_after_deadline(&attempt, observed_at)? {
+            abandon_cli_turn_observation_tx(&tx, &attempt, turn_event, "expired", observed_at)?;
+            manualize_cli_batch_after_observation_loss_tx(&tx, &attempt, observed_at)?;
+        } else {
+            match turn_event {
+                "turn_started" => {
+                    tx.execute(
+                        "UPDATE delivery_attempts
+                         SET last_observed_turn_event = ?,
+                             last_observed_turn_event_at = ?,
+                             updated_at = ?
+                         WHERE attempt_id = ?
+                           AND state = 'cooldown'
+                           AND delivery_observation_state = 'tracking'",
+                        params![turn_event, observed_at, observed_at, attempt_id],
+                    )?;
+                }
+                "turn_completed" => {
+                    ensure_batch_allows_automatic_delivery(&batch)?;
+                    tx.execute(
+                        "UPDATE delivery_attempts
+                         SET delivery_observation_state = 'completed',
+                             last_observed_turn_event = ?,
+                             last_observed_turn_event_at = ?,
+                             updated_at = ?
+                         WHERE attempt_id = ?
+                           AND state = 'cooldown'
+                           AND delivery_observation_state = 'tracking'",
+                        params![turn_event, observed_at, observed_at, attempt_id],
+                    )?;
+                    close_batch_tx(
+                        &tx,
+                        &attempt.batch_id,
+                        "delivered",
+                        Some("observed CLI turn completion"),
+                        observed_at,
+                    )?;
+                    artifacts_to_sync = extend_closed_batch_artifact_retention_tx(
+                        &tx,
+                        &attempt.batch_id,
+                        observed_at,
+                    )?;
+                }
+                "turn_failed" | "turn_interrupted" | "turn_replaced" => {
+                    abandon_cli_turn_observation_tx(
+                        &tx,
+                        &attempt,
+                        turn_event,
+                        "abandoned",
+                        observed_at,
+                    )?;
+                    manualize_cli_batch_after_observation_loss_tx(&tx, &attempt, observed_at)?;
+                }
+                other => bail!("unsupported CLI turn event {other}"),
+            }
+        }
+
+        let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+        tx.commit()?;
+        let _ = sync_artifact_manifests(&mut self.conn, layout, &artifacts_to_sync, observed_at);
         Ok(record)
     }
 
@@ -1247,6 +1372,191 @@ fn invalidate_cli_managed_session_activity_tx(
     Ok(())
 }
 
+fn manualize_cli_batch_after_observation_loss_tx(
+    tx: &Transaction<'_>,
+    attempt: &DeliveryAttemptRecord,
+    now: i64,
+) -> Result<()> {
+    let manual_resolution_window_ends_at = checked_timestamp_add(
+        now,
+        DEFAULT_REDELIVERY_WINDOW_SECONDS,
+        "manual_resolution_window_seconds",
+    )?;
+    tx.execute(
+        "UPDATE batches
+         SET replay_policy = 'manual_resolution_only',
+             redelivery_window_ends_at = max(redelivery_window_ends_at, ?),
+             updated_at = ?
+         WHERE batch_id = ?
+           AND state = 'open'",
+        params![manual_resolution_window_ends_at, now, attempt.batch_id],
+    )?;
+    invalidate_cli_managed_session_activity_tx(
+        tx,
+        attempt.managed_session_id.as_deref(),
+        attempt.session_epoch,
+        now,
+    )
+}
+
+fn abandon_cli_observations_for_session_epoch_loss_tx(
+    tx: &Transaction<'_>,
+    managed_session_id: &str,
+    now: i64,
+) -> Result<()> {
+    let manual_resolution_window_ends_at = checked_timestamp_add(
+        now,
+        DEFAULT_REDELIVERY_WINDOW_SECONDS,
+        "manual_resolution_window_seconds",
+    )?;
+    let mut stmt = tx.prepare(
+        "SELECT delivery_attempts.attempt_id, delivery_attempts.batch_id
+         FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'cli'
+           AND delivery_attempts.managed_session_id = ?
+           AND batches.state = 'open'
+           AND (
+             (
+               delivery_attempts.state = 'cooldown'
+               AND delivery_attempts.delivery_observation_state = 'tracking'
+             )
+             OR (
+               delivery_attempts.state = 'abandoned'
+               AND delivery_attempts.delivery_observation_state = 'expired'
+             )
+           )",
+    )?;
+    let attempts = stmt
+        .query_map(params![managed_session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for (attempt_id, batch_id) in attempts {
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'abandoned',
+                 delivery_observation_state = 'abandoned',
+                 updated_at = ?,
+                 abandoned_at = ?
+             WHERE attempt_id = ?
+               AND (
+                 (
+                   state = 'cooldown'
+                   AND delivery_observation_state = 'tracking'
+                 )
+                 OR (
+                   state = 'abandoned'
+                   AND delivery_observation_state = 'expired'
+                 )
+               )",
+            params![now, now, attempt_id],
+        )?;
+        tx.execute(
+            "UPDATE batches
+             SET replay_policy = 'manual_resolution_only',
+                 redelivery_window_ends_at = max(redelivery_window_ends_at, ?),
+                 updated_at = ?
+             WHERE batch_id = ?
+               AND state = 'open'",
+            params![manual_resolution_window_ends_at, now, batch_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn abandon_cli_turn_observation_tx(
+    tx: &Transaction<'_>,
+    attempt: &DeliveryAttemptRecord,
+    turn_event: &str,
+    delivery_observation_state: &str,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE delivery_attempts
+         SET state = 'abandoned',
+             delivery_observation_state = ?,
+             last_observed_turn_event = ?,
+             last_observed_turn_event_at = ?,
+             updated_at = ?,
+             abandoned_at = ?
+         WHERE attempt_id = ?
+           AND state = 'cooldown'
+           AND delivery_observation_state = 'tracking'",
+        params![
+            delivery_observation_state,
+            turn_event,
+            now,
+            now,
+            now,
+            attempt.attempt_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn record_late_cli_turn_evidence_tx(
+    tx: &Transaction<'_>,
+    attempt: &DeliveryAttemptRecord,
+    turn_event: &str,
+    observed_at: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE delivery_attempts
+         SET last_observed_turn_event = ?,
+             last_observed_turn_event_at = ?,
+             updated_at = ?
+         WHERE attempt_id = ?
+           AND state = 'abandoned'
+           AND (
+             last_observed_turn_event IS NULL
+             OR last_observed_turn_event = 'turn_started'
+           )",
+        params![turn_event, observed_at, observed_at, attempt.attempt_id],
+    )?;
+    Ok(())
+}
+
+fn complete_delayed_cli_turn_after_expiry_tx(
+    tx: &Transaction<'_>,
+    attempt: &DeliveryAttemptRecord,
+    observed_at: i64,
+) -> Result<Vec<ArtifactRecord>> {
+    let batch = query_batch_tx(tx, &attempt.batch_id)?;
+    ensure_batch_open(&batch)?;
+    ensure_batch_is_thread_head_tx(tx, &batch)?;
+    ensure_attempt_is_current_generation_tx(tx, attempt)?;
+    let changed = tx.execute(
+        "UPDATE delivery_attempts
+         SET state = 'cooldown',
+             delivery_observation_state = 'completed',
+             last_observed_turn_event = 'turn_completed',
+             last_observed_turn_event_at = ?,
+             updated_at = ?,
+             abandoned_at = NULL
+         WHERE attempt_id = ?
+           AND state = 'abandoned'
+           AND delivery_observation_state IN ('expired', 'abandoned')",
+        params![observed_at, observed_at, attempt.attempt_id],
+    )?;
+    if changed != 1 {
+        bail!(
+            "delivery attempt {} is no longer eligible for delayed completion",
+            attempt.attempt_id
+        );
+    }
+    close_batch_tx(
+        tx,
+        &attempt.batch_id,
+        "delivered",
+        Some("observed CLI turn completion"),
+        observed_at,
+    )?;
+    extend_closed_batch_artifact_retention_tx(tx, &attempt.batch_id, observed_at)
+}
+
 fn extend_closed_batch_artifact_retention_tx(
     tx: &Transaction<'_>,
     batch_id: &str,
@@ -1487,16 +1797,26 @@ fn expire_due_cli_observations_tx(tx: &Transaction<'_>, now: i64) -> Result<usiz
     drop(stmt);
 
     for (attempt_id, batch_id, managed_session_id, session_epoch) in &attempts {
+        let attempt = query_delivery_attempt_tx(tx, attempt_id)?;
+        let batch = query_batch_tx(tx, batch_id)?;
+        let expired_state =
+            if ensure_cli_attempt_has_current_managed_session_for_batch_tx(tx, &attempt, &batch)
+                .is_ok()
+            {
+                "expired"
+            } else {
+                "abandoned"
+            };
         tx.execute(
             "UPDATE delivery_attempts
              SET state = 'abandoned',
-                 delivery_observation_state = 'expired',
+                 delivery_observation_state = ?,
                  updated_at = ?,
                  abandoned_at = ?
              WHERE attempt_id = ?
                AND state = 'cooldown'
                AND delivery_observation_state = 'tracking'",
-            params![now, now, attempt_id],
+            params![expired_state, now, now, attempt_id],
         )?;
         tx.execute(
             "UPDATE batches
@@ -2136,6 +2456,14 @@ fn ensure_positive_value(name: &str, value: i64) -> Result<()> {
     }
 }
 
+fn ensure_nonempty_value(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("{name} must not be empty")
+    } else {
+        Ok(())
+    }
+}
+
 fn ensure_cli_session_epoch_matches(
     session: &CliManagedSessionRecord,
     session_epoch: i64,
@@ -2298,6 +2626,103 @@ fn ensure_attempt_accept_pending(attempt: &DeliveryAttemptRecord) -> Result<()> 
             attempt.attempt_id
         )
     }
+}
+
+fn ensure_cli_turn_event_value(turn_event: &str) -> Result<()> {
+    match turn_event {
+        "turn_started" | "turn_completed" | "turn_failed" | "turn_interrupted"
+        | "turn_replaced" => Ok(()),
+        other => bail!("unsupported CLI turn event {other}"),
+    }
+}
+
+fn ensure_cli_turn_observation_matches_attempt(
+    attempt: &DeliveryAttemptRecord,
+    delivery_turn_id: &str,
+) -> Result<()> {
+    if attempt.delivery_turn_id.as_deref() == Some(delivery_turn_id) {
+        Ok(())
+    } else {
+        bail!(
+            "delivery attempt {} is bound to a different delivery turn",
+            attempt.attempt_id
+        )
+    }
+}
+
+fn ensure_attempt_tracking_cli_turn_observation(attempt: &DeliveryAttemptRecord) -> Result<()> {
+    if attempt.adapter_kind == "cli"
+        && attempt.state == "cooldown"
+        && attempt.delivery_rpc_state.as_deref() == Some("accepted")
+        && attempt.delivery_observation_state.as_deref() == Some("tracking")
+        && attempt.delivery_turn_id.is_some()
+    {
+        Ok(())
+    } else {
+        bail!(
+            "delivery attempt {} is not tracking an accepted CLI turn",
+            attempt.attempt_id
+        )
+    }
+}
+
+fn is_idempotent_terminal_cli_turn_observation(
+    attempt: &DeliveryAttemptRecord,
+    turn_event: &str,
+) -> bool {
+    matches!(attempt.state.as_str(), "closed" | "abandoned")
+        && attempt.last_observed_turn_event.as_deref() == Some(turn_event)
+}
+
+fn can_record_late_cli_turn_evidence(attempt: &DeliveryAttemptRecord, turn_event: &str) -> bool {
+    attempt.state == "abandoned"
+        && matches!(
+            attempt.delivery_observation_state.as_deref(),
+            Some("expired") | Some("abandoned")
+        )
+        && matches!(
+            attempt.last_observed_turn_event.as_deref(),
+            None | Some("turn_started")
+        )
+        && matches!(
+            turn_event,
+            "turn_completed" | "turn_failed" | "turn_interrupted" | "turn_replaced"
+        )
+}
+
+fn can_complete_delayed_cli_turn_after_expiry(
+    attempt: &DeliveryAttemptRecord,
+    turn_event: &str,
+    observed_at: i64,
+) -> Result<bool> {
+    if turn_event != "turn_completed"
+        || attempt.state != "abandoned"
+        || attempt.delivery_rpc_state.as_deref() != Some("accepted")
+        || attempt.delivery_observation_state.as_deref() != Some("expired")
+        || !matches!(
+            attempt.last_observed_turn_event.as_deref(),
+            None | Some("turn_started")
+        )
+    {
+        return Ok(false);
+    }
+    Ok(!cli_turn_observation_is_after_deadline(
+        attempt,
+        observed_at,
+    )?)
+}
+
+fn cli_turn_observation_is_after_deadline(
+    attempt: &DeliveryAttemptRecord,
+    observed_at: i64,
+) -> Result<bool> {
+    let deadline = attempt.delivery_observation_deadline.ok_or_else(|| {
+        anyhow!(
+            "delivery attempt {} is missing an observation deadline",
+            attempt.attempt_id
+        )
+    })?;
+    Ok(observed_at >= deadline)
 }
 
 fn bool_to_i64(value: bool) -> i64 {

@@ -171,6 +171,7 @@ enum BatchCommand {
 enum AttemptCommand {
     BeginCliAccept(AttemptBeginCliAcceptArgs),
     AcceptCli(AttemptAcceptCliArgs),
+    ObserveCliTurn(AttemptObserveCliTurnArgs),
     Inspect(AttemptInspectArgs),
 }
 
@@ -291,6 +292,57 @@ struct AttemptAcceptCliArgs {
 
     #[arg(long)]
     observation_window_seconds: i64,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum CliTurnEvent {
+    #[value(name = "turn-started")]
+    Started,
+    #[value(name = "turn-completed")]
+    Completed,
+    #[value(name = "turn-failed")]
+    Failed,
+    #[value(name = "turn-interrupted")]
+    Interrupted,
+    #[value(name = "turn-replaced")]
+    Replaced,
+}
+
+impl CliTurnEvent {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Started => "turn_started",
+            Self::Completed => "turn_completed",
+            Self::Failed => "turn_failed",
+            Self::Interrupted => "turn_interrupted",
+            Self::Replaced => "turn_replaced",
+        }
+    }
+
+    fn cli_value(&self) -> &'static str {
+        match self {
+            Self::Started => "turn-started",
+            Self::Completed => "turn-completed",
+            Self::Failed => "turn-failed",
+            Self::Interrupted => "turn-interrupted",
+            Self::Replaced => "turn-replaced",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct AttemptObserveCliTurnArgs {
+    #[arg(long)]
+    attempt_id: String,
+
+    #[arg(long)]
+    delivery_turn_id: String,
+
+    #[arg(long, value_enum)]
+    turn_event: CliTurnEvent,
 
     #[arg(long, hide = true)]
     now: Option<i64>,
@@ -602,6 +654,21 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             }
             argv
         }
+        Commands::Attempt {
+            command: AttemptCommand::ObserveCliTurn(args),
+        } => {
+            let mut argv = vec![
+                OsString::from("attempt"),
+                OsString::from("observe-cli-turn"),
+            ];
+            push_string_arg(&mut argv, "--attempt-id", &args.attempt_id);
+            push_string_arg(&mut argv, "--delivery-turn-id", &args.delivery_turn_id);
+            push_string_arg(&mut argv, "--turn-event", args.turn_event.cli_value());
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
         Commands::Cli {
             command:
                 CliCommand::Session {
@@ -904,6 +971,7 @@ fn dispatch_attempt(command: AttemptCommand, layout: &FsLayout) -> Result<Value>
             Ok(json!({ "attempt": attempt }))
         }
         AttemptCommand::AcceptCli(args) => {
+            validate_nonempty("delivery_turn_id", &args.delivery_turn_id)?;
             validate_positive_max(
                 "observation_window_seconds",
                 args.observation_window_seconds,
@@ -923,6 +991,21 @@ fn dispatch_attempt(command: AttemptCommand, layout: &FsLayout) -> Result<Value>
                 &args.delivery_turn_id,
                 now,
                 deadline,
+            )?;
+            Ok(json!({ "attempt": attempt }))
+        }
+        AttemptCommand::ObserveCliTurn(args) => {
+            validate_nonempty("delivery_turn_id", &args.delivery_turn_id)?;
+            let now = match args.now {
+                Some(value) => value,
+                None => now_epoch_seconds()?,
+            };
+            let attempt = store.observe_cli_turn_event(
+                layout,
+                &args.attempt_id,
+                &args.delivery_turn_id,
+                args.turn_event.as_str(),
+                now,
             )?;
             Ok(json!({ "attempt": attempt }))
         }

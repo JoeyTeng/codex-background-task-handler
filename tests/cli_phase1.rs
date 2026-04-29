@@ -123,6 +123,82 @@ fn bind_idle_cli_session(home: &TempDir, bound_thread_id: &str) -> String {
     managed_session_id
 }
 
+fn create_accepted_cli_attempt(
+    home: &TempDir,
+    source_thread_id: &str,
+    delivery_turn_id: &str,
+) -> (String, String, String) {
+    let submitted = cbth(
+        home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            source_thread_id,
+            "--summary",
+            "ready for CLI observation",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id")
+        .to_owned();
+    let managed_session_id = bind_idle_cli_session(home, source_thread_id);
+    let rpc_request_id = format!("rpc-request-{source_thread_id}");
+    let pending = cbth(
+        home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            &batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            &rpc_request_id,
+            "--now",
+            "1000",
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id")
+        .to_owned();
+    cbth(
+        home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            delivery_turn_id,
+            "--observation-window-seconds",
+            "60",
+            "--now",
+            "1001",
+        ],
+    );
+    (batch_id, attempt_id, managed_session_id)
+}
+
 #[test]
 fn direct_store_requires_explicit_test_gate() {
     let home = tempfile::tempdir().expect("temp home");
@@ -993,6 +1069,570 @@ fn cli_attempt_acceptance_rejects_oversized_observation_window() {
         ],
     );
     assert!(stderr.contains("observation_window_seconds must be <= 21600"));
+}
+
+#[test]
+fn cli_attempt_acceptance_rejects_empty_delivery_turn_id() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-empty-turn",
+            "--summary",
+            "empty turn id",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-empty-turn");
+    let pending = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-empty-turn",
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            attempt_id,
+            "--delivery-turn-id",
+            "",
+            "--observation-window-seconds",
+            "60",
+        ],
+    );
+    assert!(stderr.contains("delivery_turn_id must not be empty"));
+}
+
+#[test]
+fn cli_turn_observation_started_keeps_attempt_tracking() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (batch_id, attempt_id, _managed_session_id) =
+        create_accepted_cli_attempt(&home, "thread-cli-turn-started", "turn-started");
+
+    let observed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-started",
+            "--turn-event",
+            "turn-started",
+            "--now",
+            "1002",
+        ],
+    );
+    assert_eq!(observed["attempt"]["state"], "cooldown");
+    assert_eq!(
+        observed["attempt"]["delivery_observation_state"],
+        "tracking"
+    );
+    assert_eq!(
+        observed["attempt"]["last_observed_turn_event"],
+        "turn_started"
+    );
+    assert_eq!(observed["attempt"]["last_observed_turn_event_at"], 1002);
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "open");
+    assert_eq!(batch["batch"]["batch"]["replay_policy"], "automatic");
+}
+
+#[test]
+fn cli_turn_observation_completed_closes_batch() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (batch_id, attempt_id, managed_session_id) =
+        create_accepted_cli_attempt(&home, "thread-cli-turn-completed", "turn-completed");
+
+    let observed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-completed",
+            "--turn-event",
+            "turn-completed",
+            "--now",
+            "1002",
+        ],
+    );
+    assert_eq!(observed["attempt"]["state"], "closed");
+    assert_eq!(
+        observed["attempt"]["delivery_observation_state"],
+        "completed"
+    );
+    assert_eq!(
+        observed["attempt"]["last_observed_turn_event"],
+        "turn_completed"
+    );
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "closed");
+    assert_eq!(batch["batch"]["batch"]["close_reason"], "delivered");
+    let head = cbth(
+        &home,
+        &[
+            "batch",
+            "inspect-head",
+            "--source-thread-id",
+            "thread-cli-turn-completed",
+        ],
+    );
+    assert!(head["batch"].is_null());
+
+    let session = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(session["cli_session"]["session_epoch"], 2);
+    assert_eq!(session["cli_session"]["activity_state"], "unknown");
+
+    let retried = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-completed",
+            "--turn-event",
+            "turn-completed",
+            "--now",
+            "1003",
+        ],
+    );
+    assert_eq!(retried["attempt"]["state"], "closed");
+    assert_eq!(
+        retried["attempt"]["last_observed_turn_event_at"],
+        observed["attempt"]["last_observed_turn_event_at"]
+    );
+}
+
+#[test]
+fn cli_turn_observation_negative_terminal_event_manualizes_batch() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (batch_id, attempt_id, managed_session_id) =
+        create_accepted_cli_attempt(&home, "thread-cli-turn-failed", "turn-failed");
+
+    let observed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-failed",
+            "--turn-event",
+            "turn-failed",
+            "--now",
+            "1002",
+        ],
+    );
+    assert_eq!(observed["attempt"]["state"], "abandoned");
+    assert_eq!(
+        observed["attempt"]["delivery_observation_state"],
+        "abandoned"
+    );
+    assert_eq!(
+        observed["attempt"]["last_observed_turn_event"],
+        "turn_failed"
+    );
+    assert_eq!(observed["attempt"]["abandoned_at"], 1002);
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    let session = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(session["cli_session"]["session_epoch"], 2);
+    assert_eq!(session["cli_session"]["activity_state"], "unknown");
+}
+
+#[test]
+fn cli_turn_observation_after_deadline_manualizes_without_delivery() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (batch_id, attempt_id, _managed_session_id) =
+        create_accepted_cli_attempt(&home, "thread-cli-turn-late", "turn-late");
+
+    let observed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-late",
+            "--turn-event",
+            "turn-completed",
+            "--now",
+            "1062",
+        ],
+    );
+    assert_eq!(observed["attempt"]["state"], "abandoned");
+    assert_eq!(observed["attempt"]["delivery_observation_state"], "expired");
+    assert_eq!(
+        observed["attempt"]["last_observed_turn_event"],
+        "turn_completed"
+    );
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    assert!(batch["batch"]["batch"]["close_reason"].is_null());
+}
+
+#[test]
+fn cli_turn_observation_at_deadline_manualizes_without_delivery() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (batch_id, attempt_id, _managed_session_id) =
+        create_accepted_cli_attempt(&home, "thread-cli-turn-deadline", "turn-deadline");
+
+    let observed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-deadline",
+            "--turn-event",
+            "turn-completed",
+            "--now",
+            "1061",
+        ],
+    );
+    assert_eq!(observed["attempt"]["state"], "abandoned");
+    assert_eq!(observed["attempt"]["delivery_observation_state"], "expired");
+    assert_eq!(
+        observed["attempt"]["last_observed_turn_event"],
+        "turn_completed"
+    );
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    assert!(batch["batch"]["batch"]["close_reason"].is_null());
+}
+
+#[test]
+fn cli_turn_observation_requires_matching_delivery_turn() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (_batch_id, attempt_id, _managed_session_id) =
+        create_accepted_cli_attempt(&home, "thread-cli-turn-mismatch", "turn-real");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-other",
+            "--turn-event",
+            "turn-completed",
+        ],
+    );
+    assert!(stderr.contains("different delivery turn"));
+}
+
+#[test]
+fn cli_turn_observation_rejects_empty_delivery_turn_id() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (_batch_id, attempt_id, _managed_session_id) =
+        create_accepted_cli_attempt(&home, "thread-cli-empty-observed-turn", "turn-real");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "",
+            "--turn-event",
+            "turn-completed",
+        ],
+    );
+    assert!(stderr.contains("delivery_turn_id must not be empty"));
+}
+
+#[test]
+fn cli_turn_observation_with_stale_session_epoch_manualizes_batch() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (batch_id, attempt_id, managed_session_id) =
+        create_accepted_cli_attempt(&home, "thread-cli-turn-stale-epoch", "turn-stale-epoch");
+
+    cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-turn-stale-epoch",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+            "--now",
+            "1002",
+        ],
+    );
+    let observed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-stale-epoch",
+            "--turn-event",
+            "turn-completed",
+            "--now",
+            "1003",
+        ],
+    );
+    assert_eq!(observed["attempt"]["state"], "abandoned");
+    assert_eq!(
+        observed["attempt"]["delivery_observation_state"],
+        "abandoned"
+    );
+    assert_eq!(
+        observed["attempt"]["last_observed_turn_event"],
+        "turn_completed"
+    );
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    let session = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(session["cli_session"]["session_epoch"], 2);
+    assert_eq!(session["cli_session"]["activity_state"], "unknown");
+}
+
+#[test]
+fn cli_turn_completion_after_continuity_loss_does_not_deliver() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (batch_id, attempt_id, _managed_session_id) = create_accepted_cli_attempt(
+        &home,
+        "thread-cli-turn-continuity-loss",
+        "turn-continuity-loss",
+    );
+
+    cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-turn-continuity-loss",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+            "--now",
+            "1002",
+        ],
+    );
+    let abandoned = cbth(&home, &["attempt", "inspect", "--attempt-id", &attempt_id]);
+    assert_eq!(abandoned["attempt"]["state"], "abandoned");
+    assert_eq!(
+        abandoned["attempt"]["delivery_observation_state"],
+        "abandoned"
+    );
+    assert!(abandoned["attempt"]["last_observed_turn_event"].is_null());
+
+    let completed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-continuity-loss",
+            "--turn-event",
+            "turn-completed",
+            "--now",
+            "1003",
+        ],
+    );
+    assert_eq!(completed["attempt"]["state"], "abandoned");
+    assert_eq!(
+        completed["attempt"]["delivery_observation_state"],
+        "abandoned"
+    );
+    assert_eq!(
+        completed["attempt"]["last_observed_turn_event"],
+        "turn_completed"
+    );
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    assert!(batch["batch"]["batch"]["close_reason"].is_null());
+}
+
+#[test]
+fn cli_turn_completion_after_continuity_loss_and_sweep_does_not_deliver() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (batch_id, attempt_id, _managed_session_id) = create_accepted_cli_attempt(
+        &home,
+        "thread-cli-turn-continuity-loss-sweep",
+        "turn-continuity-loss-sweep",
+    );
+
+    cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-turn-continuity-loss-sweep",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+            "--now",
+            "1002",
+        ],
+    );
+    cbth(&home, &["maintenance", "sweep", "--now", "1061"]);
+
+    let expired = cbth(&home, &["attempt", "inspect", "--attempt-id", &attempt_id]);
+    assert_eq!(expired["attempt"]["state"], "abandoned");
+    assert_eq!(
+        expired["attempt"]["delivery_observation_state"],
+        "abandoned"
+    );
+    assert!(expired["attempt"]["last_observed_turn_event"].is_null());
+
+    let completed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-continuity-loss-sweep",
+            "--turn-event",
+            "turn-completed",
+            "--now",
+            "1060",
+        ],
+    );
+    assert_eq!(completed["attempt"]["state"], "abandoned");
+    assert_eq!(
+        completed["attempt"]["delivery_observation_state"],
+        "abandoned"
+    );
+    assert_eq!(
+        completed["attempt"]["last_observed_turn_event"],
+        "turn_completed"
+    );
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    assert!(batch["batch"]["batch"]["close_reason"].is_null());
 }
 
 #[test]

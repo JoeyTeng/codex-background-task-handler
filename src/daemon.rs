@@ -31,7 +31,12 @@ const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_MAINTENANCE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMON_PROTOCOL_VERSION: u64 = 1;
-const DAEMON_CAPABILITIES: &[&str] = &["dispatch", "attempt-dispatch", "cli-session-dispatch"];
+const DAEMON_CAPABILITIES: &[&str] = &[
+    "dispatch",
+    "attempt-dispatch",
+    "cli-session-dispatch",
+    "cli-turn-observation-dispatch",
+];
 const MAX_DISPATCH_WORKERS: usize = 32;
 const RESERVED_CONTROL_WORKERS: usize = 8;
 const MAX_CLIENT_WORKERS: usize = MAX_DISPATCH_WORKERS + RESERVED_CONTROL_WORKERS;
