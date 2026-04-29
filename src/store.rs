@@ -15,10 +15,11 @@ use crate::fs_layout::{
 };
 use crate::models::{
     ArtifactRecord, BatchInspect, BatchJobRecord, BatchRecord, CliManagedSessionActivityUpdate,
-    CliManagedSessionAttach, CliManagedSessionProfile, CliManagedSessionRecord,
-    DEFAULT_REDELIVERY_WINDOW_SECONDS, DaemonLifecycleStatus, DeliveryAttemptRecord,
-    DeliveryPolicy, JobRecord, NewArtifact, NewBatch, NewCliAcceptPendingAttempt, NewJob,
-    ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
+    CliManagedSessionAttach, CliManagedSessionCapabilities, CliManagedSessionCapabilityUpdate,
+    CliManagedSessionProfile, CliManagedSessionRecord, DEFAULT_REDELIVERY_WINDOW_SECONDS,
+    DaemonLifecycleStatus, DeliveryAttemptRecord, DeliveryPolicy, JobRecord, NewArtifact, NewBatch,
+    NewCliAcceptPendingAttempt, NewJob, ORPHAN_ARTIFACT_GRACE_SECONDS,
+    POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
 };
 
 const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
@@ -364,6 +365,14 @@ impl Store {
                      session_epoch = session_epoch + 1,
                      activity_state = 'unknown',
                      activity_revision = 0,
+                     capability_revision = 0,
+                     capability_thread_resume = 0,
+                     capability_turn_start = 0,
+                     capability_current_state_sync = 0,
+                     capability_turn_completed_event = 0,
+                     capability_negative_terminal_events = 0,
+                     capability_thread_start = 0,
+                     capability_turn_steer = 0,
                      updated_at = ?
                  WHERE managed_session_id = ?",
                 params![now, existing.managed_session_id],
@@ -380,9 +389,13 @@ impl Store {
         tx.execute(
             "INSERT INTO cli_managed_sessions (
                 managed_session_id, bound_thread_id, session_epoch, session_state,
-                activity_state, activity_revision, session_allows_approval,
-                session_allows_network, session_allows_write_access, created_at, updated_at
-            ) VALUES (?, ?, 1, 'live', 'unknown', 0, ?, ?, ?, ?, ?)",
+                activity_state, activity_revision, capability_revision,
+                capability_thread_resume, capability_turn_start,
+                capability_current_state_sync, capability_turn_completed_event,
+                capability_negative_terminal_events, capability_thread_start,
+                capability_turn_steer, session_allows_approval, session_allows_network,
+                session_allows_write_access, created_at, updated_at
+            ) VALUES (?, ?, 1, 'live', 'unknown', 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?)",
             params![
                 managed_session_id,
                 bound_thread_id,
@@ -446,6 +459,60 @@ impl Store {
         Ok(CliManagedSessionActivityUpdate { session })
     }
 
+    pub fn note_cli_managed_session_capabilities(
+        &mut self,
+        managed_session_id: &str,
+        session_epoch: i64,
+        capability_revision: i64,
+        capabilities: CliManagedSessionCapabilities,
+        now: i64,
+    ) -> Result<CliManagedSessionCapabilityUpdate> {
+        ensure_positive_value("capability_revision", capability_revision)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
+        ensure_cli_session_epoch_matches(&session, session_epoch)?;
+        ensure_cli_session_attachable(&session)?;
+        ensure_cli_session_capability_revision_can_advance(
+            &session,
+            &capabilities,
+            capability_revision,
+        )?;
+        if session.capability_revision == capability_revision {
+            tx.commit()?;
+            return Ok(CliManagedSessionCapabilityUpdate { session });
+        }
+        tx.execute(
+            "UPDATE cli_managed_sessions
+             SET capability_revision = ?,
+                 capability_thread_resume = ?,
+                 capability_turn_start = ?,
+                 capability_current_state_sync = ?,
+                 capability_turn_completed_event = ?,
+                 capability_negative_terminal_events = ?,
+                 capability_thread_start = ?,
+                 capability_turn_steer = ?,
+                 updated_at = ?
+             WHERE managed_session_id = ?",
+            params![
+                capability_revision,
+                bool_to_i64(capabilities.capability_thread_resume),
+                bool_to_i64(capabilities.capability_turn_start),
+                bool_to_i64(capabilities.capability_current_state_sync),
+                bool_to_i64(capabilities.capability_turn_completed_event),
+                bool_to_i64(capabilities.capability_negative_terminal_events),
+                bool_to_i64(capabilities.capability_thread_start),
+                bool_to_i64(capabilities.capability_turn_steer),
+                now,
+                managed_session_id,
+            ],
+        )?;
+        let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
+        tx.commit()?;
+        Ok(CliManagedSessionCapabilityUpdate { session })
+    }
+
     pub fn begin_cli_accept_pending_attempt(
         &mut self,
         attempt: NewCliAcceptPendingAttempt,
@@ -483,8 +550,8 @@ impl Store {
                 generation, delivery_rpc_request_id, delivery_rpc_kind,
                 delivery_rpc_state, delivery_rpc_correlation_marker,
                 delivery_rpc_started_at, managed_session_id, session_epoch,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, 'cli', 'accept_pending', ?, ?, ?, 'pending_acceptance', ?, ?, ?, ?, ?, ?)",
+                session_activity_revision, session_capability_revision, created_at, updated_at
+            ) VALUES (?, ?, ?, 'cli', 'accept_pending', ?, ?, ?, 'pending_acceptance', ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 attempt.attempt_id,
                 attempt.batch_id,
@@ -496,6 +563,8 @@ impl Store {
                 attempt.delivery_rpc_started_at,
                 attempt.managed_session_id,
                 attempt.session_epoch,
+                session.activity_revision,
+                session.capability_revision,
                 attempt.delivery_rpc_started_at,
                 attempt.delivery_rpc_started_at,
             ],
@@ -601,6 +670,12 @@ impl Store {
             return Ok(attempt);
         }
         if can_complete_delayed_cli_turn_after_expiry(&attempt, turn_event, observed_at)? {
+            if ensure_cli_attempt_has_recorded_detached_delivery_proof_snapshot(&attempt).is_err() {
+                record_late_cli_turn_evidence_tx(&tx, &attempt, turn_event, observed_at)?;
+                let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+                tx.commit()?;
+                return Ok(record);
+            }
             let artifacts_to_sync =
                 complete_delayed_cli_turn_after_expiry_tx(&tx, &attempt, observed_at)?;
             let record = query_delivery_attempt_tx(&tx, attempt_id)?;
@@ -1148,6 +1223,14 @@ fn migrate(conn: &Connection) -> Result<()> {
             session_state TEXT NOT NULL CHECK (session_state IN ('live', 'detached', 'parked', 'stale', 'retired')),
             activity_state TEXT NOT NULL CHECK (activity_state IN ('unknown', 'active', 'idle')),
             activity_revision INTEGER NOT NULL DEFAULT 0,
+            capability_revision INTEGER NOT NULL DEFAULT 0,
+            capability_thread_resume INTEGER NOT NULL DEFAULT 0,
+            capability_turn_start INTEGER NOT NULL DEFAULT 0,
+            capability_current_state_sync INTEGER NOT NULL DEFAULT 0,
+            capability_turn_completed_event INTEGER NOT NULL DEFAULT 0,
+            capability_negative_terminal_events INTEGER NOT NULL DEFAULT 0,
+            capability_thread_start INTEGER NOT NULL DEFAULT 0,
+            capability_turn_steer INTEGER NOT NULL DEFAULT 0,
             session_allows_approval INTEGER NOT NULL,
             session_allows_network INTEGER NOT NULL,
             session_allows_write_access INTEGER NOT NULL,
@@ -1176,6 +1259,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             delivery_rpc_started_at INTEGER,
             managed_session_id TEXT,
             session_epoch INTEGER,
+            session_activity_revision INTEGER NOT NULL DEFAULT 0,
+            session_capability_revision INTEGER NOT NULL DEFAULT 0,
             delivery_turn_id TEXT,
             delivery_accepted_at INTEGER,
             delivery_observation_state TEXT CHECK (delivery_observation_state IS NULL OR delivery_observation_state IN ('tracking', 'completed', 'expired', 'abandoned')),
@@ -1225,6 +1310,66 @@ fn migrate(conn: &Connection) -> Result<()> {
         "cli_managed_sessions",
         "activity_revision",
         "ALTER TABLE cli_managed_sessions ADD COLUMN activity_revision INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "capability_revision",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN capability_revision INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "capability_thread_resume",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN capability_thread_resume INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "capability_turn_start",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN capability_turn_start INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "capability_current_state_sync",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN capability_current_state_sync INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "capability_turn_completed_event",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN capability_turn_completed_event INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "capability_negative_terminal_events",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN capability_negative_terminal_events INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "capability_thread_start",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN capability_thread_start INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "capability_turn_steer",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN capability_turn_steer INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "delivery_attempts",
+        "session_activity_revision",
+        "ALTER TABLE delivery_attempts ADD COLUMN session_activity_revision INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "delivery_attempts",
+        "session_capability_revision",
+        "ALTER TABLE delivery_attempts ADD COLUMN session_capability_revision INTEGER NOT NULL DEFAULT 0",
     )?;
     Ok(())
 }
@@ -1363,6 +1508,14 @@ fn invalidate_cli_managed_session_activity_tx(
          SET session_epoch = session_epoch + 1,
              activity_state = 'unknown',
              activity_revision = 0,
+             capability_revision = 0,
+             capability_thread_resume = 0,
+             capability_turn_start = 0,
+             capability_current_state_sync = 0,
+             capability_turn_completed_event = 0,
+             capability_negative_terminal_events = 0,
+             capability_thread_start = 0,
+             capability_turn_steer = 0,
              updated_at = ?
          WHERE managed_session_id = ?
            AND session_epoch = ?
@@ -2301,6 +2454,16 @@ fn cli_managed_session_from_row(
         session_state: row.get("session_state")?,
         activity_state: row.get("activity_state")?,
         activity_revision: row.get("activity_revision")?,
+        capability_revision: row.get("capability_revision")?,
+        capability_thread_resume: row.get::<_, i64>("capability_thread_resume")? != 0,
+        capability_turn_start: row.get::<_, i64>("capability_turn_start")? != 0,
+        capability_current_state_sync: row.get::<_, i64>("capability_current_state_sync")? != 0,
+        capability_turn_completed_event: row.get::<_, i64>("capability_turn_completed_event")? != 0,
+        capability_negative_terminal_events: row
+            .get::<_, i64>("capability_negative_terminal_events")?
+            != 0,
+        capability_thread_start: row.get::<_, i64>("capability_thread_start")? != 0,
+        capability_turn_steer: row.get::<_, i64>("capability_turn_steer")? != 0,
         session_allows_approval: row.get::<_, i64>("session_allows_approval")? != 0,
         session_allows_network: row.get::<_, i64>("session_allows_network")? != 0,
         session_allows_write_access: row.get::<_, i64>("session_allows_write_access")? != 0,
@@ -2325,6 +2488,8 @@ fn delivery_attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Delive
         delivery_rpc_started_at: row.get("delivery_rpc_started_at")?,
         managed_session_id: row.get("managed_session_id")?,
         session_epoch: row.get("session_epoch")?,
+        session_activity_revision: row.get("session_activity_revision")?,
+        session_capability_revision: row.get("session_capability_revision")?,
         delivery_turn_id: row.get("delivery_turn_id")?,
         delivery_accepted_at: row.get("delivery_accepted_at")?,
         delivery_observation_state: row.get("delivery_observation_state")?,
@@ -2448,6 +2613,63 @@ fn ensure_cli_session_activity_revision_can_advance(
     )
 }
 
+fn ensure_cli_session_capability_revision_can_advance(
+    session: &CliManagedSessionRecord,
+    capabilities: &CliManagedSessionCapabilities,
+    capability_revision: i64,
+) -> Result<()> {
+    if capability_revision == session.capability_revision
+        && cli_session_capabilities_match(session, capabilities)
+    {
+        return Ok(());
+    }
+    if session
+        .capability_revision
+        .checked_add(1)
+        .is_some_and(|next_revision| next_revision == capability_revision)
+    {
+        return Ok(());
+    }
+    bail!(
+        "CLI managed session {} capability revision {} is not the next revision after {}",
+        session.managed_session_id,
+        capability_revision,
+        session.capability_revision
+    )
+}
+
+fn cli_session_capabilities_match(
+    session: &CliManagedSessionRecord,
+    capabilities: &CliManagedSessionCapabilities,
+) -> bool {
+    session.capability_thread_resume == capabilities.capability_thread_resume
+        && session.capability_turn_start == capabilities.capability_turn_start
+        && session.capability_current_state_sync == capabilities.capability_current_state_sync
+        && session.capability_turn_completed_event == capabilities.capability_turn_completed_event
+        && session.capability_negative_terminal_events
+            == capabilities.capability_negative_terminal_events
+        && session.capability_thread_start == capabilities.capability_thread_start
+        && session.capability_turn_steer == capabilities.capability_turn_steer
+}
+
+fn ensure_cli_session_has_minimum_turn_start_capabilities(
+    session: &CliManagedSessionRecord,
+) -> Result<()> {
+    if session.capability_thread_resume
+        && session.capability_turn_start
+        && session.capability_current_state_sync
+        && session.capability_turn_completed_event
+        && session.capability_negative_terminal_events
+    {
+        Ok(())
+    } else {
+        bail!(
+            "CLI managed session {} has not passed the minimum turn_start capability probe",
+            session.managed_session_id
+        )
+    }
+}
+
 fn ensure_positive_value(name: &str, value: i64) -> Result<()> {
     if value > 0 {
         Ok(())
@@ -2489,6 +2711,7 @@ fn ensure_cli_session_allows_detached_delivery(
     ensure_cli_session_identity_allows_detached_delivery(session, source_thread_id, session_epoch)?;
     match delivery_rpc_kind {
         "turn_start" => {
+            ensure_cli_session_has_minimum_turn_start_capabilities(session)?;
             if session.activity_state == "idle" {
                 Ok(())
             } else {
@@ -2571,7 +2794,58 @@ fn ensure_cli_attempt_has_current_managed_session_for_batch_tx(
         &session,
         &batch.source_thread_id,
         session_epoch,
-    )
+    )?;
+    ensure_cli_attempt_has_recorded_detached_delivery_proof(attempt, &session)
+}
+
+fn ensure_cli_attempt_has_recorded_detached_delivery_proof(
+    attempt: &DeliveryAttemptRecord,
+    session: &CliManagedSessionRecord,
+) -> Result<()> {
+    match ensure_cli_attempt_has_recorded_detached_delivery_proof_snapshot(attempt)? {
+        "turn_start" => {
+            if attempt.session_capability_revision > session.capability_revision {
+                bail!(
+                    "delivery attempt {} references CLI capability revision {}, but session {} is at revision {}",
+                    attempt.attempt_id,
+                    attempt.session_capability_revision,
+                    session.managed_session_id,
+                    session.capability_revision
+                );
+            }
+            ensure_cli_session_has_minimum_turn_start_capabilities(session)
+        }
+        "turn_steer" => bail!(
+            "CLI turn_steer delivery requires active-turn risk proof, which is not implemented"
+        ),
+        other => bail!("unsupported CLI delivery RPC kind {other}"),
+    }
+}
+
+fn ensure_cli_attempt_has_recorded_detached_delivery_proof_snapshot(
+    attempt: &DeliveryAttemptRecord,
+) -> Result<&str> {
+    let delivery_rpc_kind = attempt.delivery_rpc_kind.as_deref().ok_or_else(|| {
+        anyhow!(
+            "delivery attempt {} is missing a CLI delivery RPC kind",
+            attempt.attempt_id
+        )
+    })?;
+    match delivery_rpc_kind {
+        "turn_start" => {
+            if attempt.session_activity_revision <= 0 || attempt.session_capability_revision <= 0 {
+                bail!(
+                    "delivery attempt {} was not created with a CLI detached delivery proof",
+                    attempt.attempt_id
+                );
+            }
+            Ok(delivery_rpc_kind)
+        }
+        "turn_steer" => bail!(
+            "CLI turn_steer delivery requires active-turn risk proof, which is not implemented"
+        ),
+        other => bail!("unsupported CLI delivery RPC kind {other}"),
+    }
 }
 
 fn ensure_existing_cli_accept_matches_request(
@@ -2843,6 +3117,23 @@ mod tests {
                 0,
             )
             .expect("bind CLI session");
+        store
+            .note_cli_managed_session_capabilities(
+                &session.session.managed_session_id,
+                session.session.session_epoch,
+                1,
+                CliManagedSessionCapabilities {
+                    capability_thread_resume: true,
+                    capability_turn_start: true,
+                    capability_current_state_sync: true,
+                    capability_turn_completed_event: true,
+                    capability_negative_terminal_events: true,
+                    capability_thread_start: false,
+                    capability_turn_steer: false,
+                },
+                0,
+            )
+            .expect("note CLI session capabilities");
         store
             .note_cli_managed_session_activity(
                 &session.session.managed_session_id,

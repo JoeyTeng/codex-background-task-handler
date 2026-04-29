@@ -249,22 +249,22 @@
 - [ ] 把 CLI attach/recovery 的 `activity_state=unknown -> current-state sync -> active/idle` 合同落进实现：
   - 未完成 current-state sync 前不得自动把 thread 判成 idle
   - continuity-loss 后只能 fail-closed，直到恢复到权威 current-state 或新的本地 regular turn lifecycle
-- [ ] 把 CLI current-state sync 升成最小 capability probe 的正式要求：
-  - 缺少 `thread/read` 或等价 current-state 面时，v1 不支持 detached managed-session auto-continuation
+- [x] 把 CLI current-state sync 升成最小 capability probe 的正式要求：
+  - [x] 缺少 `thread/read` 或等价 current-state 面时，v1 不支持 detached managed-session auto-continuation
   - 这个 sync 至少必须对 `bound_thread_id` 返回 `has_active_regular_turn` 与可选 `active_turn_id`
 - [ ] 把 CLI fresh-thread bootstrap 收口成正式合同：
   - `cbth cli run --new-thread` 仅在 capability probe 已证明 `thread/start` 可用时允许
   - daemon 必须先创建 brand-new thread，再把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
   - 如果既没有现成 `thread_id`，也没有 `thread/start` capability，则前台只能视为探索性 remote TUI
-- [ ] 把 accepted-turn 负终态观察面升成最小 capability probe 的正式要求：
-  - 最小 capability set 不只包括 `turn/completed`
-  - 还必须能对当前 `delivery_turn_id` 观察并 durable 区分：
-    - `turn_started`
-    - `turn_completed`
-    - `turn_failed`
-    - `turn_interrupted`
-    - `turn_replaced`
-  - 缺少这组观察面时，CLI detached auto-continuation 必须 fail-closed
+- [x] 把 accepted-turn 负终态观察面升成最小 capability probe 的正式要求：
+  - [x] 最小 capability set 不只包括 `turn/completed`
+  - [x] 还必须能对当前 `delivery_turn_id` 观察并 durable 区分：
+    - [x] `turn_started`
+    - [x] `turn_completed`
+    - [x] `turn_failed`
+    - [x] `turn_interrupted`
+    - [x] `turn_replaced`
+  - [x] 缺少这组观察面时，CLI detached auto-continuation 必须 fail-closed
 - [ ] 为 daemon 的 overdue sweep / next-start reconcile 落地稳定合同：
   - daemon 不需要为大多数长窗口 `manual_resolution_only` / deadline 持续常驻
   - 但 `delivery_observation_deadline` 是必须常驻观察的唯一例外
@@ -349,6 +349,7 @@
   - [x] 落地 durable `cli_managed_sessions` 记录，用于固定 `managed_session_id` / `bound_thread_id` / `session_epoch` / `session_state` / `activity_state` / `activity_revision` / risk profile
   - [x] 增加 hidden adapter-internal `cbth cli session bind` / `note-activity` / `inspect`，作为未来 `cbth cli run` 的 attach-or-create / monotonic current-state-sync building block
   - [x] daemon capability 增加 `cli-session-dispatch`，避免新 CLI 把 session mutation 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-session-capability-dispatch`，避免新 CLI 把 session capability mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给旧 daemon
   - shared `app-server` 归 daemon 持有
   - 前台退出但 active jobs 未结束时继续保活
@@ -402,7 +403,7 @@
   - 基于 `turn/started` / `turn/completed` / `thread/status/changed`
   - `turn/start` race 失败后回到等待下一个 idle
 - [x] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为，且不会导致当前 turn 提前结束。
-- [ ] 为 CLI adapter 明确定义实验 RPC 的最小能力集、capability probe 和 fail-closed 策略。
+- [x] 为 CLI adapter 明确定义实验 RPC 的最小能力集、capability probe 和 fail-closed 策略。
 - [ ] 把 `turn/steer` 维持为默认关闭的 gated optimization，并明确不满足条件时的 idle-only fallback。
 - [ ] 为 CLI adapter 落实 delivery completion contract：
   - [x] accepted `turn/start` 只记录 `delivery_turn_id`

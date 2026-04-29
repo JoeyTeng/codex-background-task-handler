@@ -18,8 +18,9 @@ use crate::daemon::{
 };
 use crate::fs_layout::{FsLayout, remove_dir_all_durable};
 use crate::models::{
-    CliManagedSessionProfile, DEFAULT_MAX_DELIVERY_ATTEMPTS, DEFAULT_REDELIVERY_WINDOW_SECONDS,
-    DeliveryPolicy, NewCliAcceptPendingAttempt, NewJob, PartialDeliveryPolicy, SubmitMetadata,
+    CliManagedSessionCapabilities, CliManagedSessionProfile, DEFAULT_MAX_DELIVERY_ATTEMPTS,
+    DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, NewCliAcceptPendingAttempt, NewJob,
+    PartialDeliveryPolicy, SubmitMetadata,
 };
 use crate::store::{Store, new_id};
 
@@ -187,6 +188,7 @@ enum CliCommand {
 enum CliSessionCommand {
     Bind(CliSessionBindArgs),
     NoteActivity(CliSessionNoteActivityArgs),
+    NoteCapabilities(CliSessionNoteCapabilitiesArgs),
     Inspect(CliSessionInspectArgs),
 }
 
@@ -407,6 +409,42 @@ struct CliSessionNoteActivityArgs {
 
     #[arg(long)]
     activity_revision: i64,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct CliSessionNoteCapabilitiesArgs {
+    #[arg(long)]
+    managed_session_id: String,
+
+    #[arg(long)]
+    session_epoch: i64,
+
+    #[arg(long)]
+    capability_revision: i64,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    thread_resume: bool,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    turn_start: bool,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    current_state_sync: bool,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    turn_completed_event: bool,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    negative_terminal_events: bool,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), default_value_t = false, action = clap::ArgAction::Set)]
+    thread_start: bool,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), default_value_t = false, action = clap::ArgAction::Set)]
+    turn_steer: bool,
 
     #[arg(long, hide = true)]
     now: Option<i64>,
@@ -720,6 +758,40 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
                 args.activity_state.cli_value(),
             );
             push_i64_arg(&mut argv, "--activity-revision", args.activity_revision);
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Cli {
+            command:
+                CliCommand::Session {
+                    command: CliSessionCommand::NoteCapabilities(args),
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("cli"),
+                OsString::from("session"),
+                OsString::from("note-capabilities"),
+            ];
+            push_string_arg(&mut argv, "--managed-session-id", &args.managed_session_id);
+            push_i64_arg(&mut argv, "--session-epoch", args.session_epoch);
+            push_i64_arg(&mut argv, "--capability-revision", args.capability_revision);
+            push_bool_arg(&mut argv, "--thread-resume", args.thread_resume);
+            push_bool_arg(&mut argv, "--turn-start", args.turn_start);
+            push_bool_arg(&mut argv, "--current-state-sync", args.current_state_sync);
+            push_bool_arg(
+                &mut argv,
+                "--turn-completed-event",
+                args.turn_completed_event,
+            );
+            push_bool_arg(
+                &mut argv,
+                "--negative-terminal-events",
+                args.negative_terminal_events,
+            );
+            push_bool_arg(&mut argv, "--thread-start", args.thread_start);
+            push_bool_arg(&mut argv, "--turn-steer", args.turn_steer);
             if let Some(now) = args.now {
                 push_i64_arg(&mut argv, "--now", now);
             }
@@ -1049,6 +1121,30 @@ fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
                     args.session_epoch,
                     args.activity_state.as_str(),
                     args.activity_revision,
+                    now,
+                )?;
+                Ok(json!({ "cli_session": session }))
+            }
+            CliSessionCommand::NoteCapabilities(args) => {
+                validate_positive("session_epoch", args.session_epoch)?;
+                validate_positive("capability_revision", args.capability_revision)?;
+                let now = match args.now {
+                    Some(value) => value,
+                    None => now_epoch_seconds()?,
+                };
+                let session = store.note_cli_managed_session_capabilities(
+                    &args.managed_session_id,
+                    args.session_epoch,
+                    args.capability_revision,
+                    CliManagedSessionCapabilities {
+                        capability_thread_resume: args.thread_resume,
+                        capability_turn_start: args.turn_start,
+                        capability_current_state_sync: args.current_state_sync,
+                        capability_turn_completed_event: args.turn_completed_event,
+                        capability_negative_terminal_events: args.negative_terminal_events,
+                        capability_thread_start: args.thread_start,
+                        capability_turn_steer: args.turn_steer,
+                    },
                     now,
                 )?;
                 Ok(json!({ "cli_session": session }))

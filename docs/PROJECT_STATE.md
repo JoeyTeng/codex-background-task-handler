@@ -538,8 +538,17 @@ scripts/desktop_thread_inject_poc.py
   - observed turn id 必须匹配 stored `delivery_turn_id`，否则拒绝写入
   - daemon capability 列表新增 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给 Phase 6 旧 daemon
   - 本地验证已覆盖 full Rust/JS gate、shared `app-server` e2e、以及 fresh `gpt-5.5` reviewer pass；最终 review 结果为 no findings
+- Phase 8 当前分支为 `codex/phase-8-cli-capability-probe`，范围限定在 CLI managed session 的最小 capability proof：
+  - `cli_managed_sessions` 新增 epoch-local capability fields 与 `capability_revision`
+  - 新增 hidden `cbth cli session note-capabilities`
+  - `bind` / re-attach / continuity-loss fence 会清空旧 capability proof，避免复用旧 app-server epoch 的能力结论
+  - `begin-cli-accept --rpc-kind turn-start` 现在要求同 epoch 已证明 `thread_resume`、`turn_start`、`current_state_sync`、`turn_completed_event` 与负终态 observation surface，否则 fail-closed
+  - 新建 CLI attempt 会记录 `session_activity_revision` / `session_capability_revision` proof snapshot；同 RPC retry 和 accept path 要求 snapshot 非零，避免迁移旧 attempt 绕过 Phase 8 gate，同时不因 accepted turn 后的 activity drift 破坏幂等恢复
+  - daemon capability 列表新增 `cli-session-capability-dispatch`，避免新 CLI 把 `note-capabilities` mutation 路由给 Phase 7 旧 daemon
+  - `turn_steer` 仍保持 fail-closed，直到后续 phase 落地 active-turn risk proof
+  - 本地验证已覆盖 full Rust/JS gate 与 shared `app-server` e2e；e2e 使用本机 `codex-cli 0.125.0`，确认 frontend client 仍能看到 sidecar turn started/completed，且 `thread/read` 能看到 marker
 - 当前 daemon 仍未接入完整 delivery lifecycle：
-  - CLI attempt / session mutation / turn observation 通过 daemon dispatch 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-turn-observation-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
+  - CLI attempt / session mutation / session capability / turn observation 通过 daemon dispatch 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-turn-observation-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
   - CLI accepted attempt durable schema、daemon 保活、managed-session durable record / fixed-thread gate、以及 accepted turn observation store surface 已经落地，但真实 shared `app-server` runtime、event/current-state observation loop 尚未实现
   - Desktop arm / pause / boundary deadlines 尚未有 schema / adapter，因此尚未接入 daemon 保活
   - CLI `cbth cli run` 进程模型、shared app-server lifecycle 与 Desktop bridge adapters 尚未实现
