@@ -1,14 +1,19 @@
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::mem;
+use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,10 +35,19 @@ const SOCKET_LIVENESS_TIMEOUT: Duration = Duration::from_millis(250);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_MAINTENANCE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const CLI_APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const CLI_APP_SERVER_TERM_GRACE: Duration = Duration::from_secs(2);
+const CLI_APP_SERVER_KILL_GRACE: Duration = Duration::from_secs(2);
+const CLI_APP_SERVER_JOIN_GRACE: Duration = Duration::from_secs(2);
+const CLI_APP_SERVER_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CLI_APP_SERVER_STDOUT_SCAN_BYTES: usize = 8 * 1024;
+const CLI_APP_SERVER_DRAIN_CHUNK_BYTES: usize = 4 * 1024;
+const DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS: u64 = 60;
 const DAEMON_PROTOCOL_VERSION: u64 = 1;
 const DAEMON_CAPABILITIES: &[&str] = &[
     "dispatch",
     "attempt-dispatch",
+    "cli-app-server-lifecycle",
     "cli-session-dispatch",
     "cli-session-capability-dispatch",
     "cli-turn-observation-dispatch",
@@ -115,6 +129,44 @@ struct DispatchPayload {
     argv: Vec<Vec<u8>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CliAppServerEnsurePayload {
+    managed_session_id: String,
+    bound_thread_id: String,
+    codex_binary: Vec<u8>,
+    lease_id: String,
+    #[serde(default)]
+    lease_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CliAppServerLeasePayload {
+    managed_session_id: String,
+    lease_id: String,
+    #[serde(default)]
+    lease_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CliAppServerReservePayload {
+    bound_thread_id: String,
+    lease_id: String,
+    #[serde(default)]
+    lease_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CliAppServerReleasePayload {
+    bound_thread_id: String,
+    lease_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CliAppServerStopPayload {
+    managed_session_id: String,
+    lease_id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct DaemonInfo {
     pid: u32,
@@ -123,6 +175,22 @@ struct DaemonInfo {
     socket_path: String,
     idle_timeout_seconds: u64,
     stop_requested: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CliAppServerInfo {
+    managed_session_id: String,
+    bound_thread_id: String,
+    url: String,
+    pid: u32,
+    started_at: i64,
+    lease_seconds_remaining: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CliAppServerReservationInfo {
+    bound_thread_id: String,
+    lease_seconds_remaining: u64,
 }
 
 struct DaemonState {
@@ -136,6 +204,27 @@ struct DaemonState {
     activity_generation: AtomicU64,
     active_clients: AtomicUsize,
     active_dispatches: AtomicUsize,
+    cli_app_servers: Mutex<HashMap<String, ManagedCliAppServer>>,
+    cli_app_server_reservations: Mutex<HashMap<String, CliAppServerReservation>>,
+}
+
+struct ManagedCliAppServer {
+    managed_session_id: String,
+    bound_thread_id: String,
+    url: String,
+    child: Child,
+    started_at: i64,
+    lease_id: String,
+    lease_expires_at: Instant,
+    drain_running: Arc<AtomicBool>,
+    stdout_worker: Option<thread::JoinHandle<()>>,
+    stderr_worker: Option<thread::JoinHandle<()>>,
+}
+
+struct CliAppServerReservation {
+    bound_thread_id: String,
+    lease_id: String,
+    lease_expires_at: Instant,
 }
 
 struct ActiveClientGuard<'a> {
@@ -211,6 +300,8 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         activity_generation: AtomicU64::new(0),
         active_clients: AtomicUsize::new(0),
         active_dispatches: AtomicUsize::new(0),
+        cli_app_servers: Mutex::new(HashMap::new()),
+        cli_app_server_reservations: Mutex::new(HashMap::new()),
     });
     let mut last_activity = Instant::now();
     let mut last_activity_epoch = started_at;
@@ -257,6 +348,8 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
                 }));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                reap_expired_cli_app_servers(&state);
+                reap_expired_cli_app_server_reservations(&state);
                 if state.active_clients.load(Ordering::Acquire) == 0 {
                     let activity_generation = state.activity_generation.load(Ordering::Acquire);
                     if activity_generation != observed_activity_generation {
@@ -296,6 +389,8 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
                                 .lifecycle_maintenance_suppressed
                                 .load(Ordering::Acquire),
                         )
+                        && !has_active_cli_app_servers(&state)
+                        && !has_active_cli_app_server_reservations(&state)
                     {
                         shutdown_reason = "idle_timeout";
                         break;
@@ -308,6 +403,8 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
     }
     join_workers(workers);
     join_lifecycle_maintenance(lifecycle_maintenance_worker);
+    stop_all_cli_app_servers(&state);
+    clear_cli_app_server_reservations(&state);
 
     Ok(json!({
         "daemon": daemon_info(&state),
@@ -454,6 +551,15 @@ pub fn daemon_request(layout: &FsLayout, command: &str) -> Result<Value> {
 
 pub fn daemon_request_payload(layout: &FsLayout, command: &str, payload: Value) -> Result<Value> {
     daemon_request_payload_with_timeout(layout, command, payload, DOMAIN_REQUEST_TIMEOUT)
+}
+
+pub fn daemon_request_payload_timeout(
+    layout: &FsLayout,
+    command: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    daemon_request_payload_with_timeout(layout, command, payload, timeout)
 }
 
 fn daemon_request_with_timeout(
@@ -903,12 +1009,52 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             "capabilities": DAEMON_CAPABILITIES,
             "message": "pong",
         }),
-        "status" => json!({
-            "daemon": daemon_info(state),
-            "protocol_version": DAEMON_PROTOCOL_VERSION,
-            "capabilities": DAEMON_CAPABILITIES,
-            "startup_sweep": &state.startup_sweep,
-        }),
+        "status" => {
+            reap_expired_cli_app_servers(state);
+            reap_expired_cli_app_server_reservations(state);
+            json!({
+                "daemon": daemon_info(state),
+                "protocol_version": DAEMON_PROTOCOL_VERSION,
+                "capabilities": DAEMON_CAPABILITIES,
+                "startup_sweep": &state.startup_sweep,
+                "cli_app_servers": cli_app_server_infos(state),
+            })
+        }
+        "cli_app_server_reserve" => {
+            let payload: CliAppServerReservePayload = serde_json::from_value(request.payload)
+                .context("parse cli app-server reservation payload")?;
+            json!({
+                "cli_app_server_reservation": reserve_cli_app_server(state, payload)?,
+            })
+        }
+        "cli_app_server_ensure" => {
+            let payload: CliAppServerEnsurePayload =
+                serde_json::from_value(request.payload).context("parse cli app-server payload")?;
+            json!({
+                "cli_app_server": ensure_cli_app_server(state, payload)?,
+            })
+        }
+        "cli_app_server_refresh" => {
+            let payload: CliAppServerLeasePayload = serde_json::from_value(request.payload)
+                .context("parse cli app-server lease payload")?;
+            json!({
+                "cli_app_server": refresh_cli_app_server_lease(state, payload)?,
+            })
+        }
+        "cli_app_server_release" => {
+            let payload: CliAppServerReleasePayload = serde_json::from_value(request.payload)
+                .context("parse cli app-server reservation release payload")?;
+            json!({
+                "released": release_cli_app_server_reservation(state, payload)?,
+            })
+        }
+        "cli_app_server_stop" => {
+            let payload: CliAppServerStopPayload = serde_json::from_value(request.payload)
+                .context("parse cli app-server stop payload")?;
+            json!({
+                "stopped": stop_cli_app_server(state, payload)?,
+            })
+        }
         "stop" => {
             state.stop_requested.store(true, Ordering::Release);
             json!({
@@ -939,6 +1085,669 @@ fn daemon_info(state: &DaemonState) -> DaemonInfo {
         idle_timeout_seconds: state.idle_timeout.as_secs(),
         stop_requested: state.stop_requested.load(Ordering::Acquire),
     }
+}
+
+fn reserve_cli_app_server(
+    state: &DaemonState,
+    payload: CliAppServerReservePayload,
+) -> Result<CliAppServerReservationInfo> {
+    validate_daemon_nonempty("bound_thread_id", &payload.bound_thread_id)?;
+    validate_daemon_nonempty("lease_id", &payload.lease_id)?;
+    let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
+
+    let mut dead_servers = Vec::new();
+    {
+        let mut servers = state
+            .cli_app_servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+        let mut dead_server_ids = Vec::new();
+        for (managed_session_id, server) in servers.iter_mut() {
+            if server.bound_thread_id != payload.bound_thread_id {
+                continue;
+            }
+            if cli_app_server_child_is_running(server)? {
+                bail!(
+                    "thread {} already has an active CLI app-server",
+                    payload.bound_thread_id
+                );
+            }
+            dead_server_ids.push(managed_session_id.clone());
+        }
+        dead_servers.extend(
+            dead_server_ids
+                .into_iter()
+                .filter_map(|managed_session_id| servers.remove(&managed_session_id)),
+        );
+    }
+    for server in dead_servers {
+        stop_managed_cli_app_server(server);
+    }
+
+    let mut reservations = state
+        .cli_app_server_reservations
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server reservation lock is poisoned"))?;
+    let now = Instant::now();
+    if reservations
+        .get(&payload.bound_thread_id)
+        .is_some_and(|reservation| reservation.lease_expires_at <= now)
+    {
+        reservations.remove(&payload.bound_thread_id);
+    }
+    if let Some(existing) = reservations.get_mut(&payload.bound_thread_id) {
+        if existing.lease_id != payload.lease_id {
+            bail!(
+                "thread {} already has an active CLI app-server reservation",
+                payload.bound_thread_id
+            );
+        }
+        existing.lease_expires_at = now + lease_ttl;
+        return Ok(cli_app_server_reservation_info(existing));
+    }
+    let reservation = CliAppServerReservation {
+        bound_thread_id: payload.bound_thread_id.clone(),
+        lease_id: payload.lease_id,
+        lease_expires_at: now + lease_ttl,
+    };
+    let info = cli_app_server_reservation_info(&reservation);
+    reservations.insert(payload.bound_thread_id, reservation);
+    Ok(info)
+}
+
+fn ensure_cli_app_server(
+    state: &DaemonState,
+    payload: CliAppServerEnsurePayload,
+) -> Result<CliAppServerInfo> {
+    validate_daemon_nonempty("managed_session_id", &payload.managed_session_id)?;
+    validate_daemon_nonempty("bound_thread_id", &payload.bound_thread_id)?;
+    validate_daemon_nonempty_bytes("codex_binary", &payload.codex_binary)?;
+    validate_daemon_nonempty("lease_id", &payload.lease_id)?;
+    let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
+    let mut servers = state
+        .cli_app_servers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+    if let Some(existing) = servers.get_mut(&payload.managed_session_id) {
+        if existing.bound_thread_id != payload.bound_thread_id {
+            bail!(
+                "managed session {} is already attached to app-server for thread {}",
+                payload.managed_session_id,
+                existing.bound_thread_id
+            );
+        }
+        if cli_app_server_child_is_running(existing)? {
+            ensure_cli_app_server_lease_is_reentrant(existing, &payload.lease_id)?;
+            existing.lease_id = payload.lease_id;
+            existing.lease_expires_at = Instant::now() + lease_ttl;
+            return Ok(cli_app_server_info(existing));
+        }
+    }
+    let existing = servers.remove(&payload.managed_session_id);
+    drop(servers);
+    if let Some(existing) = existing {
+        stop_managed_cli_app_server(existing);
+    }
+
+    ensure_cli_app_server_reservation_matches(state, &payload.bound_thread_id, &payload.lease_id)?;
+
+    let server = spawn_cli_app_server(
+        &payload.managed_session_id,
+        &payload.bound_thread_id,
+        &payload.codex_binary,
+        &payload.lease_id,
+        lease_ttl,
+    )?;
+    let mut servers = state
+        .cli_app_servers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+    if let Some(existing) = servers.get_mut(&payload.managed_session_id) {
+        if existing.bound_thread_id != payload.bound_thread_id {
+            let attached_thread = existing.bound_thread_id.clone();
+            drop(servers);
+            stop_managed_cli_app_server(server);
+            bail!(
+                "managed session {} is already attached to app-server for thread {}",
+                payload.managed_session_id,
+                attached_thread
+            );
+        }
+        match cli_app_server_child_is_running(existing) {
+            Ok(true) => {
+                if let Err(error) =
+                    ensure_cli_app_server_lease_is_reentrant(existing, &payload.lease_id)
+                {
+                    drop(servers);
+                    stop_managed_cli_app_server(server);
+                    return Err(error);
+                }
+                existing.lease_id = payload.lease_id;
+                existing.lease_expires_at = Instant::now() + lease_ttl;
+                let info = cli_app_server_info(existing);
+                drop(servers);
+                stop_managed_cli_app_server(server);
+                return Ok(info);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                drop(servers);
+                stop_managed_cli_app_server(server);
+                return Err(error);
+            }
+        }
+    }
+    let info = cli_app_server_info(&server);
+    let replaced = servers.insert(payload.managed_session_id, server);
+    drop(servers);
+    if let Some(replaced) = replaced {
+        stop_managed_cli_app_server(replaced);
+    }
+    let _ = release_cli_app_server_reservation(
+        state,
+        CliAppServerReleasePayload {
+            bound_thread_id: info.bound_thread_id.clone(),
+            lease_id: payload.lease_id,
+        },
+    );
+    Ok(info)
+}
+
+fn refresh_cli_app_server_lease(
+    state: &DaemonState,
+    payload: CliAppServerLeasePayload,
+) -> Result<CliAppServerInfo> {
+    validate_daemon_nonempty("managed_session_id", &payload.managed_session_id)?;
+    validate_daemon_nonempty("lease_id", &payload.lease_id)?;
+    let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
+    let mut servers = state
+        .cli_app_servers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+    let Some(server) = servers.get_mut(&payload.managed_session_id) else {
+        bail!(
+            "CLI app-server for managed session {} is not running",
+            payload.managed_session_id
+        );
+    };
+    ensure_cli_app_server_lease_matches(server, &payload.lease_id)?;
+    if !cli_app_server_child_is_running(server)? {
+        let server = servers
+            .remove(&payload.managed_session_id)
+            .expect("server exists");
+        drop(servers);
+        stop_managed_cli_app_server(server);
+        bail!(
+            "CLI app-server for managed session {} has exited",
+            payload.managed_session_id
+        );
+    }
+    server.lease_expires_at = Instant::now() + lease_ttl;
+    Ok(cli_app_server_info(server))
+}
+
+fn stop_cli_app_server(state: &DaemonState, payload: CliAppServerStopPayload) -> Result<bool> {
+    validate_daemon_nonempty("managed_session_id", &payload.managed_session_id)?;
+    validate_daemon_nonempty("lease_id", &payload.lease_id)?;
+    let mut servers = state
+        .cli_app_servers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+    let Some(server) = servers.get(&payload.managed_session_id) else {
+        return Ok(false);
+    };
+    ensure_cli_app_server_lease_matches(server, &payload.lease_id)?;
+    let server = servers
+        .remove(&payload.managed_session_id)
+        .expect("server exists");
+    drop(servers);
+    stop_managed_cli_app_server(server);
+    Ok(true)
+}
+
+fn spawn_cli_app_server(
+    managed_session_id: &str,
+    bound_thread_id: &str,
+    codex_binary: &[u8],
+    lease_id: &str,
+    lease_ttl: Duration,
+) -> Result<ManagedCliAppServer> {
+    let codex_binary = OsString::from_vec(codex_binary.to_vec());
+    let mut child = Command::new(&codex_binary)
+        .arg("app-server")
+        .arg("--listen")
+        .arg("ws://127.0.0.1:0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("spawn codex app-server via {:?}", codex_binary))?;
+    let stdout = child.stdout.take().context("capture app-server stdout")?;
+    let stderr = child.stderr.take().context("capture app-server stderr")?;
+    if let Err(error) = set_fd_nonblocking(stdout.as_raw_fd(), true) {
+        stop_cli_app_server_process(&mut child);
+        return Err(error).context("set app-server stdout nonblocking");
+    }
+    if let Err(error) = set_fd_nonblocking(stderr.as_raw_fd(), true) {
+        stop_cli_app_server_process(&mut child);
+        return Err(error).context("set app-server stderr nonblocking");
+    }
+    let (url_sender, url_receiver) = mpsc::channel();
+    let drain_running = Arc::new(AtomicBool::new(true));
+    let stdout_drain_running = Arc::clone(&drain_running);
+    let stderr_drain_running = Arc::clone(&drain_running);
+    let stdout_worker =
+        thread::spawn(move || drain_app_server_stdout(stdout, url_sender, stdout_drain_running));
+    let stderr_worker = thread::spawn(move || drain_reader(stderr, stderr_drain_running));
+    let url = match url_receiver.recv_timeout(CLI_APP_SERVER_STARTUP_TIMEOUT) {
+        Ok(url) => url,
+        Err(error) => {
+            drain_running.store(false, Ordering::Release);
+            stop_cli_app_server_process(&mut child);
+            join_worker_until(stdout_worker, Instant::now() + CLI_APP_SERVER_JOIN_GRACE);
+            join_worker_until(stderr_worker, Instant::now() + CLI_APP_SERVER_JOIN_GRACE);
+            bail!("codex app-server did not report a websocket listener: {error}");
+        }
+    };
+    if !app_server_listener_url_is_loopback(&url) {
+        drain_running.store(false, Ordering::Release);
+        stop_cli_app_server_process(&mut child);
+        join_worker_until(stdout_worker, Instant::now() + CLI_APP_SERVER_JOIN_GRACE);
+        join_worker_until(stderr_worker, Instant::now() + CLI_APP_SERVER_JOIN_GRACE);
+        bail!("codex app-server reported non-loopback listener {url}");
+    }
+    let started_at = current_epoch_seconds()?;
+    Ok(ManagedCliAppServer {
+        managed_session_id: managed_session_id.to_owned(),
+        bound_thread_id: bound_thread_id.to_owned(),
+        url,
+        child,
+        started_at,
+        lease_id: lease_id.to_owned(),
+        lease_expires_at: Instant::now() + lease_ttl,
+        drain_running,
+        stdout_worker: Some(stdout_worker),
+        stderr_worker: Some(stderr_worker),
+    })
+}
+
+fn drain_app_server_stdout<R: Read>(
+    mut reader: R,
+    url_sender: mpsc::Sender<String>,
+    running: Arc<AtomicBool>,
+) {
+    let mut sent = false;
+    let mut scan_buffer = Vec::with_capacity(CLI_APP_SERVER_STDOUT_SCAN_BYTES);
+    let mut buffer = [0_u8; CLI_APP_SERVER_DRAIN_CHUNK_BYTES];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                if !sent {
+                    append_bounded(
+                        &mut scan_buffer,
+                        &buffer[..read],
+                        CLI_APP_SERVER_STDOUT_SCAN_BYTES,
+                    );
+                    if let Some(url) = parse_app_server_listener_url(&scan_buffer) {
+                        let _ = url_sender.send(url);
+                        sent = true;
+                        scan_buffer.clear();
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if !running.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(CLI_APP_SERVER_DRAIN_POLL_INTERVAL);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+}
+
+fn drain_reader<R: Read>(mut reader: R, running: Arc<AtomicBool>) {
+    let mut buffer = [0_u8; CLI_APP_SERVER_DRAIN_CHUNK_BYTES];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if !running.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(CLI_APP_SERVER_DRAIN_POLL_INTERVAL);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+}
+
+fn append_bounded(buffer: &mut Vec<u8>, bytes: &[u8], limit: usize) {
+    if bytes.len() >= limit {
+        buffer.clear();
+        buffer.extend_from_slice(&bytes[bytes.len() - limit..]);
+        return;
+    }
+    let overflow = buffer
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(limit);
+    if overflow > 0 {
+        buffer.drain(..overflow);
+    }
+    buffer.extend_from_slice(bytes);
+}
+
+fn parse_app_server_listener_url(buffer: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(buffer);
+    let (_, value) = text.split_once("listening on:")?;
+    let url = value.split_whitespace().next()?;
+    if url.starts_with("ws://") {
+        Some(url.to_owned())
+    } else {
+        None
+    }
+}
+
+fn app_server_listener_url_is_loopback(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("ws://") else {
+        return false;
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .expect("split always yields first segment");
+    let Some((host, port)) = split_url_authority_host_port(authority) else {
+        return false;
+    };
+    port.parse::<u16>().is_ok_and(|port| port > 0) && host_is_loopback(host)
+}
+
+fn split_url_authority_host_port(authority: &str) -> Option<(&str, &str)> {
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, rest) = rest.split_once(']')?;
+        let port = rest.strip_prefix(':')?;
+        return Some((host, port));
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    Some((host, port))
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn cli_app_server_lease_ttl(value: Option<u64>) -> Result<Duration> {
+    let seconds = value.unwrap_or(DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS);
+    if seconds == 0 {
+        bail!("lease_ttl_seconds must be positive");
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn ensure_cli_app_server_reservation_matches(
+    state: &DaemonState,
+    bound_thread_id: &str,
+    lease_id: &str,
+) -> Result<()> {
+    let mut reservations = state
+        .cli_app_server_reservations
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server reservation lock is poisoned"))?;
+    if reservations
+        .get(bound_thread_id)
+        .is_some_and(|reservation| reservation.lease_expires_at <= Instant::now())
+    {
+        reservations.remove(bound_thread_id);
+    }
+    let Some(reservation) = reservations.get(bound_thread_id) else {
+        bail!("thread {bound_thread_id} does not have an active CLI app-server reservation");
+    };
+    if reservation.lease_id == lease_id {
+        Ok(())
+    } else {
+        bail!("thread {bound_thread_id} has a different active CLI app-server reservation")
+    }
+}
+
+fn release_cli_app_server_reservation(
+    state: &DaemonState,
+    payload: CliAppServerReleasePayload,
+) -> Result<bool> {
+    validate_daemon_nonempty("bound_thread_id", &payload.bound_thread_id)?;
+    validate_daemon_nonempty("lease_id", &payload.lease_id)?;
+    let mut reservations = state
+        .cli_app_server_reservations
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server reservation lock is poisoned"))?;
+    let Some(reservation) = reservations.get(&payload.bound_thread_id) else {
+        return Ok(false);
+    };
+    if reservation.lease_id != payload.lease_id {
+        bail!(
+            "thread {} has a different active CLI app-server reservation",
+            payload.bound_thread_id
+        );
+    }
+    reservations.remove(&payload.bound_thread_id);
+    Ok(true)
+}
+
+fn cli_app_server_reservation_info(
+    reservation: &CliAppServerReservation,
+) -> CliAppServerReservationInfo {
+    CliAppServerReservationInfo {
+        bound_thread_id: reservation.bound_thread_id.clone(),
+        lease_seconds_remaining: reservation
+            .lease_expires_at
+            .saturating_duration_since(Instant::now())
+            .as_secs(),
+    }
+}
+
+fn ensure_cli_app_server_lease_matches(server: &ManagedCliAppServer, lease_id: &str) -> Result<()> {
+    if server.lease_id == lease_id {
+        Ok(())
+    } else {
+        bail!(
+            "CLI app-server for managed session {} is owned by a different lease",
+            server.managed_session_id
+        )
+    }
+}
+
+fn ensure_cli_app_server_lease_is_reentrant(
+    server: &ManagedCliAppServer,
+    lease_id: &str,
+) -> Result<()> {
+    if server.lease_id == lease_id {
+        Ok(())
+    } else {
+        bail!(
+            "managed session {} already has an active CLI app-server lease",
+            server.managed_session_id
+        )
+    }
+}
+
+fn cli_app_server_child_is_running(server: &mut ManagedCliAppServer) -> Result<bool> {
+    match server.child.try_wait().context("check codex app-server")? {
+        Some(_status) => Ok(false),
+        None => Ok(true),
+    }
+}
+
+fn cli_app_server_info(server: &ManagedCliAppServer) -> CliAppServerInfo {
+    CliAppServerInfo {
+        managed_session_id: server.managed_session_id.clone(),
+        bound_thread_id: server.bound_thread_id.clone(),
+        url: server.url.clone(),
+        pid: server.child.id(),
+        started_at: server.started_at,
+        lease_seconds_remaining: server
+            .lease_expires_at
+            .saturating_duration_since(Instant::now())
+            .as_secs(),
+    }
+}
+
+fn cli_app_server_infos(state: &DaemonState) -> Vec<CliAppServerInfo> {
+    let Ok(servers) = state.cli_app_servers.lock() else {
+        return Vec::new();
+    };
+    servers.values().map(cli_app_server_info).collect()
+}
+
+fn has_active_cli_app_servers(state: &DaemonState) -> bool {
+    state
+        .cli_app_servers
+        .lock()
+        .is_ok_and(|servers| !servers.is_empty())
+}
+
+fn has_active_cli_app_server_reservations(state: &DaemonState) -> bool {
+    state
+        .cli_app_server_reservations
+        .lock()
+        .is_ok_and(|reservations| !reservations.is_empty())
+}
+
+fn reap_expired_cli_app_servers(state: &DaemonState) {
+    let Ok(mut servers) = state.cli_app_servers.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    let expired = servers
+        .iter()
+        .filter_map(|(managed_session_id, server)| {
+            if server.lease_expires_at <= now {
+                Some(managed_session_id.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut expired_servers = Vec::new();
+    for managed_session_id in expired {
+        if let Some(server) = servers.remove(&managed_session_id) {
+            expired_servers.push(server);
+        }
+    }
+    drop(servers);
+    for server in expired_servers {
+        stop_managed_cli_app_server(server);
+    }
+}
+
+fn reap_expired_cli_app_server_reservations(state: &DaemonState) {
+    let Ok(mut reservations) = state.cli_app_server_reservations.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    reservations.retain(|_, reservation| reservation.lease_expires_at > now);
+}
+
+fn stop_all_cli_app_servers(state: &DaemonState) {
+    let Ok(mut servers) = state.cli_app_servers.lock() else {
+        return;
+    };
+    let drained_servers = servers
+        .drain()
+        .map(|(_, server)| server)
+        .collect::<Vec<_>>();
+    drop(servers);
+    for server in drained_servers {
+        stop_managed_cli_app_server(server);
+    }
+}
+
+fn clear_cli_app_server_reservations(state: &DaemonState) {
+    if let Ok(mut reservations) = state.cli_app_server_reservations.lock() {
+        reservations.clear();
+    }
+}
+
+fn stop_managed_cli_app_server(mut server: ManagedCliAppServer) {
+    server.drain_running.store(false, Ordering::Release);
+    stop_cli_app_server_process(&mut server.child);
+    if let Some(worker) = server.stdout_worker.take() {
+        join_worker_until(worker, Instant::now() + CLI_APP_SERVER_JOIN_GRACE);
+    }
+    if let Some(worker) = server.stderr_worker.take() {
+        join_worker_until(worker, Instant::now() + CLI_APP_SERVER_JOIN_GRACE);
+    }
+}
+
+fn stop_cli_app_server_process(child: &mut Child) {
+    let pid = child.id();
+    if child.try_wait().ok().flatten().is_some() {
+        signal_process_group(pid, libc::SIGKILL);
+        return;
+    }
+    signal_process_group(pid, libc::SIGTERM);
+    let child_exited = wait_child_until(child, Instant::now() + CLI_APP_SERVER_TERM_GRACE);
+    signal_process_group(pid, libc::SIGKILL);
+    if !child_exited {
+        let _ = child.kill();
+        let _ = wait_child_until(child, Instant::now() + CLI_APP_SERVER_KILL_GRACE);
+    }
+}
+
+fn signal_process_group(pid: u32, signal: libc::c_int) {
+    let pgid = pid as libc::pid_t;
+    let _ = unsafe { libc::killpg(pgid, signal) };
+}
+
+fn wait_child_until(child: &mut Child, deadline: Instant) -> bool {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => return true,
+            Ok(None) => {}
+            Err(_) => return true,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(READ_POLL_INTERVAL);
+    }
+}
+
+fn join_worker_until(worker: thread::JoinHandle<()>, deadline: Instant) {
+    while !worker.is_finished() {
+        if Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(READ_POLL_INTERVAL);
+    }
+    let _ = worker.join();
+}
+
+fn validate_daemon_nonempty(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("{name} must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_daemon_nonempty_bytes(name: &str, value: &[u8]) -> Result<()> {
+    if value.is_empty() {
+        bail!("{name} must not be empty");
+    }
+    Ok(())
 }
 
 fn write_ok_response(stream: &mut UnixStream, response: Value) -> Result<()> {
@@ -1222,6 +2031,8 @@ mod tests {
                 activity_generation: AtomicU64::new(0),
                 active_clients: AtomicUsize::new(0),
                 active_dispatches: AtomicUsize::new(0),
+                cli_app_servers: Mutex::new(HashMap::new()),
+                cli_app_server_reservations: Mutex::new(HashMap::new()),
             },
         )
     }
@@ -1265,5 +2076,23 @@ mod tests {
 
         drop(dispatch_slots);
         let _slot = try_acquire_dispatch_slot(&state).expect("released dispatch slot");
+    }
+
+    #[test]
+    fn app_server_listener_url_requires_loopback_host() {
+        assert!(app_server_listener_url_is_loopback("ws://127.0.0.1:1234"));
+        assert!(app_server_listener_url_is_loopback("ws://localhost:1234"));
+        assert!(app_server_listener_url_is_loopback("ws://[::1]:1234"));
+        assert!(!app_server_listener_url_is_loopback(
+            "ws://127.0.0.1:1234@remote.example"
+        ));
+        assert!(!app_server_listener_url_is_loopback(
+            "ws://localhost:1234@remote.example"
+        ));
+        assert!(!app_server_listener_url_is_loopback(
+            "ws://localhost.example:1234"
+        ));
+        assert!(!app_server_listener_url_is_loopback("wss://127.0.0.1:1234"));
+        assert!(!app_server_listener_url_is_loopback("ws://127.0.0.1:0"));
     }
 }

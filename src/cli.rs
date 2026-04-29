@@ -1,9 +1,15 @@
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -14,7 +20,7 @@ use serde_json::{Value, json};
 use crate::artifact::{ingest_result_file, remove_ingest_marker_best_effort};
 use crate::daemon::{
     DaemonEnsureOptions, DaemonServeOptions, daemon_ensure, daemon_request, daemon_request_payload,
-    daemon_serve, validate_daemon_autostart_endpoint,
+    daemon_request_payload_timeout, daemon_serve, validate_daemon_autostart_endpoint,
 };
 use crate::fs_layout::{FsLayout, remove_dir_all_durable};
 use crate::models::{
@@ -29,6 +35,10 @@ const DIRECT_STORE_ENV: &str = "CBTH_ALLOW_DIRECT_STORE";
 const DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS: u64 = 300;
 const DEFAULT_DAEMON_STARTUP_TIMEOUT_SECONDS: u64 = 5;
 const MAX_CLI_OBSERVATION_WINDOW_SECONDS: i64 = 6 * 60 * 60;
+const CLI_APP_SERVER_LEASE_TTL_SECONDS: u64 = 60;
+const CLI_APP_SERVER_LEASE_REFRESH_SECONDS: u64 = 20;
+const CLI_APP_SERVER_ENSURE_TIMEOUT_SECONDS: u64 = 15;
+const CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS: u64 = 5;
 
 #[derive(Debug, Parser)]
 #[command(name = "cbth")]
@@ -62,7 +72,6 @@ enum Commands {
         #[command(subcommand)]
         command: AttemptCommand,
     },
-    #[command(hide = true)]
     Cli {
         #[command(subcommand)]
         command: CliCommand,
@@ -178,6 +187,8 @@ enum AttemptCommand {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    Run(CliRunArgs),
+    #[command(hide = true)]
     Session {
         #[command(subcommand)]
         command: CliSessionCommand,
@@ -190,6 +201,27 @@ enum CliSessionCommand {
     NoteActivity(CliSessionNoteActivityArgs),
     NoteCapabilities(CliSessionNoteCapabilitiesArgs),
     Inspect(CliSessionInspectArgs),
+}
+
+#[derive(Debug, Args)]
+struct CliRunArgs {
+    #[arg(long)]
+    bind_thread_id: String,
+
+    #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    session_allows_approval: bool,
+
+    #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    session_allows_network: bool,
+
+    #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    session_allows_write_access: bool,
+
+    #[arg(long, default_value = "codex")]
+    codex_bin: OsString,
+
+    #[arg(last = true)]
+    codex_args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
@@ -507,14 +539,26 @@ pub fn run() -> Result<()> {
         cli.auto_daemon_startup_timeout_seconds,
     )?;
     let layout = FsLayout::resolve(cli.home)?;
-    let output = dispatch(
-        cli.command,
-        &layout,
-        DispatchMode::Client {
-            direct_store: cli.direct_store,
-            startup_timeout_seconds: cli.auto_daemon_startup_timeout_seconds,
-        },
-    )?;
+    let output = match cli.command {
+        Commands::Cli {
+            command: CliCommand::Run(args),
+        } => {
+            if cli.direct_store {
+                bail!("cli run does not support --direct-store");
+            }
+            let exit_code =
+                run_cli_session(args, &layout, cli.auto_daemon_startup_timeout_seconds)?;
+            std::process::exit(exit_code);
+        }
+        command => dispatch(
+            command,
+            &layout,
+            DispatchMode::Client {
+                direct_store: cli.direct_store,
+                startup_timeout_seconds: cli.auto_daemon_startup_timeout_seconds,
+            },
+        )?,
+    };
     write_json(&output)
 }
 
@@ -573,6 +617,165 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
         Commands::Maintenance { command } => dispatch_maintenance(command, layout),
         Commands::Daemon { command } => dispatch_daemon(command, layout),
     }
+}
+
+fn run_cli_session(
+    args: CliRunArgs,
+    layout: &FsLayout,
+    startup_timeout_seconds: u64,
+) -> Result<i32> {
+    validate_nonempty("bind_thread_id", &args.bind_thread_id)?;
+    let codex_binary = resolve_executable(&args.codex_bin)?;
+    let lease_id = new_id();
+
+    validate_daemon_autostart_endpoint(layout)?;
+    daemon_ensure(
+        layout,
+        DaemonEnsureOptions {
+            idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
+            startup_timeout_seconds,
+            startup_sweep_now: Some(now_epoch_seconds()?),
+        },
+    )?;
+    reserve_cli_app_server_for_thread(layout, &args.bind_thread_id, &lease_id)?;
+
+    let bind = match dispatch(
+        Commands::Cli {
+            command: CliCommand::Session {
+                command: CliSessionCommand::Bind(CliSessionBindArgs {
+                    bound_thread_id: args.bind_thread_id.clone(),
+                    session_allows_approval: args.session_allows_approval,
+                    session_allows_network: args.session_allows_network,
+                    session_allows_write_access: args.session_allows_write_access,
+                    now: None,
+                }),
+            },
+        },
+        layout,
+        DispatchMode::Client {
+            direct_store: false,
+            startup_timeout_seconds,
+        },
+    ) {
+        Ok(bind) => bind,
+        Err(error) => {
+            release_cli_app_server_reservation_best_effort(layout, &args.bind_thread_id, &lease_id);
+            return Err(error);
+        }
+    };
+    let session = &bind["cli_session"]["session"];
+    let managed_session_id = json_string(session, "managed_session_id")?;
+    let bound_thread_id = json_string(session, "bound_thread_id")?;
+    let app_server = match daemon_request_payload_timeout(
+        layout,
+        "cli_app_server_ensure",
+        json!({
+            "managed_session_id": managed_session_id,
+            "bound_thread_id": bound_thread_id,
+            "codex_binary": codex_binary.as_bytes(),
+            "lease_id": lease_id,
+            "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
+        }),
+        Duration::from_secs(CLI_APP_SERVER_ENSURE_TIMEOUT_SECONDS),
+    ) {
+        Ok(app_server) => app_server,
+        Err(error) => {
+            release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
+            return Err(error);
+        }
+    };
+    let url = json_string(&app_server["cli_app_server"], "url")?;
+    let refresh_running = Arc::new(AtomicBool::new(true));
+    spawn_cli_app_server_lease_refresher(
+        layout.clone(),
+        managed_session_id.clone(),
+        lease_id.clone(),
+        Arc::clone(&refresh_running),
+    );
+
+    let foreground_status = Command::new(&codex_binary)
+        .arg("--remote")
+        .arg(&url)
+        .arg("--cd")
+        .arg(env::current_dir().context("read current directory")?)
+        .args(args.codex_args)
+        .status()
+        .with_context(|| format!("spawn foreground codex via {:?}", codex_binary));
+    refresh_running.store(false, Ordering::Release);
+    let stop_result = daemon_request_payload_timeout(
+        layout,
+        "cli_app_server_stop",
+        json!({
+            "managed_session_id": managed_session_id,
+            "lease_id": lease_id,
+        }),
+        Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+    );
+    if let Err(error) = stop_result {
+        eprintln!("warning: failed to stop CLI app-server: {error:#}");
+    }
+    let status = foreground_status?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn reserve_cli_app_server_for_thread(
+    layout: &FsLayout,
+    bound_thread_id: &str,
+    lease_id: &str,
+) -> Result<()> {
+    daemon_request_payload_timeout(
+        layout,
+        "cli_app_server_reserve",
+        json!({
+            "bound_thread_id": bound_thread_id,
+            "lease_id": lease_id,
+            "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
+        }),
+        Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+    )?;
+    Ok(())
+}
+
+fn release_cli_app_server_reservation_best_effort(
+    layout: &FsLayout,
+    bound_thread_id: &str,
+    lease_id: &str,
+) {
+    let _ = daemon_request_payload_timeout(
+        layout,
+        "cli_app_server_release",
+        json!({
+            "bound_thread_id": bound_thread_id,
+            "lease_id": lease_id,
+        }),
+        Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+    );
+}
+
+fn spawn_cli_app_server_lease_refresher(
+    layout: FsLayout,
+    managed_session_id: String,
+    lease_id: String,
+    running: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        while running.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_secs(CLI_APP_SERVER_LEASE_REFRESH_SECONDS));
+            if !running.load(Ordering::Acquire) {
+                break;
+            }
+            let _ = daemon_request_payload_timeout(
+                &layout,
+                "cli_app_server_refresh",
+                json!({
+                    "managed_session_id": managed_session_id,
+                    "lease_id": lease_id,
+                    "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
+                }),
+                Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+            );
+        }
+    });
 }
 
 fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsString>>> {
@@ -816,6 +1019,9 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             command: AttemptCommand::Inspect(_),
         }
         | Commands::Cli {
+            command: CliCommand::Run(_),
+        }
+        | Commands::Cli {
             command:
                 CliCommand::Session {
                     command: CliSessionCommand::Inspect(_),
@@ -884,6 +1090,28 @@ fn absolute_cli_path(path: &Path) -> Result<PathBuf> {
     } else {
         Ok(env::current_dir()?.join(path))
     }
+}
+
+fn resolve_executable(binary: &OsStr) -> Result<OsString> {
+    if binary.as_bytes().contains(&b'/') {
+        return Ok(absolute_cli_path(Path::new(binary))?.into_os_string());
+    }
+    let path = env::var_os("PATH").context("PATH is unset; pass --codex-bin <path>")?;
+    for directory in env::split_paths(&path) {
+        let candidate = directory.join(binary);
+        if executable_file_exists(&candidate) {
+            return Ok(candidate.into_os_string());
+        }
+    }
+    bail!(
+        "could not find executable {:?} on PATH; pass --codex-bin <path>",
+        binary
+    )
+}
+
+fn executable_file_exists(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 fn dispatch_job(command: JobCommand, layout: &FsLayout) -> Result<Value> {
@@ -1091,6 +1319,7 @@ fn dispatch_attempt(command: AttemptCommand, layout: &FsLayout) -> Result<Value>
 fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
     let mut store = Store::open(layout)?;
     match command {
+        CliCommand::Run(_) => bail!("cli run must execute from the foreground client"),
         CliCommand::Session { command } => match command {
             CliSessionCommand::Bind(args) => {
                 validate_nonempty("bound_thread_id", &args.bound_thread_id)?;
@@ -1285,6 +1514,13 @@ fn validate_nonempty(name: &str, value: &str) -> Result<()> {
         bail!("{name} must not be empty")
     }
     Ok(())
+}
+
+fn json_string(value: &Value, field: &str) -> Result<String> {
+    value[field]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("missing string field {field}"))
 }
 
 fn validate_timestamp_add(now: i64, delta: i64, name: &str) -> Result<i64> {

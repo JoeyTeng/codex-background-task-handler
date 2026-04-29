@@ -339,19 +339,21 @@
 - [x] 验证 CLI 在 shared `app-server` 模式下，第二个 sidecar client 能否对同一个 thread 执行 `thread/resume + turn/start`，并让前台 client 收到 live 通知。
 - [x] 验证真实前台 `codex --remote` TUI 在 PTY 中是否会把 sidecar 触发的新 turn 展示给用户。
 - [x] 单独沉淀 CLI shared `app-server` + sidecar 技术方案文档。
-- [ ] 为 CLI 设计最小 `cbth cli run` 进程模型：shared `app-server`、前台 `codex --remote`、sidecar、以及清理策略。
-- [ ] 把 CLI 第一版的 shared `app-server` 安全边界定死为：
-  - loopback-only listener
-  - daemon-owned random local port
-  - 单机 / 单用户 trust-domain 假设
-  - 如上游未来支持 loopback auth，再单独补更强本地 auth 设计
+- [x] 为 CLI 设计并实现最小 `cbth cli run` 进程模型：shared `app-server`、前台 `codex --remote`、lease 清理策略；真实 sidecar delivery loop 后续单独实现。
+- [x] 把 CLI 第一版的 shared `app-server` 安全边界定死为：
+  - [x] loopback-only listener
+  - [x] daemon-owned random local port
+  - [x] 单机 / 单用户 trust-domain 假设
+  - [x] 如上游未来支持 loopback auth，再单独补更强本地 auth 设计
 - [ ] 为 CLI 的 daemon-owned managed session 设计并实现：
   - [x] 落地 durable `cli_managed_sessions` 记录，用于固定 `managed_session_id` / `bound_thread_id` / `session_epoch` / `session_state` / `activity_state` / `activity_revision` / risk profile
   - [x] 增加 hidden adapter-internal `cbth cli session bind` / `note-activity` / `inspect`，作为未来 `cbth cli run` 的 attach-or-create / monotonic current-state-sync building block
   - [x] daemon capability 增加 `cli-session-dispatch`，避免新 CLI 把 session mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-session-capability-dispatch`，避免新 CLI 把 session capability mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给旧 daemon
-  - shared `app-server` 归 daemon 持有
+  - [x] daemon capability 增加 `cli-app-server-lifecycle`，避免新 CLI 把 app-server lifecycle request 路由给旧 daemon
+  - [x] shared `app-server` 归 daemon 持有
+  - [x] 前台 wrapper 持有短 lease；foreground 退出显式 stop，wrapper crash 时 daemon lease expiry 会清理 app-server
   - 前台退出但 active jobs 未结束时继续保活
   - 后续重连 / resume contract
   - 如果上游未来支持 loopback auth，再补对应 auth contract validation
@@ -362,7 +364,7 @@
     - [x] include `parked` for live-part torn down while manual batch still waits operator resolution
   - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
   - 通过显式 bootstrap 建立 `bound_thread_id`，而不是靠前台事件流自动归因：
-    - `cbth cli run --bind-thread-id <thread_id>`
+    - [x] `cbth cli run --bind-thread-id <thread_id>`
     - 或 `thread/start` 可用时的 `cbth cli run --new-thread`
   - v1 不提供 late-bind 或 `managed_session_id` 外部发现/回填的 stable surface
   - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点

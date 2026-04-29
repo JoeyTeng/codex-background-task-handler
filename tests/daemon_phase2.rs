@@ -255,6 +255,7 @@ fn daemon_ensure_starts_ping_status_and_stop() {
         json!([
             "dispatch",
             "attempt-dispatch",
+            "cli-app-server-lifecycle",
             "cli-session-dispatch",
             "cli-session-capability-dispatch",
             "cli-turn-observation-dispatch"
@@ -270,12 +271,14 @@ fn daemon_ensure_starts_ping_status_and_stop() {
         json!([
             "dispatch",
             "attempt-dispatch",
+            "cli-app-server-lifecycle",
             "cli-session-dispatch",
             "cli-session-capability-dispatch",
             "cli-turn-observation-dispatch"
         ])
     );
     assert!(status["startup_sweep"].is_object());
+    assert_eq!(status["cli_app_servers"], json!([]));
 
     #[cfg(unix)]
     {
@@ -350,6 +353,7 @@ fn daemon_ensure_restarts_incompatible_daemon() {
         json!([
             "dispatch",
             "attempt-dispatch",
+            "cli-app-server-lifecycle",
             "cli-session-dispatch",
             "cli-session-capability-dispatch",
             "cli-turn-observation-dispatch"
@@ -381,7 +385,7 @@ fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
             let response = if request.contains("\"stop\"") {
                 r#"{"ok":true,"response":{"stopping":true}}"#
             } else {
-                r#"{"ok":true,"response":{"daemon":{"pid":1313},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch","cli-session-capability-dispatch"],"message":"pong"}}"#
+                r#"{"ok":true,"response":{"daemon":{"pid":1313},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-session-dispatch","cli-session-capability-dispatch"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())
@@ -416,6 +420,7 @@ fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
         json!([
             "dispatch",
             "attempt-dispatch",
+            "cli-app-server-lifecycle",
             "cli-session-dispatch",
             "cli-session-capability-dispatch",
             "cli-turn-observation-dispatch"
@@ -447,7 +452,7 @@ fn daemon_ensure_restarts_daemon_missing_session_capability_dispatch() {
             let response = if request.contains("\"stop\"") {
                 r#"{"ok":true,"response":{"stopping":true}}"#
             } else {
-                r#"{"ok":true,"response":{"daemon":{"pid":1414},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch","cli-turn-observation-dispatch"],"message":"pong"}}"#
+                r#"{"ok":true,"response":{"daemon":{"pid":1414},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-session-dispatch","cli-turn-observation-dispatch"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())
@@ -482,6 +487,7 @@ fn daemon_ensure_restarts_daemon_missing_session_capability_dispatch() {
         json!([
             "dispatch",
             "attempt-dispatch",
+            "cli-app-server-lifecycle",
             "cli-session-dispatch",
             "cli-session-capability-dispatch",
             "cli-turn-observation-dispatch"
@@ -551,7 +557,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
                     let request = String::from_utf8_lossy(&request[..request_len]);
                     assert!(request.contains("\"ping\""));
                     if let Err(error) = stream.write_all(
-                        br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch","cli-session-capability-dispatch","cli-turn-observation-dispatch"],"message":"pong"}}"#,
+                        br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-session-dispatch","cli-session-capability-dispatch","cli-turn-observation-dispatch"],"message":"pong"}}"#,
                     ) {
                         if error.kind() == std::io::ErrorKind::BrokenPipe {
                             continue;
@@ -617,7 +623,7 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
             } else if index == 1 {
                 r#"{"ok":false,"error":"daemon connection limit reached"}"#
             } else {
-                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch","cli-session-capability-dispatch","cli-turn-observation-dispatch"],"message":"pong"}}"#
+                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-session-dispatch","cli-session-capability-dispatch","cli-turn-observation-dispatch"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())

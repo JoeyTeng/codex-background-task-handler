@@ -547,11 +547,22 @@ scripts/desktop_thread_inject_poc.py
   - daemon capability 列表新增 `cli-session-capability-dispatch`，避免新 CLI 把 `note-capabilities` mutation 路由给 Phase 7 旧 daemon
   - `turn_steer` 仍保持 fail-closed，直到后续 phase 落地 active-turn risk proof
   - 本地验证已覆盖 full Rust/JS gate 与 shared `app-server` e2e；e2e 使用本机 `codex-cli 0.125.0`，确认 frontend client 仍能看到 sidecar turn started/completed，且 `thread/read` 能看到 marker
+- Phase 9 当前分支为 `codex/phase-9-cli-run-process-model`，范围限定在 CLI existing-thread 最小进程模型与 daemon-owned app-server lifecycle：
+  - 新增 public `cbth cli run --bind-thread-id <thread_id>`，先通过 hidden `cli session bind` 建立 / attach durable managed session，再启动 foreground Codex
+  - `cli run` 要求调用方显式传入 session risk profile，不把缺失 profile 默认成低风险
+  - daemon capability 列表新增 `cli-app-server-lifecycle`，避免新 CLI 把 app-server lifecycle request 路由给 Phase 8 旧 daemon
+  - daemon-side `bound_thread_id` reservation 会在 session bind 前建立，避免重复 foreground start 在失败前推进现有 `session_epoch`
+  - daemon 现在按 `managed_session_id` 管理 shared `codex app-server --listen ws://127.0.0.1:0`
+  - daemon 只接受 app-server 上报的 `127.0.0.1` / `localhost` websocket listener，并在 `daemon status` 中暴露 active CLI app-server 列表
+  - foreground wrapper 使用 `codex --remote <url> --cd <current_dir> ...` 暴露原生 Codex CLI/TUI 体验，并支持 passthrough Codex 参数
+  - foreground wrapper 持有短 lease 并周期性 refresh；foreground 退出时显式 stop 当前 lease
+  - daemon 会在 lease 过期、daemon shutdown、或 app-server 启动失败时 kill/wait app-server，并 join stdout/stderr drain worker，避免孤儿子进程与 pipe worker 泄漏
+  - 该 phase 不包含真实 capability collection、current-state sync、websocket event loop、sidecar delivery loop 或 accepted-turn observation loop
 - 当前 daemon 仍未接入完整 delivery lifecycle：
-  - CLI attempt / session mutation / session capability / turn observation 通过 daemon dispatch 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-turn-observation-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
-  - CLI accepted attempt durable schema、daemon 保活、managed-session durable record / fixed-thread gate、以及 accepted turn observation store surface 已经落地，但真实 shared `app-server` runtime、event/current-state observation loop 尚未实现
+  - CLI attempt / session mutation / session capability / app-server lifecycle / turn observation 通过 daemon dispatch 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-app-server-lifecycle` / `cli-turn-observation-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
+  - CLI accepted attempt durable schema、daemon 保活、managed-session durable record / fixed-thread gate、daemon-owned shared app-server process model、以及 accepted turn observation store surface 已经落地，但真实 event/current-state observation loop 与 automatic delivery loop 尚未实现
   - Desktop arm / pause / boundary deadlines 尚未有 schema / adapter，因此尚未接入 daemon 保活
-  - CLI `cbth cli run` 进程模型、shared app-server lifecycle 与 Desktop bridge adapters 尚未实现
+  - CLI fresh-thread bootstrap、sidecar delivery loop 与 Desktop bridge adapters 尚未实现
 
 ## Phase 1 Implementation Priority
 
