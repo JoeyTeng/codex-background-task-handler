@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,9 +19,13 @@ fn temp_home() -> TempDir {
 
 #[cfg(unix)]
 fn fake_codex_script(dir: &TempDir) -> std::path::PathBuf {
-    let path = dir.path().join("fake-codex");
+    write_fake_codex_script(&dir.path().join("fake-codex"))
+}
+
+#[cfg(unix)]
+fn write_fake_codex_script(path: &Path) -> PathBuf {
     fs::write(
-        &path,
+        path,
         r#"#!/bin/sh
 log="${FAKE_CODEX_LOG:?}"
 if [ "${1:-}" = "app-server" ]; then
@@ -63,8 +68,8 @@ exit 0
 "#,
     )
     .expect("write fake codex");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod fake codex");
-    path
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("chmod fake codex");
+    path.to_path_buf()
 }
 
 #[cfg(unix)]
@@ -182,6 +187,74 @@ fn cli_run_binds_session_starts_foreground_codex_and_stops_app_server() {
     let status: serde_json::Value =
         serde_json::from_slice(&status_output.stdout).expect("status json");
     assert_eq!(status["cli_app_servers"], serde_json::json!([]));
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_resolves_relative_path_binary_for_existing_daemon_cwd() {
+    let home = temp_home();
+    let daemon_cwd = tempfile::tempdir().expect("daemon cwd");
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let bin_dir = client_cwd.path().join("bin");
+    fs::create_dir(&bin_dir).expect("create bin dir");
+    let fake_codex = write_fake_codex_script(&bin_dir.join("codex"));
+    let log_path = client_cwd.path().join("fake-codex.log");
+
+    let ensure_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("ensure")
+        .current_dir(daemon_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .output()
+        .expect("ensure daemon");
+    assert!(
+        ensure_output.status.success(),
+        "daemon ensure failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        ensure_output.status,
+        String::from_utf8_lossy(&ensure_output.stdout),
+        String::from_utf8_lossy(&ensure_output.stderr)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg("thread-cli-run-relative-path")
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .current_dir(client_cwd.path())
+        .env("PATH", "bin")
+        .env("FAKE_CODEX_LOG", &log_path)
+        .output()
+        .expect("run cbth cli run");
+
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("app-server\tapp-server\t--listen\tws://127.0.0.1:0"));
+    assert!(log.contains("foreground\t--remote\tws://127.0.0.1:45678"));
+    assert_eq!(fake_codex, client_cwd.path().join("bin/codex"));
 
     let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("--home")

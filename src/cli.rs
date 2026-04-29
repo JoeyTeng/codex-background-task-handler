@@ -1100,7 +1100,7 @@ fn resolve_executable(binary: &OsStr) -> Result<OsString> {
     for directory in env::split_paths(&path) {
         let candidate = directory.join(binary);
         if executable_file_exists(&candidate) {
-            return Ok(candidate.into_os_string());
+            return Ok(absolute_cli_path(&candidate)?.into_os_string());
         }
     }
     bail!(
