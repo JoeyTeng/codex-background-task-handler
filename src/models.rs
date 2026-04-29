@@ -249,6 +249,11 @@ pub struct CliManagedSessionCapabilityUpdate {
     pub session: CliManagedSessionRecord,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct CliManagedSessionProofInvalidation {
+    pub session: CliManagedSessionRecord,
+}
+
 #[derive(Clone, Debug)]
 pub struct NewCliAcceptPendingAttempt {
     pub attempt_id: String,

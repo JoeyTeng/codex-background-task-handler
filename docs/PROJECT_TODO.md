@@ -350,10 +350,13 @@
   - [x] 增加 hidden adapter-internal `cbth cli session bind` / `note-activity` / `inspect`，作为未来 `cbth cli run` 的 attach-or-create / monotonic current-state-sync building block
   - [x] daemon capability 增加 `cli-session-dispatch`，避免新 CLI 把 session mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-session-capability-dispatch`，避免新 CLI 把 session capability mutation 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-session-proof-invalidation-dispatch`，避免新 CLI 把 continuity-loss proof invalidation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-app-server-lifecycle`，避免新 CLI 把 app-server lifecycle request 路由给旧 daemon
   - [x] shared `app-server` 归 daemon 持有
   - [x] 前台 wrapper 持有短 lease；foreground 退出显式 stop，wrapper crash 时 daemon lease expiry 会清理 app-server
+  - [x] daemon-owned app-server 在 explicit stop、dead-child refresh、lease expiry 与 daemon shutdown 时会清理 registered session proof，且 cleanup 即使 proof 已 clear 也会推进 epoch fence，避免 wrapper crash 或 daemon cleanup 后旧 `idle` / capability proof 继续打开自动投递
+  - [x] `cbth cli run` 启动 passive sidecar client，完成 app-server initialize / `thread/resume` / `thread/read`，并把 lifecycle notifications 同步为 durable activity state
   - 前台退出但 active jobs 未结束时继续保活
   - 后续重连 / resume contract
   - 如果上游未来支持 loopback auth，再补对应 auth contract validation
@@ -390,6 +393,12 @@
   - [x] `delivery_observation_deadline` 的计算基准必须统一为 `delivery_accepted_at`
   - [x] detached auto-delivery 只允许在 session-scoped risk profile 三项都为 `false` 时开启
   - [x] session attach / stale accept / expired observation / operator-close active attempt 会推进 `session_epoch` 并清空 activity proof，避免旧 idle 证明继续打开自动投递
+  - [x] passive adapter continuity loss / missing authoritative current-state snapshot 会推进 `session_epoch` 并清空旧 activity / capability proof，避免断连前 idle 证明继续打开自动投递
+  - [x] passive adapter 的 matched-thread `thread.status.type` authoritative snapshot 会支配同一 request response 前消费到的 stale notification，明确不可信 snapshot 会 fail-closed，且 capability / activity 写入失败会先清空 proof 再 retry
+  - [x] passive adapter 不再在 `thread/read` timeout 后复用同一 websocket；timeout / 协议 / decode / closed / remote-error 都会关闭本轮连接并 fail-closed retry
+  - [x] `cli run` foreground 退出时会清空 passive sidecar 最后写入的 activity / capability proof，避免 event stream 已关闭后旧 `idle` proof 继续打开自动投递
+  - [x] passive adapter 的 proof 写入使用短 SQLite busy timeout，避免 DB lock 下耗尽 daemon dispatch worker
+  - [x] passive adapter websocket receive 使用 absolute deadline，且 control-frame pong 写回同样受该 deadline 约束
   - [x] `note-activity` 只能在当前 epoch 内按 `activity_revision + 1` 顺序推进，或做完全相同状态的幂等重放
   - [x] 同一 `delivery_rpc_request_id` 的 begin/accept 幂等路径仍必须引用当前有效 managed session，legacy / missing / stale session 不能绕过 Phase 6 gate
   - [x] `delivery_observation_deadline` 到期仍未看到可信 `turn/completed` 时：
@@ -398,11 +407,12 @@
     - [x] 当前 head batch -> `replay_policy=manual_resolution_only`
   - 如果 `delivery_turn_id` 的观察连续性丢失，则当前 head batch 进入 `manual_resolution_only`
   - [x] 落地 store-level `session_epoch` 的生成、递增与 fail-closed 判定规则
-  - 真实 app-server event stream 的 continuity 判定与 terminal-event reconciliation 仍待 CLI adapter phase 落地
+  - [x] `cli run` passive adapter 已能读取真实 app-server lifecycle event stream 并同步 `active` / `idle` current-state；accepted-turn continuity 判定与 terminal-event reconciliation 仍待 delivery adapter phase 落地
   - 落地 `turn_steer` 所需的 active-turn risk proof 后，再允许 `begin-cli-accept --rpc-kind turn-steer` 从 fail-closed 变成受控可用
   - 按当前合同实现 continuity-loss 场景的 `inspect-head -> close-head(reason=...)` operator-resolution flow
 - [ ] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
-  - 基于 `turn/started` / `turn/completed` / `thread/status/changed`
+  - [x] `cli run` passive adapter 已基于 `turn/started` / `turn/completed` / `thread/status/changed` 推进 durable `active` / `idle`
+  - `begin-cli-accept` / delivery loop 仍需消费该 idle proof 并处理 race
   - `turn/start` race 失败后回到等待下一个 idle
 - [x] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为，且不会导致当前 turn 提前结束。
 - [x] 为 CLI adapter 明确定义实验 RPC 的最小能力集、capability probe 和 fail-closed 策略。
@@ -414,4 +424,4 @@
   - pre-accept 的 benign race / non-steerable reject 可以回退到 retry-on-idle
   - [x] 但 accepted 之后的 interrupted / replaced / failed turn 必须 fail-closed 到 `manual_resolution_only`
   - [x] `observed_at >= delivery_observation_deadline` 的 `turn/completed` 不得关闭 batch，只能作为 late evidence 记录并 fail-closed 到 manual resolution；startup sweep 先过期但事件实际 `observed_at` 仍早于 deadline 的 completion 可以修正为 delivered
-  - 真实 shared `app-server` websocket event loop 仍待实现；当前完成的是 hidden adapter-internal store/CLI 写入面
+  - `cli run` passive websocket event loop 已实现 current-state / lifecycle sync；accepted `delivery_turn_id` 到 `attempt observe-cli-turn` 的 delivery observation loop 仍待实现

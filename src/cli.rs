@@ -6,10 +6,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -18,6 +18,10 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::artifact::{ingest_result_file, remove_ingest_marker_best_effort};
+use crate::cli_app_server_client::{
+    AppServerJsonRpcClient, AppServerNotification, AppServerReceive, AppServerRequestError,
+    ThreadActivitySnapshot, decode_notification, thread_result_activity_snapshot,
+};
 use crate::daemon::{
     DaemonEnsureOptions, DaemonServeOptions, daemon_ensure, daemon_request, daemon_request_payload,
     daemon_request_payload_timeout, daemon_serve, validate_daemon_autostart_endpoint,
@@ -39,6 +43,11 @@ const CLI_APP_SERVER_LEASE_TTL_SECONDS: u64 = 60;
 const CLI_APP_SERVER_LEASE_REFRESH_SECONDS: u64 = 20;
 const CLI_APP_SERVER_ENSURE_TIMEOUT_SECONDS: u64 = 15;
 const CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS: u64 = 5;
+const CLI_APP_SERVER_PASSIVE_CONNECT_TIMEOUT_MS: u64 = 250;
+const CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS: u64 = 3;
+const CLI_APP_SERVER_PASSIVE_RECV_TIMEOUT_MS: u64 = 500;
+const CLI_APP_SERVER_PASSIVE_RETRY_MAX_MS: u64 = 500;
+const CLI_APP_SERVER_PASSIVE_STORE_TIMEOUT_SECONDS: u64 = 1;
 
 #[derive(Debug, Parser)]
 #[command(name = "cbth")]
@@ -200,6 +209,7 @@ enum CliSessionCommand {
     Bind(CliSessionBindArgs),
     NoteActivity(CliSessionNoteActivityArgs),
     NoteCapabilities(CliSessionNoteCapabilitiesArgs),
+    InvalidateProof(CliSessionInvalidateProofArgs),
     Inspect(CliSessionInspectArgs),
 }
 
@@ -406,7 +416,7 @@ struct CliSessionBindArgs {
     now: Option<i64>,
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum CliSessionActivityState {
     Active,
     Idle,
@@ -477,6 +487,18 @@ struct CliSessionNoteCapabilitiesArgs {
 
     #[arg(long, value_parser = clap::value_parser!(bool), default_value_t = false, action = clap::ArgAction::Set)]
     turn_steer: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct CliSessionInvalidateProofArgs {
+    #[arg(long)]
+    managed_session_id: String,
+
+    #[arg(long)]
+    session_epoch: i64,
 
     #[arg(long, hide = true)]
     now: Option<i64>,
@@ -666,12 +688,16 @@ fn run_cli_session(
     let session = &bind["cli_session"]["session"];
     let managed_session_id = json_string(session, "managed_session_id")?;
     let bound_thread_id = json_string(session, "bound_thread_id")?;
+    let session_epoch = json_i64(session, "session_epoch")?;
+    let activity_revision = json_i64(session, "activity_revision")?;
+    let capability_revision = json_i64(session, "capability_revision")?;
     let app_server = match daemon_request_payload_timeout(
         layout,
         "cli_app_server_ensure",
         json!({
             "managed_session_id": managed_session_id,
             "bound_thread_id": bound_thread_id,
+            "session_epoch": session_epoch,
             "codex_binary": codex_binary.as_bytes(),
             "lease_id": lease_id,
             "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
@@ -692,6 +718,16 @@ fn run_cli_session(
         lease_id.clone(),
         Arc::clone(&refresh_running),
     );
+    let mut passive_adapter =
+        spawn_cli_app_server_passive_adapter(CliAppServerPassiveAdapterConfig {
+            layout: layout.clone(),
+            url: url.clone(),
+            managed_session_id: managed_session_id.clone(),
+            bound_thread_id: bound_thread_id.clone(),
+            session_epoch,
+            activity_revision,
+            capability_revision,
+        });
 
     let foreground_status = Command::new(&codex_binary)
         .arg("--remote")
@@ -701,6 +737,7 @@ fn run_cli_session(
         .args(args.codex_args)
         .status()
         .with_context(|| format!("spawn foreground codex via {:?}", codex_binary));
+    let passive_stop_result = passive_adapter.stop();
     refresh_running.store(false, Ordering::Release);
     let stop_result = daemon_request_payload_timeout(
         layout,
@@ -714,6 +751,7 @@ fn run_cli_session(
     if let Err(error) = stop_result {
         eprintln!("warning: failed to stop CLI app-server: {error:#}");
     }
+    passive_stop_result?;
     let status = foreground_status?;
     Ok(status.code().unwrap_or(1))
 }
@@ -776,6 +814,492 @@ fn spawn_cli_app_server_lease_refresher(
             );
         }
     });
+}
+
+#[derive(Clone)]
+struct CliAppServerPassiveAdapterConfig {
+    layout: FsLayout,
+    url: String,
+    managed_session_id: String,
+    bound_thread_id: String,
+    session_epoch: i64,
+    activity_revision: i64,
+    capability_revision: i64,
+}
+
+struct CliAppServerPassiveAdapterHandle {
+    running: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+    config: CliAppServerPassiveAdapterConfig,
+    state: Arc<Mutex<CliAppServerPassiveAdapterState>>,
+}
+
+impl CliAppServerPassiveAdapterHandle {
+    fn stop(&mut self) -> Result<()> {
+        self.running.store(false, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CLI passive adapter state lock poisoned"))?;
+        invalidate_passive_adapter_proof(&self.config, &mut state)?;
+        Ok(())
+    }
+}
+
+impl Drop for CliAppServerPassiveAdapterHandle {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop()
+            && env::var_os("CBTH_DEBUG_PASSIVE_ADAPTER").is_some()
+        {
+            eprintln!("debug: CLI passive adapter final invalidation failed: {error:#}");
+        }
+    }
+}
+
+struct CliAppServerPassiveAdapterState {
+    session_epoch: i64,
+    activity_revision: i64,
+    capability_revision: i64,
+    last_activity_state: Option<CliSessionActivityState>,
+    passive_capabilities_recorded: bool,
+    durable_proof_may_exist: bool,
+}
+
+fn spawn_cli_app_server_passive_adapter(
+    config: CliAppServerPassiveAdapterConfig,
+) -> CliAppServerPassiveAdapterHandle {
+    let running = Arc::new(AtomicBool::new(true));
+    let thread_running = Arc::clone(&running);
+    let state = Arc::new(Mutex::new(CliAppServerPassiveAdapterState {
+        session_epoch: config.session_epoch,
+        activity_revision: config.activity_revision,
+        capability_revision: config.capability_revision,
+        last_activity_state: None,
+        passive_capabilities_recorded: false,
+        durable_proof_may_exist: config.activity_revision != 0 || config.capability_revision != 0,
+    }));
+    let thread_state = Arc::clone(&state);
+    let thread_config = config.clone();
+    let join = thread::spawn(move || {
+        let mut retry_delay = Duration::from_millis(CLI_APP_SERVER_PASSIVE_CONNECT_TIMEOUT_MS);
+        while thread_running.load(Ordering::Acquire) {
+            let Ok(mut state) = thread_state.lock() else {
+                break;
+            };
+            match run_cli_app_server_passive_adapter_once(
+                &thread_config,
+                &mut state,
+                &thread_running,
+            ) {
+                Ok(()) => {
+                    retry_delay = Duration::from_millis(CLI_APP_SERVER_PASSIVE_CONNECT_TIMEOUT_MS)
+                }
+                Err(error) => {
+                    if let Err(invalidation_error) =
+                        invalidate_passive_adapter_proof(&thread_config, &mut state)
+                        && env::var_os("CBTH_DEBUG_PASSIVE_ADAPTER").is_some()
+                    {
+                        eprintln!(
+                            "debug: CLI passive adapter failed to invalidate proof after iteration error: {invalidation_error:#}"
+                        );
+                    }
+                    if env::var_os("CBTH_DEBUG_PASSIVE_ADAPTER").is_some() {
+                        eprintln!("debug: CLI passive adapter iteration failed: {error:#}");
+                    }
+                }
+            }
+            wait_for_passive_adapter_retry(&thread_running, retry_delay);
+            retry_delay =
+                (retry_delay * 2).min(Duration::from_millis(CLI_APP_SERVER_PASSIVE_RETRY_MAX_MS));
+        }
+    });
+
+    CliAppServerPassiveAdapterHandle {
+        running,
+        join: Some(join),
+        config,
+        state,
+    }
+}
+
+fn run_cli_app_server_passive_adapter_once(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    running: &AtomicBool,
+) -> Result<()> {
+    state.last_activity_state = None;
+    let mut client = AppServerJsonRpcClient::connect(
+        &config.url,
+        Duration::from_millis(CLI_APP_SERVER_PASSIVE_CONNECT_TIMEOUT_MS),
+    )?;
+    client.initialize(
+        env!("CARGO_PKG_VERSION"),
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+    )?;
+    client.notify_initialized()?;
+
+    let (resume_result, resume_messages) = passive_adapter_request(
+        &mut client,
+        "thread/resume",
+        json!({ "threadId": config.bound_thread_id }),
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+    );
+    let resume = resume_result?;
+    let mut current_state_sync = false;
+    let mut active = false;
+    match thread_result_activity_snapshot(&resume, &config.bound_thread_id) {
+        ThreadActivitySnapshot::Active => {
+            current_state_sync = true;
+            active = true;
+        }
+        ThreadActivitySnapshot::Idle => {
+            current_state_sync = true;
+        }
+        ThreadActivitySnapshot::Missing => {}
+        ThreadActivitySnapshot::Untrusted => {
+            invalidate_passive_adapter_proof(config, state)?;
+            bail!("app-server thread/resume returned untrusted current-state snapshot");
+        }
+    }
+    let mut messages_to_replay = Vec::new();
+
+    let (read_result, read_messages) = passive_adapter_request(
+        &mut client,
+        "thread/read",
+        json!({
+            "threadId": config.bound_thread_id,
+            "includeTurns": true,
+        }),
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+    );
+    match read_result {
+        Ok(read) => match thread_result_activity_snapshot(&read, &config.bound_thread_id) {
+            ThreadActivitySnapshot::Active => {
+                active = true;
+                current_state_sync = true;
+            }
+            ThreadActivitySnapshot::Idle => {
+                active = false;
+                current_state_sync = true;
+            }
+            ThreadActivitySnapshot::Missing if current_state_sync => {
+                messages_to_replay = resume_messages;
+                messages_to_replay.extend(read_messages);
+            }
+            ThreadActivitySnapshot::Missing => {}
+            ThreadActivitySnapshot::Untrusted => {
+                invalidate_passive_adapter_proof(config, state)?;
+                bail!("app-server thread/read returned untrusted current-state snapshot");
+            }
+        },
+        Err(error) => {
+            invalidate_passive_adapter_proof(config, state)?;
+            return Err(error.into());
+        }
+    }
+
+    if current_state_sync {
+        record_passive_adapter_capabilities(config, state)?;
+        record_passive_adapter_activity(
+            config,
+            state,
+            if active {
+                CliSessionActivityState::Active
+            } else {
+                CliSessionActivityState::Idle
+            },
+        )?;
+    } else {
+        invalidate_passive_adapter_proof(config, state)?;
+    }
+    for message in messages_to_replay {
+        if let Some(notification) = decode_notification(&message) {
+            record_passive_adapter_notification(config, state, notification)?;
+        }
+    }
+
+    while running.load(Ordering::Acquire) {
+        match client.recv(Duration::from_millis(
+            CLI_APP_SERVER_PASSIVE_RECV_TIMEOUT_MS,
+        ))? {
+            AppServerReceive::Message(message) => {
+                if let Some(notification) = decode_notification(&message) {
+                    record_passive_adapter_notification(config, state, notification)?;
+                }
+            }
+            AppServerReceive::Timeout => {}
+            AppServerReceive::Closed => {
+                if running.load(Ordering::Acquire) {
+                    invalidate_passive_adapter_proof(config, state)?;
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn passive_adapter_request(
+    client: &mut AppServerJsonRpcClient,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> (
+    std::result::Result<Value, AppServerRequestError>,
+    Vec<Value>,
+) {
+    let result = client.request(method, params, timeout);
+    let messages = client.drain_pending_messages();
+    (result, messages)
+}
+
+fn record_passive_adapter_notification(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    notification: AppServerNotification,
+) -> Result<()> {
+    let notification_thread_id = match &notification {
+        AppServerNotification::TurnStarted { thread_id }
+        | AppServerNotification::TurnTerminal { thread_id }
+        | AppServerNotification::ThreadProofInvalidated { thread_id }
+        | AppServerNotification::ThreadActivityChanged { thread_id, .. } => thread_id,
+    };
+    if notification_thread_id.is_none() {
+        invalidate_passive_adapter_proof(config, state)?;
+        return Ok(());
+    }
+
+    match notification {
+        AppServerNotification::TurnStarted { thread_id }
+            if passive_adapter_thread_matches(&thread_id, &config.bound_thread_id) =>
+        {
+            record_passive_adapter_activity(config, state, CliSessionActivityState::Active)?;
+        }
+        AppServerNotification::TurnTerminal { thread_id }
+            if passive_adapter_thread_matches(&thread_id, &config.bound_thread_id)
+                && state.last_activity_state == Some(CliSessionActivityState::Active) =>
+        {
+            record_passive_adapter_activity(config, state, CliSessionActivityState::Idle)?;
+        }
+        AppServerNotification::ThreadActivityChanged { thread_id, active }
+            if passive_adapter_thread_matches(&thread_id, &config.bound_thread_id) =>
+        {
+            if !active && state.last_activity_state != Some(CliSessionActivityState::Active) {
+                return Ok(());
+            }
+            record_passive_adapter_activity(
+                config,
+                state,
+                if active {
+                    CliSessionActivityState::Active
+                } else {
+                    CliSessionActivityState::Idle
+                },
+            )?;
+        }
+        AppServerNotification::ThreadProofInvalidated { thread_id }
+            if passive_adapter_thread_matches(&thread_id, &config.bound_thread_id) =>
+        {
+            invalidate_passive_adapter_proof(config, state)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn record_passive_adapter_activity(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    activity_state: CliSessionActivityState,
+) -> Result<()> {
+    if state.last_activity_state == Some(activity_state) {
+        return Ok(());
+    }
+    let next_revision = state
+        .activity_revision
+        .checked_add(1)
+        .context("CLI passive adapter activity revision overflow")?;
+    let result = dispatch_passive_adapter_command(
+        config,
+        Commands::Cli {
+            command: CliCommand::Session {
+                command: CliSessionCommand::NoteActivity(CliSessionNoteActivityArgs {
+                    managed_session_id: config.managed_session_id.clone(),
+                    session_epoch: state.session_epoch,
+                    activity_state,
+                    activity_revision: next_revision,
+                    now: None,
+                }),
+            },
+        },
+        false,
+    );
+    state.durable_proof_may_exist = true;
+    match result {
+        Ok(_) => {
+            state.activity_revision = next_revision;
+            state.last_activity_state = Some(activity_state);
+            Ok(())
+        }
+        Err(error) => {
+            invalidate_passive_adapter_proof(config, state).with_context(|| {
+                format!("invalidate passive adapter proof after activity write failed: {error:#}")
+            })?;
+            Err(error)
+        }
+    }
+}
+
+fn record_passive_adapter_capabilities(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+) -> Result<()> {
+    if state.passive_capabilities_recorded {
+        return Ok(());
+    }
+    let next_revision = state
+        .capability_revision
+        .checked_add(1)
+        .context("CLI passive adapter capability revision overflow")?;
+    let result = dispatch_passive_adapter_command(
+        config,
+        Commands::Cli {
+            command: CliCommand::Session {
+                command: CliSessionCommand::NoteCapabilities(CliSessionNoteCapabilitiesArgs {
+                    managed_session_id: config.managed_session_id.clone(),
+                    session_epoch: state.session_epoch,
+                    capability_revision: next_revision,
+                    thread_resume: true,
+                    turn_start: false,
+                    current_state_sync: true,
+                    turn_completed_event: false,
+                    negative_terminal_events: false,
+                    thread_start: false,
+                    turn_steer: false,
+                    now: None,
+                }),
+            },
+        },
+        false,
+    );
+    state.durable_proof_may_exist = true;
+    match result {
+        Ok(_) => {
+            state.capability_revision = next_revision;
+            state.passive_capabilities_recorded = true;
+            Ok(())
+        }
+        Err(error) => {
+            invalidate_passive_adapter_proof(config, state).with_context(|| {
+                format!("invalidate passive adapter proof after capability write failed: {error:#}")
+            })?;
+            Err(error)
+        }
+    }
+}
+
+fn invalidate_passive_adapter_proof(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+) -> Result<()> {
+    if !state.durable_proof_may_exist
+        && state.activity_revision == 0
+        && state.capability_revision == 0
+    {
+        state.last_activity_state = None;
+        state.passive_capabilities_recorded = false;
+        return Ok(());
+    }
+    let value = dispatch_passive_adapter_command(
+        config,
+        Commands::Cli {
+            command: CliCommand::Session {
+                command: CliSessionCommand::InvalidateProof(CliSessionInvalidateProofArgs {
+                    managed_session_id: config.managed_session_id.clone(),
+                    session_epoch: state.session_epoch,
+                    now: None,
+                }),
+            },
+        },
+        true,
+    )?;
+    let session = value.get("cli_session").ok_or_else(|| {
+        anyhow::anyhow!("passive adapter invalidation response missing cli_session")
+    })?;
+    apply_passive_adapter_invalidated_session(config, state, session)?;
+    Ok(())
+}
+
+fn apply_passive_adapter_invalidated_session(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    session: &Value,
+) -> Result<()> {
+    let managed_session_id = json_string(session, "managed_session_id")?;
+    if managed_session_id != config.managed_session_id {
+        bail!("passive adapter invalidation returned a different managed session");
+    }
+    let bound_thread_id = json_string(session, "bound_thread_id")?;
+    if bound_thread_id != config.bound_thread_id {
+        bail!("passive adapter invalidation returned a different bound thread");
+    }
+    let activity_state = json_string(session, "activity_state")?;
+    let session_epoch = json_i64(session, "session_epoch")?;
+    let activity_revision = json_i64(session, "activity_revision")?;
+    let capability_revision = json_i64(session, "capability_revision")?;
+    if activity_state != "unknown" || activity_revision != 0 || capability_revision != 0 {
+        bail!("passive adapter invalidation response did not clear proof");
+    }
+    state.session_epoch = session_epoch;
+    state.activity_revision = activity_revision;
+    state.capability_revision = capability_revision;
+    state.last_activity_state = None;
+    state.passive_capabilities_recorded = false;
+    state.durable_proof_may_exist = false;
+    Ok(())
+}
+
+fn dispatch_passive_adapter_command(
+    config: &CliAppServerPassiveAdapterConfig,
+    command: Commands,
+    allow_direct_fallback: bool,
+) -> Result<Value> {
+    let Some(argv) = daemon_argv_for_mutating_command(&command)? else {
+        bail!("passive adapter command is not daemon-routable");
+    };
+    let result = daemon_request_payload_timeout(
+        &config.layout,
+        "dispatch",
+        json!({ "argv": argv_payload(argv) }),
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_STORE_TIMEOUT_SECONDS),
+    );
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if allow_direct_fallback => {
+            dispatch(command, &config.layout, DispatchMode::Direct).with_context(|| {
+                format!("fallback direct passive adapter command after daemon error: {error:#}")
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn passive_adapter_thread_matches(thread_id: &Option<String>, bound_thread_id: &str) -> bool {
+    thread_id.as_deref() == Some(bound_thread_id)
+}
+
+fn wait_for_passive_adapter_retry(running: &AtomicBool, delay: Duration) {
+    let deadline = Instant::now() + delay;
+    while running.load(Ordering::Acquire) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
 }
 
 fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsString>>> {
@@ -995,6 +1519,24 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             );
             push_bool_arg(&mut argv, "--thread-start", args.thread_start);
             push_bool_arg(&mut argv, "--turn-steer", args.turn_steer);
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Cli {
+            command:
+                CliCommand::Session {
+                    command: CliSessionCommand::InvalidateProof(args),
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("cli"),
+                OsString::from("session"),
+                OsString::from("invalidate-proof"),
+            ];
+            push_string_arg(&mut argv, "--managed-session-id", &args.managed_session_id);
+            push_i64_arg(&mut argv, "--session-epoch", args.session_epoch);
             if let Some(now) = args.now {
                 push_i64_arg(&mut argv, "--now", now);
             }
@@ -1317,7 +1859,11 @@ fn dispatch_attempt(command: AttemptCommand, layout: &FsLayout) -> Result<Value>
 }
 
 fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
-    let mut store = Store::open(layout)?;
+    let mut store = if cli_command_uses_lifecycle_store_timeout(&command) {
+        Store::open_for_daemon_lifecycle(layout)?
+    } else {
+        Store::open(layout)?
+    };
     match command {
         CliCommand::Run(_) => bail!("cli run must execute from the foreground client"),
         CliCommand::Session { command } => match command {
@@ -1378,12 +1924,36 @@ fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
                 )?;
                 Ok(json!({ "cli_session": session }))
             }
+            CliSessionCommand::InvalidateProof(args) => {
+                validate_positive("session_epoch", args.session_epoch)?;
+                let now = match args.now {
+                    Some(value) => value,
+                    None => now_epoch_seconds()?,
+                };
+                let invalidation = store.invalidate_cli_managed_session_proof(
+                    &args.managed_session_id,
+                    args.session_epoch,
+                    now,
+                )?;
+                Ok(json!({ "cli_session": invalidation.session }))
+            }
             CliSessionCommand::Inspect(args) => {
                 let session = store.inspect_cli_managed_session(&args.managed_session_id)?;
                 Ok(json!({ "cli_session": session }))
             }
         },
     }
+}
+
+fn cli_command_uses_lifecycle_store_timeout(command: &CliCommand) -> bool {
+    matches!(
+        command,
+        CliCommand::Session {
+            command: CliSessionCommand::NoteActivity(_)
+                | CliSessionCommand::NoteCapabilities(_)
+                | CliSessionCommand::InvalidateProof(_),
+        }
+    )
 }
 
 fn dispatch_maintenance(command: MaintenanceCommand, layout: &FsLayout) -> Result<Value> {
@@ -1521,6 +2091,12 @@ fn json_string(value: &Value, field: &str) -> Result<String> {
         .as_str()
         .map(str::to_owned)
         .ok_or_else(|| anyhow::anyhow!("missing string field {field}"))
+}
+
+fn json_i64(value: &Value, field: &str) -> Result<i64> {
+    value[field]
+        .as_i64()
+        .ok_or_else(|| anyhow::anyhow!("missing integer field {field}"))
 }
 
 fn validate_timestamp_add(now: i64, delta: i64, name: &str) -> Result<i64> {
