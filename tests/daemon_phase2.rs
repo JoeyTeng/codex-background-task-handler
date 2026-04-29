@@ -90,6 +90,30 @@ fn bind_idle_cli_session(home: &TempDir, bound_thread_id: &str) -> String {
         &[
             "cli",
             "session",
+            "note-capabilities",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--capability-revision",
+            "1",
+            "--thread-resume",
+            "true",
+            "--turn-start",
+            "true",
+            "--current-state-sync",
+            "true",
+            "--turn-completed-event",
+            "true",
+            "--negative-terminal-events",
+            "true",
+        ],
+    );
+    cbth(
+        home,
+        &[
+            "cli",
+            "session",
             "note-activity",
             "--managed-session-id",
             &managed_session_id,
@@ -232,6 +256,7 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "dispatch",
             "attempt-dispatch",
             "cli-session-dispatch",
+            "cli-session-capability-dispatch",
             "cli-turn-observation-dispatch"
         ])
     );
@@ -246,6 +271,7 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "dispatch",
             "attempt-dispatch",
             "cli-session-dispatch",
+            "cli-session-capability-dispatch",
             "cli-turn-observation-dispatch"
         ])
     );
@@ -325,6 +351,7 @@ fn daemon_ensure_restarts_incompatible_daemon() {
             "dispatch",
             "attempt-dispatch",
             "cli-session-dispatch",
+            "cli-session-capability-dispatch",
             "cli-turn-observation-dispatch"
         ])
     );
@@ -354,7 +381,7 @@ fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
             let response = if request.contains("\"stop\"") {
                 r#"{"ok":true,"response":{"stopping":true}}"#
             } else {
-                r#"{"ok":true,"response":{"daemon":{"pid":1313},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch"],"message":"pong"}}"#
+                r#"{"ok":true,"response":{"daemon":{"pid":1313},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch","cli-session-capability-dispatch"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())
@@ -390,6 +417,73 @@ fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
             "dispatch",
             "attempt-dispatch",
             "cli-session-dispatch",
+            "cli-session-capability-dispatch",
+            "cli-turn-observation-dispatch"
+        ])
+    );
+
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_restarts_daemon_missing_session_capability_dispatch() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind old daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    let old_socket_path = socket_path.clone();
+    let handle = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _addr) = listener.accept().expect("accept old request");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("read old request");
+            let response = if request.contains("\"stop\"") {
+                r#"{"ok":true,"response":{"stopping":true}}"#
+            } else {
+                r#"{"ok":true,"response":{"daemon":{"pid":1414},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch","cli-turn-observation-dispatch"],"message":"pong"}}"#
+            };
+            stream
+                .write_all(response.as_bytes())
+                .expect("write old response");
+            stream.write_all(b"\n").expect("write old response newline");
+            if request.contains("\"stop\"") {
+                break;
+            }
+        }
+        drop(listener);
+        fs::remove_file(&old_socket_path).expect("remove old socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert_eq!(ensured["started"], true);
+    assert!(ensured["daemon"]["pid"].as_u64().expect("pid") > 1414);
+    handle.join().expect("old daemon thread");
+
+    let ping = cbth(&home, &["daemon", "ping"]);
+    assert_eq!(
+        ping["capabilities"],
+        json!([
+            "dispatch",
+            "attempt-dispatch",
+            "cli-session-dispatch",
+            "cli-session-capability-dispatch",
             "cli-turn-observation-dispatch"
         ])
     );
@@ -457,7 +551,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
                     let request = String::from_utf8_lossy(&request[..request_len]);
                     assert!(request.contains("\"ping\""));
                     if let Err(error) = stream.write_all(
-                        br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch","cli-turn-observation-dispatch"],"message":"pong"}}"#,
+                        br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch","cli-session-capability-dispatch","cli-turn-observation-dispatch"],"message":"pong"}}"#,
                     ) {
                         if error.kind() == std::io::ErrorKind::BrokenPipe {
                             continue;
@@ -523,7 +617,7 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
             } else if index == 1 {
                 r#"{"ok":false,"error":"daemon connection limit reached"}"#
             } else {
-                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch","cli-turn-observation-dispatch"],"message":"pong"}}"#
+                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-session-dispatch","cli-session-capability-dispatch","cli-turn-observation-dispatch"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())

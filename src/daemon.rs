@@ -35,6 +35,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "dispatch",
     "attempt-dispatch",
     "cli-session-dispatch",
+    "cli-session-capability-dispatch",
     "cli-turn-observation-dispatch",
 ];
 const MAX_DISPATCH_WORKERS: usize = 32;

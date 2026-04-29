@@ -117,8 +117,59 @@ fn note_cli_session_idle(home: &TempDir, managed_session_id: &str) {
     assert_eq!(session["cli_session"]["session"]["activity_state"], "idle");
 }
 
+fn note_cli_session_minimum_capabilities(home: &TempDir, managed_session_id: &str) {
+    let inspected = cbth(
+        home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            managed_session_id,
+        ],
+    );
+    let next_revision = inspected["cli_session"]["capability_revision"]
+        .as_i64()
+        .expect("capability revision")
+        + 1;
+    let next_revision = next_revision.to_string();
+    let session_epoch = inspected["cli_session"]["session_epoch"]
+        .as_i64()
+        .expect("session epoch")
+        .to_string();
+    let session = cbth(
+        home,
+        &[
+            "cli",
+            "session",
+            "note-capabilities",
+            "--managed-session-id",
+            managed_session_id,
+            "--session-epoch",
+            &session_epoch,
+            "--capability-revision",
+            &next_revision,
+            "--thread-resume",
+            "true",
+            "--turn-start",
+            "true",
+            "--current-state-sync",
+            "true",
+            "--turn-completed-event",
+            "true",
+            "--negative-terminal-events",
+            "true",
+        ],
+    );
+    assert_eq!(
+        session["cli_session"]["session"]["capability_current_state_sync"],
+        true
+    );
+}
+
 fn bind_idle_cli_session(home: &TempDir, bound_thread_id: &str) -> String {
     let managed_session_id = bind_cli_session(home, bound_thread_id);
+    note_cli_session_minimum_capabilities(home, &managed_session_id);
     note_cli_session_idle(home, &managed_session_id);
     managed_session_id
 }
@@ -411,6 +462,93 @@ fn cli_session_note_activity_rejects_stale_revision() {
         ],
     );
     assert!(jumped_revision.contains("not the next revision"));
+}
+
+#[test]
+fn cli_session_note_capabilities_records_epoch_local_probe() {
+    let home = tempfile::tempdir().expect("temp home");
+    let managed_session_id = bind_cli_session(&home, "thread-cli-capability-probe");
+
+    note_cli_session_minimum_capabilities(&home, &managed_session_id);
+    let inspected = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(inspected["cli_session"]["capability_revision"], 1);
+    assert_eq!(inspected["cli_session"]["capability_thread_resume"], true);
+    assert_eq!(inspected["cli_session"]["capability_turn_start"], true);
+    assert_eq!(
+        inspected["cli_session"]["capability_current_state_sync"],
+        true
+    );
+    assert_eq!(
+        inspected["cli_session"]["capability_turn_completed_event"],
+        true
+    );
+    assert_eq!(
+        inspected["cli_session"]["capability_negative_terminal_events"],
+        true
+    );
+    assert_eq!(inspected["cli_session"]["capability_thread_start"], false);
+    assert_eq!(inspected["cli_session"]["capability_turn_steer"], false);
+
+    let stale_capability = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "note-capabilities",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--capability-revision",
+            "1",
+            "--thread-resume",
+            "false",
+            "--turn-start",
+            "true",
+            "--current-state-sync",
+            "true",
+            "--turn-completed-event",
+            "true",
+            "--negative-terminal-events",
+            "true",
+        ],
+    );
+    assert!(stale_capability.contains("capability revision"));
+
+    let reattached = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-capability-probe",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+        ],
+    );
+    assert_eq!(reattached["cli_session"]["session"]["session_epoch"], 2);
+    assert_eq!(
+        reattached["cli_session"]["session"]["capability_revision"],
+        0
+    );
+    assert_eq!(
+        reattached["cli_session"]["session"]["capability_thread_resume"],
+        false
+    );
 }
 
 #[test]
@@ -1791,6 +1929,182 @@ fn cli_attempt_idempotent_paths_require_current_managed_session() {
 }
 
 #[test]
+fn cli_attempt_idempotent_paths_require_recorded_delivery_proof() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-legacy-proof",
+            "--summary",
+            "legacy proofless pending attempt",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-legacy-proof");
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "INSERT INTO delivery_attempts (
+            attempt_id, batch_id, source_thread_id, adapter_kind, state,
+            generation, delivery_rpc_request_id, delivery_rpc_kind,
+            delivery_rpc_state, delivery_rpc_started_at, managed_session_id,
+            session_epoch, created_at, updated_at
+        ) VALUES (
+            'legacy-proofless-cli-attempt', ?, 'thread-cli-legacy-proof', 'cli',
+            'accept_pending', 1, 'rpc-request-legacy-proof', 'turn_start',
+            'pending_acceptance', 100, ?, 1, 100, 100
+        )",
+        params![batch_id, managed_session_id],
+    )
+    .expect("insert proofless legacy attempt");
+    drop(conn);
+
+    let retry = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-legacy-proof",
+        ],
+    );
+    assert!(retry.contains("was not created with a CLI detached delivery proof"));
+
+    let accept = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            "legacy-proofless-cli-attempt",
+            "--delivery-turn-id",
+            "turn-legacy-proof",
+            "--observation-window-seconds",
+            "60",
+        ],
+    );
+    assert!(accept.contains("was not created with a CLI detached delivery proof"));
+}
+
+#[test]
+fn delayed_cli_completion_requires_recorded_delivery_proof() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-delayed-legacy-proof",
+            "--summary",
+            "legacy proofless delayed completion",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-delayed-legacy-proof");
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "INSERT INTO delivery_attempts (
+            attempt_id, batch_id, source_thread_id, adapter_kind, state,
+            generation, delivery_rpc_request_id, delivery_rpc_kind,
+            delivery_rpc_state, delivery_rpc_started_at, managed_session_id,
+            session_epoch, delivery_turn_id, delivery_accepted_at,
+            delivery_observation_state, delivery_observation_deadline,
+            created_at, updated_at, abandoned_at
+        ) VALUES (
+            'legacy-proofless-delayed-cli-attempt', ?,
+            'thread-cli-delayed-legacy-proof', 'cli', 'abandoned', 1,
+            'rpc-request-legacy-delayed-proof', 'turn_start', 'accepted',
+            1000, ?, 1, 'turn-legacy-delayed-proof', 1001, 'expired',
+            1061, 1000, 1061, 1061
+        )",
+        params![batch_id, managed_session_id],
+    )
+    .expect("insert proofless delayed legacy attempt");
+    conn.execute(
+        "UPDATE batches
+         SET replay_policy = 'manual_resolution_only',
+             updated_at = 1061
+         WHERE batch_id = ?",
+        params![batch_id],
+    )
+    .expect("manualize batch");
+    drop(conn);
+
+    let observed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            "legacy-proofless-delayed-cli-attempt",
+            "--delivery-turn-id",
+            "turn-legacy-delayed-proof",
+            "--turn-event",
+            "turn-completed",
+            "--now",
+            "1060",
+        ],
+    );
+    assert_eq!(observed["attempt"]["state"], "abandoned");
+    assert_eq!(observed["attempt"]["delivery_observation_state"], "expired");
+    assert_eq!(
+        observed["attempt"]["last_observed_turn_event"],
+        "turn_completed"
+    );
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    assert!(batch["batch"]["batch"]["close_reason"].is_null());
+}
+
+#[test]
 fn cli_attempt_begin_requires_idle_managed_session() {
     let home = tempfile::tempdir().expect("temp home");
     let submitted = cbth(
@@ -1821,6 +2135,7 @@ fn cli_attempt_begin_requires_idle_managed_session() {
         .as_str()
         .expect("batch id");
     let managed_session_id = bind_cli_session(&home, "thread-cli-idle-required");
+    note_cli_session_minimum_capabilities(&home, &managed_session_id);
 
     let stderr = cbth_failure(
         &home,
@@ -1840,6 +2155,59 @@ fn cli_attempt_begin_requires_idle_managed_session() {
         ],
     );
     assert!(stderr.contains("activity state is unknown, not idle"));
+}
+
+#[test]
+fn cli_attempt_begin_requires_minimum_capability_probe() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-capability-required",
+            "--summary",
+            "capabilities required",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let managed_session_id = bind_cli_session(&home, "thread-cli-capability-required");
+    note_cli_session_idle(&home, &managed_session_id);
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-capability-required",
+        ],
+    );
+    assert!(stderr.contains("minimum turn_start capability probe"));
 }
 
 #[test]
@@ -2201,7 +2569,7 @@ fn maintenance_sweep_abandons_stale_cli_accept_pending_attempt() {
             "operator-closed-unconfirmed",
         ],
     );
-    let not_idle = cbth_failure(
+    let missing_capabilities = cbth_failure(
         &home,
         &[
             "attempt",
@@ -2216,6 +2584,25 @@ fn maintenance_sweep_abandons_stale_cli_accept_pending_attempt() {
             "turn-start",
             "--rpc-request-id",
             "rpc-request-stale-next-before-proof",
+        ],
+    );
+    assert!(missing_capabilities.contains("minimum turn_start capability probe"));
+    note_cli_session_minimum_capabilities(&home, &managed_session_id);
+    let not_idle = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            second_batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "2",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-stale-next-after-capabilities",
         ],
     );
     assert!(not_idle.contains("not idle"));
@@ -2380,7 +2767,7 @@ fn operator_close_releases_active_cli_attempt_for_next_head_batch() {
         ],
     );
     assert!(old_epoch.contains("is at epoch 2, not 1"));
-    let not_idle = cbth_failure(
+    let missing_capabilities = cbth_failure(
         &home,
         &[
             "attempt",
@@ -2395,6 +2782,25 @@ fn operator_close_releases_active_cli_attempt_for_next_head_batch() {
             "turn-start",
             "--rpc-request-id",
             "rpc-request-close-release-before-proof",
+        ],
+    );
+    assert!(missing_capabilities.contains("minimum turn_start capability probe"));
+    note_cli_session_minimum_capabilities(&home, &managed_session_id);
+    let not_idle = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            second_batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "2",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-request-close-release-after-capabilities",
         ],
     );
     assert!(not_idle.contains("not idle"));

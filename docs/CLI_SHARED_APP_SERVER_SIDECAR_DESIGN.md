@@ -673,19 +673,21 @@ v1 范围外：
 - durable `cli_managed_sessions` schema 已落地，记录 `managed_session_id`、`bound_thread_id`、`session_epoch`、`session_state`、`activity_state`、`activity_revision`、session-scoped risk profile 和 timestamps。
 - hidden adapter-internal `cbth cli session bind` 已作为 existing-thread attach-or-create building block 落地；它要求调用方显式传入完整 risk profile，会复用同一 `bound_thread_id` 上的 `live` / `detached` session，并在 attach 时递增 `session_epoch`、把 `activity_state` 重置为 `unknown`、把 epoch-local `activity_revision` 重置为 0。
 - hidden adapter-internal `cbth cli session note-activity` 已作为 current-state sync 的临时 durable 写入面落地；当前只允许同 epoch 的 `live` / `detached` session 通过严格顺序递增的 `activity_revision` 被标成 `active` 或 `idle`，同 revision 只允许完全相同状态的幂等重放。
-- `begin-cli-accept` 已经要求引用一个匹配当前 batch `source_thread_id`、`session_epoch`、state、no-approval / no-network / no-write profile 且 `turn_start` 时 `activity_state=idle` 的 managed session；不再接受任意字符串形式的 `managed_session_id`。
-- 同一 `delivery_rpc_request_id` 的幂等重试会先恢复已有 attempt，但仍要求该 stored attempt 绑定当前有效 managed session；它不再受后续 activity 漂移影响，但 session epoch 失效、缺失 session、profile drift 或 thread mismatch 都会 fail-closed。
+- hidden adapter-internal `cbth cli session note-capabilities` 已作为 epoch-local capability probe 写入面落地；每次 bind / re-attach / continuity-loss fence 都会清空旧 capability proof。
+- `begin-cli-accept` 已经要求引用一个匹配当前 batch `source_thread_id`、`session_epoch`、state、no-approval / no-network / no-write profile，且 `turn_start` 时同时具备最小 capability proof 和 `activity_state=idle` 的 managed session；不再接受任意字符串形式的 `managed_session_id`。
+- 当前最小 capability proof 要求 adapter 已证明 `thread_resume`、`turn_start`、`current_state_sync`、`turn_completed_event` 和负终态 observation surface 均可用；缺任一项都会 fail-closed。
+- 新建 CLI attempt 时会把通过 gate 当时的 `activity_revision` / `capability_revision` 快照写入 `delivery_attempts`；同一 `delivery_rpc_request_id` 的幂等重试会先恢复已有 attempt，但仍要求该 stored attempt 绑定当前有效 managed session 且携带非零 proof snapshot。它不再受后续 activity 漂移影响，但 proofless legacy attempt、session epoch 失效、缺失 session、profile drift、thread mismatch 或当前 capability 不再满足最小集都会 fail-closed。
 - stale `accept_pending`、expired `cooldown` observation、以及 operator close 仍未终态的 CLI attempt 时，当前实现都会推进对应 managed session 的 `session_epoch` 并清空 activity proof，避免旧 idle 证明继续打开下一次自动投递。
 - hidden adapter-internal `cbth attempt observe-cli-turn` 已作为 terminal-event 写入面落地；它只接受 stored `delivery_turn_id` 的事件，`observed_at < delivery_observation_deadline` 的 `turn_completed` 才关闭 batch 为 `delivered`，负终态和 late observation 都会 fail-closed 到 `manual_resolution_only`。
-- daemon capability 列表已包含 `cli-turn-observation-dispatch`，避免新 CLI 把 terminal-event 写入路由给不支持该 subcommand 的旧 daemon。
+- daemon capability 列表已包含 `cli-session-capability-dispatch` 与 `cli-turn-observation-dispatch`，避免新 CLI 把 capability / terminal-event 写入路由给不支持对应 subcommand 的旧 daemon。
 - `turn_steer` 当前仍 fail-closed，直到后续 phase 落地 active-turn risk proof。
-- 这些实现仍不等价于完整 `cbth cli run`：daemon-owned shared `app-server` 进程、capability probe、真实 current-state sync、foreground TUI attachment 和 websocket event loop 仍待后续 phase 实现。
+- 这些实现仍不等价于完整 `cbth cli run`：daemon-owned shared `app-server` 进程、真实 capability collection、真实 current-state sync、foreground TUI attachment 和 websocket event loop 仍待后续 phase 实现。
 
 ## 仍待实现的边界
 
 - CLI 入口的进程生命周期和清理策略
 - sidecar 长时间运行时的状态持久化与 resume 策略
 - 如果未来上游允许 loopback websocket auth，则补一轮更强本地安全边界设计与实证
-- capability probe 的具体实现与版本策略
+- 真实 shared `app-server` capability collection 的具体实现与版本策略
 - 多个 background jobs 同时命中同一 caller thread 时的 batch 合并参数
 - accepted `delivery_turn_id` 在 daemon / websocket / app-server continuity 丢失后的 operator-resolution 实现细节；设计合同已收口为 `inspect-head -> close-head(reason=...)`

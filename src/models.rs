@@ -177,6 +177,8 @@ pub struct DeliveryAttemptRecord {
     pub delivery_rpc_started_at: Option<i64>,
     pub managed_session_id: Option<String>,
     pub session_epoch: Option<i64>,
+    pub session_activity_revision: i64,
+    pub session_capability_revision: i64,
     pub delivery_turn_id: Option<String>,
     pub delivery_accepted_at: Option<i64>,
     pub delivery_observation_state: Option<String>,
@@ -197,6 +199,14 @@ pub struct CliManagedSessionRecord {
     pub session_state: String,
     pub activity_state: String,
     pub activity_revision: i64,
+    pub capability_revision: i64,
+    pub capability_thread_resume: bool,
+    pub capability_turn_start: bool,
+    pub capability_current_state_sync: bool,
+    pub capability_turn_completed_event: bool,
+    pub capability_negative_terminal_events: bool,
+    pub capability_thread_start: bool,
+    pub capability_turn_steer: bool,
     pub session_allows_approval: bool,
     pub session_allows_network: bool,
     pub session_allows_write_access: bool,
@@ -220,6 +230,22 @@ pub struct CliManagedSessionProfile {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CliManagedSessionActivityUpdate {
+    pub session: CliManagedSessionRecord,
+}
+
+#[derive(Clone, Debug)]
+pub struct CliManagedSessionCapabilities {
+    pub capability_thread_resume: bool,
+    pub capability_turn_start: bool,
+    pub capability_current_state_sync: bool,
+    pub capability_turn_completed_event: bool,
+    pub capability_negative_terminal_events: bool,
+    pub capability_thread_start: bool,
+    pub capability_turn_steer: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CliManagedSessionCapabilityUpdate {
     pub session: CliManagedSessionRecord,
 }
 

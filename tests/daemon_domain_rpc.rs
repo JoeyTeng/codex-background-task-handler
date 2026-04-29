@@ -76,6 +76,32 @@ fn bind_idle_cli_session_direct(home: &TempDir, bound_thread_id: &str) -> String
         &[
             "cli",
             "session",
+            "note-capabilities",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--capability-revision",
+            "1",
+            "--thread-resume",
+            "true",
+            "--turn-start",
+            "true",
+            "--current-state-sync",
+            "true",
+            "--turn-completed-event",
+            "true",
+            "--negative-terminal-events",
+            "true",
+            "--now",
+            "1000",
+        ],
+    );
+    cbth_direct(
+        home,
+        &[
+            "cli",
+            "session",
             "note-activity",
             "--managed-session-id",
             &managed_session_id,
@@ -608,6 +634,10 @@ fn daemon_routed_on_time_cli_turn_completion_survives_startup_sweep() {
 
     let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
     assert_eq!(batch["batch"]["batch"]["state"], "closed");
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
     assert_eq!(batch["batch"]["batch"]["close_reason"], "delivered");
 
     cbth(&home, &["daemon", "stop"]);
