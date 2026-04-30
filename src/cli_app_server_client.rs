@@ -845,8 +845,7 @@ mod tests {
 
         assert!(
             matches!(result, Ok(AppServerReceive::Timeout))
-                || result.as_ref().is_err_and(|error| error
-                    .to_string()
+                || result.as_ref().is_err_and(|error| format!("{error:#}")
                     .contains("timed out while writing app-server websocket frame")),
             "unexpected bounded recv result: {result:?}"
         );
