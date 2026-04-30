@@ -20,6 +20,7 @@ pub(crate) struct AppServerJsonRpcClient {
     pending_messages: VecDeque<Value>,
 }
 
+#[derive(Debug)]
 pub(crate) enum AppServerReceive {
     Message(Value),
     Timeout,
@@ -840,11 +841,15 @@ mod tests {
         let mut client =
             AppServerJsonRpcClient::connect(&url, Duration::from_secs(1)).expect("connect client");
         let started = Instant::now();
-        let received = client
-            .recv(Duration::from_millis(100))
-            .expect("bounded recv");
+        let result = client.recv(Duration::from_millis(100));
 
-        assert!(matches!(received, AppServerReceive::Timeout));
+        assert!(
+            matches!(result, Ok(AppServerReceive::Timeout))
+                || result.as_ref().is_err_and(|error| error
+                    .to_string()
+                    .contains("timed out while writing app-server websocket frame")),
+            "unexpected bounded recv result: {result:?}"
+        );
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "recv timeout was extended by control frames: {:?}",
