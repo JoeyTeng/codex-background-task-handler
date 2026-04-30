@@ -1,6 +1,9 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -111,6 +114,860 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
 }
 
 #[cfg(unix)]
+fn wait_for_cli_activity_state(home: &TempDir, bound_thread_id: &str, expected: &str) -> i64 {
+    let db_path = home.path().join("cbth.sqlite3");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if db_path.exists()
+            && let Ok(conn) = Connection::open(&db_path)
+        {
+            let queried: rusqlite::Result<(String, i64)> = conn.query_row(
+                "SELECT activity_state, activity_revision
+                 FROM cli_managed_sessions
+                 WHERE bound_thread_id = ?",
+                [bound_thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            );
+            if let Ok((activity_state, activity_revision)) = queried
+                && activity_state == expected
+            {
+                return activity_revision;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {bound_thread_id} activity_state={expected}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server(thread_id: &'static str) -> (String, mpsc::Receiver<Result<(), String>>) {
+    spawn_fake_app_server_with_options(thread_id, true, true, false, true, Duration::from_secs(5))
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_without_turn_snapshot(
+    thread_id: &'static str,
+) -> (String, mpsc::Receiver<Result<(), String>>) {
+    spawn_fake_app_server_with_options(thread_id, false, false, false, true, Duration::from_secs(5))
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_started_before_read_snapshot(
+    thread_id: &'static str,
+) -> (String, mpsc::Receiver<Result<(), String>>) {
+    spawn_fake_app_server_with_options(thread_id, true, false, true, true, Duration::from_secs(5))
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_started_before_failed_read(
+    thread_id: &'static str,
+) -> (String, mpsc::Receiver<Result<(), String>>) {
+    spawn_fake_app_server_with_options(thread_id, true, false, true, false, Duration::from_secs(5))
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_idle_before_active_read_snapshot(
+    thread_id: &'static str,
+) -> (String, mpsc::Receiver<Result<(), String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = accept_fake_app_server_idle_before_active_read_snapshot(&listener, thread_id);
+        let _ = done_tx.send(result);
+    });
+
+    (url, done_rx)
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_untrusted_read_snapshot(
+    thread_id: &'static str,
+) -> (String, mpsc::Receiver<Result<(), String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = accept_fake_app_server_untrusted_read_snapshot(&listener, thread_id);
+        let _ = done_tx.send(result);
+    });
+
+    (url, done_rx)
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_resume_started_before_missing_read_snapshot(
+    thread_id: &'static str,
+) -> (String, mpsc::Receiver<Result<(), String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = accept_fake_app_server_resume_started_before_missing_read_snapshot(
+            &listener, thread_id,
+        );
+        let _ = done_tx.send(result);
+    });
+
+    (url, done_rx)
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_reconnect_without_turn_snapshot(
+    thread_id: &'static str,
+) -> (String, mpsc::Receiver<Result<(), String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = (|| {
+            accept_fake_app_server(
+                &listener,
+                thread_id,
+                true,
+                false,
+                false,
+                true,
+                Duration::from_millis(100),
+            )?;
+            accept_fake_app_server(
+                &listener,
+                thread_id,
+                false,
+                false,
+                false,
+                true,
+                Duration::from_secs(5),
+            )
+        })();
+        let _ = done_tx.send(result);
+    });
+
+    (url, done_rx)
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_with_options(
+    thread_id: &'static str,
+    include_turns: bool,
+    send_notifications: bool,
+    send_started_before_read_response: bool,
+    respond_to_thread_read: bool,
+    hold_after_response: Duration,
+) -> (String, mpsc::Receiver<Result<(), String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = accept_fake_app_server(
+            &listener,
+            thread_id,
+            include_turns,
+            send_notifications,
+            send_started_before_read_response,
+            respond_to_thread_read,
+            hold_after_response,
+        );
+        let _ = done_tx.send(result);
+    });
+
+    (url, done_rx)
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server(
+    listener: &TcpListener,
+    thread_id: &'static str,
+    include_turns: bool,
+    send_notifications: bool,
+    send_started_before_read_response: bool,
+    respond_to_thread_read: bool,
+    hold_after_response: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(format!("accept fake app-server websocket: {error}")),
+        }
+    };
+
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set fake app-server stream blocking: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("set fake app-server read timeout: {error}"))?;
+    let websocket_accept = read_fake_http_upgrade(&mut stream)?;
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("write fake app-server handshake: {error}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_thread_read = false;
+    let mut messages_seen = 0;
+    while !saw_thread_read && Instant::now() < deadline {
+        let message = read_fake_client_text_frame(&mut stream)
+            .map_err(|error| format!("{error} after {messages_seen} fake messages"))?;
+        messages_seen += 1;
+        let method = message
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match method {
+            "initialize" => write_fake_json_response(
+                &mut stream,
+                &message,
+                serde_json::json!({
+                    "userAgent": "fake-codex",
+                    "codexHome": "/tmp/fake-codex-home",
+                    "platformFamily": "unix",
+                    "platformOs": "macos"
+                }),
+            )?,
+            "initialized" => {}
+            "thread/resume" => {
+                write_fake_thread_response(&mut stream, &message, thread_id, include_turns)?
+            }
+            "thread/read" => {
+                if send_started_before_read_response {
+                    write_fake_server_text_frame(
+                        &mut stream,
+                        &serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "turn/started",
+                            "params": {
+                                "threadId": thread_id,
+                                "turn": { "id": "turn-buffered-start", "status": "inProgress", "items": [] }
+                            }
+                        }),
+                    )?;
+                }
+                if !respond_to_thread_read {
+                    thread::sleep(hold_after_response);
+                    return Ok(());
+                }
+                write_fake_thread_response(&mut stream, &message, thread_id, include_turns)?;
+                saw_thread_read = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_thread_read {
+        return Err("fake app-server did not receive thread/read".to_owned());
+    }
+    if !send_notifications {
+        thread::sleep(hold_after_response);
+        return Ok(());
+    }
+
+    write_fake_server_text_frame(
+        &mut stream,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "turn/started",
+            "params": {
+                "turn": { "id": "turn-missing-thread", "status": "inProgress", "items": [] }
+            }
+        }),
+    )?;
+    write_fake_server_text_frame(
+        &mut stream,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-other",
+                "turn": { "id": "turn-foreign-thread", "status": "completed", "items": [] }
+            }
+        }),
+    )?;
+    write_fake_server_text_frame(
+        &mut stream,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "thread-other",
+                "status": { "type": "active", "activeFlags": [] }
+            }
+        }),
+    )?;
+    write_fake_server_text_frame(
+        &mut stream,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "turn/started",
+            "params": {
+                "threadId": thread_id,
+                "turn": { "id": "turn-passive-1", "status": "inProgress", "items": [] }
+            }
+        }),
+    )?;
+    write_fake_server_text_frame(
+        &mut stream,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {
+                "threadId": thread_id,
+                "turn": { "id": "turn-passive-1", "status": "completed", "items": [] }
+            }
+        }),
+    )?;
+    thread::sleep(hold_after_response);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_resume_started_before_missing_read_snapshot(
+    listener: &TcpListener,
+    thread_id: &'static str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(format!("accept fake app-server websocket: {error}")),
+        }
+    };
+
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set fake app-server stream blocking: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("set fake app-server read timeout: {error}"))?;
+    let websocket_accept = read_fake_http_upgrade(&mut stream)?;
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("write fake app-server handshake: {error}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_thread_read = false;
+    while !saw_thread_read && Instant::now() < deadline {
+        let message = read_fake_client_text_frame(&mut stream)?;
+        let method = message
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match method {
+            "initialize" => write_fake_json_response(
+                &mut stream,
+                &message,
+                serde_json::json!({
+                    "userAgent": "fake-codex",
+                    "codexHome": "/tmp/fake-codex-home",
+                    "platformFamily": "unix",
+                    "platformOs": "macos"
+                }),
+            )?,
+            "initialized" => {}
+            "thread/resume" => {
+                write_fake_server_text_frame(
+                    &mut stream,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "turn/started",
+                        "params": {
+                            "threadId": thread_id,
+                            "turn": { "id": "turn-resume-window", "status": "inProgress", "items": [] }
+                        }
+                    }),
+                )?;
+                write_fake_thread_response(&mut stream, &message, thread_id, true)?;
+            }
+            "thread/read" => {
+                write_fake_thread_response(&mut stream, &message, thread_id, false)?;
+                saw_thread_read = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_thread_read {
+        return Err("fake app-server did not receive thread/read".to_owned());
+    }
+    thread::sleep(Duration::from_secs(5));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_idle_before_active_read_snapshot(
+    listener: &TcpListener,
+    thread_id: &'static str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(format!("accept fake app-server websocket: {error}")),
+        }
+    };
+
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set fake app-server stream blocking: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("set fake app-server read timeout: {error}"))?;
+    let websocket_accept = read_fake_http_upgrade(&mut stream)?;
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("write fake app-server handshake: {error}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_thread_read = false;
+    while !saw_thread_read && Instant::now() < deadline {
+        let message = read_fake_client_text_frame(&mut stream)?;
+        let method = message
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match method {
+            "initialize" => write_fake_json_response(
+                &mut stream,
+                &message,
+                serde_json::json!({
+                    "userAgent": "fake-codex",
+                    "codexHome": "/tmp/fake-codex-home",
+                    "platformFamily": "unix",
+                    "platformOs": "macos"
+                }),
+            )?,
+            "initialized" => {}
+            "thread/resume" => write_fake_thread_response(&mut stream, &message, thread_id, true)?,
+            "thread/read" => {
+                write_fake_server_text_frame(
+                    &mut stream,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "thread/status/changed",
+                        "params": {
+                            "threadId": thread_id,
+                            "status": { "type": "idle" }
+                        }
+                    }),
+                )?;
+                write_fake_active_thread_response(&mut stream, &message, thread_id)?;
+                saw_thread_read = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_thread_read {
+        return Err("fake app-server did not receive thread/read".to_owned());
+    }
+    thread::sleep(Duration::from_secs(5));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_untrusted_read_snapshot(
+    listener: &TcpListener,
+    thread_id: &'static str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(format!("accept fake app-server websocket: {error}")),
+        }
+    };
+
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set fake app-server stream blocking: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("set fake app-server read timeout: {error}"))?;
+    let websocket_accept = read_fake_http_upgrade(&mut stream)?;
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("write fake app-server handshake: {error}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_thread_read = false;
+    while !saw_thread_read && Instant::now() < deadline {
+        let message = read_fake_client_text_frame(&mut stream)?;
+        let method = message
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match method {
+            "initialize" => write_fake_json_response(
+                &mut stream,
+                &message,
+                serde_json::json!({
+                    "userAgent": "fake-codex",
+                    "codexHome": "/tmp/fake-codex-home",
+                    "platformFamily": "unix",
+                    "platformOs": "macos"
+                }),
+            )?,
+            "initialized" => {}
+            "thread/resume" => write_fake_thread_response(&mut stream, &message, thread_id, true)?,
+            "thread/read" => {
+                write_fake_json_response(
+                    &mut stream,
+                    &message,
+                    serde_json::json!({
+                        "thread": {
+                            "id": thread_id,
+                            "status": { "type": "systemError" },
+                            "turns": []
+                        }
+                    }),
+                )?;
+                saw_thread_read = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_thread_read {
+        return Err("fake app-server did not receive thread/read".to_owned());
+    }
+    thread::sleep(Duration::from_secs(5));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_fake_http_upgrade(stream: &mut TcpStream) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    let mut byte = [0_u8; 1];
+    while bytes.len() < 8192 {
+        stream
+            .read_exact(&mut byte)
+            .map_err(|error| format!("read fake app-server handshake: {error}"))?;
+        bytes.push(byte[0]);
+        if bytes.ends_with(b"\r\n\r\n") {
+            let request = String::from_utf8(bytes)
+                .map_err(|error| format!("decode fake handshake: {error}"))?;
+            let key = request
+                .split("\r\n")
+                .filter_map(|line| line.split_once(':'))
+                .find_map(|(name, value)| {
+                    name.eq_ignore_ascii_case("Sec-WebSocket-Key")
+                        .then(|| value.trim())
+                })
+                .ok_or_else(|| "fake handshake missing websocket key".to_owned())?;
+            return Ok(fake_websocket_accept_key(key));
+        }
+    }
+    Err("fake app-server handshake exceeded limit".to_owned())
+}
+
+#[cfg(unix)]
+fn fake_websocket_accept_key(websocket_key: &str) -> String {
+    let mut material = Vec::with_capacity(websocket_key.len() + 36);
+    material.extend_from_slice(websocket_key.as_bytes());
+    material.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    fake_base64_encode(&fake_sha1_digest(&material))
+}
+
+#[cfg(unix)]
+fn fake_base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut chunks = bytes.chunks_exact(3);
+    for chunk in &mut chunks {
+        let value = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+        encoded.push(TABLE[((value >> 18) & 0x3F) as usize] as char);
+        encoded.push(TABLE[((value >> 12) & 0x3F) as usize] as char);
+        encoded.push(TABLE[((value >> 6) & 0x3F) as usize] as char);
+        encoded.push(TABLE[(value & 0x3F) as usize] as char);
+    }
+    let remainder = chunks.remainder();
+    if !remainder.is_empty() {
+        let first = remainder[0];
+        let second = remainder.get(1).copied().unwrap_or(0);
+        let value = (u32::from(first) << 16) | (u32::from(second) << 8);
+        encoded.push(TABLE[((value >> 18) & 0x3F) as usize] as char);
+        encoded.push(TABLE[((value >> 12) & 0x3F) as usize] as char);
+        if remainder.len() == 2 {
+            encoded.push(TABLE[((value >> 6) & 0x3F) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        encoded.push('=');
+    }
+    encoded
+}
+
+#[cfg(unix)]
+fn fake_sha1_digest(input: &[u8]) -> [u8; 20] {
+    let mut message = input.to_vec();
+    let bit_len = (message.len() as u64).wrapping_mul(8);
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut h0 = 0x67452301_u32;
+    let mut h1 = 0xEFCDAB89_u32;
+    let mut h2 = 0x98BADCFE_u32;
+    let mut h3 = 0x10325476_u32;
+    let mut h4 = 0xC3D2E1F0_u32;
+
+    for chunk in message.chunks_exact(64) {
+        let mut words = [0_u32; 80];
+        for (idx, word) in words[..16].iter_mut().enumerate() {
+            let offset = idx * 4;
+            *word = u32::from_be_bytes([
+                chunk[offset],
+                chunk[offset + 1],
+                chunk[offset + 2],
+                chunk[offset + 3],
+            ]);
+        }
+        for idx in 16..80 {
+            words[idx] = (words[idx - 3] ^ words[idx - 8] ^ words[idx - 14] ^ words[idx - 16])
+                .rotate_left(1);
+        }
+
+        let mut a = h0;
+        let mut b = h1;
+        let mut c = h2;
+        let mut d = h3;
+        let mut e = h4;
+        for (idx, word) in words.iter().enumerate() {
+            let (f, k) = match idx {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut digest = [0_u8; 20];
+    for (idx, word) in [h0, h1, h2, h3, h4].iter().enumerate() {
+        digest[idx * 4..idx * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
+#[cfg(unix)]
+fn read_fake_client_text_frame(stream: &mut TcpStream) -> Result<serde_json::Value, String> {
+    let mut header = [0_u8; 2];
+    stream
+        .read_exact(&mut header)
+        .map_err(|error| format!("read fake websocket header: {error}"))?;
+    if header[0] & 0x0F != 0x1 {
+        return Err(format!(
+            "unexpected fake websocket opcode {}",
+            header[0] & 0x0F
+        ));
+    }
+    let masked = header[1] & 0x80 != 0;
+    if !masked {
+        return Err("client websocket frame was not masked".to_owned());
+    }
+    let mut length = u64::from(header[1] & 0x7F);
+    if length == 126 {
+        let mut bytes = [0_u8; 2];
+        stream
+            .read_exact(&mut bytes)
+            .map_err(|error| format!("read fake websocket medium length: {error}"))?;
+        length = u64::from(u16::from_be_bytes(bytes));
+    } else if length == 127 {
+        let mut bytes = [0_u8; 8];
+        stream
+            .read_exact(&mut bytes)
+            .map_err(|error| format!("read fake websocket large length: {error}"))?;
+        length = u64::from_be_bytes(bytes);
+    }
+    let mut mask = [0_u8; 4];
+    stream
+        .read_exact(&mut mask)
+        .map_err(|error| format!("read fake websocket mask: {error}"))?;
+    let mut payload =
+        vec![0_u8; usize::try_from(length).map_err(|error| format!("frame length: {error}"))?];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|error| format!("read fake websocket payload: {error}"))?;
+    for (idx, byte) in payload.iter_mut().enumerate() {
+        *byte ^= mask[idx % 4];
+    }
+    let text = String::from_utf8(payload).map_err(|error| format!("decode fake text: {error}"))?;
+    serde_json::from_str(&text).map_err(|error| format!("decode fake json: {error}"))
+}
+
+#[cfg(unix)]
+fn write_fake_thread_response(
+    stream: &mut TcpStream,
+    request: &serde_json::Value,
+    thread_id: &str,
+    include_turns: bool,
+) -> Result<(), String> {
+    let thread = if include_turns {
+        serde_json::json!({
+            "id": thread_id,
+            "status": { "type": "idle" },
+            "turns": []
+        })
+    } else {
+        serde_json::json!({
+            "id": thread_id
+        })
+    };
+    write_fake_json_response(
+        stream,
+        request,
+        serde_json::json!({
+            "thread": thread
+        }),
+    )
+}
+
+#[cfg(unix)]
+fn write_fake_active_thread_response(
+    stream: &mut TcpStream,
+    request: &serde_json::Value,
+    thread_id: &str,
+) -> Result<(), String> {
+    write_fake_json_response(
+        stream,
+        request,
+        serde_json::json!({
+            "thread": {
+                "id": thread_id,
+                "status": { "type": "active" },
+                "turns": [
+                    { "id": "turn-active-snapshot", "status": "inProgress" }
+                ]
+            }
+        }),
+    )
+}
+
+#[cfg(unix)]
+fn write_fake_json_response(
+    stream: &mut TcpStream,
+    request: &serde_json::Value,
+    result: serde_json::Value,
+) -> Result<(), String> {
+    let id = request
+        .get("id")
+        .cloned()
+        .ok_or_else(|| "fake app-server request missing id".to_owned())?;
+    write_fake_server_text_frame(
+        stream,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        }),
+    )
+}
+
+#[cfg(unix)]
+fn write_fake_server_text_frame(
+    stream: &mut TcpStream,
+    message: &serde_json::Value,
+) -> Result<(), String> {
+    let payload =
+        serde_json::to_vec(message).map_err(|error| format!("encode fake json: {error}"))?;
+    let mut frame = Vec::with_capacity(payload.len().saturating_add(10));
+    frame.push(0x81);
+    match payload.len() {
+        len @ 0..=125 => frame.push(u8::try_from(len).expect("small payload fits u8")),
+        len @ 126..=65535 => {
+            frame.push(126);
+            frame.extend_from_slice(&u16::try_from(len).expect("payload fits u16").to_be_bytes());
+        }
+        len => {
+            frame.push(127);
+            frame.extend_from_slice(&u64::try_from(len).expect("payload fits u64").to_be_bytes());
+        }
+    }
+    frame.extend_from_slice(&payload);
+    stream
+        .write_all(&frame)
+        .map_err(|error| format!("write fake websocket frame: {error}"))
+}
+
+#[cfg(unix)]
+fn wait_for_fake_app_server(done_rx: mpsc::Receiver<Result<(), String>>) {
+    match done_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("fake app-server failed: {error}"),
+        Err(error) => panic!("timed out waiting for fake app-server: {error}"),
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn cli_run_binds_session_starts_foreground_codex_and_stops_app_server() {
     let home = temp_home();
@@ -157,18 +1014,38 @@ fn cli_run_binds_session_starts_foreground_codex_and_stops_app_server() {
     assert!(log.contains("\t--model\tgpt-test"));
 
     let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
-    let (managed_session_id, session_state, session_epoch): (String, String, i64) = conn
+    let (
+        managed_session_id,
+        session_state,
+        session_epoch,
+        activity_state,
+        activity_revision,
+        capability_revision,
+    ): (String, String, i64, String, i64, i64) = conn
         .query_row(
-            "SELECT managed_session_id, session_state, session_epoch
+            "SELECT managed_session_id, session_state, session_epoch,
+                    activity_state, activity_revision, capability_revision
              FROM cli_managed_sessions
              WHERE bound_thread_id = ?",
             ["thread-cli-run"],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .expect("query managed session");
     assert!(!managed_session_id.is_empty());
     assert_eq!(session_state, "live");
-    assert_eq!(session_epoch, 1);
+    assert_eq!(session_epoch, 2);
+    assert_eq!(activity_state, "unknown");
+    assert_eq!(activity_revision, 0);
+    assert_eq!(capability_revision, 0);
 
     let status_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("--home")
@@ -187,6 +1064,523 @@ fn cli_run_binds_session_starts_foreground_codex_and_stops_app_server() {
     let status: serde_json::Value =
         serde_json::from_slice(&status_output.stdout).expect("status json");
     assert_eq!(status["cli_app_servers"], serde_json::json!([]));
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_passive_adapter_records_app_server_activity() {
+    let home = temp_home();
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let (app_server_url, fake_server_done) = spawn_fake_app_server("thread-cli-run-passive");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg("thread-cli-run-passive")
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth cli run");
+
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_fake_app_server(fake_server_done);
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (
+        session_epoch,
+        activity_state,
+        activity_revision,
+        capability_revision,
+        capability_thread_resume,
+        capability_turn_start,
+        capability_current_state_sync,
+    ): (i64, String, i64, i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT session_epoch, activity_state, activity_revision, capability_revision,
+                    capability_thread_resume, capability_turn_start, capability_current_state_sync
+             FROM cli_managed_sessions
+             WHERE bound_thread_id = ?",
+            ["thread-cli-run-passive"],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .expect("query managed session passive adapter state");
+    assert!(session_epoch >= 2);
+    assert_eq!(activity_state, "unknown");
+    assert_eq!(activity_revision, 0);
+    assert_eq!(capability_revision, 0);
+    assert_eq!(capability_thread_resume, 0);
+    assert_eq!(capability_turn_start, 0);
+    assert_eq!(capability_current_state_sync, 0);
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_passive_adapter_read_snapshot_dominates_request_window_notifications() {
+    let home = temp_home();
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_started_before_read_snapshot("thread-cli-run-buffered");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg("thread-cli-run-buffered")
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth cli run");
+
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_fake_app_server(fake_server_done);
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (activity_state, activity_revision): (String, i64) = conn
+        .query_row(
+            "SELECT activity_state, activity_revision
+             FROM cli_managed_sessions
+             WHERE bound_thread_id = ?",
+            ["thread-cli-run-buffered"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query managed session passive adapter state");
+    assert_eq!(activity_state, "unknown");
+    assert_eq!(activity_revision, 0);
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_passive_adapter_replays_resume_window_notifications_when_read_missing() {
+    let home = temp_home();
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_resume_started_before_missing_read_snapshot(
+            "thread-cli-run-resume-window",
+        );
+
+    let child = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg("thread-cli-run-resume-window")
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "7")
+        .spawn()
+        .expect("spawn cbth cli run");
+
+    let activity_revision =
+        wait_for_cli_activity_state(&home, "thread-cli-run-resume-window", "active");
+    assert!(activity_revision >= 2);
+
+    let output = wait_with_timeout(child, Duration::from_secs(12));
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_fake_app_server(fake_server_done);
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_passive_adapter_ignores_stale_idle_before_active_read_snapshot() {
+    let home = temp_home();
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_idle_before_active_read_snapshot("thread-cli-run-stale-idle");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg("thread-cli-run-stale-idle")
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth cli run");
+
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_fake_app_server(fake_server_done);
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (activity_state, activity_revision): (String, i64) = conn
+        .query_row(
+            "SELECT activity_state, activity_revision
+             FROM cli_managed_sessions
+             WHERE bound_thread_id = ?",
+            ["thread-cli-run-stale-idle"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query managed session passive adapter state");
+    assert_eq!(activity_state, "unknown");
+    assert_eq!(activity_revision, 0);
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_passive_adapter_invalidates_untrusted_read_snapshot() {
+    let home = temp_home();
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_untrusted_read_snapshot("thread-cli-run-untrusted-read");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg("thread-cli-run-untrusted-read")
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth cli run");
+
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_fake_app_server(fake_server_done);
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (activity_state, activity_revision, capability_revision): (String, i64, i64) = conn
+        .query_row(
+            "SELECT activity_state, activity_revision, capability_revision
+             FROM cli_managed_sessions
+             WHERE bound_thread_id = ?",
+            ["thread-cli-run-untrusted-read"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query managed session passive adapter state");
+    assert_eq!(activity_state, "unknown");
+    assert_eq!(activity_revision, 0);
+    assert_eq!(capability_revision, 0);
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_passive_adapter_invalidates_after_read_timeout() {
+    let home = temp_home();
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_started_before_failed_read("thread-cli-run-failed-read");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg("thread-cli-run-failed-read")
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth cli run");
+
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_fake_app_server(fake_server_done);
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (activity_state, activity_revision, capability_revision): (String, i64, i64) = conn
+        .query_row(
+            "SELECT activity_state, activity_revision, capability_revision
+             FROM cli_managed_sessions
+             WHERE bound_thread_id = ?",
+            ["thread-cli-run-failed-read"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query managed session passive adapter state");
+    assert_eq!(activity_state, "unknown");
+    assert_eq!(activity_revision, 0);
+    assert_eq!(capability_revision, 0);
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_passive_adapter_requires_current_state_snapshot_before_idle_proof() {
+    let home = temp_home();
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_without_turn_snapshot("thread-cli-run-no-snapshot");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg("thread-cli-run-no-snapshot")
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "1")
+        .output()
+        .expect("run cbth cli run");
+
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_fake_app_server(fake_server_done);
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (activity_state, activity_revision, capability_revision): (String, i64, i64) = conn
+        .query_row(
+            "SELECT activity_state, activity_revision, capability_revision
+             FROM cli_managed_sessions
+             WHERE bound_thread_id = ?",
+            ["thread-cli-run-no-snapshot"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query managed session passive adapter state");
+    assert_eq!(activity_state, "unknown");
+    assert_eq!(activity_revision, 0);
+    assert_eq!(capability_revision, 0);
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_passive_adapter_invalidates_old_idle_after_reconnect_without_snapshot() {
+    let home = temp_home();
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_reconnect_without_turn_snapshot("thread-cli-run-reconnect");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg("thread-cli-run-reconnect")
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "3")
+        .output()
+        .expect("run cbth cli run");
+
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_fake_app_server(fake_server_done);
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (session_epoch, activity_state, activity_revision, capability_revision): (
+        i64,
+        String,
+        i64,
+        i64,
+    ) = conn
+        .query_row(
+            "SELECT session_epoch, activity_state, activity_revision, capability_revision
+             FROM cli_managed_sessions
+             WHERE bound_thread_id = ?",
+            ["thread-cli-run-reconnect"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("query managed session passive adapter state");
+    assert!(session_epoch >= 2);
+    assert_eq!(activity_state, "unknown");
+    assert_eq!(activity_revision, 0);
+    assert_eq!(capability_revision, 0);
 
     let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("--home")
@@ -339,14 +1733,23 @@ fn cli_run_reservation_rejects_duplicate_before_session_epoch_bump() {
     );
 
     let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
-    let session_epoch: i64 = conn
+    let (session_epoch, activity_state, activity_revision, capability_revision): (
+        i64,
+        String,
+        i64,
+        i64,
+    ) = conn
         .query_row(
-            "SELECT session_epoch FROM cli_managed_sessions WHERE bound_thread_id = ?",
+            "SELECT session_epoch, activity_state, activity_revision, capability_revision
+             FROM cli_managed_sessions WHERE bound_thread_id = ?",
             ["thread-cli-run-reservation"],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .expect("query managed session epoch");
-    assert_eq!(session_epoch, 1);
+        .expect("query managed session proof");
+    assert_eq!(session_epoch, 2);
+    assert_eq!(activity_state, "unknown");
+    assert_eq!(activity_revision, 0);
+    assert_eq!(capability_revision, 0);
 
     let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("--home")
@@ -476,14 +1879,23 @@ fn cli_run_rejects_duplicate_active_thread_before_stealing_lease() {
     let log = fs::read_to_string(&log_path).expect("read fake codex log");
     assert_eq!(log.matches("foreground\t--remote").count(), 1);
     let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
-    let session_epoch: i64 = conn
+    let (session_epoch, activity_state, activity_revision, capability_revision): (
+        i64,
+        String,
+        i64,
+        i64,
+    ) = conn
         .query_row(
-            "SELECT session_epoch FROM cli_managed_sessions WHERE bound_thread_id = ?",
+            "SELECT session_epoch, activity_state, activity_revision, capability_revision
+             FROM cli_managed_sessions WHERE bound_thread_id = ?",
             ["thread-cli-run-duplicate"],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .expect("query managed session epoch");
-    assert_eq!(session_epoch, 1);
+        .expect("query managed session proof");
+    assert_eq!(session_epoch, 2);
+    assert_eq!(activity_state, "unknown");
+    assert_eq!(activity_revision, 0);
+    assert_eq!(capability_revision, 0);
 
     let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("--home")

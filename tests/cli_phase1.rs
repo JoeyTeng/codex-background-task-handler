@@ -552,6 +552,80 @@ fn cli_session_note_capabilities_records_epoch_local_probe() {
 }
 
 #[test]
+fn cli_session_invalidate_proof_resets_activity_and_capabilities() {
+    let home = tempfile::tempdir().expect("temp home");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-proof-invalidation");
+
+    let invalidated = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "invalidate-proof",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--now",
+            "300",
+        ],
+    );
+    assert_eq!(invalidated["cli_session"]["session_epoch"], 2);
+    assert_eq!(invalidated["cli_session"]["activity_state"], "unknown");
+    assert_eq!(invalidated["cli_session"]["activity_revision"], 0);
+    assert_eq!(invalidated["cli_session"]["capability_revision"], 0);
+    assert_eq!(
+        invalidated["cli_session"]["capability_thread_resume"],
+        false
+    );
+    assert_eq!(invalidated["cli_session"]["updated_at"], 300);
+
+    let replayed_invalidation = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "invalidate-proof",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--now",
+            "301",
+        ],
+    );
+    assert_eq!(replayed_invalidation["cli_session"]["session_epoch"], 2);
+    assert_eq!(
+        replayed_invalidation["cli_session"]["activity_state"],
+        "unknown"
+    );
+    assert_eq!(replayed_invalidation["cli_session"]["activity_revision"], 0);
+    assert_eq!(
+        replayed_invalidation["cli_session"]["capability_revision"],
+        0
+    );
+    assert_eq!(replayed_invalidation["cli_session"]["updated_at"], 300);
+
+    let stale_epoch = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "note-activity",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--activity-state",
+            "idle",
+            "--activity-revision",
+            "1",
+        ],
+    );
+    assert!(stale_epoch.contains("is at epoch 2, not 1"));
+}
+
+#[test]
 fn cli_session_rebind_fences_old_activity_writer() {
     let home = tempfile::tempdir().expect("temp home");
     let managed_session_id = bind_idle_cli_session(&home, "thread-cli-activity-fence");

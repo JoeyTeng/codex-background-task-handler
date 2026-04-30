@@ -4,6 +4,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -210,6 +211,13 @@ fn cbth_failure(home: &TempDir, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[cfg(unix)]
+fn cbth_failure_elapsed(home: &TempDir, args: &[&str]) -> (String, Duration) {
+    let started = Instant::now();
+    let error = cbth_failure(home, args);
+    (error, started.elapsed())
 }
 
 fn wait_for_socket_removed(home: &TempDir) {
@@ -468,6 +476,46 @@ fn mutating_dispatch_fails_closed_before_autostart_with_permissive_run_dir() {
     );
     assert!(stderr.contains("cbth run directory permissions are wider than 0700"));
     assert!(!run_dir.join("cbth.sock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_routed_cli_session_proof_writes_use_short_store_timeout() {
+    let home = temp_home();
+    let managed_session_id = bind_idle_cli_session_direct(&home, "thread-short-passive-write");
+    cbth(&home, &["daemon", "ensure"]);
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db lock");
+    conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+        .expect("hold exclusive db lock");
+
+    let (stderr, elapsed) = cbth_failure_elapsed(
+        &home,
+        &[
+            "cli",
+            "session",
+            "note-activity",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--activity-state",
+            "active",
+            "--activity-revision",
+            "2",
+            "--now",
+            "1001",
+        ],
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "daemon-routed passive write used a long busy timeout: {elapsed:?}\nstderr: {stderr}"
+    );
+    assert!(!stderr.trim().is_empty(), "expected locked write to fail");
+    drop(conn);
+
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
 }
 
 #[test]

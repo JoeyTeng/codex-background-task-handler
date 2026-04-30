@@ -16,10 +16,10 @@ use crate::fs_layout::{
 use crate::models::{
     ArtifactRecord, BatchInspect, BatchJobRecord, BatchRecord, CliManagedSessionActivityUpdate,
     CliManagedSessionAttach, CliManagedSessionCapabilities, CliManagedSessionCapabilityUpdate,
-    CliManagedSessionProfile, CliManagedSessionRecord, DEFAULT_REDELIVERY_WINDOW_SECONDS,
-    DaemonLifecycleStatus, DeliveryAttemptRecord, DeliveryPolicy, JobRecord, NewArtifact, NewBatch,
-    NewCliAcceptPendingAttempt, NewJob, ORPHAN_ARTIFACT_GRACE_SECONDS,
-    POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
+    CliManagedSessionProfile, CliManagedSessionProofInvalidation, CliManagedSessionRecord,
+    DEFAULT_REDELIVERY_WINDOW_SECONDS, DaemonLifecycleStatus, DeliveryAttemptRecord,
+    DeliveryPolicy, JobRecord, NewArtifact, NewBatch, NewCliAcceptPendingAttempt, NewJob,
+    ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
 };
 
 const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
@@ -511,6 +511,69 @@ impl Store {
         let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
         tx.commit()?;
         Ok(CliManagedSessionCapabilityUpdate { session })
+    }
+
+    pub fn invalidate_cli_managed_session_proof(
+        &mut self,
+        managed_session_id: &str,
+        session_epoch: i64,
+        now: i64,
+    ) -> Result<CliManagedSessionProofInvalidation> {
+        ensure_positive_value("session_epoch", session_epoch)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
+        ensure_cli_session_attachable(&session)?;
+        if session.session_epoch != session_epoch {
+            if session.session_epoch > session_epoch && cli_session_proof_is_clear(&session) {
+                tx.commit()?;
+                return Ok(CliManagedSessionProofInvalidation { session });
+            }
+            ensure_cli_session_epoch_matches(&session, session_epoch)?;
+        }
+        abandon_cli_observations_for_session_epoch_loss_tx(&tx, managed_session_id, now)?;
+        invalidate_cli_managed_session_activity_tx(
+            &tx,
+            Some(managed_session_id),
+            Some(session_epoch),
+            now,
+        )?;
+        let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
+        tx.commit()?;
+        Ok(CliManagedSessionProofInvalidation { session })
+    }
+
+    pub fn invalidate_cli_managed_session_current_proof(
+        &mut self,
+        managed_session_id: &str,
+        bound_thread_id: &str,
+        now: i64,
+    ) -> Result<CliManagedSessionProofInvalidation> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
+        ensure_cli_session_attachable(&session)?;
+        if session.bound_thread_id != bound_thread_id {
+            bail!(
+                "CLI managed session {} is bound to {}, not {}",
+                managed_session_id,
+                session.bound_thread_id,
+                bound_thread_id
+            );
+        }
+        let session_epoch = session.session_epoch;
+        abandon_cli_observations_for_session_epoch_loss_tx(&tx, managed_session_id, now)?;
+        invalidate_cli_managed_session_activity_tx(
+            &tx,
+            Some(managed_session_id),
+            Some(session_epoch),
+            now,
+        )?;
+        let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
+        tx.commit()?;
+        Ok(CliManagedSessionProofInvalidation { session })
     }
 
     pub fn begin_cli_accept_pending_attempt(
@@ -2592,6 +2655,19 @@ fn ensure_cli_session_activity_value(activity_state: &str) -> Result<()> {
         "active" | "idle" => Ok(()),
         other => bail!("unsupported CLI managed session activity state {other}"),
     }
+}
+
+fn cli_session_proof_is_clear(session: &CliManagedSessionRecord) -> bool {
+    session.activity_state == "unknown"
+        && session.activity_revision == 0
+        && session.capability_revision == 0
+        && !session.capability_thread_resume
+        && !session.capability_turn_start
+        && !session.capability_current_state_sync
+        && !session.capability_turn_completed_event
+        && !session.capability_negative_terminal_events
+        && !session.capability_thread_start
+        && !session.capability_turn_steer
 }
 
 fn ensure_cli_session_activity_revision_can_advance(
