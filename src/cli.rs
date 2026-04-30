@@ -52,6 +52,8 @@ const CLI_APP_SERVER_PASSIVE_RETRY_MAX_MS: u64 = 500;
 const CLI_APP_SERVER_PASSIVE_STORE_TIMEOUT_SECONDS: u64 = 1;
 const CLI_APP_SERVER_AUTO_DELIVERY_POLL_MS: u64 = 2_000;
 const CLI_APP_SERVER_TURN_START_TIMEOUT_SECONDS: u64 = 5;
+const CLI_APP_SERVER_ACCEPT_PERSIST_RETRY_TIMEOUT_SECONDS: u64 = 30;
+const CLI_APP_SERVER_ACCEPT_PERSIST_RETRY_INTERVAL_MS: u64 = 250;
 const CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS: i64 = MAX_CLI_OBSERVATION_WINDOW_SECONDS;
 const CLI_APP_SERVER_RECONCILE_INTERVAL_MS: u64 = 2_000;
 
@@ -1470,18 +1472,7 @@ fn maybe_run_cli_auto_delivery(
         }
     };
     let delivery_turn_id = parse_turn_start_delivery_turn_id(&turn_start)?;
-    let accepted = dispatch_cli_adapter_command(
-        config,
-        Commands::Attempt {
-            command: AttemptCommand::AcceptCli(AttemptAcceptCliArgs {
-                attempt_id: attempt_id.clone(),
-                delivery_turn_id: delivery_turn_id.clone(),
-                observation_window_seconds: CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS,
-                now: None,
-            }),
-        },
-        false,
-    )?;
+    let accepted = accept_cli_auto_delivery_with_retry(config, &attempt_id, &delivery_turn_id)?;
     let accepted_attempt = accepted
         .get("attempt")
         .ok_or_else(|| anyhow::anyhow!("accept-cli response missing attempt"))?;
@@ -1517,6 +1508,40 @@ fn maybe_run_cli_auto_delivery(
             initial_messages: turn_start_messages,
         },
     )
+}
+
+fn accept_cli_auto_delivery_with_retry(
+    config: &CliAppServerPassiveAdapterConfig,
+    attempt_id: &str,
+    delivery_turn_id: &str,
+) -> Result<Value> {
+    let deadline =
+        Instant::now() + Duration::from_secs(CLI_APP_SERVER_ACCEPT_PERSIST_RETRY_TIMEOUT_SECONDS);
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match dispatch_cli_adapter_command(
+            config,
+            Commands::Attempt {
+                command: AttemptCommand::AcceptCli(AttemptAcceptCliArgs {
+                    attempt_id: attempt_id.to_owned(),
+                    delivery_turn_id: delivery_turn_id.to_owned(),
+                    observation_window_seconds: CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS,
+                    now: None,
+                }),
+            },
+            true,
+        ) {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                last_error = Some(error);
+                std::thread::sleep(Duration::from_millis(
+                    CLI_APP_SERVER_ACCEPT_PERSIST_RETRY_INTERVAL_MS,
+                ));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("accept-cli persistence retry exhausted")))
+        .context("persist accepted CLI turn after turn/start")
 }
 
 struct CliAcceptedTurn {

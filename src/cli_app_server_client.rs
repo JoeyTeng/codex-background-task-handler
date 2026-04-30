@@ -517,7 +517,11 @@ pub(crate) fn thread_result_turn_status(
     if thread.get("id").and_then(Value::as_str) != Some(bound_thread_id) {
         return ThreadActivitySnapshotOrTurnStatus::Untrusted;
     }
-    let Some(turns) = thread.get("turns").and_then(Value::as_array) else {
+    let Some(turns) = thread
+        .get("turns")
+        .or_else(|| result.get("turns"))
+        .and_then(Value::as_array)
+    else {
         return ThreadActivitySnapshotOrTurnStatus::Missing;
     };
     for turn in turns {
@@ -883,7 +887,8 @@ mod tests {
 
     use super::{
         AppServerJsonRpcClient, AppServerNotification, AppServerReceive, ThreadActivitySnapshot,
-        decode_notification, thread_result_activity_snapshot,
+        ThreadActivitySnapshotOrTurnStatus, TurnStatusSnapshot, decode_notification,
+        thread_result_activity_snapshot, thread_result_turn_status,
         validate_websocket_handshake_response, websocket_accept_key,
     };
 
@@ -1282,5 +1287,23 @@ mod tests {
             decode_notification(&replaced),
             Some(AppServerNotification::TurnTerminal { .. })
         ));
+    }
+
+    #[test]
+    fn thread_result_turn_status_reads_top_level_turns_with_thread_metadata() {
+        let result = json!({
+            "thread": {
+                "id": "thread-1",
+                "status": { "type": "idle" }
+            },
+            "turns": [
+                { "id": "turn-1", "status": "completed" }
+            ]
+        });
+
+        assert_eq!(
+            thread_result_turn_status(&result, "thread-1", "turn-1"),
+            ThreadActivitySnapshotOrTurnStatus::Turn(TurnStatusSnapshot::Completed)
+        );
     }
 }
