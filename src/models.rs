@@ -168,6 +168,7 @@ pub struct DeliveryAttemptRecord {
     pub batch_id: String,
     pub source_thread_id: String,
     pub adapter_kind: String,
+    pub authorization_mode: String,
     pub state: String,
     pub generation: i64,
     pub delivery_rpc_request_id: Option<String>,
@@ -260,10 +261,43 @@ pub struct NewCliAcceptPendingAttempt {
     pub batch_id: String,
     pub managed_session_id: String,
     pub session_epoch: i64,
+    pub authorization_mode: String,
     pub delivery_rpc_request_id: String,
     pub delivery_rpc_kind: String,
     pub delivery_rpc_correlation_marker: String,
     pub delivery_rpc_started_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewAuditDecision {
+    pub audit_id: String,
+    pub recorded_at: i64,
+    pub source_thread_id: Option<String>,
+    pub batch_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub managed_session_id: Option<String>,
+    pub session_epoch: Option<i64>,
+    pub policy_kind: String,
+    pub decision: String,
+    pub reason: String,
+    pub adapter_kind: String,
+    pub details: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AuditDecisionRecord {
+    pub audit_id: String,
+    pub recorded_at: i64,
+    pub source_thread_id: Option<String>,
+    pub batch_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub managed_session_id: Option<String>,
+    pub session_epoch: Option<i64>,
+    pub policy_kind: String,
+    pub decision: String,
+    pub reason: String,
+    pub adapter_kind: String,
+    pub details: Value,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

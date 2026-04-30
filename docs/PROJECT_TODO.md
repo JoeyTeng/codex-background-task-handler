@@ -6,6 +6,16 @@
 - [x] 合入 `codex/review-gate-review-body-findings` 后，在 #12 或后续测试 PR 上验证 Codex review-body findings 会让 `codex/review-gate` deterministic failure，而旧 commit 的 review-body findings 不会 block 新 head。
 - [ ] 合入 `codex/review-gate-resolved-threads` 后，在 #12 或后续测试 PR 上验证已 resolved / outdated 的旧 Codex inline review thread 不会被 REST `commit_id` remap 误判为 current-head blocker。
 - [x] 把 deterministic fake e2e 纳入默认 Rust gate：job/batch/attempt delivered path 与 `cbth cli run` passive no-delivery-RPC guard 都由 `cargo test --locked` 覆盖。
+- [x] 实现 Phase 11b `cbth cli run --auto-delivery-policy trusted-all`：
+  - [x] 默认 passive 仍不发送 `turn/start`
+  - [x] explicit `trusted-all` 会在 durable idle proof 后发送带 unique marker 的 `turn/start`
+  - [x] completed notification 可关闭 batch 为 `delivered`
+  - [x] missed notification 可通过 same-epoch `thread/read(includeTurns=true)` reconcile 关闭为 `delivered`
+  - [x] failed/interrupted/replaced terminal evidence 会 fail-close 到 `manual_resolution_only`
+  - [x] clear pre-accept rejection 写入 `rejected_before_accept` 且不消耗 attempt count
+  - [x] timeout / closed / protocol-error ambiguity 不重发，交给 stale sweep 标成 `unknown + manual_resolution_only`
+  - [x] `strict_safe` 与 `trusted_all` 授权差异已覆盖，`trusted_all` 绕过 policy/artifact/session-risk gates 但仍要求 head/budget/session/epoch/idle proof
+  - [x] `cbth audit list` 可读取 allow/deny/attempt-start/accepted/rejected/reconciled/observed/manualized audit records
 - [x] 增加 ignored / opt-in live Codex shared `app-server` smoke，保持编译与 lint-clean，但不进入默认 CI 执行。
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
 - [x] 确认桌面端私有 `app-server` 当前正持有该 rollout 文件。
@@ -341,7 +351,7 @@
 - [x] 验证 CLI 在 shared `app-server` 模式下，第二个 sidecar client 能否对同一个 thread 执行 `thread/resume + turn/start`，并让前台 client 收到 live 通知。
 - [x] 验证真实前台 `codex --remote` TUI 在 PTY 中是否会把 sidecar 触发的新 turn 展示给用户。
 - [x] 单独沉淀 CLI shared `app-server` + sidecar 技术方案文档。
-- [x] 为 CLI 设计并实现最小 `cbth cli run` 进程模型：shared `app-server`、前台 `codex --remote`、lease 清理策略；真实 sidecar delivery loop 后续单独实现。
+- [x] 为 CLI 设计并实现最小 `cbth cli run` 进程模型：shared `app-server`、前台 `codex --remote`、lease 清理策略；后续 Phase 11b 已补上 explicit `trusted-all` sidecar delivery loop。
 - [x] 把 CLI 第一版的 shared `app-server` 安全边界定死为：
   - [x] loopback-only listener
   - [x] daemon-owned random local port
@@ -384,7 +394,7 @@
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
   - [x] `turn/start` / `turn/steer` 前必须先进入 `accept_pending`
   - [x] `accept_pending` 必须 durable 记录 `delivery_rpc_request_id + delivery_rpc_correlation_marker`
-  - [x] `accept_pending` 现在要求 `managed_session_id` 存在、绑定当前 batch `source_thread_id`、`session_epoch` 匹配、session 处于 `live` / `detached`、`turn_start` 时 `activity_state=idle`，且 risk profile 为 no-approval / no-network / no-write
+  - [x] `accept_pending` 现在要求 `managed_session_id` 存在、绑定当前 batch `source_thread_id`、`session_epoch` 匹配、session 处于 `live` / `detached`、`turn_start` 时 `activity_state=idle`；默认 `strict_safe` 还要求 risk profile 为 no-approval / no-network / no-write，显式 `trusted_all` 绕过 risk-profile gate
   - response 丢失后只能通过同一连续 event/current-state 面正向证明 marker 已接入 exactly one caller turn；否则 fail-closed，不得自动重发
   - proven-before-accept benign reject 才允许 `accept_pending -> prepared`
   - `accept_pending -> prepared` 必须写入 `delivery_rpc_state=rejected_before_accept`，且不得递增 `delivery_attempt_count`
@@ -393,7 +403,7 @@
   - [x] accepted attempt 必须 durable 记录 `last_observed_turn_event + last_observed_turn_event_at`
   - [x] accepted attempt 必须 durable 记录 `delivery_observation_deadline`
   - [x] `delivery_observation_deadline` 的计算基准必须统一为 `delivery_accepted_at`
-  - [x] detached auto-delivery 只允许在 session-scoped risk profile 三项都为 `false` 时开启
+  - [x] `strict_safe` detached auto-delivery 只允许在 session-scoped risk profile 三项都为 `false` 时开启；`trusted_all` 作为显式 broad escape hatch 已单独实现
   - [x] session attach / stale accept / expired observation / operator-close active attempt 会推进 `session_epoch` 并清空 activity proof，避免旧 idle 证明继续打开自动投递
   - [x] passive adapter continuity loss / missing authoritative current-state snapshot 会推进 `session_epoch` 并清空旧 activity / capability proof，避免断连前 idle 证明继续打开自动投递
   - [x] passive adapter 的 matched-thread `thread.status.type` authoritative snapshot 会支配同一 request response 前消费到的 stale notification，明确不可信 snapshot 会 fail-closed，且 capability / activity 写入失败会先清空 proof 再 retry
@@ -409,21 +419,21 @@
     - [x] 当前 head batch -> `replay_policy=manual_resolution_only`
   - 如果 `delivery_turn_id` 的观察连续性丢失，则当前 head batch 进入 `manual_resolution_only`
   - [x] 落地 store-level `session_epoch` 的生成、递增与 fail-closed 判定规则
-  - [x] `cli run` passive adapter 已能读取真实 app-server lifecycle event stream 并同步 `active` / `idle` current-state；accepted-turn continuity 判定与 terminal-event reconciliation 仍待 delivery adapter phase 落地
+  - [x] `cli run` sidecar 已能读取 app-server lifecycle event stream 并同步 `active` / `idle` current-state；`trusted-all` delivery loop 已接入 accepted-turn notification observation 与 same-epoch `thread/read` reconciliation
   - 落地 `turn_steer` 所需的 active-turn risk proof 后，再允许 `begin-cli-accept --rpc-kind turn-steer` 从 fail-closed 变成受控可用
   - 按当前合同实现 continuity-loss 场景的 `inspect-head -> close-head(reason=...)` operator-resolution flow
-- [ ] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
+- [x] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
   - [x] `cli run` passive adapter 已基于 `turn/started` / `turn/completed` / `thread/status/changed` 推进 durable `active` / `idle`
-  - `begin-cli-accept` / delivery loop 仍需消费该 idle proof 并处理 race
-  - `turn/start` race 失败后回到等待下一个 idle
+  - [x] `begin-cli-accept` / delivery loop 会消费该 idle proof
+  - [x] clear pre-accept `turn/start` rejection 会写入 `rejected_before_accept`，不消耗 attempt count，并等待 fresh idle proof 后再 retry
 - [x] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为，且不会导致当前 turn 提前结束。
 - [x] 为 CLI adapter 明确定义实验 RPC 的最小能力集、capability probe 和 fail-closed 策略。
 - [ ] 把 `turn/steer` 维持为默认关闭的 gated optimization，并明确不满足条件时的 idle-only fallback。
-- [ ] 为 CLI adapter 落实 delivery completion contract：
+- [x] 为 CLI adapter 落实 `turn/start` delivery completion contract：
   - [x] accepted `turn/start` 只记录 `delivery_turn_id`
   - accepted `turn/steer` 仍待 active-turn risk proof 落地后开放；当前 `begin-cli-accept --rpc-kind turn-steer` 仍 fail-closed
   - [x] 只有匹配的 `turn/completed` 才允许 close batch
-  - pre-accept 的 benign race / non-steerable reject 可以回退到 retry-on-idle
+  - [x] pre-accept 的 benign race / non-steerable reject 可以回退到 retry-on-idle
   - [x] 但 accepted 之后的 interrupted / replaced / failed turn 必须 fail-closed 到 `manual_resolution_only`
   - [x] `observed_at >= delivery_observation_deadline` 的 `turn/completed` 不得关闭 batch，只能作为 late evidence 记录并 fail-closed 到 manual resolution；startup sweep 先过期但事件实际 `observed_at` 仍早于 deadline 的 completion 可以修正为 delivered
-  - `cli run` passive websocket event loop 已实现 current-state / lifecycle sync；accepted `delivery_turn_id` 到 `attempt observe-cli-turn` 的 delivery observation loop 仍待实现
+  - [x] `cli run` websocket event loop 已实现 current-state / lifecycle sync；accepted `delivery_turn_id` 已接到 `attempt observe-cli-turn` 的 delivery observation loop，并支持 same-epoch `thread/read` reconcile

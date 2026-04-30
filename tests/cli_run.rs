@@ -307,6 +307,36 @@ fn spawn_fake_app_server_capture_passive_methods(
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+enum FakeAutoDeliveryOutcome {
+    CompletedNotification,
+    CompletedReconcile,
+    FailedNotification,
+    RejectedBeforeAccept,
+    ClosedBeforeAccept,
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_auto_delivery(
+    thread_id: &'static str,
+    outcome: FakeAutoDeliveryOutcome,
+) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = accept_fake_app_server_auto_delivery(&listener, thread_id, outcome);
+        let _ = done_tx.send(result);
+    });
+
+    (url, done_rx)
+}
+
+#[cfg(unix)]
 fn spawn_fake_app_server_with_options(
     thread_id: &'static str,
     include_turns: bool,
@@ -566,6 +596,159 @@ fn accept_fake_app_server_capture_passive_methods(
         }
     }
 
+    Ok(methods)
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_auto_delivery(
+    listener: &TcpListener,
+    thread_id: &'static str,
+    outcome: FakeAutoDeliveryOutcome,
+) -> Result<Vec<String>, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(format!("accept fake app-server websocket: {error}")),
+        }
+    };
+
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set fake app-server stream blocking: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(|error| format!("set fake app-server read timeout: {error}"))?;
+    let websocket_accept = read_fake_http_upgrade(&mut stream)?;
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("write fake app-server handshake: {error}"))?;
+
+    let mut methods = Vec::new();
+    let mut saw_delivery_terminal = false;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline && !saw_delivery_terminal {
+        let Some(message) = try_read_fake_client_text_frame(&mut stream)? else {
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        let method = record_fake_app_server_method_allowing_delivery(&mut methods, &message)?;
+        match method {
+            "initialize" => write_fake_json_response(
+                &mut stream,
+                &message,
+                serde_json::json!({
+                    "userAgent": "fake-codex",
+                    "codexHome": "/tmp/fake-codex-home",
+                    "platformFamily": "unix",
+                    "platformOs": "macos"
+                }),
+            )?,
+            "initialized" => {}
+            "thread/resume" => write_fake_thread_response(&mut stream, &message, thread_id, true)?,
+            "thread/read" => {
+                if matches!(outcome, FakeAutoDeliveryOutcome::CompletedReconcile)
+                    && methods.iter().any(|method| method == "turn/start")
+                {
+                    write_fake_thread_turn_response(
+                        &mut stream,
+                        &message,
+                        thread_id,
+                        "turn-auto-delivery",
+                        "completed",
+                    )?;
+                    saw_delivery_terminal = true;
+                } else {
+                    write_fake_thread_response(&mut stream, &message, thread_id, true)?;
+                }
+            }
+            "turn/start" => {
+                let params = message.get("params").unwrap_or(&serde_json::Value::Null);
+                if params.get("threadId").and_then(serde_json::Value::as_str) != Some(thread_id) {
+                    return Err(format!("turn/start targeted wrong thread: {params}"));
+                }
+                let input = params
+                    .get("input")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|items| items.first())
+                    .and_then(|item| item.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if !input.contains("cbth-delivery-marker:")
+                    || !input.contains("Policy: trusted-all")
+                {
+                    return Err(format!(
+                        "turn/start prompt missing marker or policy: {input}"
+                    ));
+                }
+                match outcome {
+                    FakeAutoDeliveryOutcome::RejectedBeforeAccept => {
+                        write_fake_json_error(
+                            &mut stream,
+                            &message,
+                            -32000,
+                            "caller thread is not idle",
+                        )?;
+                        saw_delivery_terminal = true;
+                    }
+                    FakeAutoDeliveryOutcome::ClosedBeforeAccept => return Ok(methods),
+                    FakeAutoDeliveryOutcome::CompletedNotification
+                    | FakeAutoDeliveryOutcome::CompletedReconcile
+                    | FakeAutoDeliveryOutcome::FailedNotification => {
+                        write_fake_json_response(
+                            &mut stream,
+                            &message,
+                            serde_json::json!({
+                                "turn": {
+                                    "id": "turn-auto-delivery",
+                                    "status": "inProgress",
+                                    "items": []
+                                }
+                            }),
+                        )?;
+                        match outcome {
+                            FakeAutoDeliveryOutcome::CompletedNotification => {
+                                write_fake_turn_completed_notification(
+                                    &mut stream,
+                                    thread_id,
+                                    "turn-auto-delivery",
+                                    "completed",
+                                )?;
+                                saw_delivery_terminal = true;
+                            }
+                            FakeAutoDeliveryOutcome::FailedNotification => {
+                                write_fake_turn_completed_notification(
+                                    &mut stream,
+                                    thread_id,
+                                    "turn-auto-delivery",
+                                    "failed",
+                                )?;
+                                saw_delivery_terminal = true;
+                            }
+                            FakeAutoDeliveryOutcome::CompletedReconcile
+                            | FakeAutoDeliveryOutcome::RejectedBeforeAccept
+                            | FakeAutoDeliveryOutcome::ClosedBeforeAccept => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !methods.iter().any(|method| method == "turn/start") {
+        return Err(format!(
+            "fake auto-delivery app-server did not receive turn/start; methods seen: {methods:?}"
+        ));
+    }
+    if saw_delivery_terminal {
+        thread::sleep(Duration::from_millis(500));
+    }
     Ok(methods)
 }
 
@@ -1063,6 +1246,19 @@ fn record_fake_app_server_method<'a>(
 }
 
 #[cfg(unix)]
+fn record_fake_app_server_method_allowing_delivery<'a>(
+    methods: &mut Vec<String>,
+    message: &'a serde_json::Value,
+) -> Result<&'a str, String> {
+    let method = message
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    methods.push(method.to_owned());
+    Ok(method)
+}
+
+#[cfg(unix)]
 fn write_fake_thread_response(
     stream: &mut TcpStream,
     request: &serde_json::Value,
@@ -1090,6 +1286,29 @@ fn write_fake_thread_response(
 }
 
 #[cfg(unix)]
+fn write_fake_thread_turn_response(
+    stream: &mut TcpStream,
+    request: &serde_json::Value,
+    thread_id: &str,
+    turn_id: &str,
+    status: &str,
+) -> Result<(), String> {
+    write_fake_json_response(
+        stream,
+        request,
+        serde_json::json!({
+            "thread": {
+                "id": thread_id,
+                "status": { "type": "idle" },
+                "turns": [
+                    { "id": turn_id, "status": status, "items": [] }
+                ]
+            }
+        }),
+    )
+}
+
+#[cfg(unix)]
 fn write_fake_active_thread_response(
     stream: &mut TcpStream,
     request: &serde_json::Value,
@@ -1105,6 +1324,54 @@ fn write_fake_active_thread_response(
                 "turns": [
                     { "id": "turn-active-snapshot", "status": "inProgress" }
                 ]
+            }
+        }),
+    )
+}
+
+#[cfg(unix)]
+fn write_fake_json_error(
+    stream: &mut TcpStream,
+    request: &serde_json::Value,
+    code: i64,
+    message: &str,
+) -> Result<(), String> {
+    let id = request
+        .get("id")
+        .cloned()
+        .ok_or_else(|| "fake app-server request missing id".to_owned())?;
+    write_fake_server_text_frame(
+        stream,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": code,
+                "message": message
+            }
+        }),
+    )
+}
+
+#[cfg(unix)]
+fn write_fake_turn_completed_notification(
+    stream: &mut TcpStream,
+    thread_id: &str,
+    turn_id: &str,
+    status: &str,
+) -> Result<(), String> {
+    write_fake_server_text_frame(
+        stream,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {
+                "threadId": thread_id,
+                "turn": {
+                    "id": turn_id,
+                    "status": status,
+                    "items": []
+                }
             }
         }),
     )
@@ -1163,6 +1430,107 @@ fn wait_for_fake_app_server(done_rx: mpsc::Receiver<Result<(), String>>) {
         Ok(Err(error)) => panic!("fake app-server failed: {error}"),
         Err(error) => panic!("timed out waiting for fake app-server: {error}"),
     }
+}
+
+#[cfg(unix)]
+fn wait_for_fake_app_server_methods(
+    done_rx: mpsc::Receiver<Result<Vec<String>, String>>,
+) -> Vec<String> {
+    match done_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(methods)) => methods,
+        Ok(Err(error)) => panic!("fake app-server failed: {error}"),
+        Err(error) => panic!("timed out waiting for fake app-server: {error}"),
+    }
+}
+
+#[cfg(unix)]
+fn submit_failed_fake_e2e_batch(home: &TempDir, thread_id: &str) -> String {
+    let submitted = cbth_direct_json(
+        home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            thread_id,
+            "--summary",
+            "fake e2e auto delivery",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth_direct_json(
+        home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready for auto delivery",
+            "--max-delivery-attempts",
+            "2",
+        ],
+    );
+    failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id")
+        .to_owned()
+}
+
+#[cfg(unix)]
+fn run_cli_trusted_all_fake_e2e(home: &TempDir, thread_id: &str, app_server_url: &str) -> Output {
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg(thread_id)
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--auto-delivery-policy")
+        .arg("trusted-all")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "7")
+        .output()
+        .expect("run cbth cli run");
+
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+#[cfg(unix)]
+fn stop_daemon(home: &TempDir) {
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
 }
 
 #[cfg(unix)]
@@ -1468,6 +1836,211 @@ fn cli_run_fake_e2e_passive_sync_does_not_send_delivery_rpc() {
         .arg("daemon")
         .arg("stop")
         .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_auto_delivery_notification_closes_delivered() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-notification";
+    let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    let (app_server_url, fake_server_done) = spawn_fake_app_server_auto_delivery(
+        thread_id,
+        FakeAutoDeliveryOutcome::CompletedNotification,
+    );
+
+    run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(methods.iter().any(|method| method == "turn/start"));
+
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "closed");
+    assert_eq!(inspected["batch"]["batch"]["close_reason"], "delivered");
+    assert_eq!(inspected["batch"]["batch"]["delivery_attempt_count"], 1);
+
+    let audit = cbth_direct_json(
+        &home,
+        &[
+            "audit",
+            "list",
+            "--source-thread-id",
+            thread_id,
+            "--limit",
+            "20",
+        ],
+    );
+    let decisions = audit["audit"].as_array().expect("audit list");
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision["decision"] == "accepted")
+    );
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision["decision"] == "observed")
+    );
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_auto_delivery_thread_read_reconcile_closes_delivered() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-reconcile";
+    let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_auto_delivery(thread_id, FakeAutoDeliveryOutcome::CompletedReconcile);
+
+    run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(
+        methods
+            .iter()
+            .filter(|method| *method == "thread/read")
+            .count()
+            >= 2
+    );
+
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "closed");
+    assert_eq!(inspected["batch"]["batch"]["close_reason"], "delivered");
+    let audit = cbth_direct_json(
+        &home,
+        &[
+            "audit",
+            "list",
+            "--source-thread-id",
+            thread_id,
+            "--limit",
+            "20",
+        ],
+    );
+    assert!(
+        audit["audit"]
+            .as_array()
+            .expect("audit list")
+            .iter()
+            .any(|decision| decision["decision"] == "reconciled")
+    );
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_auto_delivery_failed_turn_manualizes_batch() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-failed";
+    let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_auto_delivery(thread_id, FakeAutoDeliveryOutcome::FailedNotification);
+
+    run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(methods.iter().any(|method| method == "turn/start"));
+
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        inspected["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    let audit = cbth_direct_json(
+        &home,
+        &[
+            "audit",
+            "list",
+            "--source-thread-id",
+            thread_id,
+            "--limit",
+            "20",
+        ],
+    );
+    assert!(
+        audit["audit"]
+            .as_array()
+            .expect("audit list")
+            .iter()
+            .any(|decision| decision["decision"] == "manualized")
+    );
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_auto_delivery_reject_before_accept_is_retryable() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-rejected";
+    let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    let (app_server_url, fake_server_done) = spawn_fake_app_server_auto_delivery(
+        thread_id,
+        FakeAutoDeliveryOutcome::RejectedBeforeAccept,
+    );
+
+    run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(methods.iter().any(|method| method == "turn/start"));
+
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "open");
+    assert_eq!(inspected["batch"]["batch"]["replay_policy"], "automatic");
+    assert_eq!(inspected["batch"]["batch"]["delivery_attempt_count"], 0);
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (attempt_state, delivery_rpc_state): (String, String) = conn
+        .query_row(
+            "SELECT state, delivery_rpc_state
+             FROM delivery_attempts
+             WHERE source_thread_id = ?
+             ORDER BY created_at DESC
+             LIMIT 1",
+            [thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query rejected attempt");
+    assert_eq!(attempt_state, "abandoned");
+    assert_eq!(delivery_rpc_state, "rejected_before_accept");
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_auto_delivery_unknown_acceptance_sweeps_fail_closed() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-unknown";
+    let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_auto_delivery(thread_id, FakeAutoDeliveryOutcome::ClosedBeforeAccept);
+
+    run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(methods.iter().any(|method| method == "turn/start"));
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (attempt_id, started_at, delivery_rpc_state): (String, i64, String) = conn
+        .query_row(
+            "SELECT attempt_id, delivery_rpc_started_at, delivery_rpc_state
+             FROM delivery_attempts
+             WHERE source_thread_id = ?
+             ORDER BY created_at DESC
+             LIMIT 1",
+            [thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query pending attempt");
+    assert_eq!(delivery_rpc_state, "pending_acceptance");
+    drop(conn);
+
+    let sweep_now = (started_at + 301).to_string();
+    let sweep = cbth_direct_json(&home, &["maintenance", "sweep", "--now", &sweep_now]);
+    assert_eq!(sweep["sweep"]["stale_cli_acceptances_abandoned"], 1);
+    let attempt = cbth_direct_json(&home, &["attempt", "inspect", "--attempt-id", &attempt_id]);
+    assert_eq!(attempt["attempt"]["delivery_rpc_state"], "unknown");
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(
+        inspected["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    stop_daemon(&home);
 }
 
 #[cfg(unix)]

@@ -52,6 +52,14 @@ impl AppServerRequestError {
     fn protocol(error: anyhow::Error) -> Self {
         Self::new(AppServerRequestErrorKind::Protocol, format!("{error:#}"))
     }
+
+    pub(crate) fn kind(&self) -> AppServerRequestErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl fmt::Display for AppServerRequestError {
@@ -65,9 +73,12 @@ impl Error for AppServerRequestError {}
 pub(crate) enum AppServerNotification {
     TurnStarted {
         thread_id: Option<String>,
+        turn_id: Option<String>,
     },
     TurnTerminal {
         thread_id: Option<String>,
+        turn_id: Option<String>,
+        status: String,
     },
     ThreadProofInvalidated {
         thread_id: Option<String>,
@@ -84,6 +95,28 @@ pub(crate) enum ThreadActivitySnapshot {
     Idle,
     Missing,
     Untrusted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TurnStatusSnapshot {
+    InProgress,
+    Completed,
+    Failed,
+    Interrupted,
+    Replaced,
+}
+
+impl TurnStatusSnapshot {
+    pub(crate) fn from_status(status: &str) -> Option<Self> {
+        match status {
+            "inProgress" => Some(Self::InProgress),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "interrupted" => Some(Self::Interrupted),
+            "replaced" => Some(Self::Replaced),
+            _ => None,
+        }
+    }
 }
 
 impl AppServerJsonRpcClient {
@@ -382,6 +415,7 @@ pub(crate) fn decode_notification(value: &Value) -> Option<AppServerNotification
     match method {
         "turn/started" => Some(AppServerNotification::TurnStarted {
             thread_id: string_field(params, "threadId"),
+            turn_id: turn_string_field(params, "id"),
         }),
         "turn/completed" => {
             let status = params
@@ -391,6 +425,8 @@ pub(crate) fn decode_notification(value: &Value) -> Option<AppServerNotification
             if is_terminal_turn_status(status) {
                 Some(AppServerNotification::TurnTerminal {
                     thread_id: string_field(params, "threadId"),
+                    turn_id: turn_string_field(params, "id"),
+                    status: status.to_owned(),
                 })
             } else {
                 None
@@ -472,12 +508,53 @@ pub(crate) fn thread_result_activity_snapshot(
     }
 }
 
+pub(crate) fn thread_result_turn_status(
+    result: &Value,
+    bound_thread_id: &str,
+    turn_id: &str,
+) -> ThreadActivitySnapshotOrTurnStatus {
+    let thread = result.get("thread").unwrap_or(result);
+    if thread.get("id").and_then(Value::as_str) != Some(bound_thread_id) {
+        return ThreadActivitySnapshotOrTurnStatus::Untrusted;
+    }
+    let Some(turns) = thread.get("turns").and_then(Value::as_array) else {
+        return ThreadActivitySnapshotOrTurnStatus::Missing;
+    };
+    for turn in turns {
+        if turn.get("id").and_then(Value::as_str) == Some(turn_id) {
+            let Some(status) = turn.get("status").and_then(Value::as_str) else {
+                return ThreadActivitySnapshotOrTurnStatus::Untrusted;
+            };
+            return match TurnStatusSnapshot::from_status(status) {
+                Some(status) => ThreadActivitySnapshotOrTurnStatus::Turn(status),
+                None => ThreadActivitySnapshotOrTurnStatus::Untrusted,
+            };
+        }
+    }
+    ThreadActivitySnapshotOrTurnStatus::Missing
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ThreadActivitySnapshotOrTurnStatus {
+    Turn(TurnStatusSnapshot),
+    Missing,
+    Untrusted,
+}
+
 fn is_terminal_turn_status(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "interrupted" | "replaced")
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {
     value.get(field).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn turn_string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get("turn")
+        .and_then(|turn| turn.get(field))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 struct WebSocketFrame {

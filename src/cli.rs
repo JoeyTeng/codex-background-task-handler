@@ -20,7 +20,9 @@ use serde_json::{Value, json};
 use crate::artifact::{ingest_result_file, remove_ingest_marker_best_effort};
 use crate::cli_app_server_client::{
     AppServerJsonRpcClient, AppServerNotification, AppServerReceive, AppServerRequestError,
-    ThreadActivitySnapshot, decode_notification, thread_result_activity_snapshot,
+    AppServerRequestErrorKind, ThreadActivitySnapshot, ThreadActivitySnapshotOrTurnStatus,
+    TurnStatusSnapshot, decode_notification, thread_result_activity_snapshot,
+    thread_result_turn_status,
 };
 use crate::daemon::{
     DaemonEnsureOptions, DaemonServeOptions, daemon_ensure, daemon_request, daemon_request_payload,
@@ -29,8 +31,8 @@ use crate::daemon::{
 use crate::fs_layout::{FsLayout, remove_dir_all_durable};
 use crate::models::{
     CliManagedSessionCapabilities, CliManagedSessionProfile, DEFAULT_MAX_DELIVERY_ATTEMPTS,
-    DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, NewCliAcceptPendingAttempt, NewJob,
-    PartialDeliveryPolicy, SubmitMetadata,
+    DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, NewAuditDecision,
+    NewCliAcceptPendingAttempt, NewJob, PartialDeliveryPolicy, SubmitMetadata,
 };
 use crate::store::{Store, new_id};
 
@@ -48,6 +50,10 @@ const CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS: u64 = 3;
 const CLI_APP_SERVER_PASSIVE_RECV_TIMEOUT_MS: u64 = 500;
 const CLI_APP_SERVER_PASSIVE_RETRY_MAX_MS: u64 = 500;
 const CLI_APP_SERVER_PASSIVE_STORE_TIMEOUT_SECONDS: u64 = 1;
+const CLI_APP_SERVER_AUTO_DELIVERY_POLL_MS: u64 = 2_000;
+const CLI_APP_SERVER_TURN_START_TIMEOUT_SECONDS: u64 = 5;
+const CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS: i64 = MAX_CLI_OBSERVATION_WINDOW_SECONDS;
+const CLI_APP_SERVER_RECONCILE_INTERVAL_MS: u64 = 2_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "cbth")]
@@ -80,6 +86,10 @@ enum Commands {
     Attempt {
         #[command(subcommand)]
         command: AttemptCommand,
+    },
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
     },
     Cli {
         #[command(subcommand)]
@@ -191,7 +201,16 @@ enum AttemptCommand {
     BeginCliAccept(AttemptBeginCliAcceptArgs),
     AcceptCli(AttemptAcceptCliArgs),
     ObserveCliTurn(AttemptObserveCliTurnArgs),
+    #[command(hide = true)]
+    RejectCliBeforeAccept(AttemptRejectCliBeforeAcceptArgs),
     Inspect(AttemptInspectArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    List(AuditListArgs),
+    #[command(hide = true)]
+    Record(Box<AuditRecordArgs>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -229,6 +248,9 @@ struct CliRunArgs {
 
     #[arg(long, default_value = "codex")]
     codex_bin: OsString,
+
+    #[arg(long, value_enum, default_value_t = CliAutoDeliveryPolicy::Off)]
+    auto_delivery_policy: CliAutoDeliveryPolicy,
 
     #[arg(last = true)]
     codex_args: Vec<OsString>,
@@ -302,10 +324,35 @@ impl AttemptRpcKind {
     }
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+enum AttemptAuthorizationMode {
+    StrictSafe,
+    TrustedAll,
+}
+
+impl AttemptAuthorizationMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::StrictSafe => "strict_safe",
+            Self::TrustedAll => "trusted_all",
+        }
+    }
+
+    fn cli_value(&self) -> &'static str {
+        match self {
+            Self::StrictSafe => "strict-safe",
+            Self::TrustedAll => "trusted-all",
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct AttemptBeginCliAcceptArgs {
     #[arg(long)]
     batch_id: String,
+
+    #[arg(long, hide = true)]
+    attempt_id: Option<String>,
 
     #[arg(long)]
     managed_session_id: String,
@@ -321,6 +368,9 @@ struct AttemptBeginCliAcceptArgs {
 
     #[arg(long)]
     rpc_correlation_marker: Option<String>,
+
+    #[arg(long, value_enum, default_value_t = AttemptAuthorizationMode::StrictSafe)]
+    authorization_mode: AttemptAuthorizationMode,
 
     #[arg(long, hide = true)]
     now: Option<i64>,
@@ -393,9 +443,89 @@ struct AttemptObserveCliTurnArgs {
 }
 
 #[derive(Debug, Args)]
+struct AttemptRejectCliBeforeAcceptArgs {
+    #[arg(long)]
+    attempt_id: String,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
 struct AttemptInspectArgs {
     #[arg(long)]
     attempt_id: String,
+}
+
+#[derive(Debug, Args)]
+struct AuditListArgs {
+    #[arg(long)]
+    source_thread_id: Option<String>,
+
+    #[arg(long, default_value_t = 100)]
+    limit: i64,
+}
+
+#[derive(Debug, Args)]
+struct AuditRecordArgs {
+    #[arg(long)]
+    source_thread_id: Option<String>,
+
+    #[arg(long)]
+    batch_id: Option<String>,
+
+    #[arg(long)]
+    attempt_id: Option<String>,
+
+    #[arg(long)]
+    managed_session_id: Option<String>,
+
+    #[arg(long)]
+    session_epoch: Option<i64>,
+
+    #[arg(long)]
+    policy_kind: String,
+
+    #[arg(long)]
+    decision: String,
+
+    #[arg(long)]
+    reason: String,
+
+    #[arg(long, default_value = "cli")]
+    adapter_kind: String,
+
+    #[arg(long)]
+    details_json: Option<String>,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CliAutoDeliveryPolicy {
+    Off,
+    TrustedAll,
+}
+
+impl CliAutoDeliveryPolicy {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::TrustedAll => "trusted_all",
+        }
+    }
+
+    fn authorization_mode(&self) -> AttemptAuthorizationMode {
+        match self {
+            Self::Off => AttemptAuthorizationMode::StrictSafe,
+            Self::TrustedAll => AttemptAuthorizationMode::TrustedAll,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        matches!(self, Self::TrustedAll)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -635,6 +765,7 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
         Commands::Job { command } => dispatch_job(command, layout),
         Commands::Batch { command } => dispatch_batch(command, layout),
         Commands::Attempt { command } => dispatch_attempt(command, layout),
+        Commands::Audit { command } => dispatch_audit(command, layout),
         Commands::Cli { command } => dispatch_cli(command, layout),
         Commands::Maintenance { command } => dispatch_maintenance(command, layout),
         Commands::Daemon { command } => dispatch_daemon(command, layout),
@@ -727,6 +858,7 @@ fn run_cli_session(
             session_epoch,
             activity_revision,
             capability_revision,
+            auto_delivery_policy: args.auto_delivery_policy,
         });
 
     let foreground_status = Command::new(&codex_binary)
@@ -825,6 +957,7 @@ struct CliAppServerPassiveAdapterConfig {
     session_epoch: i64,
     activity_revision: i64,
     capability_revision: i64,
+    auto_delivery_policy: CliAutoDeliveryPolicy,
 }
 
 struct CliAppServerPassiveAdapterHandle {
@@ -866,6 +999,7 @@ struct CliAppServerPassiveAdapterState {
     last_activity_state: Option<CliSessionActivityState>,
     passive_capabilities_recorded: bool,
     durable_proof_may_exist: bool,
+    last_auto_delivery_poll: Option<Instant>,
 }
 
 fn spawn_cli_app_server_passive_adapter(
@@ -880,6 +1014,7 @@ fn spawn_cli_app_server_passive_adapter(
         last_activity_state: None,
         passive_capabilities_recorded: false,
         durable_proof_may_exist: config.activity_revision != 0 || config.capability_revision != 0,
+        last_auto_delivery_poll: None,
     }));
     let thread_state = Arc::clone(&state);
     let thread_config = config.clone();
@@ -1038,6 +1173,7 @@ fn run_cli_app_server_passive_adapter_once(
                 break;
             }
         }
+        maybe_run_cli_auto_delivery(config, state, &mut client, running)?;
     }
     Ok(())
 }
@@ -1056,14 +1192,618 @@ fn passive_adapter_request(
     (result, messages)
 }
 
+fn maybe_run_cli_auto_delivery(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    client: &mut AppServerJsonRpcClient,
+    running: &AtomicBool,
+) -> Result<()> {
+    if !config.auto_delivery_policy.enabled()
+        || state.last_activity_state != Some(CliSessionActivityState::Idle)
+        || !state.passive_capabilities_recorded
+    {
+        return Ok(());
+    }
+    let now = Instant::now();
+    let Some(last_poll) = state.last_auto_delivery_poll else {
+        state.last_auto_delivery_poll = Some(now);
+        return Ok(());
+    };
+    if now.saturating_duration_since(last_poll)
+        < Duration::from_millis(CLI_APP_SERVER_AUTO_DELIVERY_POLL_MS)
+    {
+        return Ok(());
+    }
+    state.last_auto_delivery_poll = Some(now);
+
+    let head = dispatch(
+        Commands::Batch {
+            command: BatchCommand::InspectHead(BatchInspectHeadArgs {
+                source_thread_id: config.bound_thread_id.clone(),
+            }),
+        },
+        &config.layout,
+        DispatchMode::Direct,
+    )?;
+    let Some(batch_inspect) = head.get("batch").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let batch = batch_inspect
+        .get("batch")
+        .ok_or_else(|| anyhow::anyhow!("head batch inspect response missing batch"))?;
+    let batch_id = json_string(batch, "batch_id")?;
+    let source_thread_id = json_string(batch, "source_thread_id")?;
+    if source_thread_id != config.bound_thread_id {
+        record_cli_auto_delivery_audit(
+            config,
+            CliAutoDeliveryAuditEvent {
+                source_thread_id: Some(&source_thread_id),
+                batch_id: Some(&batch_id),
+                attempt_id: None,
+                session_epoch: state.session_epoch,
+                decision: "deny",
+                reason: "source_thread_mismatch",
+                details: json!({ "bound_thread_id": config.bound_thread_id }),
+            },
+        )?;
+        return Ok(());
+    }
+    let attempt_id = new_id();
+    let rpc_request_id = format!("cbth-turn-start:{}", new_id());
+    let marker = format!("cbth-delivery-marker:{}", new_id());
+
+    record_cli_auto_delivery_audit(
+        config,
+        CliAutoDeliveryAuditEvent {
+            source_thread_id: Some(&source_thread_id),
+            batch_id: Some(&batch_id),
+            attempt_id: Some(&attempt_id),
+            session_epoch: state.session_epoch,
+            decision: "allow",
+            reason: "trusted_all_idle_head",
+            details: json!({
+                "rpc_kind": "turn_start",
+                "rpc_request_id": rpc_request_id,
+                "marker": marker,
+            }),
+        },
+    )?;
+    let begin = match dispatch_cli_adapter_command(
+        config,
+        Commands::Attempt {
+            command: AttemptCommand::BeginCliAccept(AttemptBeginCliAcceptArgs {
+                batch_id: batch_id.clone(),
+                attempt_id: Some(attempt_id.clone()),
+                managed_session_id: config.managed_session_id.clone(),
+                session_epoch: state.session_epoch,
+                rpc_kind: AttemptRpcKind::TurnStart,
+                rpc_request_id: rpc_request_id.clone(),
+                rpc_correlation_marker: Some(marker.clone()),
+                authorization_mode: config.auto_delivery_policy.authorization_mode(),
+                now: None,
+            }),
+        },
+        false,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            record_cli_auto_delivery_audit(
+                config,
+                CliAutoDeliveryAuditEvent {
+                    source_thread_id: Some(&source_thread_id),
+                    batch_id: Some(&batch_id),
+                    attempt_id: Some(&attempt_id),
+                    session_epoch: state.session_epoch,
+                    decision: "deny",
+                    reason: "begin_cli_accept_failed",
+                    details: json!({ "error": format!("{error:#}") }),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+    let attempt = begin
+        .get("attempt")
+        .ok_or_else(|| anyhow::anyhow!("begin-cli-accept response missing attempt"))?;
+    let attempt_id = json_string(attempt, "attempt_id")?;
+    let prompt = build_cli_auto_delivery_prompt(batch_inspect, &marker, &attempt_id)?;
+
+    record_cli_auto_delivery_audit(
+        config,
+        CliAutoDeliveryAuditEvent {
+            source_thread_id: Some(&source_thread_id),
+            batch_id: Some(&batch_id),
+            attempt_id: Some(&attempt_id),
+            session_epoch: state.session_epoch,
+            decision: "attempt-start",
+            reason: "turn_start_request_sending",
+            details: json!({
+                "rpc_request_id": rpc_request_id,
+                "marker": marker,
+                "prompt_bytes": prompt.len(),
+            }),
+        },
+    )?;
+    let (turn_start_result, turn_start_messages) = passive_adapter_request(
+        client,
+        "turn/start",
+        json!({
+            "threadId": config.bound_thread_id,
+            "input": [
+                {
+                    "type": "text",
+                    "text": prompt,
+                    "textElements": []
+                }
+            ]
+        }),
+        Duration::from_secs(CLI_APP_SERVER_TURN_START_TIMEOUT_SECONDS),
+    );
+    let turn_start = match turn_start_result {
+        Ok(value) => value,
+        Err(error) if error.kind() == AppServerRequestErrorKind::Remote => {
+            reject_cli_auto_delivery_before_accept(
+                config,
+                state,
+                &source_thread_id,
+                &batch_id,
+                &attempt_id,
+                &error,
+            )?;
+            return Ok(());
+        }
+        Err(error) => {
+            record_cli_auto_delivery_audit(
+                config,
+                CliAutoDeliveryAuditEvent {
+                    source_thread_id: Some(&source_thread_id),
+                    batch_id: Some(&batch_id),
+                    attempt_id: Some(&attempt_id),
+                    session_epoch: state.session_epoch,
+                    decision: "manualized",
+                    reason: "turn_start_acceptance_unknown",
+                    details: json!({
+                        "error_kind": format!("{:?}", error.kind()),
+                        "error": error.message(),
+                    }),
+                },
+            )?;
+            return Err(anyhow::anyhow!("turn/start acceptance is unknown: {error}"));
+        }
+    };
+    let delivery_turn_id = parse_turn_start_delivery_turn_id(&turn_start)?;
+    let accepted = dispatch_cli_adapter_command(
+        config,
+        Commands::Attempt {
+            command: AttemptCommand::AcceptCli(AttemptAcceptCliArgs {
+                attempt_id: attempt_id.clone(),
+                delivery_turn_id: delivery_turn_id.clone(),
+                observation_window_seconds: CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS,
+                now: None,
+            }),
+        },
+        false,
+    )?;
+    let accepted_attempt = accepted
+        .get("attempt")
+        .ok_or_else(|| anyhow::anyhow!("accept-cli response missing attempt"))?;
+    record_cli_auto_delivery_audit(
+        config,
+        CliAutoDeliveryAuditEvent {
+            source_thread_id: Some(&source_thread_id),
+            batch_id: Some(&batch_id),
+            attempt_id: Some(&attempt_id),
+            session_epoch: state.session_epoch,
+            decision: "accepted",
+            reason: "turn_start_returned_turn_id",
+            details: json!({
+                "delivery_turn_id": delivery_turn_id,
+                "attempt_state": accepted_attempt.get("state").cloned().unwrap_or(Value::Null),
+            }),
+        },
+    )?;
+
+    observe_cli_auto_delivery_turn(
+        config,
+        state,
+        client,
+        running,
+        CliAcceptedTurn {
+            source_thread_id,
+            batch_id,
+            attempt_id,
+            delivery_turn_id,
+            session_epoch: state.session_epoch,
+            initial_messages: turn_start_messages,
+        },
+    )
+}
+
+struct CliAcceptedTurn {
+    source_thread_id: String,
+    batch_id: String,
+    attempt_id: String,
+    delivery_turn_id: String,
+    session_epoch: i64,
+    initial_messages: Vec<Value>,
+}
+
+fn reject_cli_auto_delivery_before_accept(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    source_thread_id: &str,
+    batch_id: &str,
+    attempt_id: &str,
+    error: &AppServerRequestError,
+) -> Result<()> {
+    let _ = dispatch_cli_adapter_command(
+        config,
+        Commands::Attempt {
+            command: AttemptCommand::RejectCliBeforeAccept(AttemptRejectCliBeforeAcceptArgs {
+                attempt_id: attempt_id.to_owned(),
+                now: None,
+            }),
+        },
+        false,
+    )?;
+    record_cli_auto_delivery_audit(
+        config,
+        CliAutoDeliveryAuditEvent {
+            source_thread_id: Some(source_thread_id),
+            batch_id: Some(batch_id),
+            attempt_id: Some(attempt_id),
+            session_epoch: state.session_epoch,
+            decision: "rejected",
+            reason: "turn_start_rejected_before_accept",
+            details: json!({ "error": error.message() }),
+        },
+    )?;
+    invalidate_passive_adapter_proof(config, state)?;
+    Ok(())
+}
+
+fn observe_cli_auto_delivery_turn(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    client: &mut AppServerJsonRpcClient,
+    running: &AtomicBool,
+    mut accepted: CliAcceptedTurn,
+) -> Result<()> {
+    let mut pending_messages = std::mem::take(&mut accepted.initial_messages);
+    pending_messages.extend(client.drain_pending_messages());
+    if handle_cli_auto_delivery_messages(config, state, &accepted, pending_messages)? {
+        return Ok(());
+    }
+    while running.load(Ordering::Acquire) {
+        match client.recv(Duration::from_millis(CLI_APP_SERVER_RECONCILE_INTERVAL_MS))? {
+            AppServerReceive::Message(message) => {
+                if handle_cli_auto_delivery_messages(config, state, &accepted, vec![message])? {
+                    return Ok(());
+                }
+            }
+            AppServerReceive::Timeout => {
+                if reconcile_cli_auto_delivery_turn(config, state, client, &accepted)? {
+                    return Ok(());
+                }
+            }
+            AppServerReceive::Closed => {
+                if running.load(Ordering::Acquire) {
+                    invalidate_passive_adapter_proof(config, state)?;
+                }
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_cli_auto_delivery_messages(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    accepted: &CliAcceptedTurn,
+    messages: Vec<Value>,
+) -> Result<bool> {
+    for message in messages {
+        let Some(notification) = decode_notification(&message) else {
+            continue;
+        };
+        let terminal = matching_accepted_turn_terminal_event(&notification, accepted);
+        let started = matching_accepted_turn_started_event(&notification, accepted);
+        record_passive_adapter_notification(config, state, notification)?;
+        if started {
+            observe_cli_auto_delivery_started(config, accepted)?;
+        }
+        if let Some(turn_event) = terminal {
+            observe_cli_auto_delivery_terminal(config, accepted, turn_event, "observed")?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn matching_accepted_turn_started_event(
+    notification: &AppServerNotification,
+    accepted: &CliAcceptedTurn,
+) -> bool {
+    matches!(
+        notification,
+        AppServerNotification::TurnStarted { thread_id, turn_id }
+            if thread_id.as_deref() == Some(accepted.source_thread_id.as_str())
+                && turn_id.as_deref() == Some(accepted.delivery_turn_id.as_str())
+    )
+}
+
+fn matching_accepted_turn_terminal_event(
+    notification: &AppServerNotification,
+    accepted: &CliAcceptedTurn,
+) -> Option<CliTurnEvent> {
+    let AppServerNotification::TurnTerminal {
+        thread_id,
+        turn_id,
+        status,
+    } = notification
+    else {
+        return None;
+    };
+    if thread_id.as_deref() != Some(accepted.source_thread_id.as_str())
+        || turn_id.as_deref() != Some(accepted.delivery_turn_id.as_str())
+    {
+        return None;
+    }
+    cli_turn_event_for_status(status)
+}
+
+fn reconcile_cli_auto_delivery_turn(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    client: &mut AppServerJsonRpcClient,
+    accepted: &CliAcceptedTurn,
+) -> Result<bool> {
+    let (read_result, read_messages) = passive_adapter_request(
+        client,
+        "thread/read",
+        json!({
+            "threadId": config.bound_thread_id,
+            "includeTurns": true,
+        }),
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+    );
+    if handle_cli_auto_delivery_messages(config, state, accepted, read_messages)? {
+        return Ok(true);
+    }
+    let read = match read_result {
+        Ok(read) => read,
+        Err(error) if error.kind() == AppServerRequestErrorKind::Timeout => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    match thread_result_turn_status(&read, &config.bound_thread_id, &accepted.delivery_turn_id) {
+        ThreadActivitySnapshotOrTurnStatus::Turn(TurnStatusSnapshot::InProgress) => Ok(false),
+        ThreadActivitySnapshotOrTurnStatus::Turn(status) => {
+            let turn_event = cli_turn_event_for_turn_status(status);
+            observe_cli_auto_delivery_terminal(config, accepted, turn_event, "reconciled")?;
+            Ok(true)
+        }
+        ThreadActivitySnapshotOrTurnStatus::Missing => Ok(false),
+        ThreadActivitySnapshotOrTurnStatus::Untrusted => {
+            bail!("thread/read reconcile returned untrusted turn snapshot")
+        }
+    }
+}
+
+fn observe_cli_auto_delivery_started(
+    config: &CliAppServerPassiveAdapterConfig,
+    accepted: &CliAcceptedTurn,
+) -> Result<()> {
+    let _ = dispatch_cli_adapter_command(
+        config,
+        Commands::Attempt {
+            command: AttemptCommand::ObserveCliTurn(AttemptObserveCliTurnArgs {
+                attempt_id: accepted.attempt_id.clone(),
+                delivery_turn_id: accepted.delivery_turn_id.clone(),
+                turn_event: CliTurnEvent::Started,
+                now: None,
+            }),
+        },
+        false,
+    )?;
+    record_cli_auto_delivery_audit(
+        config,
+        CliAutoDeliveryAuditEvent {
+            source_thread_id: Some(&accepted.source_thread_id),
+            batch_id: Some(&accepted.batch_id),
+            attempt_id: Some(&accepted.attempt_id),
+            session_epoch: accepted.session_epoch,
+            decision: "observed",
+            reason: "turn_started",
+            details: json!({ "delivery_turn_id": accepted.delivery_turn_id }),
+        },
+    )
+}
+
+fn observe_cli_auto_delivery_terminal(
+    config: &CliAppServerPassiveAdapterConfig,
+    accepted: &CliAcceptedTurn,
+    turn_event: CliTurnEvent,
+    decision: &str,
+) -> Result<()> {
+    let observed = dispatch_cli_adapter_command(
+        config,
+        Commands::Attempt {
+            command: AttemptCommand::ObserveCliTurn(AttemptObserveCliTurnArgs {
+                attempt_id: accepted.attempt_id.clone(),
+                delivery_turn_id: accepted.delivery_turn_id.clone(),
+                turn_event: turn_event.clone(),
+                now: None,
+            }),
+        },
+        false,
+    )?;
+    let outcome_decision = if matches!(turn_event, CliTurnEvent::Completed) {
+        decision
+    } else {
+        "manualized"
+    };
+    record_cli_auto_delivery_audit(
+        config,
+        CliAutoDeliveryAuditEvent {
+            source_thread_id: Some(&accepted.source_thread_id),
+            batch_id: Some(&accepted.batch_id),
+            attempt_id: Some(&accepted.attempt_id),
+            session_epoch: accepted.session_epoch,
+            decision: outcome_decision,
+            reason: turn_event.as_str(),
+            details: json!({
+                "delivery_turn_id": accepted.delivery_turn_id,
+                "attempt": observed.get("attempt").cloned().unwrap_or(Value::Null),
+            }),
+        },
+    )
+}
+
+fn cli_turn_event_for_status(status: &str) -> Option<CliTurnEvent> {
+    match status {
+        "completed" => Some(CliTurnEvent::Completed),
+        "failed" => Some(CliTurnEvent::Failed),
+        "interrupted" => Some(CliTurnEvent::Interrupted),
+        "replaced" => Some(CliTurnEvent::Replaced),
+        _ => None,
+    }
+}
+
+fn cli_turn_event_for_turn_status(status: TurnStatusSnapshot) -> CliTurnEvent {
+    match status {
+        TurnStatusSnapshot::Completed => CliTurnEvent::Completed,
+        TurnStatusSnapshot::Failed => CliTurnEvent::Failed,
+        TurnStatusSnapshot::Interrupted => CliTurnEvent::Interrupted,
+        TurnStatusSnapshot::Replaced => CliTurnEvent::Replaced,
+        TurnStatusSnapshot::InProgress => CliTurnEvent::Started,
+    }
+}
+
+fn parse_turn_start_delivery_turn_id(result: &Value) -> Result<String> {
+    if let Some(turn_id) = result
+        .get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+    {
+        return Ok(turn_id.to_owned());
+    }
+    if let Some(turn_id) = result.get("turnId").and_then(Value::as_str) {
+        return Ok(turn_id.to_owned());
+    }
+    if let Some(turn_id) = result.get("id").and_then(Value::as_str) {
+        return Ok(turn_id.to_owned());
+    }
+    bail!("turn/start response did not include a turn id")
+}
+
+fn build_cli_auto_delivery_prompt(
+    batch_inspect: &Value,
+    marker: &str,
+    attempt_id: &str,
+) -> Result<String> {
+    let batch = batch_inspect
+        .get("batch")
+        .ok_or_else(|| anyhow::anyhow!("batch inspect response missing batch"))?;
+    let batch_id = json_string(batch, "batch_id")?;
+    let source_thread_id = json_string(batch, "source_thread_id")?;
+    let summary = batch
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("(no summary)");
+    let mut prompt = format!(
+        "CBTH automatic delivery for completed background work.\n\
+         Marker: {marker}\n\
+         Source thread: {source_thread_id}\n\
+         Batch: {batch_id}\n\
+         Attempt: {attempt_id}\n\
+         Policy: trusted-all\n\n\
+         Batch summary: {summary}\n\n\
+         Jobs:\n"
+    );
+    let jobs = batch_inspect
+        .get("jobs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("batch inspect response missing jobs"))?;
+    for entry in jobs {
+        let job = entry
+            .get("job")
+            .ok_or_else(|| anyhow::anyhow!("batch job entry missing job"))?;
+        let job_id = job
+            .get("job_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let status = job
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let summary = job.get("summary").and_then(Value::as_str).unwrap_or("");
+        prompt.push_str(&format!("- {job_id} [{status}]: {summary}\n"));
+        if let Some(reason) = job.get("failure_reason").and_then(Value::as_str) {
+            prompt.push_str(&format!("  Failure reason: {reason}\n"));
+        }
+        if let Some(artifact) = entry.get("artifact").filter(|value| !value.is_null()) {
+            let artifact_id = artifact
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let relative_path = artifact
+                .get("relative_path")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            prompt.push_str(&format!(
+                "  Artifact: {artifact_id} at {relative_path} (read once; copy if needed)\n"
+            ));
+        }
+    }
+    Ok(prompt)
+}
+
+struct CliAutoDeliveryAuditEvent<'a> {
+    source_thread_id: Option<&'a str>,
+    batch_id: Option<&'a str>,
+    attempt_id: Option<&'a str>,
+    session_epoch: i64,
+    decision: &'a str,
+    reason: &'a str,
+    details: Value,
+}
+
+fn record_cli_auto_delivery_audit(
+    config: &CliAppServerPassiveAdapterConfig,
+    event: CliAutoDeliveryAuditEvent<'_>,
+) -> Result<()> {
+    let details_json = serde_json::to_string(&event.details)?;
+    dispatch_cli_adapter_command(
+        config,
+        Commands::Audit {
+            command: AuditCommand::Record(Box::new(AuditRecordArgs {
+                source_thread_id: event.source_thread_id.map(str::to_owned),
+                batch_id: event.batch_id.map(str::to_owned),
+                attempt_id: event.attempt_id.map(str::to_owned),
+                managed_session_id: Some(config.managed_session_id.clone()),
+                session_epoch: Some(event.session_epoch),
+                policy_kind: config.auto_delivery_policy.as_str().to_owned(),
+                decision: event.decision.to_owned(),
+                reason: event.reason.to_owned(),
+                adapter_kind: "cli".to_owned(),
+                details_json: Some(details_json),
+                now: None,
+            })),
+        },
+        false,
+    )?;
+    Ok(())
+}
+
 fn record_passive_adapter_notification(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
     notification: AppServerNotification,
 ) -> Result<()> {
     let notification_thread_id = match &notification {
-        AppServerNotification::TurnStarted { thread_id }
-        | AppServerNotification::TurnTerminal { thread_id }
+        AppServerNotification::TurnStarted { thread_id, .. }
+        | AppServerNotification::TurnTerminal { thread_id, .. }
         | AppServerNotification::ThreadProofInvalidated { thread_id }
         | AppServerNotification::ThreadActivityChanged { thread_id, .. } => thread_id,
     };
@@ -1073,12 +1813,12 @@ fn record_passive_adapter_notification(
     }
 
     match notification {
-        AppServerNotification::TurnStarted { thread_id }
+        AppServerNotification::TurnStarted { thread_id, .. }
             if passive_adapter_thread_matches(&thread_id, &config.bound_thread_id) =>
         {
             record_passive_adapter_activity(config, state, CliSessionActivityState::Active)?;
         }
-        AppServerNotification::TurnTerminal { thread_id }
+        AppServerNotification::TurnTerminal { thread_id, .. }
             if passive_adapter_thread_matches(&thread_id, &config.bound_thread_id)
                 && state.last_activity_state == Some(CliSessionActivityState::Active) =>
         {
@@ -1122,7 +1862,7 @@ fn record_passive_adapter_activity(
         .activity_revision
         .checked_add(1)
         .context("CLI passive adapter activity revision overflow")?;
-    let result = dispatch_passive_adapter_command(
+    let result = dispatch_cli_adapter_command(
         config,
         Commands::Cli {
             command: CliCommand::Session {
@@ -1164,7 +1904,7 @@ fn record_passive_adapter_capabilities(
         .capability_revision
         .checked_add(1)
         .context("CLI passive adapter capability revision overflow")?;
-    let result = dispatch_passive_adapter_command(
+    let result = dispatch_cli_adapter_command(
         config,
         Commands::Cli {
             command: CliCommand::Session {
@@ -1173,10 +1913,10 @@ fn record_passive_adapter_capabilities(
                     session_epoch: state.session_epoch,
                     capability_revision: next_revision,
                     thread_resume: true,
-                    turn_start: false,
+                    turn_start: config.auto_delivery_policy.enabled(),
                     current_state_sync: true,
-                    turn_completed_event: false,
-                    negative_terminal_events: false,
+                    turn_completed_event: config.auto_delivery_policy.enabled(),
+                    negative_terminal_events: config.auto_delivery_policy.enabled(),
                     thread_start: false,
                     turn_steer: false,
                     now: None,
@@ -1211,9 +1951,10 @@ fn invalidate_passive_adapter_proof(
     {
         state.last_activity_state = None;
         state.passive_capabilities_recorded = false;
+        state.last_auto_delivery_poll = None;
         return Ok(());
     }
-    let value = dispatch_passive_adapter_command(
+    let value = dispatch_cli_adapter_command(
         config,
         Commands::Cli {
             command: CliCommand::Session {
@@ -1259,10 +2000,11 @@ fn apply_passive_adapter_invalidated_session(
     state.last_activity_state = None;
     state.passive_capabilities_recorded = false;
     state.durable_proof_may_exist = false;
+    state.last_auto_delivery_poll = None;
     Ok(())
 }
 
-fn dispatch_passive_adapter_command(
+fn dispatch_cli_adapter_command(
     config: &CliAppServerPassiveAdapterConfig,
     command: Commands,
     allow_direct_fallback: bool,
@@ -1389,6 +2131,7 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
                 OsString::from("begin-cli-accept"),
             ];
             push_string_arg(&mut argv, "--batch-id", &args.batch_id);
+            push_optional_string_arg(&mut argv, "--attempt-id", args.attempt_id.as_deref());
             push_string_arg(&mut argv, "--managed-session-id", &args.managed_session_id);
             push_i64_arg(&mut argv, "--session-epoch", args.session_epoch);
             push_string_arg(&mut argv, "--rpc-kind", args.rpc_kind.cli_value());
@@ -1397,6 +2140,11 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
                 &mut argv,
                 "--rpc-correlation-marker",
                 args.rpc_correlation_marker.as_deref(),
+            );
+            push_string_arg(
+                &mut argv,
+                "--authorization-mode",
+                args.authorization_mode.cli_value(),
             );
             if let Some(now) = args.now {
                 push_i64_arg(&mut argv, "--now", now);
@@ -1429,6 +2177,48 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             push_string_arg(&mut argv, "--attempt-id", &args.attempt_id);
             push_string_arg(&mut argv, "--delivery-turn-id", &args.delivery_turn_id);
             push_string_arg(&mut argv, "--turn-event", args.turn_event.cli_value());
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Attempt {
+            command: AttemptCommand::RejectCliBeforeAccept(args),
+        } => {
+            let mut argv = vec![
+                OsString::from("attempt"),
+                OsString::from("reject-cli-before-accept"),
+            ];
+            push_string_arg(&mut argv, "--attempt-id", &args.attempt_id);
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Audit {
+            command: AuditCommand::Record(args),
+        } => {
+            let mut argv = vec![OsString::from("audit"), OsString::from("record")];
+            push_optional_string_arg(
+                &mut argv,
+                "--source-thread-id",
+                args.source_thread_id.as_deref(),
+            );
+            push_optional_string_arg(&mut argv, "--batch-id", args.batch_id.as_deref());
+            push_optional_string_arg(&mut argv, "--attempt-id", args.attempt_id.as_deref());
+            push_optional_string_arg(
+                &mut argv,
+                "--managed-session-id",
+                args.managed_session_id.as_deref(),
+            );
+            if let Some(epoch) = args.session_epoch {
+                push_i64_arg(&mut argv, "--session-epoch", epoch);
+            }
+            push_string_arg(&mut argv, "--policy-kind", &args.policy_kind);
+            push_string_arg(&mut argv, "--decision", &args.decision);
+            push_string_arg(&mut argv, "--reason", &args.reason);
+            push_string_arg(&mut argv, "--adapter-kind", &args.adapter_kind);
+            push_optional_string_arg(&mut argv, "--details-json", args.details_json.as_deref());
             if let Some(now) = args.now {
                 push_i64_arg(&mut argv, "--now", now);
             }
@@ -1559,6 +2349,9 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
         }
         | Commands::Attempt {
             command: AttemptCommand::Inspect(_),
+        }
+        | Commands::Audit {
+            command: AuditCommand::List(_),
         }
         | Commands::Cli {
             command: CliCommand::Run(_),
@@ -1801,10 +2594,11 @@ fn dispatch_attempt(command: AttemptCommand, layout: &FsLayout) -> Result<Value>
                 .rpc_correlation_marker
                 .unwrap_or_else(|| format!("cbth:{}", new_id()));
             let attempt = store.begin_cli_accept_pending_attempt(NewCliAcceptPendingAttempt {
-                attempt_id: new_id(),
+                attempt_id: args.attempt_id.unwrap_or_else(new_id),
                 batch_id: args.batch_id,
                 managed_session_id: args.managed_session_id,
                 session_epoch: args.session_epoch,
+                authorization_mode: args.authorization_mode.as_str().to_owned(),
                 delivery_rpc_request_id: args.rpc_request_id,
                 delivery_rpc_kind: args.rpc_kind.as_str().to_owned(),
                 delivery_rpc_correlation_marker: marker,
@@ -1851,9 +2645,60 @@ fn dispatch_attempt(command: AttemptCommand, layout: &FsLayout) -> Result<Value>
             )?;
             Ok(json!({ "attempt": attempt }))
         }
+        AttemptCommand::RejectCliBeforeAccept(args) => {
+            let now = match args.now {
+                Some(value) => value,
+                None => now_epoch_seconds()?,
+            };
+            let attempt = store.reject_cli_attempt_before_accept(&args.attempt_id, now)?;
+            Ok(json!({ "attempt": attempt }))
+        }
         AttemptCommand::Inspect(args) => {
             let attempt = store.inspect_attempt(&args.attempt_id)?;
             Ok(json!({ "attempt": attempt }))
+        }
+    }
+}
+
+fn dispatch_audit(command: AuditCommand, layout: &FsLayout) -> Result<Value> {
+    let mut store = Store::open(layout)?;
+    match command {
+        AuditCommand::List(args) => {
+            let decisions =
+                store.list_audit_decisions(args.source_thread_id.as_deref(), args.limit)?;
+            Ok(json!({ "audit": decisions }))
+        }
+        AuditCommand::Record(args) => {
+            let args = *args;
+            validate_nonempty("policy_kind", &args.policy_kind)?;
+            validate_nonempty("decision", &args.decision)?;
+            validate_nonempty("reason", &args.reason)?;
+            validate_nonempty("adapter_kind", &args.adapter_kind)?;
+            let now = match args.now {
+                Some(value) => value,
+                None => now_epoch_seconds()?,
+            };
+            let details = match args.details_json {
+                Some(details) => {
+                    serde_json::from_str(&details).context("parse audit details JSON")?
+                }
+                None => Value::Null,
+            };
+            let decision = store.record_audit_decision(NewAuditDecision {
+                audit_id: new_id(),
+                recorded_at: now,
+                source_thread_id: args.source_thread_id,
+                batch_id: args.batch_id,
+                attempt_id: args.attempt_id,
+                managed_session_id: args.managed_session_id,
+                session_epoch: args.session_epoch,
+                policy_kind: args.policy_kind,
+                decision: args.decision,
+                reason: args.reason,
+                adapter_kind: args.adapter_kind,
+                details,
+            })?;
+            Ok(json!({ "audit": decision }))
         }
     }
 }
