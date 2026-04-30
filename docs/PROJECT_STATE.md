@@ -9,6 +9,10 @@
 - `codex/review-gate` 已抽成 repo 内部子项目：[tools/codex-review-gate](../tools/codex-review-gate/README.md)。顶层 workflow 只保留 `.github/workflows/codex-review-gate.yml` thin wrapper。
 - 当前 runner 已改成 reaction-driven serialized marker design，并通过本地 composite action wrapper 调用；ruleset 已要求 `codex/review-gate`、Rust CI 和 resolved conversations。
 - 本地确定性 Rust gate 现在有 repo-tracked githooks 入口：[docs/GIT_HOOKS.md](GIT_HOOKS.md)。安装后 pre-commit 会在 Rust/Cargo staged changes 上运行 `cargo fmt --all`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked`。
+- Phase 11a 把 deterministic fake e2e 收进 Rust integration tests，因此现有 `ubuntu-latest` / `macos-latest` matrix 的 `cargo test --locked` 会直接 gate：
+  - `job submit` / `job fail` 产生 open batch 后，经 managed CLI session proof、`attempt begin-cli-accept`、`accept-cli`、`observe-cli-turn` 收敛为 `close_reason=delivered`
+  - `cbth cli run` 配合 fake codex 与 fake app-server 验证当前 Phase 10 仍只是 passive sync：只发送 initialize / `thread/resume` / `thread/read`，不会发送 `turn/start` 或 `turn/steer`
+  - live Codex shared `app-server` smoke 放在 ignored Rust test 中，默认 CI 只编译，不执行真实 `codex` / 模型 / 网络路径
 - #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
 - 当前修复分支 `codex/review-gate-resolved-threads` 正在补兼容：GitHub REST 可能把已 resolved / outdated 的旧 inline review comment `commit_id` 映射到后续 head；gate 现在会额外读取 GraphQL `reviewThreads`，只把未 resolved、未 outdated 的 current-head Codex inline threads 算作 blocker。Codex review-body findings 仍按 `PullRequestReview.commit_id` 和 current-head blob link 判定，因为它们没有可 resolve 的 thread。
 

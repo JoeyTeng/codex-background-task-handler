@@ -5,6 +5,8 @@
 - [x] 用 live PR 验证 repo 内部子项目 [tools/codex-review-gate](../tools/codex-review-gate/README.md) 的 reaction-driven gate，然后配置 required status check 和 conversations-resolved branch protection。
 - [x] 合入 `codex/review-gate-review-body-findings` 后，在 #12 或后续测试 PR 上验证 Codex review-body findings 会让 `codex/review-gate` deterministic failure，而旧 commit 的 review-body findings 不会 block 新 head。
 - [ ] 合入 `codex/review-gate-resolved-threads` 后，在 #12 或后续测试 PR 上验证已 resolved / outdated 的旧 Codex inline review thread 不会被 REST `commit_id` remap 误判为 current-head blocker。
+- [x] 把 deterministic fake e2e 纳入默认 Rust gate：job/batch/attempt delivered path 与 `cbth cli run` passive no-delivery-RPC guard 都由 `cargo test --locked` 覆盖。
+- [x] 增加 ignored / opt-in live Codex shared `app-server` smoke，保持编译与 lint-clean，但不进入默认 CI 执行。
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
 - [x] 确认桌面端私有 `app-server` 当前正持有该 rollout 文件。
 - [x] 实现最小 PoC 脚本，通过外部独立 `codex app-server` 对该 thread 执行 `read` / `resume` / `inject_items`。
