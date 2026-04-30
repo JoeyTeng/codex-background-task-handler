@@ -52,8 +52,8 @@ const CLI_APP_SERVER_PASSIVE_RETRY_MAX_MS: u64 = 500;
 const CLI_APP_SERVER_PASSIVE_STORE_TIMEOUT_SECONDS: u64 = 1;
 const CLI_APP_SERVER_AUTO_DELIVERY_POLL_MS: u64 = 2_000;
 const CLI_APP_SERVER_TURN_START_TIMEOUT_SECONDS: u64 = 5;
-const CLI_APP_SERVER_ACCEPT_PERSIST_RETRY_TIMEOUT_SECONDS: u64 = 30;
-const CLI_APP_SERVER_ACCEPT_PERSIST_RETRY_INTERVAL_MS: u64 = 250;
+const CLI_APP_SERVER_DURABLE_WRITE_RETRY_TIMEOUT_SECONDS: u64 = 30;
+const CLI_APP_SERVER_DURABLE_WRITE_RETRY_INTERVAL_MS: u64 = 250;
 const CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS: i64 = MAX_CLI_OBSERVATION_WINDOW_SECONDS;
 const CLI_APP_SERVER_RECONCILE_INTERVAL_MS: u64 = 2_000;
 
@@ -1281,26 +1281,25 @@ fn maybe_run_cli_auto_delivery(
             }),
         },
     )?;
-    let begin = match dispatch_cli_adapter_command(
+    let begin = match begin_cli_auto_delivery_with_retry(
         config,
-        Commands::Attempt {
-            command: AttemptCommand::BeginCliAccept(AttemptBeginCliAcceptArgs {
-                batch_id: batch_id.clone(),
-                attempt_id: Some(attempt_id.clone()),
-                managed_session_id: config.managed_session_id.clone(),
-                session_epoch: state.session_epoch,
-                rpc_kind: AttemptRpcKind::TurnStart,
-                rpc_request_id: rpc_request_id.clone(),
-                rpc_correlation_marker: Some(marker.clone()),
-                authorization_mode: config.auto_delivery_policy.authorization_mode(),
-                now: None,
-            }),
-        },
-        false,
+        &batch_id,
+        &attempt_id,
+        state.session_epoch,
+        &rpc_request_id,
+        &marker,
     ) {
         Ok(value) => value,
         Err(error) => {
-            record_cli_auto_delivery_audit(
+            cleanup_cli_auto_delivery_before_start_after_error(
+                config,
+                state,
+                &source_thread_id,
+                &batch_id,
+                &attempt_id,
+                "begin_cli_accept_failed",
+            );
+            record_cli_auto_delivery_audit_best_effort(
                 config,
                 CliAutoDeliveryAuditEvent {
                     source_thread_id: Some(&source_thread_id),
@@ -1311,7 +1310,7 @@ fn maybe_run_cli_auto_delivery(
                     reason: "begin_cli_accept_failed",
                     details: json!({ "error": format!("{error:#}") }),
                 },
-            )?;
+            );
             return Ok(());
         }
     };
@@ -1515,33 +1514,95 @@ fn accept_cli_auto_delivery_with_retry(
     attempt_id: &str,
     delivery_turn_id: &str,
 ) -> Result<Value> {
+    dispatch_cli_adapter_command_with_retry(
+        config,
+        || Commands::Attempt {
+            command: AttemptCommand::AcceptCli(AttemptAcceptCliArgs {
+                attempt_id: attempt_id.to_owned(),
+                delivery_turn_id: delivery_turn_id.to_owned(),
+                observation_window_seconds: CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS,
+                now: None,
+            }),
+        },
+        true,
+        "persist accepted CLI turn after turn/start",
+    )
+}
+
+fn begin_cli_auto_delivery_with_retry(
+    config: &CliAppServerPassiveAdapterConfig,
+    batch_id: &str,
+    attempt_id: &str,
+    session_epoch: i64,
+    rpc_request_id: &str,
+    marker: &str,
+) -> Result<Value> {
+    dispatch_cli_adapter_command_with_retry(
+        config,
+        || Commands::Attempt {
+            command: AttemptCommand::BeginCliAccept(AttemptBeginCliAcceptArgs {
+                batch_id: batch_id.to_owned(),
+                attempt_id: Some(attempt_id.to_owned()),
+                managed_session_id: config.managed_session_id.clone(),
+                session_epoch,
+                rpc_kind: AttemptRpcKind::TurnStart,
+                rpc_request_id: rpc_request_id.to_owned(),
+                rpc_correlation_marker: Some(marker.to_owned()),
+                authorization_mode: config.auto_delivery_policy.authorization_mode(),
+                now: None,
+            }),
+        },
+        true,
+        "begin CLI auto-delivery accept pending attempt",
+    )
+}
+
+fn observe_cli_auto_delivery_terminal_with_retry(
+    config: &CliAppServerPassiveAdapterConfig,
+    accepted: &CliAcceptedTurn,
+    turn_event: CliTurnEvent,
+) -> Result<Value> {
+    dispatch_cli_adapter_command_with_retry(
+        config,
+        || Commands::Attempt {
+            command: AttemptCommand::ObserveCliTurn(AttemptObserveCliTurnArgs {
+                attempt_id: accepted.attempt_id.clone(),
+                delivery_turn_id: accepted.delivery_turn_id.clone(),
+                turn_event: turn_event.clone(),
+                now: None,
+            }),
+        },
+        true,
+        "persist accepted CLI terminal turn observation",
+    )
+}
+
+fn dispatch_cli_adapter_command_with_retry<F>(
+    config: &CliAppServerPassiveAdapterConfig,
+    mut command_factory: F,
+    allow_direct_fallback: bool,
+    context: &'static str,
+) -> Result<Value>
+where
+    F: FnMut() -> Commands,
+{
     let deadline =
-        Instant::now() + Duration::from_secs(CLI_APP_SERVER_ACCEPT_PERSIST_RETRY_TIMEOUT_SECONDS);
-    let mut last_error = None;
-    while Instant::now() < deadline {
-        match dispatch_cli_adapter_command(
-            config,
-            Commands::Attempt {
-                command: AttemptCommand::AcceptCli(AttemptAcceptCliArgs {
-                    attempt_id: attempt_id.to_owned(),
-                    delivery_turn_id: delivery_turn_id.to_owned(),
-                    observation_window_seconds: CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS,
-                    now: None,
-                }),
-            },
-            true,
-        ) {
+        Instant::now() + Duration::from_secs(CLI_APP_SERVER_DURABLE_WRITE_RETRY_TIMEOUT_SECONDS);
+    let mut last_error: anyhow::Error;
+    loop {
+        match dispatch_cli_adapter_command(config, command_factory(), allow_direct_fallback) {
             Ok(value) => return Ok(value),
-            Err(error) => {
-                last_error = Some(error);
-                std::thread::sleep(Duration::from_millis(
-                    CLI_APP_SERVER_ACCEPT_PERSIST_RETRY_INTERVAL_MS,
-                ));
-            }
+            Err(error) => last_error = error,
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(
+            CLI_APP_SERVER_DURABLE_WRITE_RETRY_INTERVAL_MS,
+        )));
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("accept-cli persistence retry exhausted")))
-        .context("persist accepted CLI turn after turn/start")
+    Err(last_error).context(context)
 }
 
 struct CliAcceptedTurn {
@@ -1572,7 +1633,7 @@ fn reject_cli_auto_delivery_before_accept(
                 now: None,
             }),
         },
-        false,
+        true,
     )?;
     record_cli_auto_delivery_audit(
         config,
@@ -1597,7 +1658,7 @@ fn cancel_cli_auto_delivery_before_accept(
     attempt_id: &str,
     reason: &str,
 ) -> Result<()> {
-    let _ = dispatch_cli_adapter_command(
+    let reject_result = dispatch_cli_adapter_command(
         config,
         Commands::Attempt {
             command: AttemptCommand::RejectCliBeforeAccept(AttemptRejectCliBeforeAcceptArgs {
@@ -1606,8 +1667,8 @@ fn cancel_cli_auto_delivery_before_accept(
                 now: None,
             }),
         },
-        false,
-    )?;
+        true,
+    );
     state.last_activity_state = None;
     state.passive_capabilities_recorded = false;
     record_cli_auto_delivery_audit_best_effort(
@@ -1619,10 +1680,16 @@ fn cancel_cli_auto_delivery_before_accept(
             session_epoch: state.session_epoch,
             decision: "rejected",
             reason,
-            details: json!({ "running": false }),
+            details: json!({
+                "running": false,
+                "reject_error": reject_result
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("{error:#}")),
+            }),
         },
     );
-    Ok(())
+    reject_result.map(|_| ())
 }
 
 fn cleanup_cli_auto_delivery_before_start_after_error(
@@ -1661,7 +1728,7 @@ fn reject_cli_auto_delivery_permanent_before_accept(
                 now: None,
             }),
         },
-        false,
+        true,
     )?;
     record_cli_auto_delivery_audit(
         config,
@@ -1945,18 +2012,8 @@ fn observe_cli_auto_delivery_terminal(
     turn_event: CliTurnEvent,
     decision: &str,
 ) -> Result<()> {
-    let observed = dispatch_cli_adapter_command(
-        config,
-        Commands::Attempt {
-            command: AttemptCommand::ObserveCliTurn(AttemptObserveCliTurnArgs {
-                attempt_id: accepted.attempt_id.clone(),
-                delivery_turn_id: accepted.delivery_turn_id.clone(),
-                turn_event: turn_event.clone(),
-                now: None,
-            }),
-        },
-        false,
-    )?;
+    let observed =
+        observe_cli_auto_delivery_terminal_with_retry(config, accepted, turn_event.clone())?;
     let outcome_decision = if matches!(turn_event, CliTurnEvent::Completed) {
         decision
     } else {

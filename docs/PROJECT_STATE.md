@@ -20,8 +20,10 @@
   - failed/interrupted/replaced terminal evidence fail-close 到 `manual_resolution_only`
   - clear pre-accept rejection 写入 `rejected_before_accept` 且不消耗 attempt count
   - timeout / websocket closed / protocol error 不重发，保留 `accept_pending` 交给 stale sweep 标成 `unknown + manual_resolution_only`
+  - `begin-cli-accept` 使用 deterministic attempt/request id，daemon IPC 失败后走幂等 direct-store fallback；最终仍无法证明 begin 是否落库时，会 best-effort reject 该 attempt 并清空 proof
   - `turn/start` 返回 `turn.id` 后，adapter 会在有界窗口内重试幂等 `accept-cli` 持久化，并允许 daemon IPC 失败后的 direct-store fallback，减少已接受 turn id 丢失风险
   - `turn/start` accepted 之后，accepted / started / terminal audit 变为 best-effort；matching terminal evidence 先写入 `attempt observe-cli-turn`，再做 passive activity bookkeeping / resync，避免审计或 activity 写入失败覆盖真实完成证据
+  - matching terminal evidence 的 `observe-cli-turn` 持久化也使用有界重试与 direct-store fallback，减少 accepted turn 已完成但 durable observation 丢失的风险
   - `thread/read(includeTurns=true)` reconcile 同时兼容 nested `thread.turns` 与真实 app-server 可能返回的 top-level `turns`
   - accepted-turn observation loop 现在按 accepted attempt 的 `delivery_observation_deadline` 本地收敛；deadline 到期会 best-effort sweep / proof refresh 后退出观察，避免长期前台进程阻塞后续 head batch
   - sidecar shutdown 现在是 `turn/start` 前硬门禁：auto-delivery poll 前会重查 stop flag；`begin-cli-accept` 后若进入 shutdown，会写入 pre-accept rejection 并保留 batch 可重试，不在关闭窗口里继续发送 side-effectful RPC
