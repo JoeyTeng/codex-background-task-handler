@@ -325,6 +325,7 @@ enum FakeAutoDeliveryOutcome {
     RejectedBeforeAccept,
     RejectThenComplete,
     PermanentRemoteError,
+    AcceptedThenClosedBeforeTerminal,
     ClosedBeforeAccept,
 }
 
@@ -732,7 +733,8 @@ fn accept_fake_app_server_auto_delivery(
                     | FakeAutoDeliveryOutcome::TwoCompletedNotifications
                     | FakeAutoDeliveryOutcome::CompletedReconcile
                     | FakeAutoDeliveryOutcome::FailedNotification
-                    | FakeAutoDeliveryOutcome::RejectThenComplete => {
+                    | FakeAutoDeliveryOutcome::RejectThenComplete
+                    | FakeAutoDeliveryOutcome::AcceptedThenClosedBeforeTerminal => {
                         let turn_id = fake_auto_delivery_turn_id(turn_start_count);
                         write_fake_json_response(
                             &mut stream,
@@ -745,6 +747,12 @@ fn accept_fake_app_server_auto_delivery(
                                 }
                             }),
                         )?;
+                        if matches!(
+                            outcome,
+                            FakeAutoDeliveryOutcome::AcceptedThenClosedBeforeTerminal
+                        ) {
+                            return Ok(methods);
+                        }
                         thread::sleep(Duration::from_millis(100));
                         match outcome {
                             FakeAutoDeliveryOutcome::CompletedNotification
@@ -771,6 +779,7 @@ fn accept_fake_app_server_auto_delivery(
                             | FakeAutoDeliveryOutcome::RejectedBeforeAccept
                             | FakeAutoDeliveryOutcome::ClosedBeforeAccept => {}
                             FakeAutoDeliveryOutcome::PermanentRemoteError => {}
+                            FakeAutoDeliveryOutcome::AcceptedThenClosedBeforeTerminal => {}
                         }
                     }
                 }
@@ -2235,6 +2244,46 @@ fn cli_run_trusted_all_auto_delivery_permanent_remote_error_manualizes_batch() {
             .iter()
             .any(|decision| decision["reason"] == "turn_start_rejected_permanent")
     );
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_auto_delivery_closed_after_accept_manualizes_batch() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-accepted-closed";
+    let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    let (app_server_url, fake_server_done) = spawn_fake_app_server_auto_delivery(
+        thread_id,
+        FakeAutoDeliveryOutcome::AcceptedThenClosedBeforeTerminal,
+    );
+
+    run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(methods.iter().any(|method| method == "turn/start"));
+
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        inspected["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    assert_eq!(inspected["batch"]["batch"]["delivery_attempt_count"], 1);
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (attempt_state, observation_state): (String, String) = conn
+        .query_row(
+            "SELECT state, delivery_observation_state
+             FROM delivery_attempts
+             WHERE source_thread_id = ?
+             ORDER BY created_at DESC
+             LIMIT 1",
+            [thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query abandoned observation");
+    assert_eq!(attempt_state, "abandoned");
+    assert_eq!(observation_state, "abandoned");
     stop_daemon(&home);
 }
 

@@ -1562,14 +1562,34 @@ fn observe_cli_auto_delivery_turn(
                 }
             }
             AppServerReceive::Closed => {
-                if running.load(Ordering::Acquire) {
-                    invalidate_passive_adapter_proof(config, state)?;
-                }
+                abandon_cli_auto_delivery_after_observation_connection_loss(
+                    config, state, &accepted,
+                )?;
                 return Ok(());
             }
         }
     }
     Ok(())
+}
+
+fn abandon_cli_auto_delivery_after_observation_connection_loss(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    accepted: &CliAcceptedTurn,
+) -> Result<()> {
+    invalidate_passive_adapter_proof(config, state)?;
+    record_cli_auto_delivery_audit(
+        config,
+        CliAutoDeliveryAuditEvent {
+            source_thread_id: Some(&accepted.source_thread_id),
+            batch_id: Some(&accepted.batch_id),
+            attempt_id: Some(&accepted.attempt_id),
+            session_epoch: accepted.session_epoch,
+            decision: "manualized",
+            reason: "app_server_closed_before_terminal",
+            details: json!({ "delivery_turn_id": accepted.delivery_turn_id }),
+        },
+    )
 }
 
 fn handle_cli_auto_delivery_messages(
