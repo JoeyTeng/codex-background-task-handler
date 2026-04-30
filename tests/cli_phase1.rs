@@ -251,6 +251,172 @@ fn create_accepted_cli_attempt(
 }
 
 #[test]
+fn cli_fake_e2e_job_batch_attempt_observation_delivers_head() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-fake-e2e",
+            "--summary",
+            "fake e2e job",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+
+    let failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "fake e2e result ready",
+            "--max-delivery-attempts",
+            "2",
+        ],
+    );
+    let batch = &failed["batch"]["batch"];
+    let batch_id = batch["batch_id"].as_str().expect("batch id");
+    assert_eq!(batch["source_thread_id"], "thread-cli-fake-e2e");
+    assert_eq!(batch["state"], "open");
+    assert_eq!(batch["replay_policy"], "automatic");
+    assert_eq!(batch["delivery_policy"]["delivery_read_only"], true);
+    assert_eq!(
+        batch["delivery_policy"]["delivery_requires_approval"],
+        false
+    );
+    assert_eq!(batch["delivery_policy"]["delivery_requires_network"], false);
+    assert_eq!(
+        batch["delivery_policy"]["delivery_requires_write_access"],
+        false
+    );
+    assert_eq!(batch["requires_artifact_read"], false);
+    assert_eq!(batch["delivery_attempt_count"], 0);
+
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-fake-e2e");
+    let session = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    let session_epoch = session["cli_session"]["session_epoch"]
+        .as_i64()
+        .expect("session epoch")
+        .to_string();
+
+    let pending = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            &session_epoch,
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-fake-e2e-1",
+            "--rpc-correlation-marker",
+            "cbth:fake-e2e-1",
+            "--now",
+            "2000",
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id");
+    assert_eq!(pending["attempt"]["state"], "accept_pending");
+    assert_eq!(
+        pending["attempt"]["delivery_rpc_state"],
+        "pending_acceptance"
+    );
+    assert_eq!(
+        pending["attempt"]["delivery_rpc_correlation_marker"],
+        "cbth:fake-e2e-1"
+    );
+
+    let accepted = cbth(
+        &home,
+        &[
+            "attempt",
+            "accept-cli",
+            "--attempt-id",
+            attempt_id,
+            "--delivery-turn-id",
+            "turn-fake-e2e-1",
+            "--observation-window-seconds",
+            "60",
+            "--now",
+            "2001",
+        ],
+    );
+    assert_eq!(accepted["attempt"]["state"], "cooldown");
+    assert_eq!(accepted["attempt"]["delivery_rpc_state"], "accepted");
+    assert_eq!(accepted["attempt"]["delivery_turn_id"], "turn-fake-e2e-1");
+    assert_eq!(
+        accepted["attempt"]["delivery_observation_state"],
+        "tracking"
+    );
+    assert_eq!(accepted["attempt"]["delivery_observation_deadline"], 2061);
+
+    let observed = cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            attempt_id,
+            "--delivery-turn-id",
+            "turn-fake-e2e-1",
+            "--turn-event",
+            "turn-completed",
+            "--now",
+            "2002",
+        ],
+    );
+    assert_eq!(observed["attempt"]["state"], "closed");
+    assert_eq!(
+        observed["attempt"]["delivery_observation_state"],
+        "completed"
+    );
+
+    let delivered = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
+    assert_eq!(delivered["batch"]["batch"]["state"], "closed");
+    assert_eq!(delivered["batch"]["batch"]["close_reason"], "delivered");
+    assert_eq!(delivered["batch"]["batch"]["delivery_attempt_count"], 1);
+    let head = cbth(
+        &home,
+        &[
+            "batch",
+            "inspect-head",
+            "--source-thread-id",
+            "thread-cli-fake-e2e",
+        ],
+    );
+    assert!(head["batch"].is_null());
+}
+
+#[test]
 fn direct_store_requires_explicit_test_gate() {
     let home = tempfile::tempdir().expect("temp home");
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))

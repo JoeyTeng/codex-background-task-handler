@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -111,6 +111,28 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
             None => thread::sleep(Duration::from_millis(50)),
         }
     }
+}
+
+#[cfg(unix)]
+fn cbth_direct_json(home: &TempDir, args: &[&str]) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env("CBTH_ALLOW_DIRECT_STORE", "1")
+        .arg("--direct-store")
+        .arg("--home")
+        .arg(home.path())
+        .args(args)
+        .output()
+        .expect("run cbth");
+
+    assert!(
+        output.status.success(),
+        "cbth failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    serde_json::from_slice(&output.stdout).expect("valid json output")
 }
 
 #[cfg(unix)]
@@ -259,6 +281,25 @@ fn spawn_fake_app_server_reconnect_without_turn_snapshot(
                 Duration::from_secs(5),
             )
         })();
+        let _ = done_tx.send(result);
+    });
+
+    (url, done_rx)
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_capture_passive_methods(
+    thread_id: &'static str,
+) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = accept_fake_app_server_capture_passive_methods(&listener, thread_id);
         let _ = done_tx.send(result);
     });
 
@@ -448,6 +489,84 @@ fn accept_fake_app_server(
     )?;
     thread::sleep(hold_after_response);
     Ok(())
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_capture_passive_methods(
+    listener: &TcpListener,
+    thread_id: &'static str,
+) -> Result<Vec<String>, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(format!("accept fake app-server websocket: {error}")),
+        }
+    };
+
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set fake app-server stream blocking: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("set fake app-server read timeout: {error}"))?;
+    let websocket_accept = read_fake_http_upgrade(&mut stream)?;
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("write fake app-server handshake: {error}"))?;
+
+    let mut methods = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_thread_read = false;
+    while !saw_thread_read && Instant::now() < deadline {
+        let message = read_fake_client_text_frame(&mut stream)?;
+        let method = record_fake_app_server_method(&mut methods, &message)?;
+        match method {
+            "initialize" => write_fake_json_response(
+                &mut stream,
+                &message,
+                serde_json::json!({
+                    "userAgent": "fake-codex",
+                    "codexHome": "/tmp/fake-codex-home",
+                    "platformFamily": "unix",
+                    "platformOs": "macos"
+                }),
+            )?,
+            "initialized" => {}
+            "thread/resume" => write_fake_thread_response(&mut stream, &message, thread_id, true)?,
+            "thread/read" => {
+                write_fake_thread_response(&mut stream, &message, thread_id, true)?;
+                saw_thread_read = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_thread_read {
+        return Err(format!(
+            "fake app-server did not receive thread/read; methods seen: {methods:?}"
+        ));
+    }
+
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .map_err(|error| format!("set fake app-server post-read timeout: {error}"))?;
+    let observe_until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < observe_until {
+        match try_read_fake_client_text_frame(&mut stream)? {
+            Some(message) => {
+                let _ = record_fake_app_server_method(&mut methods, &message)?;
+            }
+            None => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+
+    Ok(methods)
 }
 
 #[cfg(unix)]
@@ -865,6 +984,85 @@ fn read_fake_client_text_frame(stream: &mut TcpStream) -> Result<serde_json::Val
 }
 
 #[cfg(unix)]
+fn try_read_fake_client_text_frame(
+    stream: &mut TcpStream,
+) -> Result<Option<serde_json::Value>, String> {
+    let mut header = [0_u8; 2];
+    match stream.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::WouldBlock
+                    | ErrorKind::TimedOut
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::BrokenPipe
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("read fake websocket header: {error}")),
+    }
+    let opcode = header[0] & 0x0F;
+    let masked = header[1] & 0x80 != 0;
+    if !masked {
+        return Err("client websocket frame was not masked".to_owned());
+    }
+    let mut length = u64::from(header[1] & 0x7F);
+    if length == 126 {
+        let mut bytes = [0_u8; 2];
+        stream
+            .read_exact(&mut bytes)
+            .map_err(|error| format!("read fake websocket medium length: {error}"))?;
+        length = u64::from(u16::from_be_bytes(bytes));
+    } else if length == 127 {
+        let mut bytes = [0_u8; 8];
+        stream
+            .read_exact(&mut bytes)
+            .map_err(|error| format!("read fake websocket large length: {error}"))?;
+        length = u64::from_be_bytes(bytes);
+    }
+    let mut mask = [0_u8; 4];
+    stream
+        .read_exact(&mut mask)
+        .map_err(|error| format!("read fake websocket mask: {error}"))?;
+    let mut payload =
+        vec![0_u8; usize::try_from(length).map_err(|error| format!("frame length: {error}"))?];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|error| format!("read fake websocket payload: {error}"))?;
+    for (idx, byte) in payload.iter_mut().enumerate() {
+        *byte ^= mask[idx % 4];
+    }
+    if opcode != 0x1 {
+        return Ok(None);
+    }
+    let text = String::from_utf8(payload).map_err(|error| format!("decode fake text: {error}"))?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|error| format!("decode fake json: {error}"))
+}
+
+#[cfg(unix)]
+fn record_fake_app_server_method<'a>(
+    methods: &mut Vec<String>,
+    message: &'a serde_json::Value,
+) -> Result<&'a str, String> {
+    let method = message
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    methods.push(method.to_owned());
+    match method {
+        "turn/start" | "turn/steer" => Err(format!(
+            "fake app-server received unexpected delivery RPC {method}; methods seen: {methods:?}"
+        )),
+        _ => Ok(method),
+    }
+}
+
+#[cfg(unix)]
 fn write_fake_thread_response(
     stream: &mut TcpStream,
     request: &serde_json::Value,
@@ -1148,6 +1346,121 @@ fn cli_run_passive_adapter_records_app_server_activity() {
     assert_eq!(capability_thread_resume, 0);
     assert_eq!(capability_turn_start, 0);
     assert_eq!(capability_current_state_sync, 0);
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_fake_e2e_passive_sync_does_not_send_delivery_rpc() {
+    let home = temp_home();
+    let submitted = cbth_direct_json(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-run-passive-delivery-guard",
+            "--summary",
+            "fake e2e passive guard",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth_direct_json(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready for passive guard",
+            "--max-delivery-attempts",
+            "2",
+        ],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id")
+        .to_owned();
+
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_capture_passive_methods("thread-cli-run-passive-delivery-guard");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg("thread-cli-run-passive-delivery-guard")
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "1")
+        .output()
+        .expect("run cbth cli run");
+
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let methods = match fake_server_done.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(methods)) => methods,
+        Ok(Err(error)) => panic!("fake app-server failed: {error}"),
+        Err(error) => panic!("timed out waiting for fake app-server: {error}"),
+    };
+    assert_eq!(
+        methods,
+        vec![
+            "initialize".to_owned(),
+            "initialized".to_owned(),
+            "thread/resume".to_owned(),
+            "thread/read".to_owned(),
+        ]
+    );
+
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "open");
+    assert_eq!(inspected["batch"]["batch"]["replay_policy"], "automatic");
+    assert_eq!(inspected["batch"]["batch"]["delivery_attempt_count"], 0);
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let attempt_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM delivery_attempts
+             WHERE source_thread_id = ?",
+            ["thread-cli-run-passive-delivery-guard"],
+            |row| row.get(0),
+        )
+        .expect("count delivery attempts");
+    assert_eq!(attempt_count, 0);
 
     let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("--home")
