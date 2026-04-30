@@ -1176,6 +1176,9 @@ fn run_cli_app_server_passive_adapter_once(
                 break;
             }
         }
+        if !running.load(Ordering::Acquire) {
+            break;
+        }
         maybe_run_cli_auto_delivery(config, state, &mut client, running)?;
     }
     Ok(())
@@ -1204,6 +1207,7 @@ fn maybe_run_cli_auto_delivery(
     if !config.auto_delivery_policy.enabled()
         || state.last_activity_state != Some(CliSessionActivityState::Idle)
         || !state.passive_capabilities_recorded
+        || !running.load(Ordering::Acquire)
     {
         return Ok(());
     }
@@ -1315,6 +1319,17 @@ fn maybe_run_cli_auto_delivery(
     let attempt_id = json_string(attempt, "attempt_id")?;
     let prompt =
         build_cli_auto_delivery_prompt(&config.layout, batch_inspect, &marker, &attempt_id)?;
+    if !running.load(Ordering::Acquire) {
+        cancel_cli_auto_delivery_before_accept(
+            config,
+            state,
+            &source_thread_id,
+            &batch_id,
+            &attempt_id,
+            "sidecar_stopping_before_attempt_start",
+        )?;
+        return Ok(());
+    }
 
     record_cli_auto_delivery_audit(
         config,
@@ -1332,6 +1347,17 @@ fn maybe_run_cli_auto_delivery(
             }),
         },
     )?;
+    if !running.load(Ordering::Acquire) {
+        cancel_cli_auto_delivery_before_accept(
+            config,
+            state,
+            &source_thread_id,
+            &batch_id,
+            &attempt_id,
+            "sidecar_stopping_before_turn_start",
+        )?;
+        return Ok(());
+    }
     let (turn_start_result, turn_start_messages) = passive_adapter_request(
         client,
         "turn/start",
@@ -1488,6 +1514,42 @@ fn reject_cli_auto_delivery_before_accept(
         },
     )?;
     resync_passive_adapter_after_durable_invalidation(config, state, client)
+}
+
+fn cancel_cli_auto_delivery_before_accept(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    source_thread_id: &str,
+    batch_id: &str,
+    attempt_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let _ = dispatch_cli_adapter_command(
+        config,
+        Commands::Attempt {
+            command: AttemptCommand::RejectCliBeforeAccept(AttemptRejectCliBeforeAcceptArgs {
+                attempt_id: attempt_id.to_owned(),
+                manual_resolution_only: false,
+                now: None,
+            }),
+        },
+        false,
+    )?;
+    state.last_activity_state = None;
+    state.passive_capabilities_recorded = false;
+    record_cli_auto_delivery_audit_best_effort(
+        config,
+        CliAutoDeliveryAuditEvent {
+            source_thread_id: Some(source_thread_id),
+            batch_id: Some(batch_id),
+            attempt_id: Some(attempt_id),
+            session_epoch: state.session_epoch,
+            decision: "rejected",
+            reason,
+            details: json!({ "running": false }),
+        },
+    );
+    Ok(())
 }
 
 fn reject_cli_auto_delivery_permanent_before_accept(
