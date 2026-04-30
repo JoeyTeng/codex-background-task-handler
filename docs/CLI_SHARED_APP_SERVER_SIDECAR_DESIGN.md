@@ -677,7 +677,7 @@ v1 范围外：
   - foreground wrapper 使用 `codex --remote <url> --cd <current_dir> ...` 暴露原生 Codex CLI/TUI 体验。
   - foreground wrapper 持有短 app-server lease，并在运行期间定期 refresh；如果 wrapper crash，daemon 会在 lease TTL 到期后 kill/wait app-server 并 join stdout/stderr drain worker。
   - foreground 退出时会显式 stop 当前 lease 下的 daemon-owned app-server。
-  - daemon 对已注册 managed app-server 的 cleanup 是 fail-closed：explicit stop、refresh 发现 child 已退出、以及 lease expiry reaper 都必须先按注册的 `managed_session_id + bound_thread_id` 推进一个 current-proof epoch fence，再从 registry 移除并停止进程；即使 proof 已经 clear，也要推进 epoch，避免 cleanup 与 sidecar 重新写 proof 之间的竞态。如果 proof invalidation 失败，registry entry 保留以便后续重试。registry 里的启动时 `session_epoch` 只用于确认 registry entry 身份，不能作为 proof invalidation 的目标 epoch，否则 sidecar 断连后推进 epoch 并重新写入 proof 时会让 reaper 永远卡在旧 epoch。
+  - daemon 对已注册 managed app-server 的 cleanup 是 fail-closed：explicit stop、refresh 发现 child 已退出、以及 lease expiry reaper 都必须先按注册的 `managed_session_id + bound_thread_id` 推进一个 current-proof epoch fence，再从 registry 移除并停止进程；即使 proof 已经 clear，也要推进 epoch，避免 cleanup 与 sidecar 重新写 proof 之间的竞态。如果 proof invalidation 失败，registry entry 保留以便后续重试。registry 里的启动时 `session_epoch`、lease id 和 child pid 只用于确认 registry entry 身份，不能作为 proof invalidation 的目标 epoch，否则 sidecar 断连后推进 epoch 并重新写入 proof 时会让 reaper 永远卡在旧 epoch。
   - 尚未注册进 registry 的候选 app-server 不得触碰 session proof，只能停止候选进程，避免并发 ensure 误清真实 session。
   - daemon shutdown 例外采用 best-effort proof invalidation，然后仍然 kill/wait 子进程并 join drain worker，优先避免 daemon 退出时泄漏 app-server。
 - daemon status 现在会列出 active CLI app-server，并且 daemon capability 列表包含 `cli-app-server-lifecycle`；新 CLI 不会把 lifecycle request 投递给不支持该命令的旧 daemon。

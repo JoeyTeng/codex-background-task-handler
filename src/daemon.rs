@@ -228,6 +228,8 @@ struct ManagedCliAppServerProof {
     managed_session_id: String,
     bound_thread_id: String,
     session_epoch: i64,
+    lease_id: String,
+    child_pid: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1360,24 +1362,7 @@ fn stop_cli_app_server(state: &DaemonState, payload: CliAppServerStopPayload) ->
     ensure_cli_app_server_lease_matches(server, &payload.lease_id)?;
     let proof = cli_app_server_proof(server);
     drop(servers);
-    invalidate_cli_app_server_proof(&state.layout, &proof)?;
-    let mut servers = state
-        .cli_app_servers
-        .lock()
-        .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
-    let Some(server) = servers.get(&payload.managed_session_id) else {
-        return Ok(false);
-    };
-    if !cli_app_server_matches_proof(server, &proof) {
-        return Ok(false);
-    }
-    ensure_cli_app_server_lease_matches(server, &payload.lease_id)?;
-    let server = servers
-        .remove(&payload.managed_session_id)
-        .expect("server exists");
-    drop(servers);
-    stop_managed_cli_app_server_process(server);
-    Ok(true)
+    invalidate_and_stop_registered_cli_app_server(state, &proof)
 }
 
 fn spawn_cli_app_server(
@@ -1694,6 +1679,8 @@ fn cli_app_server_proof(server: &ManagedCliAppServer) -> ManagedCliAppServerProo
         managed_session_id: server.managed_session_id.clone(),
         bound_thread_id: server.bound_thread_id.clone(),
         session_epoch: server.session_epoch,
+        lease_id: server.lease_id.clone(),
+        child_pid: server.child.id(),
     }
 }
 
@@ -1704,6 +1691,8 @@ fn cli_app_server_matches_proof(
     server.managed_session_id == proof.managed_session_id
         && server.bound_thread_id == proof.bound_thread_id
         && server.session_epoch == proof.session_epoch
+        && server.lease_id == proof.lease_id
+        && server.child.id() == proof.child_pid
 }
 
 fn cli_app_server_infos(state: &DaemonState) -> Vec<CliAppServerInfo> {
@@ -1792,7 +1781,6 @@ fn invalidate_and_stop_registered_cli_app_server(
     state: &DaemonState,
     proof: &ManagedCliAppServerProof,
 ) -> Result<bool> {
-    invalidate_cli_app_server_proof(&state.layout, proof)?;
     let mut servers = state
         .cli_app_servers
         .lock()
@@ -1803,6 +1791,7 @@ fn invalidate_and_stop_registered_cli_app_server(
     if !cli_app_server_matches_proof(server, proof) {
         return Ok(false);
     }
+    invalidate_cli_app_server_proof(&state.layout, proof)?;
     let server = servers
         .remove(&proof.managed_session_id)
         .expect("server exists");
@@ -2494,6 +2483,51 @@ mod tests {
                 .is_empty()
         );
         assert_cli_session_proof_invalidated_at_epoch(&state, &managed_session_id, 3);
+    }
+
+    #[test]
+    fn stale_cli_app_server_proof_does_not_invalidate_replacement() {
+        let (_home, state) = test_state();
+        let managed_session_id = create_proven_cli_session(&state, "thread-daemon-replaced");
+        let stale_server = test_managed_cli_app_server(
+            &managed_session_id,
+            "thread-daemon-replaced",
+            Instant::now() - Duration::from_secs(1),
+        );
+        let stale_proof = cli_app_server_proof(&stale_server);
+        stop_managed_cli_app_server_process(stale_server);
+
+        let replacement = test_managed_cli_app_server(
+            &managed_session_id,
+            "thread-daemon-replaced",
+            Instant::now() + Duration::from_secs(60),
+        );
+        let replacement_pid = replacement.child.id();
+        state
+            .cli_app_servers
+            .lock()
+            .expect("servers lock")
+            .insert(managed_session_id.clone(), replacement);
+
+        assert!(
+            !invalidate_and_stop_registered_cli_app_server(&state, &stale_proof)
+                .expect("stale proof cleanup")
+        );
+
+        let servers = state.cli_app_servers.lock().expect("servers lock");
+        let server = servers
+            .get(&managed_session_id)
+            .expect("replacement remains registered");
+        assert_eq!(server.child.id(), replacement_pid);
+        drop(servers);
+        let store = Store::open(&state.layout).expect("open store");
+        let session = store
+            .inspect_cli_managed_session(&managed_session_id)
+            .expect("inspect CLI managed session");
+        assert_eq!(session.session_epoch, 1);
+        assert_eq!(session.activity_state, "idle");
+
+        stop_all_cli_app_servers(&state);
     }
 
     #[test]
