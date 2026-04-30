@@ -1233,6 +1233,10 @@ fn maybe_run_cli_auto_delivery(
         .ok_or_else(|| anyhow::anyhow!("head batch inspect response missing batch"))?;
     let batch_id = json_string(batch, "batch_id")?;
     let source_thread_id = json_string(batch, "source_thread_id")?;
+    let replay_policy = json_string(batch, "replay_policy")?;
+    if replay_policy != "automatic" {
+        return Ok(());
+    }
     if source_thread_id != config.bound_thread_id {
         record_cli_auto_delivery_audit(
             config,
@@ -1345,6 +1349,7 @@ fn maybe_run_cli_auto_delivery(
             reject_cli_auto_delivery_before_accept(
                 config,
                 state,
+                client,
                 &source_thread_id,
                 &batch_id,
                 &attempt_id,
@@ -1431,6 +1436,7 @@ struct CliAcceptedTurn {
 fn reject_cli_auto_delivery_before_accept(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
+    client: &mut AppServerJsonRpcClient,
     source_thread_id: &str,
     batch_id: &str,
     attempt_id: &str,
@@ -1458,8 +1464,7 @@ fn reject_cli_auto_delivery_before_accept(
             details: json!({ "error": error.message() }),
         },
     )?;
-    invalidate_passive_adapter_proof(config, state)?;
-    Ok(())
+    resync_passive_adapter_after_durable_invalidation(config, state, client)
 }
 
 fn observe_cli_auto_delivery_turn(
@@ -1471,13 +1476,19 @@ fn observe_cli_auto_delivery_turn(
 ) -> Result<()> {
     let mut pending_messages = std::mem::take(&mut accepted.initial_messages);
     pending_messages.extend(client.drain_pending_messages());
-    if handle_cli_auto_delivery_messages(config, state, &accepted, pending_messages)? {
+    if handle_cli_auto_delivery_messages(config, state, client, &accepted, pending_messages)? {
         return Ok(());
     }
     while running.load(Ordering::Acquire) {
         match client.recv(Duration::from_millis(CLI_APP_SERVER_RECONCILE_INTERVAL_MS))? {
             AppServerReceive::Message(message) => {
-                if handle_cli_auto_delivery_messages(config, state, &accepted, vec![message])? {
+                if handle_cli_auto_delivery_messages(
+                    config,
+                    state,
+                    client,
+                    &accepted,
+                    vec![message],
+                )? {
                     return Ok(());
                 }
             }
@@ -1500,6 +1511,7 @@ fn observe_cli_auto_delivery_turn(
 fn handle_cli_auto_delivery_messages(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
+    client: &mut AppServerJsonRpcClient,
     accepted: &CliAcceptedTurn,
     messages: Vec<Value>,
 ) -> Result<bool> {
@@ -1514,7 +1526,9 @@ fn handle_cli_auto_delivery_messages(
             observe_cli_auto_delivery_started(config, accepted)?;
         }
         if let Some(turn_event) = terminal {
-            observe_cli_auto_delivery_terminal(config, accepted, turn_event, "observed")?;
+            observe_cli_auto_delivery_terminal(
+                config, state, client, accepted, turn_event, "observed",
+            )?;
             return Ok(true);
         }
     }
@@ -1568,7 +1582,7 @@ fn reconcile_cli_auto_delivery_turn(
         }),
         Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
     );
-    if handle_cli_auto_delivery_messages(config, state, accepted, read_messages)? {
+    if handle_cli_auto_delivery_messages(config, state, client, accepted, read_messages)? {
         return Ok(true);
     }
     let read = match read_result {
@@ -1580,7 +1594,14 @@ fn reconcile_cli_auto_delivery_turn(
         ThreadActivitySnapshotOrTurnStatus::Turn(TurnStatusSnapshot::InProgress) => Ok(false),
         ThreadActivitySnapshotOrTurnStatus::Turn(status) => {
             let turn_event = cli_turn_event_for_turn_status(status);
-            observe_cli_auto_delivery_terminal(config, accepted, turn_event, "reconciled")?;
+            observe_cli_auto_delivery_terminal(
+                config,
+                state,
+                client,
+                accepted,
+                turn_event,
+                "reconciled",
+            )?;
             Ok(true)
         }
         ThreadActivitySnapshotOrTurnStatus::Missing => Ok(false),
@@ -1622,6 +1643,8 @@ fn observe_cli_auto_delivery_started(
 
 fn observe_cli_auto_delivery_terminal(
     config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    client: &mut AppServerJsonRpcClient,
     accepted: &CliAcceptedTurn,
     turn_event: CliTurnEvent,
     decision: &str,
@@ -1657,7 +1680,46 @@ fn observe_cli_auto_delivery_terminal(
                 "attempt": observed.get("attempt").cloned().unwrap_or(Value::Null),
             }),
         },
-    )
+    )?;
+    resync_passive_adapter_after_durable_invalidation(config, state, client)
+}
+
+fn resync_passive_adapter_after_durable_invalidation(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    client: &mut AppServerJsonRpcClient,
+) -> Result<()> {
+    invalidate_passive_adapter_proof(config, state)?;
+    let (read_result, _read_messages) = passive_adapter_request(
+        client,
+        "thread/read",
+        json!({
+            "threadId": config.bound_thread_id,
+            "includeTurns": true,
+        }),
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+    );
+    let read = match read_result {
+        Ok(read) => read,
+        Err(error) => {
+            invalidate_passive_adapter_proof(config, state)?;
+            return Err(error.into());
+        }
+    };
+    let activity_state = match thread_result_activity_snapshot(&read, &config.bound_thread_id) {
+        ThreadActivitySnapshot::Active => CliSessionActivityState::Active,
+        ThreadActivitySnapshot::Idle => CliSessionActivityState::Idle,
+        ThreadActivitySnapshot::Missing => {
+            invalidate_passive_adapter_proof(config, state)?;
+            bail!("thread/read proof refresh did not return the bound thread");
+        }
+        ThreadActivitySnapshot::Untrusted => {
+            invalidate_passive_adapter_proof(config, state)?;
+            bail!("thread/read proof refresh returned untrusted current-state snapshot");
+        }
+    };
+    record_passive_adapter_capabilities(config, state)?;
+    record_passive_adapter_activity(config, state, activity_state)
 }
 
 fn cli_turn_event_for_status(status: &str) -> Option<CliTurnEvent> {
