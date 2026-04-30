@@ -390,22 +390,26 @@ PoC 流程：
 
 CLI adapter 不直接按单 job 投递，而是消费共享核心为每个 thread 生成的 `delivery batch`。
 
-### 默认策略
+### 默认策略与 explicit trusted-all escape hatch
 
 - 同一 `source_thread_id` 只允许一个 in-flight delivery attempt。
 - ready jobs 先进入 thread-scoped FIFO 队列。
 - daemon 对同一 thread 上的相邻 jobs 做 batch 合并。
-- 第一版自动投递的前提要先过共享核心的安全门槛：
+- 默认 `strict_safe` 自动投递的前提要先过共享核心的安全门槛：
   - `delivery_read_only=true`
   - `delivery_requires_approval=false`
   - `delivery_requires_network=false`
   - `delivery_requires_write_access=false`
-- 除了 batch 本身，managed session 自身也必须满足 detached auto-continuation profile：
+- 默认 `strict_safe` 还要求 managed session 自身满足 detached auto-continuation profile：
   - `session_allows_approval=false`
   - `session_allows_network=false`
   - `session_allows_write_access=false`
-  - 如果 session profile 本身允许 write / network / approval，v1 不得自动 `turn/start` / `turn/steer`，只能转入 manual/operator path
-- 不满足这些条件的 batch 不得自动 `turn/start`；它们保留为 operator/manual 路径。
+- `trusted_all` 是显式 opt-in broad escape hatch：
+  - 由 `cbth cli run --auto-delivery-policy trusted-all` 开启
+  - 会绕过 batch policy gates、artifact-read gate 与 session risk-profile gates
+  - 仍要求 current head batch、remaining budget、matching `source_thread_id`、bound `managed_session_id`、matching `session_epoch`、fresh idle proof
+  - 仍不开放 `turn/steer` 或 active-turn injection
+- 不满足 `strict_safe` 条件且未显式选择 `trusted_all` 的 batch 不得自动 `turn/start`；它们保留为 operator/manual 路径。
 - 默认只在 caller thread idle 时使用：
 
 ```text
@@ -427,7 +431,7 @@ thread/resume + turn/start
   - adapter 不得因为 daemon 崩溃、websocket 断开、或 response 丢失而直接重新发送同一个 batch
   - 下一次 sweep 必须先做 accepted/unknown reconciliation
 - 如果 RPC 在同一进程、同一 `managed_session_id + session_epoch` 内明确返回“未被接受”的 benign reject，例如 idle race 或 non-steerable active turn，才允许把该 attempt 恢复为 retry-on-idle 或重新排队。
-  - 具体状态迁移是 `accept_pending -> prepared`
+  - 当前实现状态迁移是 `accept_pending -> abandoned`
   - 必须先 durable 写入 `delivery_rpc_state=rejected_before_accept`
   - `delivery_turn_id` 必须保持为空
   - `delivery_attempt_count` 不得递增
@@ -687,7 +691,7 @@ v1 范围外：
 - hidden adapter-internal `cbth cli session note-capabilities` 已作为 epoch-local capability probe 写入面落地；每次 bind / re-attach / continuity-loss fence 都会清空旧 capability proof。
 - `begin-cli-accept` 已经要求引用一个匹配当前 batch `source_thread_id`、`session_epoch`、state、no-approval / no-network / no-write profile，且 `turn_start` 时同时具备最小 capability proof 和 `activity_state=idle` 的 managed session；不再接受任意字符串形式的 `managed_session_id`。
 - 当前最小 capability proof 要求 adapter 已证明 `thread_resume`、`turn_start`、`current_state_sync`、`turn_completed_event` 和负终态 observation surface 均可用；缺任一项都会 fail-closed。
-- `cbth cli run` 已启动 wrapper-owned passive sidecar client：
+- `cbth cli run` 已启动 wrapper-owned sidecar client：
   - sidecar 连接 daemon-owned loopback app-server，执行 initialize / `thread/resume` / `thread/read(includeTurns=true)`
   - foreground Codex 退出时，wrapper 会先停止 / join passive sidecar，并用 sidecar 的最新 epoch/revision 清空 activity / capability proof；之后再停止 daemon-owned app-server，避免 event stream 已结束后旧 `idle` proof 继续打开自动投递
   - 初始 `thread/resume` / `thread/read` 结果会同步成当前 epoch 的 `idle` / `active` activity proof；成功返回且 `thread.id` 匹配 `bound_thread_id` 的 `thread.status.type` authoritative snapshot 会支配该 request response 前已消费的 stale notification，缺少 status 时才 fallback 到 turns tail
@@ -697,20 +701,31 @@ v1 范围外：
   - websocket continuity loss、activity write failure 或 authoritative current-state snapshot 缺失时，sidecar 会通过 hidden `cli session invalidate-proof` 推进 `session_epoch` 并清空旧 activity / capability proof；daemon 短超时失败时该 invalidation 命令允许 direct-store fallback；store 对“daemon 已经推进 epoch 并清空 proof”的旧 epoch 重放返回幂等成功，避免旧 proof 只被 best-effort 清理
   - passive sidecar 的 proof 写入路径必须使用短 SQLite busy timeout；不能把 1s client timeout 的 passive write 交给 daemon worker 后再让 worker 按普通 30s store timeout 阻塞，否则 DB lock 下的 retry loop 会耗尽 dispatch worker。
   - websocket receive 必须用 absolute deadline 贯穿 frame header / length / mask / payload 读取、control-frame loop 和 pong 写回；连续 ping/pong 或 trickled payload 不能无限延长一次 `recv`，control frame payload 也必须限制在 125 bytes，否则 foreground 退出时 sidecar join 会延迟 app-server cleanup。
-  - sidecar 只记录 partial passive capability proof：`thread_resume=true`、`current_state_sync=true`，但不会把 `turn_start` 或 terminal-event proof 标成 true，因此不会绕过当前最小 delivery gate
-  - sidecar 明确不发送 `turn/start` / `turn/steer`，也不调用 `attempt observe-cli-turn`
+  - 默认 `--auto-delivery-policy off` 时，sidecar 只记录 partial passive capability proof：`thread_resume=true`、`current_state_sync=true`，但不会把 `turn_start` 或 terminal-event proof 标成 true，因此不会绕过当前最小 delivery gate
+  - 显式 `--auto-delivery-policy trusted-all` 时，sidecar 会记录当前 epoch 的完整 automatic delivery capability，按 2 秒 poll interval 等待 durable idle proof，写入 accept-pending barrier 与 audit records，然后发送带唯一 marker 的 `turn/start`
+  - accepted `turn.id` 会立即通过 `accept-cli` 进入 6 小时 v1 observation window；matching completed notification 关闭 batch 为 `delivered`，missed notification 可通过同一 websocket/session epoch 下的 `thread/read(includeTurns=true)` reconcile 收口
+  - matching failed/interrupted/replaced terminal evidence 会 fail-close 到 `manual_resolution_only`
+  - clear pre-accept rejection 会写入 `delivery_rpc_state=rejected_before_accept`，不递增 attempt count；timeout / closed / protocol ambiguity 不重发，保留 `accept_pending` 给 stale sweep 标成 `unknown + manual_resolution_only`
 - 新建 CLI attempt 时会把通过 gate 当时的 `activity_revision` / `capability_revision` 快照写入 `delivery_attempts`；同一 `delivery_rpc_request_id` 的幂等重试会先恢复已有 attempt，但仍要求该 stored attempt 绑定当前有效 managed session 且携带非零 proof snapshot。它不再受后续 activity 漂移影响，但 proofless legacy attempt、session epoch 失效、缺失 session、profile drift、thread mismatch 或当前 capability 不再满足最小集都会 fail-closed。
 - stale `accept_pending`、expired `cooldown` observation、以及 operator close 仍未终态的 CLI attempt 时，当前实现都会推进对应 managed session 的 `session_epoch` 并清空 activity proof，避免旧 idle 证明继续打开下一次自动投递。
 - hidden adapter-internal `cbth attempt observe-cli-turn` 已作为 terminal-event 写入面落地；它只接受 stored `delivery_turn_id` 的事件，`observed_at < delivery_observation_deadline` 的 `turn_completed` 才关闭 batch 为 `delivered`，负终态和 late observation 都会 fail-closed 到 `manual_resolution_only`。
-- daemon capability 列表已包含 `cli-app-server-lifecycle`、`cli-session-capability-dispatch`、`cli-session-proof-invalidation-dispatch` 与 `cli-turn-observation-dispatch`，避免新 CLI 把 app-server lifecycle / capability / proof invalidation / terminal-event 写入路由给不支持对应 subcommand 的旧 daemon。
+- `begin-cli-accept` 使用 deterministic `attempt_id` / `delivery_rpc_request_id`，daemon IPC 失败后会走幂等 direct-store fallback；最终仍无法证明 begin 是否落库时，会 best-effort reject 该 deterministic attempt 并清空本地 proof，避免未发送 `turn/start` 的 pending attempt 长时间阻塞。
+- `turn/start` 返回 `turn.id` 后，adapter 会在有界窗口内重试幂等 `accept-cli` 持久化，并允许 daemon IPC 失败后的 direct-store fallback；只有在无法持久化 accepted turn id 后才 fail-closed。
+- `turn/start` 已被接受后，accepted-turn observation 是高优先级路径：accepted / started / terminal audit 记录为 best-effort；matching terminal evidence 会先写入 `attempt observe-cli-turn`，再做 passive activity bookkeeping / resync，避免审计或 activity 写入失败覆盖真实完成证据。
+- matching terminal evidence 的 `observe-cli-turn` 持久化同样使用有界重试与 direct-store fallback，避免已观察到的 accepted-turn completion 因 1 秒 daemon IPC/store timeout 被丢弃。
+- `thread/read(includeTurns=true)` reconcile 同时兼容 nested `thread.turns` 与真实 app-server 可能返回的 top-level `turns`，前提是 `thread.id` / top-level `id` 仍匹配 bound thread。
+- accepted-turn observation loop 也受 accepted attempt 的 `delivery_observation_deadline` 约束；本地 deadline 到期会触发一次 best-effort sweep / proof refresh 后退出观察，避免前台进程长期存活时旧 attempt 阻塞后续 head batch。
+- sidecar shutdown 是 `turn/start` 前的硬门禁：passive loop 在每次 auto-delivery poll 前重新检查 stop flag；如果 `begin-cli-accept` 后、真正发送 `turn/start` 前进入 shutdown，会写入 pre-accept rejection 并保留 batch 可重试，而不是在关闭窗口里继续发 side-effectful RPC。
+- 同一 pre-start cleanup 也覆盖 `begin-cli-accept` 后、`turn/start` 前的 prompt 构造 / attempt-start audit / response parsing 失败：这些失败都必须先 best-effort `reject-cli-before-accept`，避免从未发出 RPC 的 attempt 之后被 stale sweep 当作 unknown manualize。
+- daemon capability 列表已包含 `cli-app-server-lifecycle`、`cli-session-capability-dispatch`、`cli-session-proof-invalidation-dispatch`、`cli-turn-observation-dispatch` 与 `cli-auto-delivery-dispatch`，避免新 CLI 把 app-server lifecycle / capability / proof invalidation / terminal-event / auto-delivery audit or rejection 写入路由给不支持对应 subcommand 的旧 daemon。
 - `turn_steer` 当前仍 fail-closed，直到后续 phase 落地 active-turn risk proof。
-- 这些实现仍不等价于完整自动续跑：passive current-state / lifecycle event sync 已落地，但完整 `turn_start` capability proof、sidecar delivery loop 与 accepted-turn observation loop 仍待后续 phase 实现。
+- 这些实现仍不等价于完整 CLI 自动续跑：`trusted-all` idle `turn/start` 路径已落地，但 `turn/steer`、active-turn injection、`--new-thread` fresh bootstrap、rollout-only automatic delivered proof、以及更细粒度 policy engine 仍待后续 phase 实现。
 
 ## 仍待实现的边界
 
 - `cbth cli run --new-thread` fresh-thread bootstrap
 - sidecar 长时间运行时的状态持久化与 resume 策略
 - 如果未来上游允许 loopback websocket auth，则补一轮更强本地安全边界设计与实证
-- 完整 shared `app-server` capability collection 的具体实现与版本策略，尤其是如何在不产生用户可见 turn 的前提下证明 `turn/start` / terminal-event surface
+- 更细的 shared `app-server` capability collection 版本策略，尤其是未来如何在不产生用户可见 turn 的前提下证明 `turn/start` / terminal-event surface
 - 多个 background jobs 同时命中同一 caller thread 时的 batch 合并参数
-- accepted `delivery_turn_id` 在 daemon / websocket / app-server continuity 丢失后的 operator-resolution 实现细节；设计合同已收口为 `inspect-head -> close-head(reason=...)`
+- accepted `delivery_turn_id` 在 daemon / websocket / app-server continuity 丢失后的 operator-resolution 体验细节；当前自动路径已 fail-closed 到 manual resolution

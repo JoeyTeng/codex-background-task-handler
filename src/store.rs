@@ -14,12 +14,13 @@ use crate::fs_layout::{
     set_private_file_permissions_if_exists, validate_id_path_component,
 };
 use crate::models::{
-    ArtifactRecord, BatchInspect, BatchJobRecord, BatchRecord, CliManagedSessionActivityUpdate,
-    CliManagedSessionAttach, CliManagedSessionCapabilities, CliManagedSessionCapabilityUpdate,
-    CliManagedSessionProfile, CliManagedSessionProofInvalidation, CliManagedSessionRecord,
-    DEFAULT_REDELIVERY_WINDOW_SECONDS, DaemonLifecycleStatus, DeliveryAttemptRecord,
-    DeliveryPolicy, JobRecord, NewArtifact, NewBatch, NewCliAcceptPendingAttempt, NewJob,
-    ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
+    ArtifactRecord, AuditDecisionRecord, BatchInspect, BatchJobRecord, BatchRecord,
+    CliManagedSessionActivityUpdate, CliManagedSessionAttach, CliManagedSessionCapabilities,
+    CliManagedSessionCapabilityUpdate, CliManagedSessionProfile,
+    CliManagedSessionProofInvalidation, CliManagedSessionRecord, DEFAULT_REDELIVERY_WINDOW_SECONDS,
+    DaemonLifecycleStatus, DeliveryAttemptRecord, DeliveryPolicy, JobRecord, NewArtifact,
+    NewAuditDecision, NewBatch, NewCliAcceptPendingAttempt, NewJob, ORPHAN_ARTIFACT_GRACE_SECONDS,
+    POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
 };
 
 const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
@@ -580,6 +581,7 @@ impl Store {
         &mut self,
         attempt: NewCliAcceptPendingAttempt,
     ) -> Result<DeliveryAttemptRecord> {
+        ensure_cli_attempt_authorization_mode_value(&attempt.authorization_mode)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -595,13 +597,14 @@ impl Store {
         ensure_batch_open(&batch)?;
         ensure_batch_is_thread_head_tx(&tx, &batch)?;
         ensure_batch_allows_automatic_delivery(&batch)?;
-        ensure_batch_allows_detached_cli_delivery(&batch)?;
+        ensure_batch_allows_cli_delivery_for_authorization(&batch, &attempt.authorization_mode)?;
         let session = query_cli_managed_session_tx(&tx, &attempt.managed_session_id)?;
-        ensure_cli_session_allows_detached_delivery(
+        ensure_cli_session_allows_delivery(
             &session,
             &batch.source_thread_id,
             attempt.session_epoch,
             &attempt.delivery_rpc_kind,
+            &attempt.authorization_mode,
         )?;
         ensure_attempt_budget_remaining(&batch)?;
         ensure_no_active_attempt_for_thread_tx(&tx, &batch.source_thread_id)?;
@@ -609,16 +612,18 @@ impl Store {
 
         tx.execute(
             "INSERT INTO delivery_attempts (
-                attempt_id, batch_id, source_thread_id, adapter_kind, state,
+                attempt_id, batch_id, source_thread_id, adapter_kind,
+                authorization_mode, state,
                 generation, delivery_rpc_request_id, delivery_rpc_kind,
                 delivery_rpc_state, delivery_rpc_correlation_marker,
                 delivery_rpc_started_at, managed_session_id, session_epoch,
                 session_activity_revision, session_capability_revision, created_at, updated_at
-            ) VALUES (?, ?, ?, 'cli', 'accept_pending', ?, ?, ?, 'pending_acceptance', ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, 'cli', ?, 'accept_pending', ?, ?, ?, 'pending_acceptance', ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 attempt.attempt_id,
                 attempt.batch_id,
                 batch.source_thread_id,
+                attempt.authorization_mode,
                 generation,
                 attempt.delivery_rpc_request_id,
                 attempt.delivery_rpc_kind,
@@ -662,7 +667,7 @@ impl Store {
         ensure_batch_open(&batch)?;
         ensure_batch_is_thread_head_tx(&tx, &batch)?;
         ensure_batch_allows_automatic_delivery(&batch)?;
-        ensure_batch_allows_detached_cli_delivery(&batch)?;
+        ensure_batch_allows_cli_delivery_for_authorization(&batch, &attempt.authorization_mode)?;
         ensure_cli_attempt_has_current_managed_session_for_batch_tx(&tx, &attempt, &batch)?;
         ensure_attempt_budget_remaining(&batch)?;
         ensure_attempt_is_current_generation_tx(&tx, &attempt)?;
@@ -702,6 +707,67 @@ impl Store {
                 attempt.batch_id
             );
         }
+        let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn reject_cli_attempt_before_accept(
+        &mut self,
+        attempt_id: &str,
+        rejected_at: i64,
+        manual_resolution_only: bool,
+    ) -> Result<DeliveryAttemptRecord> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
+        if attempt.state == "abandoned"
+            && attempt.delivery_rpc_state.as_deref() == Some("rejected_before_accept")
+        {
+            if manual_resolution_only {
+                manualize_cli_batch_after_pre_accept_rejection_tx(&tx, &attempt, rejected_at)?;
+                invalidate_cli_managed_session_activity_tx(
+                    &tx,
+                    attempt.managed_session_id.as_deref(),
+                    attempt.session_epoch,
+                    rejected_at,
+                )?;
+                let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+                tx.commit()?;
+                return Ok(record);
+            } else {
+                tx.commit()?;
+                return Ok(attempt);
+            }
+        }
+        ensure_attempt_accept_pending(&attempt)?;
+        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
+        ensure_batch_open(&batch)?;
+        ensure_batch_is_thread_head_tx(&tx, &batch)?;
+        ensure_attempt_is_current_generation_tx(&tx, &attempt)?;
+        ensure_cli_attempt_has_current_managed_session_for_batch_tx(&tx, &attempt, &batch)?;
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'abandoned',
+                 delivery_rpc_state = 'rejected_before_accept',
+                 delivery_observation_state = 'abandoned',
+                 updated_at = ?,
+                 abandoned_at = ?
+             WHERE attempt_id = ?
+               AND state = 'accept_pending'
+               AND delivery_rpc_state = 'pending_acceptance'",
+            params![rejected_at, rejected_at, attempt_id],
+        )?;
+        if manual_resolution_only {
+            manualize_cli_batch_after_pre_accept_rejection_tx(&tx, &attempt, rejected_at)?;
+        }
+        invalidate_cli_managed_session_activity_tx(
+            &tx,
+            attempt.managed_session_id.as_deref(),
+            attempt.session_epoch,
+            rejected_at,
+        )?;
         let record = query_delivery_attempt_tx(&tx, attempt_id)?;
         tx.commit()?;
         Ok(record)
@@ -834,6 +900,65 @@ impl Store {
 
     pub fn inspect_attempt(&self, attempt_id: &str) -> Result<DeliveryAttemptRecord> {
         query_delivery_attempt(&self.conn, attempt_id)
+    }
+
+    pub fn record_audit_decision(
+        &mut self,
+        decision: NewAuditDecision,
+    ) -> Result<AuditDecisionRecord> {
+        let details_json = serde_json::to_string(&decision.details)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO audit_decisions (
+                audit_id, recorded_at, source_thread_id, batch_id, attempt_id,
+                managed_session_id, session_epoch, policy_kind, decision,
+                reason, adapter_kind, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                decision.audit_id,
+                decision.recorded_at,
+                decision.source_thread_id,
+                decision.batch_id,
+                decision.attempt_id,
+                decision.managed_session_id,
+                decision.session_epoch,
+                decision.policy_kind,
+                decision.decision,
+                decision.reason,
+                decision.adapter_kind,
+                details_json,
+            ],
+        )?;
+        let record = query_audit_decision_tx(&tx, &decision.audit_id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn list_audit_decisions(
+        &self,
+        source_thread_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<AuditDecisionRecord>> {
+        let limit = limit.clamp(1, 500);
+        match source_thread_id {
+            Some(thread_id) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM audit_decisions
+                     WHERE source_thread_id = ?
+                     ORDER BY recorded_at DESC, audit_id DESC
+                     LIMIT ?",
+                )?;
+                rows_to_audit_decisions(stmt.query(params![thread_id, limit])?)
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM audit_decisions
+                     ORDER BY recorded_at DESC, audit_id DESC
+                     LIMIT ?",
+                )?;
+                rows_to_audit_decisions(stmt.query(params![limit])?)
+            }
+        }
     }
 
     pub fn daemon_lifecycle_status(
@@ -1313,6 +1438,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
             source_thread_id TEXT NOT NULL,
             adapter_kind TEXT NOT NULL CHECK (adapter_kind IN ('cli', 'desktop')),
+            authorization_mode TEXT NOT NULL DEFAULT 'strict_safe' CHECK (authorization_mode IN ('strict_safe', 'trusted_all')),
             state TEXT NOT NULL CHECK (state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown', 'abandoned', 'superseded', 'closed')),
             generation INTEGER NOT NULL,
             delivery_rpc_request_id TEXT UNIQUE,
@@ -1341,6 +1467,24 @@ fn migrate(conn: &Connection) -> Result<()> {
             ON delivery_attempts(batch_id, state, generation);
         CREATE INDEX IF NOT EXISTS idx_delivery_attempts_cli_observation
             ON delivery_attempts(adapter_kind, delivery_observation_state, delivery_observation_deadline);
+
+        CREATE TABLE IF NOT EXISTS audit_decisions (
+            audit_id TEXT PRIMARY KEY,
+            recorded_at INTEGER NOT NULL,
+            source_thread_id TEXT,
+            batch_id TEXT,
+            attempt_id TEXT,
+            managed_session_id TEXT,
+            session_epoch INTEGER,
+            policy_kind TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            adapter_kind TEXT NOT NULL,
+            details_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_audit_decisions_thread_time
+            ON audit_decisions(source_thread_id, recorded_at DESC, audit_id DESC);
 
         CREATE TABLE IF NOT EXISTS batch_jobs (
             batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
@@ -1421,6 +1565,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         "cli_managed_sessions",
         "capability_turn_steer",
         "ALTER TABLE cli_managed_sessions ADD COLUMN capability_turn_steer INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "delivery_attempts",
+        "authorization_mode",
+        "ALTER TABLE delivery_attempts ADD COLUMN authorization_mode TEXT NOT NULL DEFAULT 'strict_safe'",
     )?;
     ensure_column(
         conn,
@@ -1613,6 +1763,28 @@ fn manualize_cli_batch_after_observation_loss_tx(
         attempt.session_epoch,
         now,
     )
+}
+
+fn manualize_cli_batch_after_pre_accept_rejection_tx(
+    tx: &Transaction<'_>,
+    attempt: &DeliveryAttemptRecord,
+    now: i64,
+) -> Result<()> {
+    let manual_resolution_window_ends_at = checked_timestamp_add(
+        now,
+        DEFAULT_REDELIVERY_WINDOW_SECONDS,
+        "manual_resolution_window_seconds",
+    )?;
+    tx.execute(
+        "UPDATE batches
+         SET replay_policy = 'manual_resolution_only',
+             redelivery_window_ends_at = max(redelivery_window_ends_at, ?),
+             updated_at = ?
+         WHERE batch_id = ?
+           AND state = 'open'",
+        params![manual_resolution_window_ends_at, now, attempt.batch_id],
+    )?;
+    Ok(())
 }
 
 fn abandon_cli_observations_for_session_epoch_loss_tx(
@@ -2262,6 +2434,16 @@ fn query_delivery_attempt_by_rpc_request_id_tx(
     .map_err(Into::into)
 }
 
+fn query_audit_decision_tx(tx: &Transaction<'_>, audit_id: &str) -> Result<AuditDecisionRecord> {
+    tx.query_row(
+        "SELECT * FROM audit_decisions WHERE audit_id = ?",
+        params![audit_id],
+        audit_decision_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("audit decision not found: {audit_id}"))
+}
+
 fn ensure_no_active_attempt_for_thread_tx(
     tx: &Transaction<'_>,
     source_thread_id: &str,
@@ -2439,6 +2621,14 @@ fn rows_to_jobs(mut rows: rusqlite::Rows<'_>) -> Result<Vec<JobRecord>> {
     Ok(jobs)
 }
 
+fn rows_to_audit_decisions(mut rows: rusqlite::Rows<'_>) -> Result<Vec<AuditDecisionRecord>> {
+    let mut decisions = Vec::new();
+    while let Some(row) = rows.next()? {
+        decisions.push(audit_decision_from_row(row)?);
+    }
+    Ok(decisions)
+}
+
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
     let metadata_json: String = row.get("metadata_json")?;
     let metadata = serde_json::from_str(&metadata_json).unwrap_or(serde_json::Value::Null);
@@ -2542,6 +2732,7 @@ fn delivery_attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Delive
         batch_id: row.get("batch_id")?,
         source_thread_id: row.get("source_thread_id")?,
         adapter_kind: row.get("adapter_kind")?,
+        authorization_mode: row.get("authorization_mode")?,
         state: row.get("state")?,
         generation: row.get("generation")?,
         delivery_rpc_request_id: row.get("delivery_rpc_request_id")?,
@@ -2563,6 +2754,25 @@ fn delivery_attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Delive
         updated_at: row.get("updated_at")?,
         abandoned_at: row.get("abandoned_at")?,
         closed_at: row.get("closed_at")?,
+    })
+}
+
+fn audit_decision_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditDecisionRecord> {
+    let details_json: String = row.get("details_json")?;
+    let details = serde_json::from_str(&details_json).unwrap_or(serde_json::Value::Null);
+    Ok(AuditDecisionRecord {
+        audit_id: row.get("audit_id")?,
+        recorded_at: row.get("recorded_at")?,
+        source_thread_id: row.get("source_thread_id")?,
+        batch_id: row.get("batch_id")?,
+        attempt_id: row.get("attempt_id")?,
+        managed_session_id: row.get("managed_session_id")?,
+        session_epoch: row.get("session_epoch")?,
+        policy_kind: row.get("policy_kind")?,
+        decision: row.get("decision")?,
+        reason: row.get("reason")?,
+        adapter_kind: row.get("adapter_kind")?,
+        details,
     })
 }
 
@@ -2608,6 +2818,17 @@ fn ensure_batch_allows_detached_cli_delivery(batch: &BatchRecord) -> Result<()> 
             "batch {} is not eligible for detached CLI delivery",
             batch.batch_id
         )
+    }
+}
+
+fn ensure_batch_allows_cli_delivery_for_authorization(
+    batch: &BatchRecord,
+    authorization_mode: &str,
+) -> Result<()> {
+    match authorization_mode {
+        "strict_safe" => ensure_batch_allows_detached_cli_delivery(batch),
+        "trusted_all" => Ok(()),
+        other => bail!("unsupported CLI attempt authorization mode {other}"),
     }
 }
 
@@ -2778,13 +2999,19 @@ fn ensure_cli_session_epoch_matches(
     }
 }
 
-fn ensure_cli_session_allows_detached_delivery(
+fn ensure_cli_session_allows_delivery(
     session: &CliManagedSessionRecord,
     source_thread_id: &str,
     session_epoch: i64,
     delivery_rpc_kind: &str,
+    authorization_mode: &str,
 ) -> Result<()> {
-    ensure_cli_session_identity_allows_detached_delivery(session, source_thread_id, session_epoch)?;
+    ensure_cli_session_identity_allows_delivery(
+        session,
+        source_thread_id,
+        session_epoch,
+        authorization_mode,
+    )?;
     match delivery_rpc_kind {
         "turn_start" => {
             ensure_cli_session_has_minimum_turn_start_capabilities(session)?;
@@ -2805,11 +3032,13 @@ fn ensure_cli_session_allows_detached_delivery(
     }
 }
 
-fn ensure_cli_session_identity_allows_detached_delivery(
+fn ensure_cli_session_identity_allows_delivery(
     session: &CliManagedSessionRecord,
     source_thread_id: &str,
     session_epoch: i64,
+    authorization_mode: &str,
 ) -> Result<()> {
+    ensure_cli_attempt_authorization_mode_value(authorization_mode)?;
     if session.bound_thread_id != source_thread_id {
         bail!(
             "CLI managed session {} is bound to thread {}, not {}",
@@ -2826,16 +3055,18 @@ fn ensure_cli_session_identity_allows_detached_delivery(
             session.managed_session_id
         ),
     }
-    if !session.session_allows_approval
-        && !session.session_allows_network
-        && !session.session_allows_write_access
-    {
-        // Continue to the rpc-kind-specific activity proof below.
-    } else {
-        bail!(
-            "CLI managed session {} is not eligible for detached delivery",
-            session.managed_session_id
-        )
+    if authorization_mode == "strict_safe" {
+        if !session.session_allows_approval
+            && !session.session_allows_network
+            && !session.session_allows_write_access
+        {
+            // Continue to the rpc-kind-specific activity proof below.
+        } else {
+            bail!(
+                "CLI managed session {} is not eligible for detached delivery",
+                session.managed_session_id
+            )
+        }
     }
     Ok(())
 }
@@ -2866,10 +3097,11 @@ fn ensure_cli_attempt_has_current_managed_session_for_batch_tx(
         )
     })?;
     let session = query_cli_managed_session_tx(tx, managed_session_id)?;
-    ensure_cli_session_identity_allows_detached_delivery(
+    ensure_cli_session_identity_allows_delivery(
         &session,
         &batch.source_thread_id,
         session_epoch,
+        &attempt.authorization_mode,
     )?;
     ensure_cli_attempt_has_recorded_detached_delivery_proof(attempt, &session)
 }
@@ -2953,6 +3185,12 @@ fn ensure_existing_cli_accept_matches_request(
             attempt.delivery_rpc_request_id
         );
     }
+    if existing.authorization_mode != attempt.authorization_mode {
+        bail!(
+            "delivery RPC request {} already belongs to a different authorization mode",
+            attempt.delivery_rpc_request_id
+        );
+    }
     Ok(())
 }
 
@@ -2975,6 +3213,13 @@ fn ensure_attempt_accept_pending(attempt: &DeliveryAttemptRecord) -> Result<()> 
             "delivery attempt {} is not a pending CLI acceptance",
             attempt.attempt_id
         )
+    }
+}
+
+fn ensure_cli_attempt_authorization_mode_value(authorization_mode: &str) -> Result<()> {
+    match authorization_mode {
+        "strict_safe" | "trusted_all" => Ok(()),
+        other => bail!("unsupported CLI attempt authorization mode {other}"),
     }
 }
 
@@ -3225,6 +3470,7 @@ mod tests {
                 batch_id,
                 managed_session_id: session.session.managed_session_id,
                 session_epoch: 1,
+                authorization_mode: "strict_safe".to_owned(),
                 delivery_rpc_request_id: "rpc-cli-accept-lifecycle".to_owned(),
                 delivery_rpc_kind: "turn_start".to_owned(),
                 delivery_rpc_correlation_marker: "cbth:lifecycle".to_owned(),

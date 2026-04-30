@@ -52,6 +52,16 @@ fn cbth_failure(home: &TempDir, args: &[&str]) -> String {
 }
 
 fn bind_cli_session(home: &TempDir, bound_thread_id: &str) -> String {
+    bind_cli_session_with_profile(home, bound_thread_id, false, false, false)
+}
+
+fn bind_cli_session_with_profile(
+    home: &TempDir,
+    bound_thread_id: &str,
+    session_allows_approval: bool,
+    session_allows_network: bool,
+    session_allows_write_access: bool,
+) -> String {
     let session = cbth(
         home,
         &[
@@ -61,11 +71,11 @@ fn bind_cli_session(home: &TempDir, bound_thread_id: &str) -> String {
             "--bound-thread-id",
             bound_thread_id,
             "--session-allows-approval",
-            "false",
+            &session_allows_approval.to_string(),
             "--session-allows-network",
-            "false",
+            &session_allows_network.to_string(),
             "--session-allows-write-access",
-            "false",
+            &session_allows_write_access.to_string(),
         ],
     );
     assert!(matches!(
@@ -3576,6 +3586,213 @@ fn redelivery_window_overflow_is_rejected() {
         ],
     );
     assert!(fail_stderr.contains("overflows timestamp range"));
+}
+
+#[test]
+fn trusted_all_cli_attempt_bypasses_policy_and_session_risk_gates() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-trusted-all",
+            "--summary",
+            "unsafe but trusted",
+            "--delivery-read-only",
+            "false",
+            "--delivery-requires-approval",
+            "true",
+            "--delivery-requires-network",
+            "true",
+            "--delivery-requires-write-access",
+            "true",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let managed_session_id =
+        bind_cli_session_with_profile(&home, "thread-trusted-all", true, true, true);
+    note_cli_session_minimum_capabilities(&home, &managed_session_id);
+    note_cli_session_idle(&home, &managed_session_id);
+
+    let strict_stderr = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-strict-trusted-all-test",
+            "--authorization-mode",
+            "strict-safe",
+        ],
+    );
+    assert!(strict_stderr.contains("not eligible for detached CLI delivery"));
+
+    let trusted = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-trusted-all-test",
+            "--authorization-mode",
+            "trusted-all",
+        ],
+    );
+    assert_eq!(trusted["attempt"]["authorization_mode"], "trusted_all");
+    assert_eq!(
+        trusted["attempt"]["delivery_rpc_state"],
+        "pending_acceptance"
+    );
+}
+
+#[test]
+fn reject_cli_before_accept_leaves_batch_retryable_without_attempt_charge() {
+    let home = tempfile::tempdir().expect("temp home");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-reject-before-accept",
+            "--summary",
+            "reject before accept",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-reject-before-accept");
+    let pending = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-reject-before-accept",
+            "--now",
+            "100",
+        ],
+    );
+    let attempt_id = pending["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id");
+
+    let rejected = cbth(
+        &home,
+        &[
+            "attempt",
+            "reject-cli-before-accept",
+            "--attempt-id",
+            attempt_id,
+            "--now",
+            "101",
+        ],
+    );
+    assert_eq!(rejected["attempt"]["state"], "abandoned");
+    assert_eq!(
+        rejected["attempt"]["delivery_rpc_state"],
+        "rejected_before_accept"
+    );
+
+    let inspected = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "open");
+    assert_eq!(inspected["batch"]["batch"]["replay_policy"], "automatic");
+    assert_eq!(inspected["batch"]["batch"]["delivery_attempt_count"], 0);
+}
+
+#[test]
+fn audit_record_and_list_round_trip_details() {
+    let home = tempfile::tempdir().expect("temp home");
+    cbth(
+        &home,
+        &[
+            "audit",
+            "record",
+            "--source-thread-id",
+            "thread-audit",
+            "--batch-id",
+            "batch-audit",
+            "--attempt-id",
+            "attempt-audit",
+            "--managed-session-id",
+            "session-audit",
+            "--session-epoch",
+            "2",
+            "--policy-kind",
+            "trusted_all",
+            "--decision",
+            "accepted",
+            "--reason",
+            "test_round_trip",
+            "--details-json",
+            r#"{"delivery_turn_id":"turn-audit"}"#,
+            "--now",
+            "123",
+        ],
+    );
+    let listed = cbth(
+        &home,
+        &[
+            "audit",
+            "list",
+            "--source-thread-id",
+            "thread-audit",
+            "--limit",
+            "10",
+        ],
+    );
+    let first = &listed["audit"][0];
+    assert_eq!(first["recorded_at"], 123);
+    assert_eq!(first["policy_kind"], "trusted_all");
+    assert_eq!(first["decision"], "accepted");
+    assert_eq!(first["details"]["delivery_turn_id"], "turn-audit");
 }
 
 #[cfg(unix)]
