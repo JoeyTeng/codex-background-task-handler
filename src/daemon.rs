@@ -51,6 +51,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "cli-session-capability-dispatch",
     "cli-session-proof-invalidation-dispatch",
     "cli-turn-observation-dispatch",
+    "cli-auto-delivery-dispatch",
 ];
 const MAX_DISPATCH_WORKERS: usize = 32;
 const RESERVED_CONTROL_WORKERS: usize = 8;

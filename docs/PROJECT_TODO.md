@@ -364,6 +364,7 @@
   - [x] daemon capability 增加 `cli-session-capability-dispatch`，避免新 CLI 把 session capability mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-session-proof-invalidation-dispatch`，避免新 CLI 把 continuity-loss proof invalidation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-auto-delivery-dispatch`，避免新 CLI 把 auto-delivery audit / reject-before-accept / trusted-all auth-mode 路由给旧 daemon
   - [x] daemon capability 增加 `cli-app-server-lifecycle`，避免新 CLI 把 app-server lifecycle request 路由给旧 daemon
   - [x] shared `app-server` 归 daemon 持有
   - [x] 前台 wrapper 持有短 lease；foreground 退出显式 stop，wrapper crash 时 daemon lease expiry 会清理 app-server

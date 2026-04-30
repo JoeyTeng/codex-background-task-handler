@@ -21,6 +21,7 @@
   - clear pre-accept rejection 写入 `rejected_before_accept` 且不消耗 attempt count
   - timeout / websocket closed / protocol error 不重发，保留 `accept_pending` 交给 stale sweep 标成 `unknown + manual_resolution_only`
   - 新增 append-only audit log 与 `cbth audit list`
+  - daemon capability 列表新增 `cli-auto-delivery-dispatch`，避免新 CLI 把 auto-delivery audit / reject-before-accept / trusted-all auth-mode 写入路由给 Phase 11a 或更早旧 daemon
   - fake e2e 覆盖 notification delivered、`thread/read` reconcile、terminal failure manualize、pre-accept rejection、unknown+sweep，以及 `strict_safe` vs `trusted_all` 授权差异
 - #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
 - 当前修复分支 `codex/review-gate-resolved-threads` 正在补兼容：GitHub REST 可能把已 resolved / outdated 的旧 inline review comment `commit_id` 映射到后续 head；gate 现在会额外读取 GraphQL `reviewThreads`，只把未 resolved、未 outdated 的 current-head Codex inline threads 算作 blocker。Codex review-body findings 仍按 `PullRequestReview.commit_id` 和 current-head blob link 判定，因为它们没有可 resolve 的 thread。
@@ -590,7 +591,7 @@ scripts/desktop_thread_inject_poc.py
   - 本 phase 不发送 `turn/start` / `turn/steer`，也不调用 `attempt observe-cli-turn`；完整 `turn_start` capability proof、主动 delivery loop 与 accepted-turn observation loop 留给后续 phase
   - 测试新增 fake app-server websocket，验证 passive adapter 能完成 initialize / resume / read，并从 lifecycle notifications 推进 durable activity state
 - 当前 daemon / CLI adapter 已接入 explicit opt-in delivery lifecycle：
-  - CLI attempt / session mutation / session capability / session proof invalidation / app-server lifecycle / turn observation 通过 daemon dispatch 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-session-proof-invalidation-dispatch` / `cli-app-server-lifecycle` / `cli-turn-observation-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
+  - CLI attempt / session mutation / session capability / session proof invalidation / app-server lifecycle / turn observation / auto-delivery audit-reject-auth 通过 daemon dispatch 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-session-proof-invalidation-dispatch` / `cli-app-server-lifecycle` / `cli-turn-observation-dispatch` / `cli-auto-delivery-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
   - CLI accepted attempt durable schema、daemon 保活、managed-session durable record / fixed-thread gate、daemon-owned shared app-server process model、passive current-state / lifecycle event sync、accepted turn observation store surface、`trusted-all` delivery loop、notification observation、`thread/read` reconcile、pre-accept reject、unknown+sweep fail-closed 均已落地
   - Desktop arm / pause / boundary deadlines 尚未有 schema / adapter，因此尚未接入 daemon 保活
   - CLI fresh-thread bootstrap、`turn/steer` automatic path 与 Desktop bridge adapters 尚未实现
