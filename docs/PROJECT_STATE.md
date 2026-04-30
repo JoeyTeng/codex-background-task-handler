@@ -20,6 +20,7 @@
   - failed/interrupted/replaced terminal evidence fail-close 到 `manual_resolution_only`
   - clear pre-accept rejection 写入 `rejected_before_accept` 且不消耗 attempt count
   - timeout / websocket closed / protocol error 不重发，保留 `accept_pending` 交给 stale sweep 标成 `unknown + manual_resolution_only`
+  - `turn/start` accepted 之后，accepted / started / terminal audit 变为 best-effort；matching terminal evidence 先写入 `attempt observe-cli-turn`，再做 passive activity bookkeeping / resync，避免审计或 activity 写入失败覆盖真实完成证据
   - 新增 append-only audit log 与 `cbth audit list`
   - daemon capability 列表新增 `cli-auto-delivery-dispatch`，避免新 CLI 把 auto-delivery audit / reject-before-accept / trusted-all auth-mode 写入路由给 Phase 11a 或更早旧 daemon
   - fake e2e 覆盖 notification delivered、`thread/read` reconcile、terminal failure manualize、pre-accept rejection、unknown+sweep，以及 `strict_safe` vs `trusted_all` 授权差异

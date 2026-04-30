@@ -1411,7 +1411,7 @@ fn maybe_run_cli_auto_delivery(
     let accepted_attempt = accepted
         .get("attempt")
         .ok_or_else(|| anyhow::anyhow!("accept-cli response missing attempt"))?;
-    record_cli_auto_delivery_audit(
+    record_cli_auto_delivery_audit_best_effort(
         config,
         CliAutoDeliveryAuditEvent {
             source_thread_id: Some(&source_thread_id),
@@ -1425,7 +1425,7 @@ fn maybe_run_cli_auto_delivery(
                 "attempt_state": accepted_attempt.get("state").cloned().unwrap_or(Value::Null),
             }),
         },
-    )?;
+    );
 
     observe_cli_auto_delivery_turn(
         config,
@@ -1578,7 +1578,7 @@ fn abandon_cli_auto_delivery_after_observation_connection_loss(
     accepted: &CliAcceptedTurn,
 ) -> Result<()> {
     invalidate_passive_adapter_proof(config, state)?;
-    record_cli_auto_delivery_audit(
+    record_cli_auto_delivery_audit_best_effort(
         config,
         CliAutoDeliveryAuditEvent {
             source_thread_id: Some(&accepted.source_thread_id),
@@ -1589,7 +1589,8 @@ fn abandon_cli_auto_delivery_after_observation_connection_loss(
             reason: "app_server_closed_before_terminal",
             details: json!({ "delivery_turn_id": accepted.delivery_turn_id }),
         },
-    )
+    );
+    Ok(())
 }
 
 fn handle_cli_auto_delivery_messages(
@@ -1605,9 +1606,8 @@ fn handle_cli_auto_delivery_messages(
         };
         let terminal = matching_accepted_turn_terminal_event(&notification, accepted);
         let started = matching_accepted_turn_started_event(&notification, accepted);
-        record_passive_adapter_notification(config, state, notification)?;
         if started {
-            observe_cli_auto_delivery_started(config, accepted)?;
+            let _ = observe_cli_auto_delivery_started(config, accepted);
         }
         if let Some(turn_event) = terminal {
             observe_cli_auto_delivery_terminal(
@@ -1615,6 +1615,7 @@ fn handle_cli_auto_delivery_messages(
             )?;
             return Ok(true);
         }
+        record_passive_adapter_notification(config, state, notification)?;
     }
     Ok(false)
 }
@@ -1711,7 +1712,7 @@ fn observe_cli_auto_delivery_started(
         },
         false,
     )?;
-    record_cli_auto_delivery_audit(
+    record_cli_auto_delivery_audit_best_effort(
         config,
         CliAutoDeliveryAuditEvent {
             source_thread_id: Some(&accepted.source_thread_id),
@@ -1722,7 +1723,8 @@ fn observe_cli_auto_delivery_started(
             reason: "turn_started",
             details: json!({ "delivery_turn_id": accepted.delivery_turn_id }),
         },
-    )
+    );
+    Ok(())
 }
 
 fn observe_cli_auto_delivery_terminal(
@@ -1750,7 +1752,7 @@ fn observe_cli_auto_delivery_terminal(
     } else {
         "manualized"
     };
-    record_cli_auto_delivery_audit(
+    record_cli_auto_delivery_audit_best_effort(
         config,
         CliAutoDeliveryAuditEvent {
             source_thread_id: Some(&accepted.source_thread_id),
@@ -1764,7 +1766,7 @@ fn observe_cli_auto_delivery_terminal(
                 "attempt": observed.get("attempt").cloned().unwrap_or(Value::Null),
             }),
         },
-    )?;
+    );
     resync_passive_adapter_after_durable_invalidation(config, state, client)
 }
 
@@ -1943,6 +1945,13 @@ fn record_cli_auto_delivery_audit(
         false,
     )?;
     Ok(())
+}
+
+fn record_cli_auto_delivery_audit_best_effort(
+    config: &CliAppServerPassiveAdapterConfig,
+    event: CliAutoDeliveryAuditEvent<'_>,
+) {
+    let _ = record_cli_auto_delivery_audit(config, event);
 }
 
 fn record_passive_adapter_notification(
