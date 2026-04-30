@@ -2007,14 +2007,15 @@ fn cli_run_trusted_all_auto_delivery_resyncs_after_terminal_for_next_head() {
         .stderr(Stdio::piped())
         .env("FAKE_CODEX_LOG", &log_path)
         .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
-        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "10")
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "15")
         .spawn()
         .expect("spawn cbth cli run");
 
     wait_for_batch_close_reason(&home, &first_batch_id, "delivered");
     let second_batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    wait_for_batch_close_reason(&home, &second_batch_id, "delivered");
 
-    let output = wait_with_timeout(child, Duration::from_secs(15));
+    let output = wait_with_timeout(child, Duration::from_secs(20));
     assert!(
         output.status.success(),
         "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
