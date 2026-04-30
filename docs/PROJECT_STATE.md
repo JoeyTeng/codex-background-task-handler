@@ -31,6 +31,11 @@
   - 新增 append-only audit log 与 `cbth audit list`
   - daemon capability 列表新增 `cli-auto-delivery-dispatch`，避免新 CLI 把 auto-delivery audit / reject-before-accept / trusted-all auth-mode 写入路由给 Phase 11a 或更早旧 daemon
   - fake e2e 覆盖 notification delivered、`thread/read` reconcile、terminal failure manualize、pre-accept rejection、unknown+sweep，以及 `strict_safe` vs `trusted_all` 授权差异
+- Live opt-in 复测已覆盖 CLI trusted-all 自动投递：
+  - `codex-cli 0.125.0` 在非 TTY 下会把 `codex app-server` listener banner 输出到 `stderr`；`cbth` daemon 和 live smoke 现在都会同时扫描 `stdout` / `stderr`
+  - `CBTH_RUN_LIVE_CODEX_E2E=1 cargo test --test live_smoke -- --ignored` 已在本机通过，验证真实 shared app-server sidecar turn 仍可完成并被 `thread/read` 看到 marker
+  - `CBTH_RUN_LIVE_TRUSTED_ALL_E2E=1 cargo test --test live_trusted_all -- --ignored` 已在本机通过，验证真实 `cbth cli run --auto-delivery-policy trusted-all` 可在 seed 后的 existing thread 上自动投递 head batch 并关闭为 `delivered`
+  - 复测流程、env 和失败排查记录在 [docs/LIVE_E2E.md](LIVE_E2E.md)
 - #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
 - 当前修复分支 `codex/review-gate-resolved-threads` 正在补兼容：GitHub REST 可能把已 resolved / outdated 的旧 inline review comment `commit_id` 映射到后续 head；gate 现在会额外读取 GraphQL `reviewThreads`，只把未 resolved、未 outdated 的 current-head Codex inline threads 算作 blocker。Codex review-body findings 仍按 `PullRequestReview.commit_id` 和 current-head blob link 判定，因为它们没有可 resolve 的 thread。
 

@@ -2,7 +2,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -36,12 +36,13 @@ fn live_codex_shared_app_server_smoke_is_opt_in() {
         .arg("--listen")
         .arg("ws://127.0.0.1:0")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn codex app-server");
     let stdout = child.stdout.take().expect("capture app-server stdout");
+    let stderr = child.stderr.take().expect("capture app-server stderr");
     let mut app_server = ChildGuard(child);
-    let listener_url = wait_for_app_server_listener(stdout);
+    let listener_url = wait_for_app_server_listener(stdout, stderr);
 
     let node_bin = std::env::var_os("CBTH_LIVE_NODE_BIN").unwrap_or_else(|| "node".into());
     let timeout_ms =
@@ -69,29 +70,44 @@ fn live_codex_shared_app_server_smoke_is_opt_in() {
     );
 }
 
-fn wait_for_app_server_listener(stdout: ChildStdout) -> String {
+fn wait_for_app_server_listener(stdout: ChildStdout, stderr: ChildStderr) -> String {
     let (tx, rx) = mpsc::channel();
+    spawn_listener_reader(stdout, tx.clone());
+    spawn_listener_reader(stderr, tx);
+
+    let mut closed_streams = 0;
+    while closed_streams < 2 {
+        match rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(ListenerEvent::Url(url)) => return url,
+            Ok(ListenerEvent::Closed) => closed_streams += 1,
+            Err(error) => panic!("timed out waiting for codex app-server listener URL: {error}"),
+        }
+    }
+    panic!("codex app-server did not print a listener URL");
+}
+
+enum ListenerEvent {
+    Url(String),
+    Closed,
+}
+
+fn spawn_listener_reader<R>(stream: R, tx: mpsc::Sender<ListenerEvent>)
+where
+    R: std::io::Read + Send + 'static,
+{
     thread::spawn(move || {
-        let reader = BufReader::new(stdout);
+        let reader = BufReader::new(stream);
         for line in reader.lines() {
             let Ok(line) = line else {
                 break;
             };
             if let Some(url) = parse_app_server_listener_url(&line) {
-                let _ = tx.send(Ok(url));
+                let _ = tx.send(ListenerEvent::Url(url));
                 return;
             }
         }
-        let _ = tx.send(Err(
-            "codex app-server did not print a listener URL".to_owned()
-        ));
+        let _ = tx.send(ListenerEvent::Closed);
     });
-
-    match rx.recv_timeout(Duration::from_secs(15)) {
-        Ok(Ok(url)) => url,
-        Ok(Err(error)) => panic!("{error}"),
-        Err(error) => panic!("timed out waiting for codex app-server listener URL: {error}"),
-    }
 }
 
 fn parse_app_server_listener_url(line: &str) -> Option<String> {
