@@ -448,6 +448,9 @@ struct AttemptRejectCliBeforeAcceptArgs {
     attempt_id: String,
 
     #[arg(long, hide = true)]
+    manual_resolution_only: bool,
+
+    #[arg(long, hide = true)]
     now: Option<i64>,
 }
 
@@ -1310,7 +1313,8 @@ fn maybe_run_cli_auto_delivery(
         .get("attempt")
         .ok_or_else(|| anyhow::anyhow!("begin-cli-accept response missing attempt"))?;
     let attempt_id = json_string(attempt, "attempt_id")?;
-    let prompt = build_cli_auto_delivery_prompt(batch_inspect, &marker, &attempt_id)?;
+    let prompt =
+        build_cli_auto_delivery_prompt(&config.layout, batch_inspect, &marker, &attempt_id)?;
 
     record_cli_auto_delivery_audit(
         config,
@@ -1345,8 +1349,23 @@ fn maybe_run_cli_auto_delivery(
     );
     let turn_start = match turn_start_result {
         Ok(value) => value,
-        Err(error) if error.kind() == AppServerRequestErrorKind::Remote => {
+        Err(error)
+            if error.kind() == AppServerRequestErrorKind::Remote
+                && remote_error_is_retryable_pre_accept_rejection(&error) =>
+        {
             reject_cli_auto_delivery_before_accept(
+                config,
+                state,
+                client,
+                &source_thread_id,
+                &batch_id,
+                &attempt_id,
+                &error,
+            )?;
+            return Ok(());
+        }
+        Err(error) if error.kind() == AppServerRequestErrorKind::Remote => {
+            reject_cli_auto_delivery_permanent_before_accept(
                 config,
                 state,
                 client,
@@ -1447,6 +1466,7 @@ fn reject_cli_auto_delivery_before_accept(
         Commands::Attempt {
             command: AttemptCommand::RejectCliBeforeAccept(AttemptRejectCliBeforeAcceptArgs {
                 attempt_id: attempt_id.to_owned(),
+                manual_resolution_only: false,
                 now: None,
             }),
         },
@@ -1465,6 +1485,50 @@ fn reject_cli_auto_delivery_before_accept(
         },
     )?;
     resync_passive_adapter_after_durable_invalidation(config, state, client)
+}
+
+fn reject_cli_auto_delivery_permanent_before_accept(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    client: &mut AppServerJsonRpcClient,
+    source_thread_id: &str,
+    batch_id: &str,
+    attempt_id: &str,
+    error: &AppServerRequestError,
+) -> Result<()> {
+    let _ = dispatch_cli_adapter_command(
+        config,
+        Commands::Attempt {
+            command: AttemptCommand::RejectCliBeforeAccept(AttemptRejectCliBeforeAcceptArgs {
+                attempt_id: attempt_id.to_owned(),
+                manual_resolution_only: true,
+                now: None,
+            }),
+        },
+        false,
+    )?;
+    record_cli_auto_delivery_audit(
+        config,
+        CliAutoDeliveryAuditEvent {
+            source_thread_id: Some(source_thread_id),
+            batch_id: Some(batch_id),
+            attempt_id: Some(attempt_id),
+            session_epoch: state.session_epoch,
+            decision: "manualized",
+            reason: "turn_start_rejected_permanent",
+            details: json!({ "error": error.message() }),
+        },
+    )?;
+    resync_passive_adapter_after_durable_invalidation(config, state, client)
+}
+
+fn remote_error_is_retryable_pre_accept_rejection(error: &AppServerRequestError) -> bool {
+    let message = error.message().to_ascii_lowercase();
+    message.contains("not idle")
+        || message.contains("thread is active")
+        || message.contains("active turn")
+        || message.contains("turn in progress")
+        || message.contains("already running")
 }
 
 fn observe_cli_auto_delivery_turn(
@@ -1760,6 +1824,7 @@ fn parse_turn_start_delivery_turn_id(result: &Value) -> Result<String> {
 }
 
 fn build_cli_auto_delivery_prompt(
+    layout: &FsLayout,
     batch_inspect: &Value,
     marker: &str,
     attempt_id: &str,
@@ -1813,8 +1878,10 @@ fn build_cli_auto_delivery_prompt(
                 .get("relative_path")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
+            let absolute_path = layout.home_dir().join(relative_path);
             prompt.push_str(&format!(
-                "  Artifact: {artifact_id} at {relative_path} (read once; copy if needed)\n"
+                "  Artifact: {artifact_id} at {} (CBTH home-relative: {relative_path}; read once; copy if needed)\n",
+                absolute_path.display()
             ));
         }
     }
@@ -2252,6 +2319,9 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
                 OsString::from("reject-cli-before-accept"),
             ];
             push_string_arg(&mut argv, "--attempt-id", &args.attempt_id);
+            if args.manual_resolution_only {
+                argv.push(OsString::from("--manual-resolution-only"));
+            }
             if let Some(now) = args.now {
                 push_i64_arg(&mut argv, "--now", now);
             }
@@ -2712,7 +2782,11 @@ fn dispatch_attempt(command: AttemptCommand, layout: &FsLayout) -> Result<Value>
                 Some(value) => value,
                 None => now_epoch_seconds()?,
             };
-            let attempt = store.reject_cli_attempt_before_accept(&args.attempt_id, now)?;
+            let attempt = store.reject_cli_attempt_before_accept(
+                &args.attempt_id,
+                now,
+                args.manual_resolution_only,
+            )?;
             Ok(json!({ "attempt": attempt }))
         }
         AttemptCommand::Inspect(args) => {

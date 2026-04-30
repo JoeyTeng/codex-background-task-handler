@@ -324,6 +324,7 @@ enum FakeAutoDeliveryOutcome {
     FailedNotification,
     RejectedBeforeAccept,
     RejectThenComplete,
+    PermanentRemoteError,
     ClosedBeforeAccept,
 }
 
@@ -722,6 +723,10 @@ fn accept_fake_app_server_auto_delivery(
                             "caller thread is not idle",
                         )?;
                     }
+                    FakeAutoDeliveryOutcome::PermanentRemoteError => {
+                        write_fake_json_error(&mut stream, &message, -32601, "method not found")?;
+                        terminal_count += 1;
+                    }
                     FakeAutoDeliveryOutcome::ClosedBeforeAccept => return Ok(methods),
                     FakeAutoDeliveryOutcome::CompletedNotification
                     | FakeAutoDeliveryOutcome::TwoCompletedNotifications
@@ -765,6 +770,7 @@ fn accept_fake_app_server_auto_delivery(
                             FakeAutoDeliveryOutcome::CompletedReconcile
                             | FakeAutoDeliveryOutcome::RejectedBeforeAccept
                             | FakeAutoDeliveryOutcome::ClosedBeforeAccept => {}
+                            FakeAutoDeliveryOutcome::PermanentRemoteError => {}
                         }
                     }
                 }
@@ -2179,6 +2185,56 @@ fn cli_run_trusted_all_auto_delivery_reject_before_accept_is_retryable() {
         .expect("query rejected attempt");
     assert_eq!(attempt_state, "abandoned");
     assert_eq!(delivery_rpc_state, "rejected_before_accept");
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_auto_delivery_permanent_remote_error_manualizes_batch() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-permanent-error";
+    let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    let (app_server_url, fake_server_done) = spawn_fake_app_server_auto_delivery(
+        thread_id,
+        FakeAutoDeliveryOutcome::PermanentRemoteError,
+    );
+
+    run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| *method == "turn/start")
+            .count(),
+        1
+    );
+
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        inspected["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    assert_eq!(inspected["batch"]["batch"]["delivery_attempt_count"], 0);
+
+    let audit = cbth_direct_json(
+        &home,
+        &[
+            "audit",
+            "list",
+            "--source-thread-id",
+            thread_id,
+            "--limit",
+            "20",
+        ],
+    );
+    assert!(
+        audit["audit"]
+            .as_array()
+            .expect("audit list")
+            .iter()
+            .any(|decision| decision["reason"] == "turn_start_rejected_permanent")
+    );
     stop_daemon(&home);
 }
 

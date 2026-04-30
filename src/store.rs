@@ -716,6 +716,7 @@ impl Store {
         &mut self,
         attempt_id: &str,
         rejected_at: i64,
+        manual_resolution_only: bool,
     ) -> Result<DeliveryAttemptRecord> {
         let tx = self
             .conn
@@ -724,8 +725,21 @@ impl Store {
         if attempt.state == "abandoned"
             && attempt.delivery_rpc_state.as_deref() == Some("rejected_before_accept")
         {
-            tx.commit()?;
-            return Ok(attempt);
+            if manual_resolution_only {
+                manualize_cli_batch_after_pre_accept_rejection_tx(&tx, &attempt, rejected_at)?;
+                invalidate_cli_managed_session_activity_tx(
+                    &tx,
+                    attempt.managed_session_id.as_deref(),
+                    attempt.session_epoch,
+                    rejected_at,
+                )?;
+                let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+                tx.commit()?;
+                return Ok(record);
+            } else {
+                tx.commit()?;
+                return Ok(attempt);
+            }
         }
         ensure_attempt_accept_pending(&attempt)?;
         let batch = query_batch_tx(&tx, &attempt.batch_id)?;
@@ -745,6 +759,9 @@ impl Store {
                AND delivery_rpc_state = 'pending_acceptance'",
             params![rejected_at, rejected_at, attempt_id],
         )?;
+        if manual_resolution_only {
+            manualize_cli_batch_after_pre_accept_rejection_tx(&tx, &attempt, rejected_at)?;
+        }
         invalidate_cli_managed_session_activity_tx(
             &tx,
             attempt.managed_session_id.as_deref(),
@@ -1746,6 +1763,28 @@ fn manualize_cli_batch_after_observation_loss_tx(
         attempt.session_epoch,
         now,
     )
+}
+
+fn manualize_cli_batch_after_pre_accept_rejection_tx(
+    tx: &Transaction<'_>,
+    attempt: &DeliveryAttemptRecord,
+    now: i64,
+) -> Result<()> {
+    let manual_resolution_window_ends_at = checked_timestamp_add(
+        now,
+        DEFAULT_REDELIVERY_WINDOW_SECONDS,
+        "manual_resolution_window_seconds",
+    )?;
+    tx.execute(
+        "UPDATE batches
+         SET replay_policy = 'manual_resolution_only',
+             redelivery_window_ends_at = max(redelivery_window_ends_at, ?),
+             updated_at = ?
+         WHERE batch_id = ?
+           AND state = 'open'",
+        params![manual_resolution_window_ends_at, now, attempt.batch_id],
+    )?;
+    Ok(())
 }
 
 fn abandon_cli_observations_for_session_epoch_loss_tx(
