@@ -1313,12 +1313,50 @@ fn maybe_run_cli_auto_delivery(
             return Ok(());
         }
     };
-    let attempt = begin
-        .get("attempt")
-        .ok_or_else(|| anyhow::anyhow!("begin-cli-accept response missing attempt"))?;
-    let attempt_id = json_string(attempt, "attempt_id")?;
+    let attempt = match begin.get("attempt") {
+        Some(attempt) => attempt,
+        None => {
+            let error = anyhow::anyhow!("begin-cli-accept response missing attempt");
+            cleanup_cli_auto_delivery_before_start_after_error(
+                config,
+                state,
+                &source_thread_id,
+                &batch_id,
+                &attempt_id,
+                "begin_cli_accept_missing_attempt",
+            );
+            return Err(error);
+        }
+    };
+    let attempt_id = match json_string(attempt, "attempt_id") {
+        Ok(attempt_id) => attempt_id,
+        Err(error) => {
+            cleanup_cli_auto_delivery_before_start_after_error(
+                config,
+                state,
+                &source_thread_id,
+                &batch_id,
+                &attempt_id,
+                "begin_cli_accept_missing_attempt_id",
+            );
+            return Err(error);
+        }
+    };
     let prompt =
-        build_cli_auto_delivery_prompt(&config.layout, batch_inspect, &marker, &attempt_id)?;
+        match build_cli_auto_delivery_prompt(&config.layout, batch_inspect, &marker, &attempt_id) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                cleanup_cli_auto_delivery_before_start_after_error(
+                    config,
+                    state,
+                    &source_thread_id,
+                    &batch_id,
+                    &attempt_id,
+                    "prompt_build_failed_before_turn_start",
+                );
+                return Err(error);
+            }
+        };
     if !running.load(Ordering::Acquire) {
         cancel_cli_auto_delivery_before_accept(
             config,
@@ -1331,7 +1369,7 @@ fn maybe_run_cli_auto_delivery(
         return Ok(());
     }
 
-    record_cli_auto_delivery_audit(
+    if let Err(error) = record_cli_auto_delivery_audit(
         config,
         CliAutoDeliveryAuditEvent {
             source_thread_id: Some(&source_thread_id),
@@ -1346,7 +1384,17 @@ fn maybe_run_cli_auto_delivery(
                 "prompt_bytes": prompt.len(),
             }),
         },
-    )?;
+    ) {
+        cleanup_cli_auto_delivery_before_start_after_error(
+            config,
+            state,
+            &source_thread_id,
+            &batch_id,
+            &attempt_id,
+            "attempt_start_audit_failed_before_turn_start",
+        );
+        return Err(error);
+    }
     if !running.load(Ordering::Acquire) {
         cancel_cli_auto_delivery_before_accept(
             config,
@@ -1550,6 +1598,24 @@ fn cancel_cli_auto_delivery_before_accept(
         },
     );
     Ok(())
+}
+
+fn cleanup_cli_auto_delivery_before_start_after_error(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    source_thread_id: &str,
+    batch_id: &str,
+    attempt_id: &str,
+    reason: &str,
+) {
+    let _ = cancel_cli_auto_delivery_before_accept(
+        config,
+        state,
+        source_thread_id,
+        batch_id,
+        attempt_id,
+        reason,
+    );
 }
 
 fn reject_cli_auto_delivery_permanent_before_accept(

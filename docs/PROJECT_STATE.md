@@ -23,6 +23,7 @@
   - `turn/start` accepted 之后，accepted / started / terminal audit 变为 best-effort；matching terminal evidence 先写入 `attempt observe-cli-turn`，再做 passive activity bookkeeping / resync，避免审计或 activity 写入失败覆盖真实完成证据
   - accepted-turn observation loop 现在按 accepted attempt 的 `delivery_observation_deadline` 本地收敛；deadline 到期会 best-effort sweep / proof refresh 后退出观察，避免长期前台进程阻塞后续 head batch
   - sidecar shutdown 现在是 `turn/start` 前硬门禁：auto-delivery poll 前会重查 stop flag；`begin-cli-accept` 后若进入 shutdown，会写入 pre-accept rejection 并保留 batch 可重试，不在关闭窗口里继续发送 side-effectful RPC
+  - `begin-cli-accept` 后、`turn/start` 前的 prompt 构造 / attempt-start audit / response parsing 失败也会先 best-effort `reject-cli-before-accept`，避免从未发出 RPC 的 pending attempt 被 stale sweep 误判为 unknown
   - 新增 append-only audit log 与 `cbth audit list`
   - daemon capability 列表新增 `cli-auto-delivery-dispatch`，避免新 CLI 把 auto-delivery audit / reject-before-accept / trusted-all auth-mode 写入路由给 Phase 11a 或更早旧 daemon
   - fake e2e 覆盖 notification delivered、`thread/read` reconcile、terminal failure manualize、pre-accept rejection、unknown+sweep，以及 `strict_safe` vs `trusted_all` 授权差异
