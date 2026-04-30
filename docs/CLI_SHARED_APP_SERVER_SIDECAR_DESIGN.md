@@ -710,6 +710,7 @@ v1 范围外：
 - stale `accept_pending`、expired `cooldown` observation、以及 operator close 仍未终态的 CLI attempt 时，当前实现都会推进对应 managed session 的 `session_epoch` 并清空 activity proof，避免旧 idle 证明继续打开下一次自动投递。
 - hidden adapter-internal `cbth attempt observe-cli-turn` 已作为 terminal-event 写入面落地；它只接受 stored `delivery_turn_id` 的事件，`observed_at < delivery_observation_deadline` 的 `turn_completed` 才关闭 batch 为 `delivered`，负终态和 late observation 都会 fail-closed 到 `manual_resolution_only`。
 - `turn/start` 已被接受后，accepted-turn observation 是高优先级路径：accepted / started / terminal audit 记录为 best-effort；matching terminal evidence 会先写入 `attempt observe-cli-turn`，再做 passive activity bookkeeping / resync，避免审计或 activity 写入失败覆盖真实完成证据。
+- accepted-turn observation loop 也受 accepted attempt 的 `delivery_observation_deadline` 约束；本地 deadline 到期会触发一次 best-effort sweep / proof refresh 后退出观察，避免前台进程长期存活时旧 attempt 阻塞后续 head batch。
 - daemon capability 列表已包含 `cli-app-server-lifecycle`、`cli-session-capability-dispatch`、`cli-session-proof-invalidation-dispatch`、`cli-turn-observation-dispatch` 与 `cli-auto-delivery-dispatch`，避免新 CLI 把 app-server lifecycle / capability / proof invalidation / terminal-event / auto-delivery audit or rejection 写入路由给不支持对应 subcommand 的旧 daemon。
 - `turn_steer` 当前仍 fail-closed，直到后续 phase 落地 active-turn risk proof。
 - 这些实现仍不等价于完整 CLI 自动续跑：`trusted-all` idle `turn/start` 路径已落地，但 `turn/steer`、active-turn injection、`--new-thread` fresh bootstrap、rollout-only automatic delivered proof、以及更细粒度 policy engine 仍待后续 phase 实现。

@@ -1411,6 +1411,7 @@ fn maybe_run_cli_auto_delivery(
     let accepted_attempt = accepted
         .get("attempt")
         .ok_or_else(|| anyhow::anyhow!("accept-cli response missing attempt"))?;
+    let observation_deadline_epoch = json_i64(accepted_attempt, "delivery_observation_deadline")?;
     record_cli_auto_delivery_audit_best_effort(
         config,
         CliAutoDeliveryAuditEvent {
@@ -1438,6 +1439,7 @@ fn maybe_run_cli_auto_delivery(
             attempt_id,
             delivery_turn_id,
             session_epoch: state.session_epoch,
+            observation_deadline_epoch,
             initial_messages: turn_start_messages,
         },
     )
@@ -1449,6 +1451,7 @@ struct CliAcceptedTurn {
     attempt_id: String,
     delivery_turn_id: String,
     session_epoch: i64,
+    observation_deadline_epoch: i64,
     initial_messages: Vec<Value>,
 }
 
@@ -1544,7 +1547,11 @@ fn observe_cli_auto_delivery_turn(
         return Ok(());
     }
     while running.load(Ordering::Acquire) {
-        match client.recv(Duration::from_millis(CLI_APP_SERVER_RECONCILE_INTERVAL_MS))? {
+        if accepted_cli_observation_deadline_elapsed(&accepted)? {
+            expire_cli_auto_delivery_observation(config, state, client, &accepted)?;
+            return Ok(());
+        }
+        match client.recv(accepted_cli_observation_recv_timeout(&accepted)?)? {
             AppServerReceive::Message(message) => {
                 if handle_cli_auto_delivery_messages(
                     config,
@@ -1569,6 +1576,56 @@ fn observe_cli_auto_delivery_turn(
             }
         }
     }
+    Ok(())
+}
+
+fn accepted_cli_observation_deadline_elapsed(accepted: &CliAcceptedTurn) -> Result<bool> {
+    Ok(now_epoch_seconds()? >= accepted.observation_deadline_epoch)
+}
+
+fn accepted_cli_observation_recv_timeout(accepted: &CliAcceptedTurn) -> Result<Duration> {
+    let now = now_epoch_seconds()?;
+    let remaining_millis = accepted
+        .observation_deadline_epoch
+        .saturating_sub(now)
+        .try_into()
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1_000);
+    Ok(Duration::from_millis(
+        remaining_millis.clamp(1, CLI_APP_SERVER_RECONCILE_INTERVAL_MS),
+    ))
+}
+
+fn expire_cli_auto_delivery_observation(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    client: &mut AppServerJsonRpcClient,
+    accepted: &CliAcceptedTurn,
+) -> Result<()> {
+    let now = now_epoch_seconds()?;
+    let _ = dispatch_cli_adapter_command(
+        config,
+        Commands::Maintenance {
+            command: MaintenanceCommand::Sweep(MaintenanceSweepArgs { now: Some(now) }),
+        },
+        false,
+    );
+    record_cli_auto_delivery_audit_best_effort(
+        config,
+        CliAutoDeliveryAuditEvent {
+            source_thread_id: Some(&accepted.source_thread_id),
+            batch_id: Some(&accepted.batch_id),
+            attempt_id: Some(&accepted.attempt_id),
+            session_epoch: accepted.session_epoch,
+            decision: "manualized",
+            reason: "observation_deadline_elapsed",
+            details: json!({
+                "delivery_turn_id": accepted.delivery_turn_id,
+                "delivery_observation_deadline": accepted.observation_deadline_epoch,
+            }),
+        },
+    );
+    let _ = resync_passive_adapter_after_durable_invalidation(config, state, client);
     Ok(())
 }
 
