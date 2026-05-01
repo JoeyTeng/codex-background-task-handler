@@ -21,6 +21,7 @@ cargo --version
 - `CBTH_LIVE_NODE_BIN`: 覆盖 Node binary，默认 `node`。
 - `CBTH_LIVE_CODEX_E2E_TIMEOUT_MS`: shared app-server smoke 超时，默认 `180000`。
 - `CBTH_LIVE_TRUSTED_ALL_E2E_TIMEOUT_SECONDS`: trusted-all full e2e 超时，默认 `360`。
+- `CBTH_LIVE_NEW_THREAD_E2E_TIMEOUT_SECONDS`: `--new-thread` full e2e 超时，默认 `360`。
 
 ## Shared App-Server Smoke
 
@@ -52,14 +53,37 @@ CBTH_RUN_LIVE_TRUSTED_ALL_E2E=1 cargo test --test live_trusted_all -- --ignored
 
 ```text
 test live_codex_trusted_all_auto_delivery_is_opt_in ... ok
-test result: ok. 1 passed; finished in 139.65s
+test result: ok. 1 passed; finished in 52.59s
+```
+
+## New-Thread Trusted-All Full Live E2E
+
+该 e2e 验证真实 `cbth cli run --new-thread --auto-delivery-policy trusted-all` 的 fresh bootstrap：
+
+- `cbth` 先启动 daemon-owned pending `codex app-server`，在同一个进程上调用 `thread/start`，再把该进程提升为 managed app-server；这是因为 Codex 0.128 在 first user message 前不会把 fresh thread rollout materialize，关闭 bootstrap app-server 会让后续 `thread/resume` 失去该 thread。
+- bootstrap 不向 foreground TUI 注入任何输入。
+- `cbth` 在启动 foreground 前向 stderr 打印 `cbth: bound thread id: <thread-id>`；测试只用这行提取 thread id。
+- 测试专用 wrapper 只拦截 foreground `codex --remote` 并保持进程存活；`app-server` 分支仍执行真实 `codex app-server`。
+- 后续流程与 existing-thread trusted-all e2e 相同：等待 session idle/capability proof，提交 exact-reply marker failed job，等待自动 `turn/start` 并关闭 batch 为 `delivered`。fresh unmaterialized thread 的初始 proof 使用 `thread_start + thread/read(includeTurns=false)`，accepted turn 后再回到 materialized rollout 的 observation/reconcile 路径。live marker 明确要求 assistant 只回复固定字符串且不运行工具，避免 fresh thread 把 e2e prompt 当作真实开发任务递归执行。
+
+```bash
+CBTH_RUN_LIVE_NEW_THREAD_E2E=1 cargo test --test live_new_thread -- --ignored
+```
+
+本机已验证一次成功运行：
+
+```text
+test live_codex_new_thread_trusted_all_auto_delivery_is_opt_in ... ok
+test result: ok. 1 passed; finished in 15.54s
 ```
 
 ## Failure Notes
 
 - 如果卡在 listener bootstrap，先单独运行 shared app-server smoke；它能快速暴露 `codex app-server` 输出流、登录态或 Node PoC 问题。
-- 如果卡在 session readiness，通常说明 bootstrap thread 不能被新的 app-server resume，或 passive adapter 没拿到 idle/current-state/capability proof。测试失败信息会打印最后观察到的 session proof 字段。
-- 如果卡在 batch delivered，优先看 `cbth audit list --source-thread-id <thread-id>`：`accepted` 后没有 `observed/reconciled` 说明真实 model turn 还没有 terminal evidence，或 websocket continuity 已丢失。
+- 如果 `--new-thread` 没打印 `cbth: bound thread id: ...`，优先看 bootstrap `thread/start` 是否被当前 `codex app-server` 支持；该失败会发生在 foreground 启动前。
+- 如果卡在 session readiness，通常说明 pending app-server 没有被成功 promote，或 passive adapter 没拿到 fresh `thread_start` / current-state / capability proof。测试失败信息会打印最后观察到的 session proof 字段。
+- 如果 rollout 显示 assistant 已完成 marker turn，但 batch 进入 `manual_resolution_only`，检查 `turn/start` acceptance 是否超过 60 秒；也要检查 accepted observation 是否遇到 proof-only `thread/status/changed` noise 或 fresh first-turn `thread/read(includeTurns=true)` materialization error。
+- 如果卡在 batch delivered，优先看 `cbth audit list --source-thread-id <thread-id>`：`accepted` 后长时间没有 `observed/reconciled` 说明真实 model turn 还没有 terminal evidence，或 websocket continuity 已丢失。terminal audit 是 batch close 后的 best-effort 记录，live harness 会短暂轮询，避免把 close/audit 的事务边界当成同步点。
 - 测试使用临时 `CBTH_HOME`，结束时会 stop daemon 并清理临时目录；异常中断后可用 `pgrep -af "codex app-server"` 和 `pgrep -af cbth` 检查是否有遗留进程。
 
 ## Skill Candidate

@@ -265,10 +265,14 @@
 - [x] 把 CLI current-state sync 升成最小 capability probe 的正式要求：
   - [x] 缺少 `thread/read` 或等价 current-state 面时，v1 不支持 detached managed-session auto-continuation
   - 这个 sync 至少必须对 `bound_thread_id` 返回 `has_active_regular_turn` 与可选 `active_turn_id`
-- [ ] 把 CLI fresh-thread bootstrap 收口成正式合同：
-  - `cbth cli run --new-thread` 仅在 capability probe 已证明 `thread/start` 可用时允许
-  - daemon 必须先创建 brand-new thread，再把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
-  - 如果既没有现成 `thread_id`，也没有 `thread/start` capability，则前台只能视为探索性 remote TUI
+- [x] 把 CLI fresh-thread bootstrap 收口成正式合同：
+  - [x] `cbth cli run --new-thread` 通过 daemon-owned pending app-server 成功执行 `thread/start` 后才进入 fixed-thread managed session
+  - [x] daemon 先创建 brand-new thread，再把同一个 app-server 进程提升为 managed app-server，并把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
+  - [x] fresh unmaterialized thread 的初始 idle proof 使用 `thread_start + thread/read(includeTurns=false)`，避免依赖 first user message 前不可用的 `thread/resume`
+  - [x] bootstrap 失败时在 foreground 启动前 fail closed，不创建 managed session，不进入 auto-delivery
+  - [x] `--new-thread` 只向 stderr 打印 `cbth: bound thread id: <thread_id>`，不改变 foreground Codex 交互模型
+  - [x] opt-in live `CBTH_RUN_LIVE_NEW_THREAD_E2E=1 cargo test --test live_new_thread -- --ignored --nocapture` 已验证 fresh bootstrap + trusted-all delivered path
+  - [x] fake e2e 覆盖 accepted observation 中的 proof-only status noise 与 fresh first-turn `thread/read(includeTurns=true)` materialization error
 - [x] 把 accepted-turn 负终态观察面升成最小 capability probe 的正式要求：
   - [x] 最小 capability set 不只包括 `turn/completed`
   - [x] 还必须能对当前 `delivery_turn_id` 观察并 durable 区分：

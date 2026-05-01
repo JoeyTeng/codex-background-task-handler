@@ -60,17 +60,23 @@ CBTH_RUN_LIVE_CODEX_E2E=1 cargo test --test live_smoke -- --ignored
 CBTH_RUN_LIVE_TRUSTED_ALL_E2E=1 cargo test --test live_trusted_all -- --ignored
 ```
 
+完整 live `--new-thread` e2e 同样是 opt-in；它用真实 `codex app-server` 在启动前创建 caller thread，通过 stderr 暴露新 thread id，然后验证 trusted-all 自动投递闭环：
+
+```bash
+CBTH_RUN_LIVE_NEW_THREAD_E2E=1 cargo test --test live_new_thread -- --ignored
+```
+
 复测步骤、环境变量和失败排查见 [docs/LIVE_E2E.md](docs/LIVE_E2E.md)。
 
 ## Rust CLI Usage
 
 The Rust CLI currently provides read-only store inspection commands, daemon-routed mutating job/batch/maintenance commands, `cbth cli run`, adapter-internal attempt and CLI-session commands, an audit log, and a daemon control surface backed by a same-user Unix socket.
 
-`cbth cli run --bind-thread-id <thread-id>` attach-or-creates a durable fixed-thread managed session, asks the daemon to launch a loopback-only `codex app-server --listen ws://127.0.0.1:0`, refreshes a short app-server lease while foreground Codex runs, launches native `codex --remote <url> --cd <cwd> ...`, and starts a sidecar websocket client that performs initialize / `thread/resume` / `thread/read` and maps `turn/started`, `turn/completed`, and `thread/status/changed` into durable activity updates. Successful `thread.status.type` snapshots for the bound thread dominate earlier request-window notifications, and capability/activity write failures invalidate proof before retry. On foreground exit it stops and joins the sidecar, clears activity/capability proof with the latest sidecar epoch, and stops the daemon-owned app-server.
+`cbth cli run --bind-thread-id <thread-id>` attach-or-creates a durable fixed-thread managed session, asks the daemon to launch a loopback-only `codex app-server --listen ws://127.0.0.1:0`, refreshes a short app-server lease while foreground Codex runs, launches native `codex --remote <url> --cd <cwd> ...`, and starts a sidecar websocket client that performs initialize / `thread/resume` / `thread/read` and maps `turn/started`, `turn/completed`, and `thread/status/changed` into durable activity updates. `cbth cli run --new-thread` asks the daemon to start a pending app-server, calls `thread/start` on that same process, prints `cbth: bound thread id: <thread-id>` to stderr, then promotes the pending process into the fixed-thread managed session before foreground Codex starts. This avoids losing Codex's fresh unmaterialized thread state while still not sending a foreground prompt, injecting user input, or changing the native `codex --remote` interaction model. Successful `thread.status.type` snapshots for the bound thread dominate earlier request-window notifications, and capability/activity write failures invalidate proof before retry. On foreground exit it stops and joins the sidecar, clears activity/capability proof with the latest sidecar epoch, and stops the daemon-owned app-server.
 
-Default `cbth cli run` remains passive and records only `thread_resume` / `current_state_sync` capability proof. With explicit `--auto-delivery-policy trusted-all`, the sidecar records full automatic-delivery capability for the current epoch, polls durable idle state every 2 seconds, writes an `accept_pending` barrier, sends a unique-marker `turn/start`, calls `accept-cli` with the returned `turn.id`, and observes the accepted turn. Matching completed notifications close the batch as `delivered`; missed notifications can be reconciled with same-epoch `thread/read(includeTurns=true)`; failed/interrupted/replaced turns move the batch to `manual_resolution_only`. Clear pre-accept rejection uses hidden `attempt reject-cli-before-accept` and keeps the batch automatic without incrementing `delivery_attempt_count`. Timeout, websocket close, or protocol ambiguity is not retried; stale sweep later marks the attempt `unknown` and fail-closes the batch.
+Default `cbth cli run` remains passive and records only current-state proof. Existing-thread sessions use `thread_resume` / `current_state_sync`; fresh unmaterialized `--new-thread` sessions can use the same-process `thread_start` + `thread/read(includeTurns=false)` proof until the first turn materializes rollout storage. With explicit `--auto-delivery-policy trusted-all`, the sidecar records full automatic-delivery capability for the current epoch, polls durable idle state every 2 seconds, writes an `accept_pending` barrier, sends a unique-marker `turn/start`, waits up to 60 seconds for acceptance, calls `accept-cli` with the returned `turn.id`, and observes the accepted turn. Matching completed notifications close the batch as `delivered`; missed notifications can be reconciled with same-epoch `thread/read(includeTurns=true)` after the accepted turn materializes the rollout; failed/interrupted/replaced turns move the batch to `manual_resolution_only`. Clear pre-accept rejection uses hidden `attempt reject-cli-before-accept` and keeps the batch automatic without incrementing `delivery_attempt_count`. Timeout, websocket close, or protocol ambiguity is not retried; stale sweep later marks the attempt `unknown` and fail-closes the batch.
 
-`trusted-all` is deliberately broad: it bypasses batch policy, artifact-read, and managed-session risk-profile gates, but it still requires an open head batch, remaining budget, matching `source_thread_id`, bound `managed_session_id`, matching `session_epoch`, and fresh idle proof. `cbth audit list` exposes the append-only decision trail for allow/deny/attempt-start/accepted/rejected/reconciled/observed/manualized records. `turn/steer`, active-turn injection, and `--new-thread` are still outside the implemented automatic delivery path.
+`trusted-all` is deliberately broad: it bypasses batch policy, artifact-read, and managed-session risk-profile gates, but it still requires an open head batch, remaining budget, matching `source_thread_id`, bound `managed_session_id`, matching `session_epoch`, and fresh idle proof. `cbth audit list` exposes the append-only decision trail for allow/deny/attempt-start/accepted/rejected/reconciled/observed/manualized records. `turn/steer`, active-turn injection, rollout-only delivery proof, and foreground thread retargeting are still outside the implemented automatic delivery path.
 
 State lives under `~/.cbth` by default. Use `--home <path>` or `CBTH_HOME` for tests and isolated runs.
 The local-store and daemon IPC semantics are supported on macOS and Linux; pure Windows support is out of scope until the IPC, atomic-replace, and directory-sync contracts are designed separately.
@@ -113,6 +119,15 @@ cargo run --bin cbth -- \
 cargo run --bin cbth -- \
   cli run \
   --bind-thread-id <thread-id> \
+  --session-allows-approval false \
+  --session-allows-network false \
+  --session-allows-write-access false \
+  --auto-delivery-policy trusted-all \
+  -- --model gpt-5.5
+
+cargo run --bin cbth -- \
+  cli run \
+  --new-thread \
   --session-allows-approval false \
   --session-allows-network false \
   --session-allows-write-access false \

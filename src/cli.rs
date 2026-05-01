@@ -45,13 +45,14 @@ const CLI_APP_SERVER_LEASE_TTL_SECONDS: u64 = 60;
 const CLI_APP_SERVER_LEASE_REFRESH_SECONDS: u64 = 20;
 const CLI_APP_SERVER_ENSURE_TIMEOUT_SECONDS: u64 = 15;
 const CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS: u64 = 5;
+const CLI_THREAD_START_BOOTSTRAP_TIMEOUT_SECONDS: u64 = 20;
 const CLI_APP_SERVER_PASSIVE_CONNECT_TIMEOUT_MS: u64 = 250;
 const CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS: u64 = 3;
 const CLI_APP_SERVER_PASSIVE_RECV_TIMEOUT_MS: u64 = 500;
 const CLI_APP_SERVER_PASSIVE_RETRY_MAX_MS: u64 = 500;
 const CLI_APP_SERVER_PASSIVE_STORE_TIMEOUT_SECONDS: u64 = 1;
 const CLI_APP_SERVER_AUTO_DELIVERY_POLL_MS: u64 = 2_000;
-const CLI_APP_SERVER_TURN_START_TIMEOUT_SECONDS: u64 = 5;
+const CLI_APP_SERVER_TURN_START_ACCEPTANCE_TIMEOUT_SECONDS: u64 = 60;
 const CLI_APP_SERVER_DURABLE_WRITE_RETRY_TIMEOUT_SECONDS: u64 = 30;
 const CLI_APP_SERVER_DURABLE_WRITE_RETRY_INTERVAL_MS: u64 = 250;
 const CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS: i64 = MAX_CLI_OBSERVATION_WINDOW_SECONDS;
@@ -237,7 +238,10 @@ enum CliSessionCommand {
 #[derive(Debug, Args)]
 struct CliRunArgs {
     #[arg(long)]
-    bind_thread_id: String,
+    bind_thread_id: Option<String>,
+
+    #[arg(long, conflicts_with = "bind_thread_id")]
+    new_thread: bool,
 
     #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
     session_allows_approval: bool,
@@ -782,8 +786,9 @@ fn run_cli_session(
     layout: &FsLayout,
     startup_timeout_seconds: u64,
 ) -> Result<i32> {
-    validate_nonempty("bind_thread_id", &args.bind_thread_id)?;
+    validate_cli_run_target_args(&args)?;
     let codex_binary = resolve_executable(&args.codex_bin)?;
+    let cwd = env::current_dir().context("read current directory")?;
     let lease_id = new_id();
 
     validate_daemon_autostart_endpoint(layout)?;
@@ -795,13 +800,17 @@ fn run_cli_session(
             startup_sweep_now: Some(now_epoch_seconds()?),
         },
     )?;
-    reserve_cli_app_server_for_thread(layout, &args.bind_thread_id, &lease_id)?;
+    let target = resolve_cli_run_thread_target(layout, &args, &codex_binary, &cwd, &lease_id)?;
+    let bound_thread_id = target.bound_thread_id.clone();
+    reserve_cli_app_server_for_thread(layout, &bound_thread_id, &lease_id).inspect_err(|_| {
+        abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
+    })?;
 
     let bind = match dispatch(
         Commands::Cli {
             command: CliCommand::Session {
                 command: CliSessionCommand::Bind(CliSessionBindArgs {
-                    bound_thread_id: args.bind_thread_id.clone(),
+                    bound_thread_id: bound_thread_id.clone(),
                     session_allows_approval: args.session_allows_approval,
                     session_allows_network: args.session_allows_network,
                     session_allows_write_access: args.session_allows_write_access,
@@ -817,7 +826,8 @@ fn run_cli_session(
     ) {
         Ok(bind) => bind,
         Err(error) => {
-            release_cli_app_server_reservation_best_effort(layout, &args.bind_thread_id, &lease_id);
+            release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
+            abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
             return Err(error);
         }
     };
@@ -827,22 +837,19 @@ fn run_cli_session(
     let session_epoch = json_i64(session, "session_epoch")?;
     let activity_revision = json_i64(session, "activity_revision")?;
     let capability_revision = json_i64(session, "capability_revision")?;
-    let app_server = match daemon_request_payload_timeout(
+    let app_server = match ensure_cli_run_app_server(
         layout,
-        "cli_app_server_ensure",
-        json!({
-            "managed_session_id": managed_session_id,
-            "bound_thread_id": bound_thread_id,
-            "session_epoch": session_epoch,
-            "codex_binary": codex_binary.as_bytes(),
-            "lease_id": lease_id,
-            "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
-        }),
-        Duration::from_secs(CLI_APP_SERVER_ENSURE_TIMEOUT_SECONDS),
+        &target.bootstrap_id,
+        &managed_session_id,
+        &bound_thread_id,
+        session_epoch,
+        &codex_binary,
+        &lease_id,
     ) {
         Ok(app_server) => app_server,
         Err(error) => {
             release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
+            abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
             return Err(error);
         }
     };
@@ -864,13 +871,14 @@ fn run_cli_session(
             activity_revision,
             capability_revision,
             auto_delivery_policy: args.auto_delivery_policy,
+            fresh_thread_bootstrap: target.bootstrap_id.is_some(),
         });
 
     let foreground_status = Command::new(&codex_binary)
         .arg("--remote")
         .arg(&url)
         .arg("--cd")
-        .arg(env::current_dir().context("read current directory")?)
+        .arg(&cwd)
         .args(args.codex_args)
         .status()
         .with_context(|| format!("spawn foreground codex via {:?}", codex_binary));
@@ -891,6 +899,122 @@ fn run_cli_session(
     passive_stop_result?;
     let status = foreground_status?;
     Ok(status.code().unwrap_or(1))
+}
+
+fn validate_cli_run_target_args(args: &CliRunArgs) -> Result<()> {
+    match (&args.bind_thread_id, args.new_thread) {
+        (Some(bound_thread_id), false) => validate_nonempty("bind_thread_id", bound_thread_id),
+        (None, true) => Ok(()),
+        (None, false) => {
+            bail!("cli run requires either --bind-thread-id <thread-id> or --new-thread")
+        }
+        (Some(_), true) => bail!("cli run accepts only one of --bind-thread-id or --new-thread"),
+    }
+}
+
+struct CliRunThreadTarget {
+    bound_thread_id: String,
+    bootstrap_id: Option<String>,
+}
+
+fn resolve_cli_run_thread_target(
+    layout: &FsLayout,
+    args: &CliRunArgs,
+    codex_binary: &OsStr,
+    cwd: &Path,
+    lease_id: &str,
+) -> Result<CliRunThreadTarget> {
+    if let Some(bound_thread_id) = &args.bind_thread_id {
+        return Ok(CliRunThreadTarget {
+            bound_thread_id: bound_thread_id.clone(),
+            bootstrap_id: None,
+        });
+    }
+    let cwd = cwd
+        .as_os_str()
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("current directory path is not valid UTF-8"))?;
+    let started = daemon_request_payload_timeout(
+        layout,
+        "cli_thread_start",
+        json!({
+            "codex_binary": codex_binary.as_bytes(),
+            "cwd": cwd,
+            "lease_id": lease_id,
+            "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
+        }),
+        Duration::from_secs(CLI_THREAD_START_BOOTSTRAP_TIMEOUT_SECONDS),
+    )?;
+    let thread = started
+        .get("thread")
+        .ok_or_else(|| anyhow::anyhow!("cli_thread_start response missing thread"))?;
+    let thread_id = json_string(thread, "thread_id")?;
+    let bootstrap_id = json_string(thread, "bootstrap_id")?;
+    eprintln!("cbth: bound thread id: {thread_id}");
+    Ok(CliRunThreadTarget {
+        bound_thread_id: thread_id,
+        bootstrap_id: Some(bootstrap_id),
+    })
+}
+
+fn ensure_cli_run_app_server(
+    layout: &FsLayout,
+    bootstrap_id: &Option<String>,
+    managed_session_id: &str,
+    bound_thread_id: &str,
+    session_epoch: i64,
+    codex_binary: &OsStr,
+    lease_id: &str,
+) -> Result<Value> {
+    let command = if let Some(bootstrap_id) = bootstrap_id {
+        (
+            "cli_thread_start_promote",
+            json!({
+                "bootstrap_id": bootstrap_id,
+                "managed_session_id": managed_session_id,
+                "bound_thread_id": bound_thread_id,
+                "session_epoch": session_epoch,
+                "lease_id": lease_id,
+                "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
+            }),
+        )
+    } else {
+        (
+            "cli_app_server_ensure",
+            json!({
+                "managed_session_id": managed_session_id,
+                "bound_thread_id": bound_thread_id,
+                "session_epoch": session_epoch,
+                "codex_binary": codex_binary.as_bytes(),
+                "lease_id": lease_id,
+                "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
+            }),
+        )
+    };
+    daemon_request_payload_timeout(
+        layout,
+        command.0,
+        command.1,
+        Duration::from_secs(CLI_APP_SERVER_ENSURE_TIMEOUT_SECONDS),
+    )
+}
+
+fn abort_cli_thread_start_bootstrap_best_effort(
+    layout: &FsLayout,
+    bootstrap_id: &Option<String>,
+    lease_id: &str,
+) {
+    if let Some(bootstrap_id) = bootstrap_id {
+        let _ = daemon_request_payload_timeout(
+            layout,
+            "cli_thread_start_abort",
+            json!({
+                "bootstrap_id": bootstrap_id,
+                "lease_id": lease_id,
+            }),
+            Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+        );
+    }
 }
 
 fn reserve_cli_app_server_for_thread(
@@ -963,6 +1087,7 @@ struct CliAppServerPassiveAdapterConfig {
     activity_revision: i64,
     capability_revision: i64,
     auto_delivery_policy: CliAutoDeliveryPolicy,
+    fresh_thread_bootstrap: bool,
 }
 
 struct CliAppServerPassiveAdapterHandle {
@@ -1087,31 +1212,44 @@ fn run_cli_app_server_passive_adapter_once(
         json!({ "threadId": config.bound_thread_id }),
         Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
     );
-    let resume = resume_result?;
+    let mut thread_resume_capability = false;
+    let mut thread_start_capability = config.fresh_thread_bootstrap;
     let mut current_state_sync = false;
     let mut active = false;
-    match thread_result_activity_snapshot(&resume, &config.bound_thread_id) {
-        ThreadActivitySnapshot::Active => {
-            current_state_sync = true;
-            active = true;
+    match resume_result {
+        Ok(resume) => {
+            thread_resume_capability = true;
+            match thread_result_activity_snapshot(&resume, &config.bound_thread_id) {
+                ThreadActivitySnapshot::Active => {
+                    current_state_sync = true;
+                    active = true;
+                }
+                ThreadActivitySnapshot::Idle => {
+                    current_state_sync = true;
+                }
+                ThreadActivitySnapshot::Missing => {}
+                ThreadActivitySnapshot::Untrusted => {
+                    invalidate_passive_adapter_proof(config, state)?;
+                    bail!("app-server thread/resume returned untrusted current-state snapshot");
+                }
+            }
         }
-        ThreadActivitySnapshot::Idle => {
-            current_state_sync = true;
+        Err(error)
+            if config.fresh_thread_bootstrap && is_unmaterialized_thread_resume_error(&error) =>
+        {
+            thread_start_capability = true;
         }
-        ThreadActivitySnapshot::Missing => {}
-        ThreadActivitySnapshot::Untrusted => {
-            invalidate_passive_adapter_proof(config, state)?;
-            bail!("app-server thread/resume returned untrusted current-state snapshot");
-        }
+        Err(error) => return Err(error.into()),
     }
     let mut messages_to_replay = Vec::new();
 
+    let include_turns = thread_resume_capability;
     let (read_result, read_messages) = passive_adapter_request(
         &mut client,
         "thread/read",
         json!({
             "threadId": config.bound_thread_id,
-            "includeTurns": true,
+            "includeTurns": include_turns,
         }),
         Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
     );
@@ -1142,7 +1280,12 @@ fn run_cli_app_server_passive_adapter_once(
     }
 
     if current_state_sync {
-        record_passive_adapter_capabilities(config, state)?;
+        record_passive_adapter_capabilities(
+            config,
+            state,
+            thread_resume_capability,
+            thread_start_capability,
+        )?;
         record_passive_adapter_activity(
             config,
             state,
@@ -1198,6 +1341,11 @@ fn passive_adapter_request(
     let result = client.request(method, params, timeout);
     let messages = client.drain_pending_messages();
     (result, messages)
+}
+
+fn is_unmaterialized_thread_resume_error(error: &AppServerRequestError) -> bool {
+    error.kind() == AppServerRequestErrorKind::Remote
+        && error.message().contains("no rollout found for thread id")
 }
 
 fn maybe_run_cli_auto_delivery(
@@ -1420,7 +1568,7 @@ fn maybe_run_cli_auto_delivery(
                 }
             ]
         }),
-        Duration::from_secs(CLI_APP_SERVER_TURN_START_TIMEOUT_SECONDS),
+        Duration::from_secs(CLI_APP_SERVER_TURN_START_ACCEPTANCE_TIMEOUT_SECONDS),
     );
     let turn_start = match turn_start_result {
         Ok(value) => value,
@@ -1892,7 +2040,8 @@ fn handle_cli_auto_delivery_messages(
             )?;
             return Ok(true);
         }
-        record_passive_adapter_notification(config, state, notification)?;
+        // The accepted turn owns this observation window; proof-only status noise
+        // must not abandon an already accepted delivery before its terminal event.
     }
     Ok(false)
 }
@@ -1950,6 +2099,13 @@ fn reconcile_cli_auto_delivery_turn(
     let read = match read_result {
         Ok(read) => read,
         Err(error) if error.kind() == AppServerRequestErrorKind::Timeout => return Ok(false),
+        Err(error)
+            if config.fresh_thread_bootstrap
+                && error.kind() == AppServerRequestErrorKind::Remote
+                && remote_error_is_temporarily_unreadable_thread(&error) =>
+        {
+            return Ok(false);
+        }
         Err(error) => return Err(error.into()),
     };
     match thread_result_turn_status(&read, &config.bound_thread_id, &accepted.delivery_turn_id) {
@@ -1971,6 +2127,13 @@ fn reconcile_cli_auto_delivery_turn(
             bail!("thread/read reconcile returned untrusted turn snapshot")
         }
     }
+}
+
+fn remote_error_is_temporarily_unreadable_thread(error: &AppServerRequestError) -> bool {
+    let message = error.message();
+    message.contains("is not materialized yet")
+        || message.contains("includeTurns is unavailable before first user message")
+        || message.contains("no rollout found for thread id")
 }
 
 fn observe_cli_auto_delivery_started(
@@ -2071,7 +2234,7 @@ fn resync_passive_adapter_after_durable_invalidation(
             bail!("thread/read proof refresh returned untrusted current-state snapshot");
         }
     };
-    record_passive_adapter_capabilities(config, state)?;
+    record_passive_adapter_capabilities(config, state, true, config.fresh_thread_bootstrap)?;
     record_passive_adapter_activity(config, state, activity_state)
 }
 
@@ -2321,6 +2484,8 @@ fn record_passive_adapter_activity(
 fn record_passive_adapter_capabilities(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
+    thread_resume: bool,
+    thread_start: bool,
 ) -> Result<()> {
     if state.passive_capabilities_recorded {
         return Ok(());
@@ -2337,12 +2502,12 @@ fn record_passive_adapter_capabilities(
                     managed_session_id: config.managed_session_id.clone(),
                     session_epoch: state.session_epoch,
                     capability_revision: next_revision,
-                    thread_resume: true,
+                    thread_resume,
                     turn_start: config.auto_delivery_policy.enabled(),
                     current_state_sync: true,
                     turn_completed_event: config.auto_delivery_policy.enabled(),
                     negative_terminal_events: config.auto_delivery_policy.enabled(),
-                    thread_start: false,
+                    thread_start,
                     turn_steer: false,
                     now: None,
                 }),
