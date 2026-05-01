@@ -39,7 +39,7 @@ const CLI_APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_APP_SERVER_TERM_GRACE: Duration = Duration::from_secs(2);
 const CLI_APP_SERVER_KILL_GRACE: Duration = Duration::from_secs(2);
 const CLI_APP_SERVER_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const CLI_APP_SERVER_STDOUT_SCAN_BYTES: usize = 8 * 1024;
+const CLI_APP_SERVER_LISTENER_SCAN_BYTES: usize = 8 * 1024;
 const CLI_APP_SERVER_DRAIN_CHUNK_BYTES: usize = 4 * 1024;
 const DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS: u64 = 60;
 const DAEMON_PROTOCOL_VERSION: u64 = 1;
@@ -1399,9 +1399,13 @@ fn spawn_cli_app_server(
     let drain_running = Arc::new(AtomicBool::new(true));
     let stdout_drain_running = Arc::clone(&drain_running);
     let stderr_drain_running = Arc::clone(&drain_running);
-    let stdout_worker =
-        thread::spawn(move || drain_app_server_stdout(stdout, url_sender, stdout_drain_running));
-    let stderr_worker = thread::spawn(move || drain_reader(stderr, stderr_drain_running));
+    let stderr_url_sender = url_sender.clone();
+    let stdout_worker = thread::spawn(move || {
+        drain_app_server_listener_stream(stdout, url_sender, stdout_drain_running)
+    });
+    let stderr_worker = thread::spawn(move || {
+        drain_app_server_listener_stream(stderr, stderr_url_sender, stderr_drain_running)
+    });
     let url = match url_receiver.recv_timeout(CLI_APP_SERVER_STARTUP_TIMEOUT) {
         Ok(url) => url,
         Err(error) => {
@@ -1435,13 +1439,13 @@ fn spawn_cli_app_server(
     })
 }
 
-fn drain_app_server_stdout<R: Read>(
+fn drain_app_server_listener_stream<R: Read>(
     mut reader: R,
     url_sender: mpsc::Sender<String>,
     running: Arc<AtomicBool>,
 ) {
     let mut sent = false;
-    let mut scan_buffer = Vec::with_capacity(CLI_APP_SERVER_STDOUT_SCAN_BYTES);
+    let mut scan_buffer = Vec::with_capacity(CLI_APP_SERVER_LISTENER_SCAN_BYTES);
     let mut buffer = [0_u8; CLI_APP_SERVER_DRAIN_CHUNK_BYTES];
     loop {
         if !running.load(Ordering::Acquire) {
@@ -1454,7 +1458,7 @@ fn drain_app_server_stdout<R: Read>(
                     append_bounded(
                         &mut scan_buffer,
                         &buffer[..read],
-                        CLI_APP_SERVER_STDOUT_SCAN_BYTES,
+                        CLI_APP_SERVER_LISTENER_SCAN_BYTES,
                     );
                     if let Some(url) = parse_app_server_listener_url(&scan_buffer) {
                         let _ = url_sender.send(url);
@@ -1475,6 +1479,7 @@ fn drain_app_server_stdout<R: Read>(
     }
 }
 
+#[cfg(test)]
 fn drain_reader<R: Read>(mut reader: R, running: Arc<AtomicBool>) {
     let mut buffer = [0_u8; CLI_APP_SERVER_DRAIN_CHUNK_BYTES];
     loop {

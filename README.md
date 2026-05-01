@@ -54,6 +54,14 @@ bash scripts/install-git-hooks.sh
 CBTH_RUN_LIVE_CODEX_E2E=1 cargo test --test live_smoke -- --ignored
 ```
 
+完整 live `trusted-all` 自动投递 e2e 也是 opt-in；它会创建真实 Codex thread、运行 seed turn，并验证 `cbth cli run --auto-delivery-policy trusted-all` 能把 head batch 自动投递后关闭为 `delivered`：
+
+```bash
+CBTH_RUN_LIVE_TRUSTED_ALL_E2E=1 cargo test --test live_trusted_all -- --ignored
+```
+
+复测步骤、环境变量和失败排查见 [docs/LIVE_E2E.md](docs/LIVE_E2E.md)。
+
 ## Rust CLI Usage
 
 The Rust CLI currently provides read-only store inspection commands, daemon-routed mutating job/batch/maintenance commands, `cbth cli run`, adapter-internal attempt and CLI-session commands, an audit log, and a daemon control surface backed by a same-user Unix socket.

@@ -16,6 +16,8 @@ function parseArgs(argv) {
     cwd: process.cwd(),
     timeoutMs: 120000,
     seedMessage: DEFAULT_SEED_MESSAGE,
+    createThreadOnly: false,
+    seedOnly: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -30,6 +32,10 @@ function parseArgs(argv) {
       options.timeoutMs = Number(argv[++index]);
     } else if (arg === "--seed-message") {
       options.seedMessage = argv[++index];
+    } else if (arg === "--create-thread-only") {
+      options.createThreadOnly = true;
+    } else if (arg === "--seed-only") {
+      options.seedOnly = true;
     } else if (arg === "--help" || arg === "-h") {
       printHelp();
       process.exit(0);
@@ -48,6 +54,8 @@ Options:
   --url <ws-url>         Websocket app-server URL (default: ${DEFAULT_URL})
   --message <text>       Prompt sent by the sidecar client
   --seed-message <text>  Prompt sent by the frontend client before sidecar resume
+  --create-thread-only   Create a thread, print its id, and skip model turns
+  --seed-only            Create a thread, run the seed turn, and skip sidecar turn
   --cwd <path>           Working directory for thread/start (default: current cwd)
   --timeout-ms <ms>      Overall timeout (default: 120000)
 `);
@@ -392,6 +400,12 @@ async function main() {
     });
     const threadId = threadStart.thread.id;
     summary.thread_id = threadId;
+    summary.thread_source = threadStart.thread.source ?? null;
+
+    if (options.createThreadOnly) {
+      console.log(JSON.stringify(summary, null, 2));
+      return;
+    }
 
     const seedTurn = await frontend.request("turn/start", {
       threadId,
@@ -413,6 +427,19 @@ async function main() {
       ),
       abortPromise(deadline, "overall timeout while waiting for frontend seed turn"),
     ]);
+
+    if (options.seedOnly) {
+      const threadRead = await frontend.request("thread/read", {
+        threadId,
+        includeTurns: true,
+      });
+      summary.frontend_seed_turn_id = seedTurn.turn.id;
+      summary.seed_turn_status = "completed";
+      summary.turn_count = Array.isArray(threadRead.turns) ? threadRead.turns.length : null;
+      summary.thread_source = threadRead.thread?.source ?? null;
+      console.log(JSON.stringify(summary, null, 2));
+      return;
+    }
 
     await sidecar.connect();
     await sidecar.initialize();

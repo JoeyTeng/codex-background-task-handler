@@ -17,6 +17,7 @@
   - [x] `strict_safe` 与 `trusted_all` 授权差异已覆盖，`trusted_all` 绕过 policy/artifact/session-risk gates 但仍要求 head/budget/session/epoch/idle proof
   - [x] `cbth audit list` 可读取 allow/deny/attempt-start/accepted/rejected/reconciled/observed/manualized audit records
 - [x] 增加 ignored / opt-in live Codex shared `app-server` smoke，保持编译与 lint-clean，但不进入默认 CI 执行。
+- [x] 增加 ignored / opt-in live CLI trusted-all full e2e，验证真实 `cbth cli run --auto-delivery-policy trusted-all` 能在 existing thread idle 后自动投递 head batch 并关闭为 `delivered`。
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
 - [x] 确认桌面端私有 `app-server` 当前正持有该 rollout 文件。
 - [x] 实现最小 PoC 脚本，通过外部独立 `codex app-server` 对该 thread 执行 `read` / `resume` / `inject_items`。
