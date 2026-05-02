@@ -46,6 +46,11 @@
   - `CBTH_RUN_LIVE_TRUSTED_ALL_E2E=1 cargo test --test live_trusted_all -- --ignored` 已在本机通过，验证真实 `cbth cli run --auto-delivery-policy trusted-all` 可在 seed 后的 existing thread 上自动投递 head batch 并关闭为 `delivered`
   - `CBTH_RUN_LIVE_NEW_THREAD_E2E=1 cargo test --test live_new_thread -- --ignored --nocapture` 已在本机通过，验证真实 `thread/start` fresh bootstrap 后 trusted-all 自动投递闭环；本轮复测覆盖了 Codex 0.128 fresh first-turn materialization 下的 proof-noise / reconcile-error 边界
   - 复测流程、env 和失败排查记录在 [docs/LIVE_E2E.md](LIVE_E2E.md)
+- CLI Dogfood V1 的收敛计划已单独记录在 [docs/CLI_DOGFOOD_V1_COMPLETION_PLAN.md](CLI_DOGFOOD_V1_COMPLETION_PLAN.md)：
+  - 当前边界是本机 macOS/Linux dedicated single-user workstation dogfood，不是多用户服务器产品
+  - 下一步先 land Phase 12，再实现 daemon-owned `cbth task run/list/inspect/cancel`
+  - 自动投递仍只走 idle `turn/start`；active-turn `turn/steer` 当前只补设计，不进入自动路径
+  - 后续还需要 `cbth doctor cli`、operator recovery 文档、local binary 安装/复测文档和 task-supervisor live e2e
 - #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
 - 当前修复分支 `codex/review-gate-resolved-threads` 正在补兼容：GitHub REST 可能把已 resolved / outdated 的旧 inline review comment `commit_id` 映射到后续 head；gate 现在会额外读取 GraphQL `reviewThreads`，只把未 resolved、未 outdated 的 current-head Codex inline threads 算作 blocker。Codex review-body findings 仍按 `PullRequestReview.commit_id` 和 current-head blob link 判定，因为它们没有可 resolve 的 thread。
 
