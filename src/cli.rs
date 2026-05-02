@@ -51,6 +51,7 @@ const CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS: u64 = 3;
 const CLI_APP_SERVER_PASSIVE_RECV_TIMEOUT_MS: u64 = 500;
 const CLI_APP_SERVER_PASSIVE_RETRY_MAX_MS: u64 = 500;
 const CLI_APP_SERVER_PASSIVE_STORE_TIMEOUT_SECONDS: u64 = 1;
+const CLI_APP_SERVER_PASSIVE_PROOF_WRITE_RETRY_TIMEOUT_SECONDS: u64 = 10;
 const CLI_APP_SERVER_AUTO_DELIVERY_POLL_MS: u64 = 2_000;
 const CLI_APP_SERVER_TURN_START_ACCEPTANCE_TIMEOUT_SECONDS: u64 = 60;
 const CLI_APP_SERVER_DURABLE_WRITE_RETRY_TIMEOUT_SECONDS: u64 = 30;
@@ -1107,7 +1108,7 @@ impl CliAppServerPassiveAdapterHandle {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("CLI passive adapter state lock poisoned"))?;
-        invalidate_passive_adapter_proof(&self.config, &mut state)?;
+        invalidate_passive_adapter_proof(&self.config, &mut state, Some(&self.running))?;
         Ok(())
     }
 }
@@ -1163,9 +1164,11 @@ fn spawn_cli_app_server_passive_adapter(
                     retry_delay = Duration::from_millis(CLI_APP_SERVER_PASSIVE_CONNECT_TIMEOUT_MS)
                 }
                 Err(error) => {
-                    if let Err(invalidation_error) =
-                        invalidate_passive_adapter_proof(&thread_config, &mut state)
-                        && env::var_os("CBTH_DEBUG_PASSIVE_ADAPTER").is_some()
+                    if let Err(invalidation_error) = invalidate_passive_adapter_proof(
+                        &thread_config,
+                        &mut state,
+                        Some(&thread_running),
+                    ) && env::var_os("CBTH_DEBUG_PASSIVE_ADAPTER").is_some()
                     {
                         eprintln!(
                             "debug: CLI passive adapter failed to invalidate proof after iteration error: {invalidation_error:#}"
@@ -1229,7 +1232,7 @@ fn run_cli_app_server_passive_adapter_once(
                 }
                 ThreadActivitySnapshot::Missing => {}
                 ThreadActivitySnapshot::Untrusted => {
-                    invalidate_passive_adapter_proof(config, state)?;
+                    invalidate_passive_adapter_proof(config, state, Some(running))?;
                     bail!("app-server thread/resume returned untrusted current-state snapshot");
                 }
             }
@@ -1269,12 +1272,12 @@ fn run_cli_app_server_passive_adapter_once(
             }
             ThreadActivitySnapshot::Missing => {}
             ThreadActivitySnapshot::Untrusted => {
-                invalidate_passive_adapter_proof(config, state)?;
+                invalidate_passive_adapter_proof(config, state, Some(running))?;
                 bail!("app-server thread/read returned untrusted current-state snapshot");
             }
         },
         Err(error) => {
-            invalidate_passive_adapter_proof(config, state)?;
+            invalidate_passive_adapter_proof(config, state, Some(running))?;
             return Err(error.into());
         }
     }
@@ -1285,6 +1288,7 @@ fn run_cli_app_server_passive_adapter_once(
             state,
             thread_resume_capability,
             thread_start_capability,
+            Some(running),
         )?;
         record_passive_adapter_activity(
             config,
@@ -1294,13 +1298,14 @@ fn run_cli_app_server_passive_adapter_once(
             } else {
                 CliSessionActivityState::Idle
             },
+            Some(running),
         )?;
     } else {
-        invalidate_passive_adapter_proof(config, state)?;
+        invalidate_passive_adapter_proof(config, state, Some(running))?;
     }
     for message in messages_to_replay {
         if let Some(notification) = decode_notification(&message) {
-            record_passive_adapter_notification(config, state, notification)?;
+            record_passive_adapter_notification(config, state, notification, Some(running))?;
         }
     }
 
@@ -1310,13 +1315,18 @@ fn run_cli_app_server_passive_adapter_once(
         ))? {
             AppServerReceive::Message(message) => {
                 if let Some(notification) = decode_notification(&message) {
-                    record_passive_adapter_notification(config, state, notification)?;
+                    record_passive_adapter_notification(
+                        config,
+                        state,
+                        notification,
+                        Some(running),
+                    )?;
                 }
             }
             AppServerReceive::Timeout => {}
             AppServerReceive::Closed => {
                 if running.load(Ordering::Acquire) {
-                    invalidate_passive_adapter_proof(config, state)?;
+                    invalidate_passive_adapter_proof(config, state, Some(running))?;
                 }
                 break;
             }
@@ -1580,9 +1590,12 @@ fn maybe_run_cli_auto_delivery(
                 config,
                 state,
                 client,
-                &source_thread_id,
-                &batch_id,
-                &attempt_id,
+                running,
+                CliAutoDeliveryPendingAttempt {
+                    source_thread_id: &source_thread_id,
+                    batch_id: &batch_id,
+                    attempt_id: &attempt_id,
+                },
                 &error,
             )?;
             return Ok(());
@@ -1592,9 +1605,12 @@ fn maybe_run_cli_auto_delivery(
                 config,
                 state,
                 client,
-                &source_thread_id,
-                &batch_id,
-                &attempt_id,
+                running,
+                CliAutoDeliveryPendingAttempt {
+                    source_thread_id: &source_thread_id,
+                    batch_id: &batch_id,
+                    attempt_id: &attempt_id,
+                },
                 &error,
             )?;
             return Ok(());
@@ -1727,30 +1743,69 @@ fn observe_cli_auto_delivery_terminal_with_retry(
 
 fn dispatch_cli_adapter_command_with_retry<F>(
     config: &CliAppServerPassiveAdapterConfig,
-    mut command_factory: F,
+    command_factory: F,
     allow_direct_fallback: bool,
     context: &'static str,
 ) -> Result<Value>
 where
     F: FnMut() -> Commands,
 {
-    let deadline =
-        Instant::now() + Duration::from_secs(CLI_APP_SERVER_DURABLE_WRITE_RETRY_TIMEOUT_SECONDS);
-    let mut last_error: anyhow::Error;
+    dispatch_cli_adapter_command_with_retry_timeout(
+        config,
+        command_factory,
+        allow_direct_fallback,
+        Duration::from_secs(CLI_APP_SERVER_DURABLE_WRITE_RETRY_TIMEOUT_SECONDS),
+        None,
+        context,
+    )
+}
+
+fn dispatch_cli_adapter_command_with_retry_timeout<F>(
+    config: &CliAppServerPassiveAdapterConfig,
+    mut command_factory: F,
+    allow_direct_fallback: bool,
+    timeout: Duration,
+    running: Option<&AtomicBool>,
+    context: &'static str,
+) -> Result<Value>
+where
+    F: FnMut() -> Commands,
+{
+    let deadline = Instant::now() + timeout;
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut attempted = false;
     loop {
+        if attempted
+            && let Some(running) = running
+            && !running.load(Ordering::Acquire)
+        {
+            break;
+        }
         match dispatch_cli_adapter_command(config, command_factory(), allow_direct_fallback) {
             Ok(value) => return Ok(value),
-            Err(error) => last_error = error,
+            Err(error) => last_error = Some(error),
+        }
+        attempted = true;
+        if let Some(running) = running
+            && !running.load(Ordering::Acquire)
+        {
+            break;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
-        thread::sleep(remaining.min(Duration::from_millis(
+        let retry_delay = remaining.min(Duration::from_millis(
             CLI_APP_SERVER_DURABLE_WRITE_RETRY_INTERVAL_MS,
-        )));
+        ));
+        if let Some(running) = running {
+            wait_for_passive_adapter_retry(running, retry_delay);
+        } else {
+            thread::sleep(retry_delay);
+        }
     }
-    Err(last_error).context(context)
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("passive adapter retry stopped")))
+        .context(context)
 }
 
 struct CliAcceptedTurn {
@@ -1763,20 +1818,25 @@ struct CliAcceptedTurn {
     initial_messages: Vec<Value>,
 }
 
+struct CliAutoDeliveryPendingAttempt<'a> {
+    source_thread_id: &'a str,
+    batch_id: &'a str,
+    attempt_id: &'a str,
+}
+
 fn reject_cli_auto_delivery_before_accept(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
     client: &mut AppServerJsonRpcClient,
-    source_thread_id: &str,
-    batch_id: &str,
-    attempt_id: &str,
+    running: &AtomicBool,
+    pending: CliAutoDeliveryPendingAttempt<'_>,
     error: &AppServerRequestError,
 ) -> Result<()> {
     let _ = dispatch_cli_adapter_command(
         config,
         Commands::Attempt {
             command: AttemptCommand::RejectCliBeforeAccept(AttemptRejectCliBeforeAcceptArgs {
-                attempt_id: attempt_id.to_owned(),
+                attempt_id: pending.attempt_id.to_owned(),
                 manual_resolution_only: false,
                 now: None,
             }),
@@ -1786,16 +1846,16 @@ fn reject_cli_auto_delivery_before_accept(
     record_cli_auto_delivery_audit(
         config,
         CliAutoDeliveryAuditEvent {
-            source_thread_id: Some(source_thread_id),
-            batch_id: Some(batch_id),
-            attempt_id: Some(attempt_id),
+            source_thread_id: Some(pending.source_thread_id),
+            batch_id: Some(pending.batch_id),
+            attempt_id: Some(pending.attempt_id),
             session_epoch: state.session_epoch,
             decision: "rejected",
             reason: "turn_start_rejected_before_accept",
             details: json!({ "error": error.message() }),
         },
     )?;
-    resync_passive_adapter_after_durable_invalidation(config, state, client)
+    resync_passive_adapter_after_durable_invalidation(config, state, client, Some(running))
 }
 
 fn cancel_cli_auto_delivery_before_accept(
@@ -1862,16 +1922,15 @@ fn reject_cli_auto_delivery_permanent_before_accept(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
     client: &mut AppServerJsonRpcClient,
-    source_thread_id: &str,
-    batch_id: &str,
-    attempt_id: &str,
+    running: &AtomicBool,
+    pending: CliAutoDeliveryPendingAttempt<'_>,
     error: &AppServerRequestError,
 ) -> Result<()> {
     let _ = dispatch_cli_adapter_command(
         config,
         Commands::Attempt {
             command: AttemptCommand::RejectCliBeforeAccept(AttemptRejectCliBeforeAcceptArgs {
-                attempt_id: attempt_id.to_owned(),
+                attempt_id: pending.attempt_id.to_owned(),
                 manual_resolution_only: true,
                 now: None,
             }),
@@ -1881,16 +1940,16 @@ fn reject_cli_auto_delivery_permanent_before_accept(
     record_cli_auto_delivery_audit(
         config,
         CliAutoDeliveryAuditEvent {
-            source_thread_id: Some(source_thread_id),
-            batch_id: Some(batch_id),
-            attempt_id: Some(attempt_id),
+            source_thread_id: Some(pending.source_thread_id),
+            batch_id: Some(pending.batch_id),
+            attempt_id: Some(pending.attempt_id),
             session_epoch: state.session_epoch,
             decision: "manualized",
             reason: "turn_start_rejected_permanent",
             details: json!({ "error": error.message() }),
         },
     )?;
-    resync_passive_adapter_after_durable_invalidation(config, state, client)
+    resync_passive_adapter_after_durable_invalidation(config, state, client, Some(running))
 }
 
 fn remote_error_is_retryable_pre_accept_rejection(error: &AppServerRequestError) -> bool {
@@ -1911,12 +1970,19 @@ fn observe_cli_auto_delivery_turn(
 ) -> Result<()> {
     let mut pending_messages = std::mem::take(&mut accepted.initial_messages);
     pending_messages.extend(client.drain_pending_messages());
-    if handle_cli_auto_delivery_messages(config, state, client, &accepted, pending_messages)? {
+    if handle_cli_auto_delivery_messages(
+        config,
+        state,
+        client,
+        running,
+        &accepted,
+        pending_messages,
+    )? {
         return Ok(());
     }
     while running.load(Ordering::Acquire) {
         if accepted_cli_observation_deadline_elapsed(&accepted)? {
-            expire_cli_auto_delivery_observation(config, state, client, &accepted)?;
+            expire_cli_auto_delivery_observation(config, state, client, running, &accepted)?;
             return Ok(());
         }
         match client.recv(accepted_cli_observation_recv_timeout(&accepted)?)? {
@@ -1925,6 +1991,7 @@ fn observe_cli_auto_delivery_turn(
                     config,
                     state,
                     client,
+                    running,
                     &accepted,
                     vec![message],
                 )? {
@@ -1932,13 +1999,13 @@ fn observe_cli_auto_delivery_turn(
                 }
             }
             AppServerReceive::Timeout => {
-                if reconcile_cli_auto_delivery_turn(config, state, client, &accepted)? {
+                if reconcile_cli_auto_delivery_turn(config, state, client, running, &accepted)? {
                     return Ok(());
                 }
             }
             AppServerReceive::Closed => {
                 abandon_cli_auto_delivery_after_observation_connection_loss(
-                    config, state, &accepted,
+                    config, state, running, &accepted,
                 )?;
                 return Ok(());
             }
@@ -1968,6 +2035,7 @@ fn expire_cli_auto_delivery_observation(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
     client: &mut AppServerJsonRpcClient,
+    running: &AtomicBool,
     accepted: &CliAcceptedTurn,
 ) -> Result<()> {
     let now = now_epoch_seconds()?;
@@ -1993,16 +2061,17 @@ fn expire_cli_auto_delivery_observation(
             }),
         },
     );
-    let _ = resync_passive_adapter_after_durable_invalidation(config, state, client);
+    let _ = resync_passive_adapter_after_durable_invalidation(config, state, client, Some(running));
     Ok(())
 }
 
 fn abandon_cli_auto_delivery_after_observation_connection_loss(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
+    running: &AtomicBool,
     accepted: &CliAcceptedTurn,
 ) -> Result<()> {
-    invalidate_passive_adapter_proof(config, state)?;
+    invalidate_passive_adapter_proof(config, state, Some(running))?;
     record_cli_auto_delivery_audit_best_effort(
         config,
         CliAutoDeliveryAuditEvent {
@@ -2022,6 +2091,7 @@ fn handle_cli_auto_delivery_messages(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
     client: &mut AppServerJsonRpcClient,
+    running: &AtomicBool,
     accepted: &CliAcceptedTurn,
     messages: Vec<Value>,
 ) -> Result<bool> {
@@ -2036,7 +2106,7 @@ fn handle_cli_auto_delivery_messages(
         }
         if let Some(turn_event) = terminal {
             observe_cli_auto_delivery_terminal(
-                config, state, client, accepted, turn_event, "observed",
+                config, state, client, running, accepted, turn_event, "observed",
             )?;
             return Ok(true);
         }
@@ -2082,6 +2152,7 @@ fn reconcile_cli_auto_delivery_turn(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
     client: &mut AppServerJsonRpcClient,
+    running: &AtomicBool,
     accepted: &CliAcceptedTurn,
 ) -> Result<bool> {
     let (read_result, read_messages) = passive_adapter_request(
@@ -2093,7 +2164,7 @@ fn reconcile_cli_auto_delivery_turn(
         }),
         Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
     );
-    if handle_cli_auto_delivery_messages(config, state, client, accepted, read_messages)? {
+    if handle_cli_auto_delivery_messages(config, state, client, running, accepted, read_messages)? {
         return Ok(true);
     }
     let read = match read_result {
@@ -2116,6 +2187,7 @@ fn reconcile_cli_auto_delivery_turn(
                 config,
                 state,
                 client,
+                running,
                 accepted,
                 turn_event,
                 "reconciled",
@@ -2171,6 +2243,7 @@ fn observe_cli_auto_delivery_terminal(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
     client: &mut AppServerJsonRpcClient,
+    running: &AtomicBool,
     accepted: &CliAcceptedTurn,
     turn_event: CliTurnEvent,
     decision: &str,
@@ -2197,15 +2270,16 @@ fn observe_cli_auto_delivery_terminal(
             }),
         },
     );
-    resync_passive_adapter_after_durable_invalidation(config, state, client)
+    resync_passive_adapter_after_durable_invalidation(config, state, client, Some(running))
 }
 
 fn resync_passive_adapter_after_durable_invalidation(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
     client: &mut AppServerJsonRpcClient,
+    running: Option<&AtomicBool>,
 ) -> Result<()> {
-    invalidate_passive_adapter_proof(config, state)?;
+    invalidate_passive_adapter_proof(config, state, running)?;
     let (read_result, _read_messages) = passive_adapter_request(
         client,
         "thread/read",
@@ -2218,7 +2292,7 @@ fn resync_passive_adapter_after_durable_invalidation(
     let read = match read_result {
         Ok(read) => read,
         Err(error) => {
-            invalidate_passive_adapter_proof(config, state)?;
+            invalidate_passive_adapter_proof(config, state, running)?;
             return Err(error.into());
         }
     };
@@ -2226,16 +2300,22 @@ fn resync_passive_adapter_after_durable_invalidation(
         ThreadActivitySnapshot::Active => CliSessionActivityState::Active,
         ThreadActivitySnapshot::Idle => CliSessionActivityState::Idle,
         ThreadActivitySnapshot::Missing => {
-            invalidate_passive_adapter_proof(config, state)?;
+            invalidate_passive_adapter_proof(config, state, running)?;
             bail!("thread/read proof refresh did not return the bound thread");
         }
         ThreadActivitySnapshot::Untrusted => {
-            invalidate_passive_adapter_proof(config, state)?;
+            invalidate_passive_adapter_proof(config, state, running)?;
             bail!("thread/read proof refresh returned untrusted current-state snapshot");
         }
     };
-    record_passive_adapter_capabilities(config, state, true, config.fresh_thread_bootstrap)?;
-    record_passive_adapter_activity(config, state, activity_state)
+    record_passive_adapter_capabilities(
+        config,
+        state,
+        true,
+        config.fresh_thread_bootstrap,
+        running,
+    )?;
+    record_passive_adapter_activity(config, state, activity_state, running)
 }
 
 fn cli_turn_event_for_status(status: &str) -> Option<CliTurnEvent> {
@@ -2388,6 +2468,7 @@ fn record_passive_adapter_notification(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
     notification: AppServerNotification,
+    running: Option<&AtomicBool>,
 ) -> Result<()> {
     let notification_thread_id = match &notification {
         AppServerNotification::TurnStarted { thread_id, .. }
@@ -2396,7 +2477,7 @@ fn record_passive_adapter_notification(
         | AppServerNotification::ThreadActivityChanged { thread_id, .. } => thread_id,
     };
     if notification_thread_id.is_none() {
-        invalidate_passive_adapter_proof(config, state)?;
+        invalidate_passive_adapter_proof(config, state, running)?;
         return Ok(());
     }
 
@@ -2404,13 +2485,18 @@ fn record_passive_adapter_notification(
         AppServerNotification::TurnStarted { thread_id, .. }
             if passive_adapter_thread_matches(&thread_id, &config.bound_thread_id) =>
         {
-            record_passive_adapter_activity(config, state, CliSessionActivityState::Active)?;
+            record_passive_adapter_activity(
+                config,
+                state,
+                CliSessionActivityState::Active,
+                running,
+            )?;
         }
         AppServerNotification::TurnTerminal { thread_id, .. }
             if passive_adapter_thread_matches(&thread_id, &config.bound_thread_id)
                 && state.last_activity_state == Some(CliSessionActivityState::Active) =>
         {
-            record_passive_adapter_activity(config, state, CliSessionActivityState::Idle)?;
+            record_passive_adapter_activity(config, state, CliSessionActivityState::Idle, running)?;
         }
         AppServerNotification::ThreadActivityChanged { thread_id, active }
             if passive_adapter_thread_matches(&thread_id, &config.bound_thread_id) =>
@@ -2426,12 +2512,13 @@ fn record_passive_adapter_notification(
                 } else {
                     CliSessionActivityState::Idle
                 },
+                running,
             )?;
         }
         AppServerNotification::ThreadProofInvalidated { thread_id }
             if passive_adapter_thread_matches(&thread_id, &config.bound_thread_id) =>
         {
-            invalidate_passive_adapter_proof(config, state)?;
+            invalidate_passive_adapter_proof(config, state, running)?;
         }
         _ => {}
     }
@@ -2442,6 +2529,7 @@ fn record_passive_adapter_activity(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
     activity_state: CliSessionActivityState,
+    running: Option<&AtomicBool>,
 ) -> Result<()> {
     if state.last_activity_state == Some(activity_state) {
         return Ok(());
@@ -2450,9 +2538,9 @@ fn record_passive_adapter_activity(
         .activity_revision
         .checked_add(1)
         .context("CLI passive adapter activity revision overflow")?;
-    let result = dispatch_cli_adapter_command(
+    let result = dispatch_cli_adapter_command_with_retry_timeout(
         config,
-        Commands::Cli {
+        || Commands::Cli {
             command: CliCommand::Session {
                 command: CliSessionCommand::NoteActivity(CliSessionNoteActivityArgs {
                     managed_session_id: config.managed_session_id.clone(),
@@ -2464,6 +2552,9 @@ fn record_passive_adapter_activity(
             },
         },
         false,
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_PROOF_WRITE_RETRY_TIMEOUT_SECONDS),
+        running,
+        "persist passive CLI activity proof",
     );
     state.durable_proof_may_exist = true;
     match result {
@@ -2473,7 +2564,7 @@ fn record_passive_adapter_activity(
             Ok(())
         }
         Err(error) => {
-            invalidate_passive_adapter_proof(config, state).with_context(|| {
+            invalidate_passive_adapter_proof(config, state, running).with_context(|| {
                 format!("invalidate passive adapter proof after activity write failed: {error:#}")
             })?;
             Err(error)
@@ -2486,6 +2577,7 @@ fn record_passive_adapter_capabilities(
     state: &mut CliAppServerPassiveAdapterState,
     thread_resume: bool,
     thread_start: bool,
+    running: Option<&AtomicBool>,
 ) -> Result<()> {
     if state.passive_capabilities_recorded {
         return Ok(());
@@ -2494,9 +2586,9 @@ fn record_passive_adapter_capabilities(
         .capability_revision
         .checked_add(1)
         .context("CLI passive adapter capability revision overflow")?;
-    let result = dispatch_cli_adapter_command(
+    let result = dispatch_cli_adapter_command_with_retry_timeout(
         config,
-        Commands::Cli {
+        || Commands::Cli {
             command: CliCommand::Session {
                 command: CliSessionCommand::NoteCapabilities(CliSessionNoteCapabilitiesArgs {
                     managed_session_id: config.managed_session_id.clone(),
@@ -2514,6 +2606,9 @@ fn record_passive_adapter_capabilities(
             },
         },
         false,
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_PROOF_WRITE_RETRY_TIMEOUT_SECONDS),
+        running,
+        "persist passive CLI capability proof",
     );
     state.durable_proof_may_exist = true;
     match result {
@@ -2523,7 +2618,7 @@ fn record_passive_adapter_capabilities(
             Ok(())
         }
         Err(error) => {
-            invalidate_passive_adapter_proof(config, state).with_context(|| {
+            invalidate_passive_adapter_proof(config, state, running).with_context(|| {
                 format!("invalidate passive adapter proof after capability write failed: {error:#}")
             })?;
             Err(error)
@@ -2534,6 +2629,7 @@ fn record_passive_adapter_capabilities(
 fn invalidate_passive_adapter_proof(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
+    running: Option<&AtomicBool>,
 ) -> Result<()> {
     if !state.durable_proof_may_exist
         && state.activity_revision == 0
@@ -2544,9 +2640,9 @@ fn invalidate_passive_adapter_proof(
         state.last_auto_delivery_poll = None;
         return Ok(());
     }
-    let value = dispatch_cli_adapter_command(
+    let value = dispatch_cli_adapter_command_with_retry_timeout(
         config,
-        Commands::Cli {
+        || Commands::Cli {
             command: CliCommand::Session {
                 command: CliSessionCommand::InvalidateProof(CliSessionInvalidateProofArgs {
                     managed_session_id: config.managed_session_id.clone(),
@@ -2556,6 +2652,9 @@ fn invalidate_passive_adapter_proof(
             },
         },
         true,
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_PROOF_WRITE_RETRY_TIMEOUT_SECONDS),
+        running,
+        "invalidate passive CLI proof",
     )?;
     let session = value.get("cli_session").ok_or_else(|| {
         anyhow::anyhow!("passive adapter invalidation response missing cli_session")

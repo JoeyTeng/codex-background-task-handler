@@ -1817,7 +1817,7 @@ fn submit_failed_fake_e2e_batch(home: &TempDir, thread_id: &str) -> String {
 
 #[cfg(unix)]
 fn run_cli_trusted_all_fake_e2e(home: &TempDir, thread_id: &str, app_server_url: &str) -> Output {
-    run_cli_trusted_all_fake_e2e_with_sleep(home, thread_id, app_server_url, "7")
+    run_cli_trusted_all_fake_e2e_with_sleep(home, thread_id, app_server_url, "12")
 }
 
 #[cfg(unix)]
@@ -2168,7 +2168,7 @@ fn cli_run_new_thread_trusted_all_auto_delivery_closes_delivered() {
         .arg(&fake_codex)
         .env("FAKE_CODEX_LOG", &log_path)
         .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
-        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "7")
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "12")
         .output()
         .expect("run cbth cli run --new-thread trusted-all");
     assert!(
@@ -2715,7 +2715,7 @@ fn cli_run_trusted_all_tolerates_fresh_read_error_during_accepted_observation() 
         .arg(&fake_codex)
         .env("FAKE_CODEX_LOG", &log_path)
         .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
-        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "7")
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "12")
         .output()
         .expect("run cbth cli run --new-thread trusted-all");
     assert!(

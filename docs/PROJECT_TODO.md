@@ -430,7 +430,7 @@
   - [x] passive adapter 的 matched-thread `thread.status.type` authoritative snapshot 会支配同一 request response 前消费到的 stale notification，明确不可信 snapshot 会 fail-closed，且 capability / activity 写入失败会先清空 proof 再 retry
   - [x] passive adapter 不再在 `thread/read` timeout 后复用同一 websocket；timeout / 协议 / decode / closed / remote-error 都会关闭本轮连接并 fail-closed retry
   - [x] `cli run` foreground 退出时会清空 passive sidecar 最后写入的 activity / capability proof，避免 event stream 已关闭后旧 `idle` proof 继续打开自动投递
-  - [x] passive adapter 的 proof 写入使用短 SQLite busy timeout，避免 DB lock 下耗尽 daemon dispatch worker
+  - [x] passive adapter 的 proof 写入使用短 SQLite busy timeout 与 lifecycle-aware bounded retry，避免 DB lock 下耗尽 daemon dispatch worker、让短暂 lock 直接失败 foreground `cli run`，或在 foreground 退出后继续阻塞 cleanup
   - [x] passive adapter websocket receive 使用 absolute deadline，且 control-frame pong 写回同样受该 deadline 约束
   - [x] `note-activity` 只能在当前 epoch 内按 `activity_revision + 1` 顺序推进，或做完全相同状态的幂等重放
   - [x] 同一 `delivery_rpc_request_id` 的 begin/accept 幂等路径仍必须引用当前有效 managed session，legacy / missing / stale session 不能绕过 Phase 6 gate
