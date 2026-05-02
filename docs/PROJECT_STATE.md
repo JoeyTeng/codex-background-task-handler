@@ -15,7 +15,7 @@
   - live Codex shared `app-server` smoke 放在 ignored Rust test 中，默认 CI 只编译，不执行真实 `codex` / 模型 / 网络路径
 - Phase 11b 已实现 CLI explicit opt-in 自动投递闭环：
   - 默认 `cbth cli run` 仍是 passive，不发送 delivery RPC
-  - `--auto-delivery-policy trusted-all` 会在 durable idle proof 后写入 `accept_pending`、发送带唯一 marker 的 `turn/start`、接受返回的 `turn.id`，并通过 matching notification 或 same-epoch `thread/read` reconcile 收口
+  - `--auto-delivery-policy trusted-all` 会在 durable idle proof 后写入 `accept_pending`、发送带唯一 marker 的 `turn/start`、最多等待 60 秒取得 acceptance response、接受返回的 `turn.id`，并通过 matching notification 或 same-epoch `thread/read` reconcile 收口
   - completed turn 关闭 batch 为 `delivered`
   - failed/interrupted/replaced terminal evidence fail-close 到 `manual_resolution_only`
   - clear pre-accept rejection 写入 `rejected_before_accept` 且不消耗 attempt count
@@ -25,17 +25,32 @@
   - `turn/start` accepted 之后，accepted / started / terminal audit 变为 best-effort；matching terminal evidence 先写入 `attempt observe-cli-turn`，再做 passive activity bookkeeping / resync，避免审计或 activity 写入失败覆盖真实完成证据
   - matching terminal evidence 的 `observe-cli-turn` 持久化也使用有界重试与 direct-store fallback，减少 accepted turn 已完成但 durable observation 丢失的风险
   - `thread/read(includeTurns=true)` reconcile 同时兼容 nested `thread.turns` 与真实 app-server 可能返回的 top-level `turns`
+  - accepted-turn observation window 内的 proof-only `thread/status/changed` noise 不再废弃已 accepted attempt；fresh first-turn materialization 前的临时 `thread/read(includeTurns=true)` remote error 也按“暂无 reconcile 证据”处理，继续等待 notification 或下一次 reconcile
   - accepted-turn observation loop 现在按 accepted attempt 的 `delivery_observation_deadline` 本地收敛；deadline 到期会 best-effort sweep / proof refresh 后退出观察，避免长期前台进程阻塞后续 head batch
   - sidecar shutdown 现在是 `turn/start` 前硬门禁：auto-delivery poll 前会重查 stop flag；`begin-cli-accept` 后若进入 shutdown，会写入 pre-accept rejection 并保留 batch 可重试，不在关闭窗口里继续发送 side-effectful RPC
   - `begin-cli-accept` 后、`turn/start` 前的 prompt 构造 / attempt-start audit / response parsing 失败也会先 best-effort `reject-cli-before-accept`，避免从未发出 RPC 的 pending attempt 被 stale sweep 误判为 unknown
   - 新增 append-only audit log 与 `cbth audit list`
   - daemon capability 列表新增 `cli-auto-delivery-dispatch`，避免新 CLI 把 auto-delivery audit / reject-before-accept / trusted-all auth-mode 写入路由给 Phase 11a 或更早旧 daemon
   - fake e2e 覆盖 notification delivered、`thread/read` reconcile、terminal failure manualize、pre-accept rejection、unknown+sweep，以及 `strict_safe` vs `trusted_all` 授权差异
+- Phase 12 已实现 CLI fresh-thread bootstrap：
+  - `cbth cli run` 现在要求 `--bind-thread-id <thread_id>` 或 `--new-thread` 二选一
+  - `--new-thread` 通过 daemon-owned pending loopback app-server 调用 `thread/start`，成功后把同一个 app-server 进程提升为 fixed-thread managed session，并把返回的 `thread_id` durable 绑定为 `bound_thread_id`
+  - 这样避开 Codex 0.128 的 fresh-thread 行为：first user message 前 rollout 不会 materialize，关闭 bootstrap app-server 后新的 app-server 不能 `thread/resume` 该 thread
+  - 成功 bootstrap 后只向 stderr 打印 `cbth: bound thread id: <thread_id>`，不注入 foreground 输入，不改变原生 `codex --remote` 交互模型
+  - bootstrap 的 remote error / timeout / closed / protocol / malformed response 都在 foreground 启动前 fail closed，不创建 managed session，也不进入自动投递
+  - fresh unmaterialized thread 的初始 idle proof 使用同一 app-server 上的 `thread_start + thread/read(includeTurns=false)`；accepted turn materialize rollout 后再使用正常 observation / reconcile 路径
+  - fake e2e 覆盖 `--new-thread` passive session、fresh-unmaterialized trusted-all 自动投递、互斥参数、bootstrap 失败不启动 foreground / 不绑定 session
 - Live opt-in 复测已覆盖 CLI trusted-all 自动投递：
   - `codex-cli 0.125.0` 在非 TTY 下会把 `codex app-server` listener banner 输出到 `stderr`；`cbth` daemon 和 live smoke 现在都会同时扫描 `stdout` / `stderr`
   - `CBTH_RUN_LIVE_CODEX_E2E=1 cargo test --test live_smoke -- --ignored` 已在本机通过，验证真实 shared app-server sidecar turn 仍可完成并被 `thread/read` 看到 marker
   - `CBTH_RUN_LIVE_TRUSTED_ALL_E2E=1 cargo test --test live_trusted_all -- --ignored` 已在本机通过，验证真实 `cbth cli run --auto-delivery-policy trusted-all` 可在 seed 后的 existing thread 上自动投递 head batch 并关闭为 `delivered`
+  - `CBTH_RUN_LIVE_NEW_THREAD_E2E=1 cargo test --test live_new_thread -- --ignored --nocapture` 已在本机通过，验证真实 `thread/start` fresh bootstrap 后 trusted-all 自动投递闭环；本轮复测覆盖了 Codex 0.128 fresh first-turn materialization 下的 proof-noise / reconcile-error 边界
   - 复测流程、env 和失败排查记录在 [docs/LIVE_E2E.md](LIVE_E2E.md)
+- CLI Dogfood V1 的收敛计划已单独记录在 [docs/CLI_DOGFOOD_V1_COMPLETION_PLAN.md](CLI_DOGFOOD_V1_COMPLETION_PLAN.md)：
+  - 当前边界是本机 macOS/Linux dedicated single-user workstation dogfood，不是多用户服务器产品
+  - 下一步先 land Phase 12，再实现 daemon-owned `cbth task run/list/inspect/cancel`
+  - 自动投递仍只走 idle `turn/start`；active-turn `turn/steer` 当前只补设计，不进入自动路径
+  - 后续还需要 `cbth doctor cli`、operator recovery 文档、local binary 安装/复测文档和 task-supervisor live e2e
 - #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
 - 当前修复分支 `codex/review-gate-resolved-threads` 正在补兼容：GitHub REST 可能把已 resolved / outdated 的旧 inline review comment `commit_id` 映射到后续 head；gate 现在会额外读取 GraphQL `reviewThreads`，只把未 resolved、未 outdated 的 current-head Codex inline threads 算作 blocker。Codex review-body findings 仍按 `PullRequestReview.commit_id` 和 current-head blob link 判定，因为它们没有可 resolve 的 thread。
 
@@ -570,7 +585,7 @@ scripts/desktop_thread_inject_poc.py
   - `cli_managed_sessions` 新增 epoch-local capability fields 与 `capability_revision`
   - 新增 hidden `cbth cli session note-capabilities`
   - `bind` / re-attach / continuity-loss fence 会清空旧 capability proof，避免复用旧 app-server epoch 的能力结论
-  - `begin-cli-accept --rpc-kind turn-start` 现在要求同 epoch 已证明 `thread_resume`、`turn_start`、`current_state_sync`、`turn_completed_event` 与负终态 observation surface，否则 fail-closed
+  - `begin-cli-accept --rpc-kind turn-start` 现在要求同 epoch 已证明 `turn_start`、`current_state_sync`、`turn_completed_event`、负终态 observation surface，以及 `thread_resume` 或 fresh `thread_start` attachment proof，否则 fail-closed
   - 新建 CLI attempt 会记录 `session_activity_revision` / `session_capability_revision` proof snapshot；同 RPC retry 和 accept path 要求 snapshot 非零，避免迁移旧 attempt 绕过 Phase 8 gate，同时不因 accepted turn 后的 activity drift 破坏幂等恢复
   - daemon capability 列表新增 `cli-session-capability-dispatch`，避免新 CLI 把 `note-capabilities` mutation 路由给 Phase 7 旧 daemon
   - `turn_steer` 仍保持 fail-closed，直到后续 phase 落地 active-turn risk proof
@@ -598,16 +613,16 @@ scripts/desktop_thread_inject_poc.py
   - sidecar 不把缺失 / foreign `threadId` 的 notification 当成当前 bound thread 证据；snapshot path 也要求 returned `thread.id` 匹配当前 bound thread；unknown turn status、`notLoaded` 或 `systemError` 都不会被折叠成 `idle`
   - sidecar 在 JSON-RPC request 等待窗口内不会让 stale lifecycle notification 覆盖后续 authoritative snapshot；如果 `thread/read` 缺少 authoritative snapshot 但 `thread/resume` 已给出可信 current-state snapshot，则会按顺序 replay `thread/resume` / `thread/read` 两个 request window 的 notification，避免丢失 resume 响应前到达的 active 信号；如果 `thread/read` 超时、protocol / decode / closed / remote-error 等失败，则关闭本轮连接并 fail-closed retry，避免复用可能存在 outstanding response 或已失同步的 websocket；如果 snapshot 缺失导致 epoch invalidation，则不会把旧 epoch 的 buffered notification 写回新 epoch
   - proof invalidation 是 fail-closed 写入：daemon 短超时失败后会对该 invalidation 命令做 direct-store fallback，且 store 对“daemon 已经推进 epoch 并清空 proof”的旧 epoch 重放返回幂等成功，避免 continuity loss、activity write failure 或 snapshot 缺失时旧 idle / capability proof 只是 best-effort 清理
-  - passive proof 写入路径现在使用 daemon lifecycle 级短 SQLite busy timeout，避免 DB lock 下 sidecar 1s request timeout 之后仍把 daemon dispatch worker 卡在普通 30s store open / transaction wait
+  - passive proof 写入路径现在使用 daemon lifecycle 级短 SQLite busy timeout，并在 sidecar 侧做 lifecycle-aware bounded retry，避免 DB lock 下 sidecar 1s request timeout 之后仍把 daemon dispatch worker 卡在普通 30s store open / transaction wait，同时降低短暂 lock 造成 foreground `cli run` 失败的概率；foreground 退出后 retry 会观察 shutdown flag，避免 stop / cleanup 被 proof retry 拖住
   - passive websocket receive 现在用 absolute deadline 贯穿 frame parse、control-frame loop 和 pong 写回，并拒绝超过 125 bytes 的 control frame，避免连续 control frame 或 trickled payload 无限延长一次 `recv` 并阻塞 foreground exit 后的 sidecar join / app-server cleanup
-  - sidecar 只记录 partial passive capability proof：`thread_resume=true`、`current_state_sync=true`，但 `turn_start=false`、terminal-event proof 仍为 false，因此不会打开 `begin-cli-accept` 的最小自动投递 gate
+  - sidecar 只记录 partial passive capability proof：existing-thread path 为 `thread_resume=true`、`current_state_sync=true`，fresh unmaterialized path 为 `thread_start=true`、`current_state_sync=true`，但 `turn_start=false`、terminal-event proof 仍为 false，因此不会打开 `begin-cli-accept` 的最小自动投递 gate
   - 本 phase 不发送 `turn/start` / `turn/steer`，也不调用 `attempt observe-cli-turn`；完整 `turn_start` capability proof、主动 delivery loop 与 accepted-turn observation loop 留给后续 phase
   - 测试新增 fake app-server websocket，验证 passive adapter 能完成 initialize / resume / read，并从 lifecycle notifications 推进 durable activity state
 - 当前 daemon / CLI adapter 已接入 explicit opt-in delivery lifecycle：
   - CLI attempt / session mutation / session capability / session proof invalidation / app-server lifecycle / turn observation / auto-delivery audit-reject-auth 通过 daemon dispatch 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-session-proof-invalidation-dispatch` / `cli-app-server-lifecycle` / `cli-turn-observation-dispatch` / `cli-auto-delivery-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
   - CLI accepted attempt durable schema、daemon 保活、managed-session durable record / fixed-thread gate、daemon-owned shared app-server process model、passive current-state / lifecycle event sync、accepted turn observation store surface、`trusted-all` delivery loop、notification observation、`thread/read` reconcile、pre-accept reject、unknown+sweep fail-closed 均已落地
   - Desktop arm / pause / boundary deadlines 尚未有 schema / adapter，因此尚未接入 daemon 保活
-  - CLI fresh-thread bootstrap、`turn/steer` automatic path 与 Desktop bridge adapters 尚未实现
+  - CLI fresh-thread bootstrap 已落地；`turn/steer` automatic path 与 Desktop bridge adapters 尚未实现
 
 ## Phase 1 Implementation Priority
 

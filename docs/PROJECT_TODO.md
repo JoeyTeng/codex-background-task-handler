@@ -18,6 +18,21 @@
   - [x] `cbth audit list` 可读取 allow/deny/attempt-start/accepted/rejected/reconciled/observed/manualized audit records
 - [x] 增加 ignored / opt-in live Codex shared `app-server` smoke，保持编译与 lint-clean，但不进入默认 CI 执行。
 - [x] 增加 ignored / opt-in live CLI trusted-all full e2e，验证真实 `cbth cli run --auto-delivery-policy trusted-all` 能在 existing thread idle 后自动投递 head batch 并关闭为 `delivered`。
+- [x] 单独沉淀 CLI Dogfood V1 完成计划，见 [CLI_DOGFOOD_V1_COMPLETION_PLAN.md](CLI_DOGFOOD_V1_COMPLETION_PLAN.md)。
+- [ ] 合入 Phase 12 `cbth cli run --new-thread` PR 后，从最新 `master` 开始 CLI Dogfood V1 后续 PR。
+- [ ] 实现 daemon-owned CLI task supervisor：
+  - `cbth task run --source-thread-id ... --summary ... -- <cmd> [args...]`
+  - `cbth task inspect --task-id ...`
+  - `cbth task list [--source-thread-id ...]`
+  - `cbth task cancel --task-id ...`
+  - daemon 创建 job、监督 child/process group，并在任务结束后自动 complete/fail job
+  - stdout/stderr 写 managed task log artifacts，prompt 只放退出状态、tail summary、truncation flags 和 artifact refs
+  - active supervised tasks 阻止 daemon idle exit；完成后恢复正常 idle exit
+- [ ] 增加 `cbth doctor cli`，检查 codex binary、app-server listener parsing、same-user daemon IPC、store permissions、SQLite open、platform support 和 optional live smoke prerequisites。
+- [ ] 补齐 CLI operator recovery 文档：batch inspect/manual close、audit、task logs、`manual_resolution_only` 处理。
+- [ ] 补齐 local binary dogfood 部署文档：`cargo install --path .`、PATH 检查、`cbth doctor cli`、最小端到端 walkthrough。
+- [ ] 增加 opt-in live task-supervisor e2e：`CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture`。
+- [ ] 文档化 active-turn `turn/steer` 后续进入自动路径前需要的 risk/capability proof；当前自动投递继续只允许 idle `turn/start`。
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
 - [x] 确认桌面端私有 `app-server` 当前正持有该 rollout 文件。
 - [x] 实现最小 PoC 脚本，通过外部独立 `codex app-server` 对该 thread 执行 `read` / `resume` / `inject_items`。
@@ -265,10 +280,14 @@
 - [x] 把 CLI current-state sync 升成最小 capability probe 的正式要求：
   - [x] 缺少 `thread/read` 或等价 current-state 面时，v1 不支持 detached managed-session auto-continuation
   - 这个 sync 至少必须对 `bound_thread_id` 返回 `has_active_regular_turn` 与可选 `active_turn_id`
-- [ ] 把 CLI fresh-thread bootstrap 收口成正式合同：
-  - `cbth cli run --new-thread` 仅在 capability probe 已证明 `thread/start` 可用时允许
-  - daemon 必须先创建 brand-new thread，再把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
-  - 如果既没有现成 `thread_id`，也没有 `thread/start` capability，则前台只能视为探索性 remote TUI
+- [x] 把 CLI fresh-thread bootstrap 收口成正式合同：
+  - [x] `cbth cli run --new-thread` 通过 daemon-owned pending app-server 成功执行 `thread/start` 后才进入 fixed-thread managed session
+  - [x] daemon 先创建 brand-new thread，再把同一个 app-server 进程提升为 managed app-server，并把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
+  - [x] fresh unmaterialized thread 的初始 idle proof 使用 `thread_start + thread/read(includeTurns=false)`，避免依赖 first user message 前不可用的 `thread/resume`
+  - [x] bootstrap 失败时在 foreground 启动前 fail closed，不创建 managed session，不进入 auto-delivery
+  - [x] `--new-thread` 只向 stderr 打印 `cbth: bound thread id: <thread_id>`，不改变 foreground Codex 交互模型
+  - [x] opt-in live `CBTH_RUN_LIVE_NEW_THREAD_E2E=1 cargo test --test live_new_thread -- --ignored --nocapture` 已验证 fresh bootstrap + trusted-all delivered path
+  - [x] fake e2e 覆盖 accepted observation 中的 proof-only status noise 与 fresh first-turn `thread/read(includeTurns=true)` materialization error
 - [x] 把 accepted-turn 负终态观察面升成最小 capability probe 的正式要求：
   - [x] 最小 capability set 不只包括 `turn/completed`
   - [x] 还必须能对当前 `delivery_turn_id` 观察并 durable 区分：
@@ -411,7 +430,7 @@
   - [x] passive adapter 的 matched-thread `thread.status.type` authoritative snapshot 会支配同一 request response 前消费到的 stale notification，明确不可信 snapshot 会 fail-closed，且 capability / activity 写入失败会先清空 proof 再 retry
   - [x] passive adapter 不再在 `thread/read` timeout 后复用同一 websocket；timeout / 协议 / decode / closed / remote-error 都会关闭本轮连接并 fail-closed retry
   - [x] `cli run` foreground 退出时会清空 passive sidecar 最后写入的 activity / capability proof，避免 event stream 已关闭后旧 `idle` proof 继续打开自动投递
-  - [x] passive adapter 的 proof 写入使用短 SQLite busy timeout，避免 DB lock 下耗尽 daemon dispatch worker
+  - [x] passive adapter 的 proof 写入使用短 SQLite busy timeout 与 lifecycle-aware bounded retry，避免 DB lock 下耗尽 daemon dispatch worker、让短暂 lock 直接失败 foreground `cli run`，或在 foreground 退出后继续阻塞 cleanup
   - [x] passive adapter websocket receive 使用 absolute deadline，且 control-frame pong 写回同样受该 deadline 约束
   - [x] `note-activity` 只能在当前 epoch 内按 `activity_revision + 1` 顺序推进，或做完全相同状态的幂等重放
   - [x] 同一 `delivery_rpc_request_id` 的 begin/accept 幂等路径仍必须引用当前有效 managed session，legacy / missing / stale session 不能绕过 Phase 6 gate

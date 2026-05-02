@@ -3,7 +3,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, Command, Output, Stdio};
+use std::process::{Child, ChildStderr, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,103 +20,44 @@ fn temp_home() -> TempDir {
 }
 
 #[test]
-#[ignore = "requires a real codex login, model access, node, and network"]
-fn live_codex_trusted_all_auto_delivery_is_opt_in() {
-    if std::env::var("CBTH_RUN_LIVE_TRUSTED_ALL_E2E").as_deref() != Ok("1") {
-        eprintln!("set CBTH_RUN_LIVE_TRUSTED_ALL_E2E=1 to run the live trusted-all e2e");
+#[ignore = "requires a real codex login, model access, and network"]
+fn live_codex_new_thread_trusted_all_auto_delivery_is_opt_in() {
+    if std::env::var("CBTH_RUN_LIVE_NEW_THREAD_E2E").as_deref() != Ok("1") {
+        eprintln!("set CBTH_RUN_LIVE_NEW_THREAD_E2E=1 to run the live new-thread e2e");
         return;
     }
 
     let codex_bin = std::env::var_os("CBTH_LIVE_CODEX_BIN").unwrap_or_else(|| "codex".into());
-    let node_bin = std::env::var_os("CBTH_LIVE_NODE_BIN").unwrap_or_else(|| "node".into());
-    let timeout = live_timeout("CBTH_LIVE_TRUSTED_ALL_E2E_TIMEOUT_SECONDS", 360);
+    let timeout = live_timeout("CBTH_LIVE_NEW_THREAD_E2E_TIMEOUT_SECONDS", 360);
     let home = temp_home();
-    let thread_id = create_live_codex_thread(&codex_bin, &node_bin, timeout);
-
     let wrapper_dir = tempfile::tempdir().expect("wrapper dir");
     let exit_file = wrapper_dir.path().join("foreground-exit");
     let wrapper_log = wrapper_dir.path().join("codex-wrapper.log");
     let wrapper = write_live_codex_wrapper(wrapper_dir.path());
-    let cbth_run = CbthRunGuard::spawn(
+    let mut cbth_run = CbthRunGuard::spawn_new_thread(
         home.path(),
-        &thread_id,
         &wrapper,
         &codex_bin,
         &exit_file,
         &wrapper_log,
         timeout,
     );
+    let thread_id = cbth_run.wait_for_bound_thread_id(timeout);
 
     wait_for_live_session_ready(&home, &thread_id, timeout);
     let batch_id = submit_failed_live_batch(&home, &thread_id);
     wait_for_batch_close_reason(&home, &batch_id, "delivered", timeout);
     assert_trusted_all_delivery_audit(&home, &thread_id);
 
-    let output = cbth_run.finish(Duration::from_secs(20));
+    let (output, stderr) = cbth_run.finish(Duration::from_secs(20));
     assert!(
         output.status.success(),
-        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}\nwrapper log: {}",
+        "cbth cli run --new-thread failed\nstatus: {}\nstdout: {}\nstderr: {}\nwrapper log: {}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        stderr,
         fs::read_to_string(&wrapper_log).unwrap_or_default()
     );
-}
-
-fn create_live_codex_thread(
-    codex_bin: &std::ffi::OsStr,
-    node_bin: &std::ffi::OsStr,
-    timeout: Duration,
-) -> String {
-    let mut child = Command::new(codex_bin)
-        .arg("app-server")
-        .arg("--listen")
-        .arg("ws://127.0.0.1:0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bootstrap codex app-server");
-    let stdout = child
-        .stdout
-        .take()
-        .expect("capture bootstrap app-server stdout");
-    let stderr = child
-        .stderr
-        .take()
-        .expect("capture bootstrap app-server stderr");
-    let mut app_server = ChildGuard(child);
-    let listener_url = wait_for_app_server_listener(stdout, stderr, Duration::from_secs(15));
-
-    let script =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/cli_shared_app_server_poc.mjs");
-    let output = Command::new(node_bin)
-        .arg(script)
-        .arg("--url")
-        .arg(&listener_url)
-        .arg("--cwd")
-        .arg(env!("CARGO_MANIFEST_DIR"))
-        .arg("--timeout-ms")
-        .arg(timeout.as_millis().to_string())
-        .arg("--seed-message")
-        .arg("Reply with exactly `CBTH_LIVE_TRUSTED_ALL_BOOTSTRAP_READY` and nothing else.")
-        .arg("--seed-only")
-        .output()
-        .expect("bootstrap live caller thread");
-    app_server.kill_and_wait();
-
-    assert!(
-        output.status.success(),
-        "live thread bootstrap failed\nstatus: {}\nstdout: {}\nstderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let summary: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("bootstrap summary JSON");
-    summary["thread_id"]
-        .as_str()
-        .expect("bootstrap thread id")
-        .to_owned()
 }
 
 fn write_live_codex_wrapper(dir: &Path) -> PathBuf {
@@ -163,25 +104,25 @@ struct CbthRunGuard {
     child: Option<Child>,
     exit_file: PathBuf,
     home: PathBuf,
+    bound_thread_rx: mpsc::Receiver<String>,
+    stderr_reader: Option<thread::JoinHandle<String>>,
 }
 
 impl CbthRunGuard {
-    fn spawn(
+    fn spawn_new_thread(
         home: &Path,
-        thread_id: &str,
         wrapper: &Path,
         real_codex_bin: &std::ffi::OsStr,
         exit_file: &Path,
         wrapper_log: &Path,
         timeout: Duration,
     ) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cbth"))
             .arg("--home")
             .arg(home)
             .arg("cli")
             .arg("run")
-            .arg("--bind-thread-id")
-            .arg(thread_id)
+            .arg("--new-thread")
             .arg("--session-allows-approval")
             .arg("false")
             .arg("--session-allows-network")
@@ -194,6 +135,7 @@ impl CbthRunGuard {
             .arg(wrapper)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
             .env("CBTH_LIVE_REAL_CODEX_BIN", real_codex_bin)
             .env("CBTH_LIVE_FOREGROUND_EXIT_FILE", exit_file)
             .env("CBTH_LIVE_WRAPPER_LOG", wrapper_log)
@@ -202,21 +144,38 @@ impl CbthRunGuard {
                 timeout.as_secs().to_string(),
             )
             .spawn()
-            .expect("spawn cbth cli run live trusted-all");
+            .expect("spawn cbth cli run live new-thread");
+        let stderr = child.stderr.take().expect("capture cbth stderr");
+        let (bound_thread_tx, bound_thread_rx) = mpsc::channel();
+        let stderr_reader = spawn_cbth_stderr_reader(stderr, bound_thread_tx);
 
         Self {
             child: Some(child),
             exit_file: exit_file.to_path_buf(),
             home: home.to_path_buf(),
+            bound_thread_rx,
+            stderr_reader: Some(stderr_reader),
         }
     }
 
-    fn finish(mut self, timeout: Duration) -> Output {
+    fn wait_for_bound_thread_id(&mut self, timeout: Duration) -> String {
+        self.bound_thread_rx
+            .recv_timeout(timeout)
+            .expect("cbth did not print a bound thread id")
+    }
+
+    fn finish(mut self, timeout: Duration) -> (Output, String) {
         self.signal_exit();
         let child = self.child.take().expect("cbth child");
         let output = wait_with_timeout(child, timeout);
+        let stderr = self
+            .stderr_reader
+            .take()
+            .expect("stderr reader")
+            .join()
+            .unwrap_or_else(|_| "stderr reader panicked".to_owned());
         stop_daemon(&self.home);
-        output
+        (output, stderr)
     }
 
     fn signal_exit(&self) {
@@ -229,6 +188,9 @@ impl Drop for CbthRunGuard {
         self.signal_exit();
         if let Some(child) = self.child.take() {
             terminate_child_best_effort(child, Duration::from_secs(5));
+        }
+        if let Some(stderr_reader) = self.stderr_reader.take() {
+            let _ = stderr_reader.join();
         }
         stop_daemon(&self.home);
     }
@@ -254,19 +216,33 @@ fn terminate_child_best_effort(mut child: Child, graceful_timeout: Duration) {
     }
 }
 
-struct ChildGuard(Child);
-
-impl ChildGuard {
-    fn kill_and_wait(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+fn spawn_cbth_stderr_reader(
+    stderr: ChildStderr,
+    bound_thread_tx: mpsc::Sender<String>,
+) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        let mut stderr_text = String::new();
+        let mut sent = false;
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if !sent && let Some(thread_id) = parse_bound_thread_line(&line) {
+                let _ = bound_thread_tx.send(thread_id);
+                sent = true;
+            }
+            stderr_text.push_str(&line);
+            stderr_text.push('\n');
+        }
+        stderr_text
+    })
 }
 
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        self.kill_and_wait();
-    }
+fn parse_bound_thread_line(line: &str) -> Option<String> {
+    line.strip_prefix("cbth: bound thread id: ")
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn submit_failed_live_batch(home: &TempDir, thread_id: &str) -> String {
@@ -278,7 +254,7 @@ fn submit_failed_live_batch(home: &TempDir, thread_id: &str) -> String {
             "--source-thread-id",
             thread_id,
             "--summary",
-            "live trusted-all e2e auto delivery",
+            "live new-thread trusted-all e2e exact-reply marker",
             "--delivery-read-only",
             "true",
             "--delivery-requires-approval",
@@ -298,7 +274,7 @@ fn submit_failed_live_batch(home: &TempDir, thread_id: &str) -> String {
             "--job-id",
             job_id,
             "--reason",
-            "Live trusted-all e2e marker job is ready for automatic delivery.",
+            "Live new-thread trusted-all e2e: reply with exactly `CBTH_LIVE_NEW_THREAD_DELIVERED` and nothing else. Do not run tools.",
             "--max-delivery-attempts",
             "2",
         ],
@@ -317,8 +293,8 @@ fn wait_for_live_session_ready(home: &TempDir, bound_thread_id: &str, timeout: D
         if db_path.exists()
             && let Ok(conn) = Connection::open(&db_path)
         {
-            let queried: rusqlite::Result<(String, i64, i64, i64, i64, i64)> = conn.query_row(
-                "SELECT activity_state, capability_thread_resume, capability_turn_start,
+            let queried: rusqlite::Result<(String, i64, i64, i64, i64, i64, i64)> = conn.query_row(
+                "SELECT activity_state, capability_thread_resume, capability_thread_start, capability_turn_start,
                         capability_current_state_sync, capability_turn_completed_event,
                         capability_negative_terminal_events
                  FROM cli_managed_sessions
@@ -332,6 +308,7 @@ fn wait_for_live_session_ready(home: &TempDir, bound_thread_id: &str, timeout: D
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             );
@@ -339,6 +316,7 @@ fn wait_for_live_session_ready(home: &TempDir, bound_thread_id: &str, timeout: D
                 Ok((
                     activity_state,
                     thread_resume,
+                    thread_start,
                     turn_start,
                     current_state_sync,
                     turn_completed_event,
@@ -346,12 +324,13 @@ fn wait_for_live_session_ready(home: &TempDir, bound_thread_id: &str, timeout: D
                 )) => {
                     last_seen = format!(
                         "activity_state={activity_state}, thread_resume={thread_resume}, \
+                         thread_start={thread_start}, \
                          turn_start={turn_start}, current_state_sync={current_state_sync}, \
                          turn_completed_event={turn_completed_event}, \
                          negative_terminal_events={negative_terminal_events}"
                     );
                     if activity_state == "idle"
-                        && thread_resume != 0
+                        && (thread_resume != 0 || thread_start != 0)
                         && turn_start != 0
                         && current_state_sync != 0
                         && turn_completed_event != 0
@@ -499,62 +478,6 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
             None => thread::sleep(Duration::from_millis(100)),
         }
     }
-}
-
-fn wait_for_app_server_listener(
-    stdout: ChildStdout,
-    stderr: ChildStderr,
-    timeout: Duration,
-) -> String {
-    let (tx, rx) = mpsc::channel();
-    spawn_listener_reader(stdout, tx.clone());
-    spawn_listener_reader(stderr, tx);
-
-    let deadline = Instant::now() + timeout;
-    let mut closed_streams = 0;
-    while closed_streams < 2 {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out waiting for codex app-server listener URL"
-        );
-        match rx.recv_timeout(remaining) {
-            Ok(ListenerEvent::Url(url)) => return url,
-            Ok(ListenerEvent::Closed) => closed_streams += 1,
-            Err(error) => panic!("timed out waiting for codex app-server listener URL: {error}"),
-        }
-    }
-    panic!("codex app-server did not print a listener URL");
-}
-
-enum ListenerEvent {
-    Url(String),
-    Closed,
-}
-
-fn spawn_listener_reader<R>(stream: R, tx: mpsc::Sender<ListenerEvent>)
-where
-    R: std::io::Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let reader = BufReader::new(stream);
-        for line in reader.lines() {
-            let Ok(line) = line else {
-                break;
-            };
-            if let Some(url) = parse_app_server_listener_url(&line) {
-                let _ = tx.send(ListenerEvent::Url(url));
-                return;
-            }
-        }
-        let _ = tx.send(ListenerEvent::Closed);
-    });
-}
-
-fn parse_app_server_listener_url(line: &str) -> Option<String> {
-    let value = line.trim_start().strip_prefix("listening on:")?;
-    let url = value.split_whitespace().next()?;
-    url.starts_with("ws://").then(|| url.to_owned())
 }
 
 fn live_timeout(name: &str, default_seconds: u64) -> Duration {

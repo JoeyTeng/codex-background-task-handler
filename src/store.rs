@@ -2952,7 +2952,7 @@ fn cli_session_capabilities_match(
 fn ensure_cli_session_has_minimum_turn_start_capabilities(
     session: &CliManagedSessionRecord,
 ) -> Result<()> {
-    if session.capability_thread_resume
+    if (session.capability_thread_resume || session.capability_thread_start)
         && session.capability_turn_start
         && session.capability_current_state_sync
         && session.capability_turn_completed_event

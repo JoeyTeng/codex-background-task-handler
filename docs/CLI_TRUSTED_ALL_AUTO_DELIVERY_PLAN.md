@@ -115,7 +115,7 @@ engines:
 The sidecar must not record full automatic delivery capability until the current
 session epoch has proven:
 
-- `thread_resume`
+- existing-thread `thread_resume` or fresh-thread `thread_start`
 - `turn_start`
 - `current_state_sync`
 - `turn_completed_event`
