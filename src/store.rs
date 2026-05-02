@@ -18,18 +18,21 @@ use crate::models::{
     CliManagedSessionActivityUpdate, CliManagedSessionAttach, CliManagedSessionCapabilities,
     CliManagedSessionCapabilityUpdate, CliManagedSessionProfile,
     CliManagedSessionProofInvalidation, CliManagedSessionRecord, DEFAULT_REDELIVERY_WINDOW_SECONDS,
-    DaemonLifecycleStatus, DeliveryAttemptRecord, DeliveryPolicy, JobRecord, NewArtifact,
-    NewAuditDecision, NewBatch, NewCliAcceptPendingAttempt, NewJob, ORPHAN_ARTIFACT_GRACE_SECONDS,
-    POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
+    DaemonLifecycleStatus, DeliveryAttemptRecord, DeliveryPolicy, JobRecord,
+    LostPendingTaskProcess, NewArtifact, NewAuditDecision, NewBatch, NewCliAcceptPendingAttempt,
+    NewJob, NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
+    TaskRecord,
 };
 
 const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
 const MAX_EXPIRED_BATCHES_PER_SWEEP: i64 = 100;
 const MAX_DELETABLE_ARTIFACTS_PER_SWEEP: i64 = 100;
+const MAX_DELETABLE_TASK_LOG_DIRS_PER_SWEEP: i64 = 100;
 const MAX_MANIFEST_SYNCS_PER_SWEEP: i64 = 100;
 const CLI_ACCEPT_PENDING_TIMEOUT_SECONDS: i64 = 5 * 60;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(100);
+const SQLITE_TASK_SUPERVISOR_SETUP_TIMEOUT: Duration = Duration::from_millis(100);
 const SQLITE_OPEN_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const SQLITE_OPEN_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
 
@@ -40,6 +43,33 @@ pub struct Store {
 struct ArtifactIngestRecord {
     artifact_id: String,
     relative_path: String,
+}
+
+struct LostTaskRecovery {
+    task_id: String,
+    job_id: String,
+    job_status: String,
+    job_completed_at: Option<i64>,
+    job_failed_at: Option<i64>,
+    job_failure_reason: Option<String>,
+    max_delivery_attempts: i64,
+    redelivery_window_seconds: i64,
+    cancel_requested_at: Option<i64>,
+}
+
+pub struct TaskFinishUpdate<'a> {
+    pub task_id: &'a str,
+    pub status: &'a str,
+    pub completed_at: i64,
+    pub exit_code: Option<i64>,
+    pub signal: Option<i64>,
+    pub failure_reason: Option<&'a str>,
+    pub stdout_log_path: Option<&'a str>,
+    pub stderr_log_path: Option<&'a str>,
+    pub stdout_bytes: i64,
+    pub stderr_bytes: i64,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 #[derive(Default)]
@@ -55,6 +85,10 @@ impl Store {
 
     pub fn open_for_daemon_lifecycle(layout: &FsLayout) -> Result<Self> {
         Self::open_with_timeout(layout, SQLITE_DAEMON_LIFECYCLE_TIMEOUT)
+    }
+
+    pub fn open_for_task_supervisor_setup(layout: &FsLayout) -> Result<Self> {
+        Self::open_with_timeout(layout, SQLITE_TASK_SUPERVISOR_SETUP_TIMEOUT)
     }
 
     fn open_with_timeout(layout: &FsLayout, busy_timeout: Duration) -> Result<Self> {
@@ -126,6 +160,419 @@ impl Store {
         Ok(record)
     }
 
+    pub fn create_task_with_job(
+        &mut self,
+        job: NewJob,
+        task: NewTask,
+    ) -> Result<(JobRecord, TaskRecord)> {
+        if job.job_id != task.job_id {
+            bail!("task job_id must match created job");
+        }
+        if job.source_thread_id != task.source_thread_id {
+            bail!("task source_thread_id must match created job");
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO jobs (
+                job_id, source_thread_id, status, summary, metadata_json,
+                created_at, updated_at, delivery_read_only,
+                delivery_requires_approval, delivery_requires_network,
+                delivery_requires_write_access
+            ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                job.job_id,
+                job.source_thread_id,
+                job.summary,
+                job.metadata_json,
+                job.created_at,
+                job.created_at,
+                bool_to_i64(job.policy.delivery_read_only),
+                bool_to_i64(job.policy.delivery_requires_approval),
+                bool_to_i64(job.policy.delivery_requires_network),
+                bool_to_i64(job.policy.delivery_requires_write_access),
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO tasks (
+                task_id, job_id, source_thread_id, status, summary, command_json,
+                cwd, timeout_seconds, max_delivery_attempts,
+                redelivery_window_seconds, created_at
+            ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                task.task_id,
+                task.job_id,
+                task.source_thread_id,
+                task.summary,
+                task.command_json,
+                task.cwd,
+                task.timeout_seconds,
+                task.max_delivery_attempts,
+                task.redelivery_window_seconds,
+                task.created_at,
+            ],
+        )?;
+        let job = query_job_tx(&tx, &task.job_id)?;
+        let task = query_task_tx(&tx, &task.task_id)?;
+        tx.commit()?;
+        Ok((job, task))
+    }
+
+    pub fn mark_task_started(
+        &mut self,
+        task_id: &str,
+        pid: i64,
+        pid_identity: Option<&str>,
+        now: i64,
+    ) -> Result<TaskRecord> {
+        let tx = self.conn.transaction()?;
+        let task = query_task_tx(&tx, task_id)?;
+        ensure_task_not_terminal(&task)?;
+        tx.execute(
+            "UPDATE tasks
+             SET status = 'running',
+                 pid = ?,
+                 pid_identity = ?,
+                 started_at = COALESCE(started_at, ?)
+             WHERE task_id = ?",
+            params![pid, pid_identity, now, task_id],
+        )?;
+        let task = query_task_tx(&tx, task_id)?;
+        tx.commit()?;
+        Ok(task)
+    }
+
+    pub fn request_task_cancel(&mut self, task_id: &str, now: i64) -> Result<TaskRecord> {
+        let tx = self.conn.transaction()?;
+        let task = query_task_tx(&tx, task_id)?;
+        if task.completed_at.is_none() {
+            tx.execute(
+                "UPDATE tasks
+                 SET cancel_requested_at = COALESCE(cancel_requested_at, ?)
+                 WHERE task_id = ?",
+                params![now, task_id],
+            )?;
+        }
+        let task = query_task_tx(&tx, task_id)?;
+        tx.commit()?;
+        Ok(task)
+    }
+
+    pub fn finish_task(&mut self, update: TaskFinishUpdate<'_>) -> Result<TaskRecord> {
+        let tx = self.conn.transaction()?;
+        let task = query_task_tx(&tx, update.task_id)?;
+        ensure_task_not_terminal(&task)?;
+        tx.execute(
+            "UPDATE tasks
+             SET status = ?,
+                 completed_at = ?,
+                 exit_code = ?,
+                 signal = ?,
+                 failure_reason = ?,
+                 stdout_log_path = ?,
+                 stderr_log_path = ?,
+                 stdout_bytes = ?,
+                 stderr_bytes = ?,
+                 stdout_truncated = ?,
+                 stderr_truncated = ?
+             WHERE task_id = ?",
+            params![
+                update.status,
+                update.completed_at,
+                update.exit_code,
+                update.signal,
+                update.failure_reason,
+                update.stdout_log_path,
+                update.stderr_log_path,
+                update.stdout_bytes,
+                update.stderr_bytes,
+                bool_to_i64(update.stdout_truncated),
+                bool_to_i64(update.stderr_truncated),
+                update.task_id,
+            ],
+        )?;
+        let task = query_task_tx(&tx, update.task_id)?;
+        tx.commit()?;
+        Ok(task)
+    }
+
+    pub fn fail_supervised_task_with_job(
+        &mut self,
+        job_id: &str,
+        reason: &str,
+        update: TaskFinishUpdate<'_>,
+        max_delivery_attempts: i64,
+        redelivery_window_seconds: i64,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let mut job = query_job_tx(&tx, job_id)?;
+        if job.status == "pending" {
+            tx.execute(
+                "UPDATE jobs
+                 SET status = 'failed',
+                     updated_at = ?,
+                     failed_at = ?,
+                     failure_reason = ?
+                 WHERE job_id = ?",
+                params![update.completed_at, update.completed_at, reason, job_id],
+            )?;
+            job = query_job_tx(&tx, job_id)?;
+            let redelivery_window_seconds = clamp_redelivery_window_seconds_for_timestamp(
+                update.completed_at,
+                redelivery_window_seconds,
+            );
+            let redelivery_window_ends_at = checked_timestamp_add(
+                update.completed_at,
+                redelivery_window_seconds,
+                "redelivery_window_seconds",
+            )?;
+            let batch = NewBatch {
+                batch_id: new_id(),
+                source_thread_id: job.source_thread_id.clone(),
+                summary: format!("Background job failed: {reason}"),
+                created_at: update.completed_at,
+                redelivery_window_ends_at,
+                max_delivery_attempts,
+                policy: job.delivery_policy.clone(),
+                inline_payload_bytes: 0,
+                requires_artifact_read: false,
+            };
+            insert_batch_tx(&tx, &batch, std::slice::from_ref(&job.job_id))?;
+        }
+        let task = query_task_tx(&tx, update.task_id)?;
+        if task.completed_at.is_none() {
+            let task_status = task_status_for_supervised_job_terminal(&job, update.status);
+            let completed_at = match job.status.as_str() {
+                "completed" => job.completed_at.unwrap_or(update.completed_at),
+                "failed" => job.failed_at.unwrap_or(update.completed_at),
+                _ => update.completed_at,
+            };
+            let failure_reason = if task_status == "succeeded" {
+                None
+            } else if job.status == "failed" {
+                job.failure_reason.as_deref().or(update.failure_reason)
+            } else {
+                update.failure_reason
+            };
+            let exit_code = if task_status == "succeeded" && update.exit_code.is_none() {
+                Some(0)
+            } else {
+                update.exit_code
+            };
+            tx.execute(
+                "UPDATE tasks
+                 SET status = ?,
+                     completed_at = ?,
+                     exit_code = ?,
+                     signal = ?,
+                     failure_reason = ?,
+                     stdout_log_path = ?,
+                     stderr_log_path = ?,
+                     stdout_bytes = ?,
+                     stderr_bytes = ?,
+                     stdout_truncated = ?,
+                     stderr_truncated = ?
+                 WHERE task_id = ?",
+                params![
+                    task_status,
+                    completed_at,
+                    exit_code,
+                    update.signal,
+                    failure_reason,
+                    update.stdout_log_path,
+                    update.stderr_log_path,
+                    update.stdout_bytes,
+                    update.stderr_bytes,
+                    bool_to_i64(update.stdout_truncated),
+                    bool_to_i64(update.stderr_truncated),
+                    update.task_id,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn inspect_task(&self, task_id: &str) -> Result<TaskRecord> {
+        query_task(&self.conn, task_id)
+    }
+
+    pub fn list_tasks(
+        &self,
+        source_thread_id: Option<&str>,
+        status: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<TaskRecord>> {
+        let limit = limit.clamp(1, 500);
+        match (source_thread_id, status) {
+            (Some(thread_id), Some(status)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM tasks
+                     WHERE source_thread_id = ? AND status = ?
+                     ORDER BY created_at DESC, task_id DESC
+                     LIMIT ?",
+                )?;
+                rows_to_tasks(stmt.query(params![thread_id, status, limit])?)
+            }
+            (Some(thread_id), None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM tasks
+                     WHERE source_thread_id = ?
+                     ORDER BY created_at DESC, task_id DESC
+                     LIMIT ?",
+                )?;
+                rows_to_tasks(stmt.query(params![thread_id, limit])?)
+            }
+            (None, Some(status)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM tasks
+                     WHERE status = ?
+                     ORDER BY created_at DESC, task_id DESC
+                     LIMIT ?",
+                )?;
+                rows_to_tasks(stmt.query(params![status, limit])?)
+            }
+            (None, None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM tasks
+                     ORDER BY created_at DESC, task_id DESC
+                     LIMIT ?",
+                )?;
+                rows_to_tasks(stmt.query(params![limit])?)
+            }
+        }
+    }
+
+    pub fn lost_pending_task_processes(&self) -> Result<Vec<LostPendingTaskProcess>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tasks.pid, tasks.pid_identity
+             FROM tasks
+             JOIN jobs ON jobs.job_id = tasks.job_id
+             WHERE tasks.status IN ('queued', 'running')
+               AND tasks.pid IS NOT NULL
+             ORDER BY tasks.started_at ASC, tasks.task_id ASC",
+        )?;
+        let processes = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        processes
+            .into_iter()
+            .map(|(pid, pid_identity)| {
+                Ok(LostPendingTaskProcess {
+                    pid: u32::try_from(pid)
+                        .with_context(|| format!("stored task pid {pid} is invalid"))?,
+                    pid_identity,
+                })
+            })
+            .collect()
+    }
+
+    pub fn fail_lost_tasks(&mut self, now: i64) -> Result<usize> {
+        let tasks = {
+            let mut stmt = self.conn.prepare(
+                "SELECT tasks.task_id, tasks.job_id, jobs.status, jobs.completed_at,
+                        jobs.failed_at, jobs.failure_reason, tasks.max_delivery_attempts,
+                        tasks.redelivery_window_seconds, tasks.cancel_requested_at
+                 FROM tasks
+                 JOIN jobs ON jobs.job_id = tasks.job_id
+                 WHERE tasks.status IN ('queued', 'running')
+                   AND jobs.status IN ('pending', 'completed', 'failed')
+                 ORDER BY tasks.created_at ASC, tasks.task_id ASC",
+            )?;
+            stmt.query_map([], |row| {
+                Ok(LostTaskRecovery {
+                    task_id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    job_status: row.get(2)?,
+                    job_completed_at: row.get(3)?,
+                    job_failed_at: row.get(4)?,
+                    job_failure_reason: row.get(5)?,
+                    max_delivery_attempts: row.get(6)?,
+                    redelivery_window_seconds: row.get(7)?,
+                    cancel_requested_at: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for task in &tasks {
+            let stdout_log_path = format!("tasks/{}/stdout.log", task.task_id);
+            let stderr_log_path = format!("tasks/{}/stderr.log", task.task_id);
+            match task.job_status.as_str() {
+                "pending" => {
+                    let (status, reason) = if task.cancel_requested_at.is_some() {
+                        ("cancelled", "task cancelled")
+                    } else {
+                        ("lost", "task supervisor lost after daemon restart")
+                    };
+                    self.fail_job(
+                        &task.job_id,
+                        reason,
+                        now,
+                        task.max_delivery_attempts,
+                        clamp_redelivery_window_seconds_for_timestamp(
+                            now,
+                            task.redelivery_window_seconds,
+                        ),
+                    )?;
+                    self.finish_task(TaskFinishUpdate {
+                        task_id: &task.task_id,
+                        status,
+                        completed_at: now,
+                        exit_code: None,
+                        signal: None,
+                        failure_reason: Some(reason),
+                        stdout_log_path: Some(stdout_log_path.as_str()),
+                        stderr_log_path: Some(stderr_log_path.as_str()),
+                        stdout_bytes: 0,
+                        stderr_bytes: 0,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    })?;
+                }
+                "completed" => {
+                    self.finish_task(TaskFinishUpdate {
+                        task_id: &task.task_id,
+                        status: "succeeded",
+                        completed_at: task.job_completed_at.unwrap_or(now),
+                        exit_code: Some(0),
+                        signal: None,
+                        failure_reason: None,
+                        stdout_log_path: Some(stdout_log_path.as_str()),
+                        stderr_log_path: Some(stderr_log_path.as_str()),
+                        stdout_bytes: 0,
+                        stderr_bytes: 0,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    })?;
+                }
+                "failed" => {
+                    let reason = task
+                        .job_failure_reason
+                        .as_deref()
+                        .unwrap_or("task job failed before daemon restart");
+                    let status = task_status_from_failure_reason(reason).unwrap_or("failed");
+                    self.finish_task(TaskFinishUpdate {
+                        task_id: &task.task_id,
+                        status,
+                        completed_at: task.job_failed_at.or(task.job_completed_at).unwrap_or(now),
+                        exit_code: None,
+                        signal: None,
+                        failure_reason: Some(reason),
+                        stdout_log_path: Some(stdout_log_path.as_str()),
+                        stderr_log_path: Some(stderr_log_path.as_str()),
+                        stdout_bytes: 0,
+                        stderr_bytes: 0,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                    })?;
+                }
+                other => bail!("unexpected lost task job status {other}"),
+            }
+        }
+        Ok(tasks.len())
+    }
+
     pub fn complete_job(
         &mut self,
         artifact: NewArtifact,
@@ -186,6 +633,74 @@ impl Store {
             requires_artifact_read: true,
         };
         insert_batch_tx(&tx, &batch, std::slice::from_ref(&completed_job.job_id))?;
+        tx.execute(
+            "DELETE FROM artifact_ingests WHERE artifact_id = ?",
+            params![artifact.artifact_id],
+        )?;
+        let inspect = query_batch_inspect_tx(&tx, &batch.batch_id)?;
+        tx.commit()?;
+        Ok(inspect)
+    }
+
+    pub fn fail_job_with_artifact(
+        &mut self,
+        artifact: NewArtifact,
+        reason: &str,
+        now: i64,
+        max_delivery_attempts: i64,
+        redelivery_window_seconds: i64,
+    ) -> Result<BatchInspect> {
+        let tx = self.conn.transaction()?;
+        let job = query_job_tx(&tx, &artifact.job_id)?;
+        ensure_job_pending(&job)?;
+
+        tx.execute(
+            "INSERT INTO artifacts (
+                artifact_id, job_id, relative_path, original_filename,
+                size_bytes, sha256, created_at, retention_until,
+                manifest_synced_retention_until, manifest_sync_attempted_at,
+                gc_attempted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                artifact.artifact_id,
+                artifact.job_id,
+                artifact.relative_path,
+                artifact.original_filename,
+                artifact.size_bytes,
+                artifact.sha256,
+                artifact.created_at,
+                artifact.retention_until,
+                artifact.retention_until,
+                0_i64,
+                0_i64,
+            ],
+        )?;
+
+        tx.execute(
+            "UPDATE jobs
+             SET status = 'failed',
+                 updated_at = ?,
+                 failed_at = ?,
+                 failure_reason = ?,
+                 result_artifact_id = ?
+             WHERE job_id = ?",
+            params![now, now, reason, artifact.artifact_id, artifact.job_id],
+        )?;
+        let failed_job = query_job_tx(&tx, &artifact.job_id)?;
+        let redelivery_window_ends_at =
+            checked_timestamp_add(now, redelivery_window_seconds, "redelivery_window_seconds")?;
+        let batch = NewBatch {
+            batch_id: new_id(),
+            source_thread_id: failed_job.source_thread_id.clone(),
+            summary: format!("Background task failed: {reason}"),
+            created_at: now,
+            redelivery_window_ends_at,
+            max_delivery_attempts,
+            policy: failed_job.delivery_policy.clone(),
+            inline_payload_bytes: 0,
+            requires_artifact_read: true,
+        };
+        insert_batch_tx(&tx, &batch, std::slice::from_ref(&failed_job.job_id))?;
         tx.execute(
             "DELETE FROM artifact_ingests WHERE artifact_id = ?",
             params![artifact.artifact_id],
@@ -1026,6 +1541,7 @@ impl Store {
         let (expired_automatic_batches_closed, automatic_artifacts_to_sync) =
             close_expired_automatic_batches_tx(&tx, now)?;
         let expired_artifacts = query_deletable_artifacts_tx(&tx, now)?;
+        let expired_task_log_task_ids = query_deletable_task_log_dirs_tx(&tx, now)?;
         let manifest_sync_artifacts = query_artifacts_for_manifest_sync_tx(&tx)?;
         tx.commit()?;
         let mut manifest_sync_candidates = artifacts_to_sync;
@@ -1053,6 +1569,8 @@ impl Store {
             }
         }
         let orphan_report = self.cleanup_stale_artifact_ingests(layout)?;
+        let task_log_report =
+            cleanup_expired_task_log_dirs(&self.conn, layout, &expired_task_log_task_ids)?;
 
         if !deleted_artifact_ids.is_empty() {
             let tx = self.conn.transaction()?;
@@ -1076,6 +1594,8 @@ impl Store {
             orphan_artifact_delete_failures: orphan_report.failed,
             artifact_manifests_synced: manifest_report.synced,
             artifact_manifest_sync_failures: manifest_report.failed,
+            task_log_dirs_deleted: task_log_report.deleted,
+            task_log_delete_failures: task_log_report.failed,
         })
     }
 
@@ -1323,6 +1843,45 @@ fn remove_artifact_dir(path: &std::path::Path) -> Result<bool> {
     remove_dir_all_durable(path)
 }
 
+fn cleanup_expired_task_log_dirs(
+    conn: &Connection,
+    layout: &FsLayout,
+    task_ids: &[String],
+) -> Result<CleanupReport> {
+    let mut report = CleanupReport::default();
+    let mut deleted_task_ids = Vec::new();
+    for task_id in task_ids {
+        if validate_id_path_component(task_id, "task_id").is_err() {
+            report.failed += 1;
+            continue;
+        }
+        match remove_dir_all_durable(&layout.task_dir(task_id)) {
+            Ok(true) => {
+                report.deleted += 1;
+                deleted_task_ids.push(task_id.clone());
+            }
+            Ok(false) => {
+                deleted_task_ids.push(task_id.clone());
+            }
+            Err(_) => {
+                report.failed += 1;
+            }
+        }
+    }
+    if !deleted_task_ids.is_empty() {
+        let mut stmt = conn.prepare(
+            "UPDATE tasks
+             SET stdout_log_path = NULL,
+                 stderr_log_path = NULL
+             WHERE task_id = ?",
+        )?;
+        for task_id in deleted_task_ids {
+            stmt.execute(params![task_id])?;
+        }
+    }
+    Ok(report)
+}
+
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
@@ -1348,6 +1907,39 @@ fn migrate(conn: &Connection) -> Result<()> {
             ON jobs(source_thread_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_jobs_status_created
             ON jobs(status, created_at);
+
+        CREATE TABLE IF NOT EXISTS tasks (
+            task_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id) ON DELETE CASCADE,
+            source_thread_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled', 'timed_out', 'lost')),
+            summary TEXT NOT NULL,
+            command_json TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            timeout_seconds INTEGER,
+            max_delivery_attempts INTEGER NOT NULL DEFAULT 3,
+            redelivery_window_seconds INTEGER NOT NULL DEFAULT 86400,
+            pid INTEGER,
+            pid_identity TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            exit_code INTEGER,
+            signal INTEGER,
+            failure_reason TEXT,
+            stdout_log_path TEXT,
+            stderr_log_path TEXT,
+            stdout_bytes INTEGER NOT NULL DEFAULT 0,
+            stderr_bytes INTEGER NOT NULL DEFAULT 0,
+            stdout_truncated INTEGER NOT NULL DEFAULT 0,
+            stderr_truncated INTEGER NOT NULL DEFAULT 0,
+            cancel_requested_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tasks_thread_created
+            ON tasks(source_thread_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_tasks_status_created
+            ON tasks(status, created_at);
 
         CREATE TABLE IF NOT EXISTS artifacts (
             artifact_id TEXT PRIMARY KEY,
@@ -1583,6 +2175,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         "delivery_attempts",
         "session_capability_revision",
         "ALTER TABLE delivery_attempts ADD COLUMN session_capability_revision INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "tasks",
+        "max_delivery_attempts",
+        "ALTER TABLE tasks ADD COLUMN max_delivery_attempts INTEGER NOT NULL DEFAULT 3",
+    )?;
+    ensure_column(
+        conn,
+        "tasks",
+        "redelivery_window_seconds",
+        "ALTER TABLE tasks ADD COLUMN redelivery_window_seconds INTEGER NOT NULL DEFAULT 86400",
+    )?;
+    ensure_column(
+        conn,
+        "tasks",
+        "pid_identity",
+        "ALTER TABLE tasks ADD COLUMN pid_identity TEXT",
     )?;
     Ok(())
 }
@@ -2289,6 +2899,47 @@ fn query_deletable_artifacts_tx(tx: &Transaction<'_>, now: i64) -> Result<Vec<Ar
     Ok(records)
 }
 
+fn query_deletable_task_log_dirs_tx(tx: &Transaction<'_>, now: i64) -> Result<Vec<String>> {
+    let retention_cutoff = now.saturating_sub(POST_CLOSE_ARTIFACT_TTL_SECONDS);
+    let mut stmt = tx.prepare(
+        "SELECT task_id
+         FROM tasks
+         WHERE completed_at IS NOT NULL
+           AND completed_at <= ?
+           AND (stdout_log_path IS NOT NULL OR stderr_log_path IS NOT NULL)
+           AND NOT EXISTS (
+             SELECT 1
+             FROM batch_jobs
+             JOIN batches ON batches.batch_id = batch_jobs.batch_id
+             WHERE batch_jobs.job_id = tasks.job_id
+               AND batches.state = 'open'
+           )
+           AND COALESCE((
+             SELECT max(batches.closed_at)
+             FROM batch_jobs
+             JOIN batches ON batches.batch_id = batch_jobs.batch_id
+             WHERE batch_jobs.job_id = tasks.job_id
+           ), completed_at) <= ?
+         ORDER BY COALESCE((
+             SELECT max(batches.closed_at)
+             FROM batch_jobs
+             JOIN batches ON batches.batch_id = batch_jobs.batch_id
+             WHERE batch_jobs.job_id = tasks.job_id
+           ), completed_at) ASC, task_id ASC
+         LIMIT ?",
+    )?;
+    stmt.query_map(
+        params![
+            retention_cutoff,
+            retention_cutoff,
+            MAX_DELETABLE_TASK_LOG_DIRS_PER_SWEEP
+        ],
+        |row| row.get::<_, String>(0),
+    )?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(Into::into)
+}
+
 fn query_artifacts_for_manifest_sync_tx(tx: &Transaction<'_>) -> Result<Vec<ArtifactRecord>> {
     let mut stmt = tx.prepare(
         "SELECT *
@@ -2321,6 +2972,26 @@ fn query_job_tx(tx: &Transaction<'_>, job_id: &str) -> Result<JobRecord> {
     )
     .optional()?
     .ok_or_else(|| anyhow!("job not found: {job_id}"))
+}
+
+fn query_task(conn: &Connection, task_id: &str) -> Result<TaskRecord> {
+    conn.query_row(
+        "SELECT * FROM tasks WHERE task_id = ?",
+        params![task_id],
+        task_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("task not found: {task_id}"))
+}
+
+fn query_task_tx(tx: &Transaction<'_>, task_id: &str) -> Result<TaskRecord> {
+    tx.query_row(
+        "SELECT * FROM tasks WHERE task_id = ?",
+        params![task_id],
+        task_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("task not found: {task_id}"))
 }
 
 fn query_batch_inspect(conn: &Connection, batch_id: &str) -> Result<BatchInspect> {
@@ -2621,6 +3292,14 @@ fn rows_to_jobs(mut rows: rusqlite::Rows<'_>) -> Result<Vec<JobRecord>> {
     Ok(jobs)
 }
 
+fn rows_to_tasks(mut rows: rusqlite::Rows<'_>) -> Result<Vec<TaskRecord>> {
+    let mut tasks = Vec::new();
+    while let Some(row) = rows.next()? {
+        tasks.push(task_from_row(row)?);
+    }
+    Ok(tasks)
+}
+
 fn rows_to_audit_decisions(mut rows: rusqlite::Rows<'_>) -> Result<Vec<AuditDecisionRecord>> {
     let mut decisions = Vec::new();
     while let Some(row) = rows.next()? {
@@ -2652,6 +3331,67 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
                 != 0,
         },
     })
+}
+
+fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
+    let command_json: String = row.get("command_json")?;
+    let command = serde_json::from_str(&command_json).unwrap_or(serde_json::Value::Null);
+    Ok(TaskRecord {
+        task_id: row.get("task_id")?,
+        job_id: row.get("job_id")?,
+        source_thread_id: row.get("source_thread_id")?,
+        status: row.get("status")?,
+        summary: row.get("summary")?,
+        command,
+        cwd: row.get("cwd")?,
+        timeout_seconds: row.get("timeout_seconds")?,
+        max_delivery_attempts: row.get("max_delivery_attempts")?,
+        redelivery_window_seconds: row.get("redelivery_window_seconds")?,
+        pid: row.get("pid")?,
+        pid_identity: row.get("pid_identity")?,
+        created_at: row.get("created_at")?,
+        started_at: row.get("started_at")?,
+        completed_at: row.get("completed_at")?,
+        exit_code: row.get("exit_code")?,
+        signal: row.get("signal")?,
+        failure_reason: row.get("failure_reason")?,
+        stdout_log_path: row.get("stdout_log_path")?,
+        stderr_log_path: row.get("stderr_log_path")?,
+        stdout_bytes: row.get("stdout_bytes")?,
+        stderr_bytes: row.get("stderr_bytes")?,
+        stdout_truncated: row.get::<_, i64>("stdout_truncated")? != 0,
+        stderr_truncated: row.get::<_, i64>("stderr_truncated")? != 0,
+        cancel_requested_at: row.get("cancel_requested_at")?,
+    })
+}
+
+fn task_status_for_supervised_job_terminal<'a>(job: &JobRecord, fallback: &'a str) -> &'a str {
+    match job.status.as_str() {
+        "completed" => "succeeded",
+        "failed" => job
+            .failure_reason
+            .as_deref()
+            .and_then(task_status_from_failure_reason)
+            .unwrap_or(fallback),
+        _ => fallback,
+    }
+}
+
+fn task_status_from_failure_reason(reason: &str) -> Option<&'static str> {
+    if reason == "task cancelled" {
+        return Some("cancelled");
+    }
+    if reason == "task timed out" {
+        return Some("timed_out");
+    }
+    let status = reason.strip_prefix("Background task ")?.split_once('.')?.0;
+    match status {
+        "succeeded" => Some("succeeded"),
+        "failed" => Some("failed"),
+        "cancelled" => Some("cancelled"),
+        "timed_out" => Some("timed_out"),
+        _ => None,
+    }
 }
 
 fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRecord> {
@@ -2781,6 +3521,14 @@ fn ensure_job_pending(job: &JobRecord) -> Result<()> {
         Ok(())
     } else {
         bail!("job {} is already {}", job.job_id, job.status)
+    }
+}
+
+fn ensure_task_not_terminal(task: &TaskRecord) -> Result<()> {
+    if task.completed_at.is_none() {
+        Ok(())
+    } else {
+        bail!("task {} is already {}", task.task_id, task.status)
     }
 }
 
@@ -3329,6 +4077,10 @@ fn checked_timestamp_add(now: i64, delta: i64, field_name: &str) -> Result<i64> 
         .ok_or_else(|| anyhow!("{field_name} overflows timestamp range"))
 }
 
+fn clamp_redelivery_window_seconds_for_timestamp(now: i64, redelivery_window_seconds: i64) -> i64 {
+    redelivery_window_seconds.min(i64::MAX.saturating_sub(now))
+}
+
 pub fn new_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
@@ -3340,6 +4092,72 @@ mod tests {
     use rusqlite::params;
 
     use super::*;
+
+    fn test_policy() -> DeliveryPolicy {
+        DeliveryPolicy {
+            delivery_read_only: true,
+            delivery_requires_approval: false,
+            delivery_requires_network: false,
+            delivery_requires_write_access: false,
+        }
+    }
+
+    fn create_test_task(
+        store: &mut Store,
+        job_id: &str,
+        task_id: &str,
+        source_thread_id: &str,
+        max_delivery_attempts: i64,
+        redelivery_window_seconds: i64,
+    ) {
+        store
+            .create_task_with_job(
+                NewJob {
+                    job_id: job_id.to_owned(),
+                    source_thread_id: source_thread_id.to_owned(),
+                    summary: "task summary".to_owned(),
+                    metadata_json: "{}".to_owned(),
+                    policy: test_policy(),
+                    created_at: 10,
+                },
+                NewTask {
+                    task_id: task_id.to_owned(),
+                    job_id: job_id.to_owned(),
+                    source_thread_id: source_thread_id.to_owned(),
+                    summary: "task summary".to_owned(),
+                    command_json: r#"["/bin/sh","-c","true"]"#.to_owned(),
+                    cwd: "/tmp".to_owned(),
+                    timeout_seconds: None,
+                    max_delivery_attempts,
+                    redelivery_window_seconds,
+                    created_at: 10,
+                },
+            )
+            .expect("create task");
+    }
+
+    #[test]
+    fn list_tasks_clamps_large_limits() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+
+        for index in 0..501 {
+            create_test_task(
+                &mut store,
+                &format!("job-list-limit-{index:03}"),
+                &format!("task-list-limit-{index:03}"),
+                "thread-list-limit",
+                3,
+                60,
+            );
+        }
+
+        let tasks = store
+            .list_tasks(None, None, 10_000)
+            .expect("list clamped tasks");
+        assert_eq!(tasks.len(), 500);
+    }
 
     #[test]
     fn manifest_sync_progresses_beyond_one_sweep_limit() {
@@ -3400,6 +4218,337 @@ mod tests {
         let second = store.sweep(&layout, 0).expect("second sweep");
         assert_eq!(second.artifact_manifests_synced, 1);
         assert_eq!(pending_manifest_sync_count(&store.conn), 0);
+    }
+
+    #[test]
+    fn lost_task_recovery_uses_persisted_delivery_settings() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        create_test_task(
+            &mut store,
+            "job-lost-custom-window",
+            "task-lost-custom-window",
+            "thread-lost-custom-window",
+            7,
+            11,
+        );
+
+        let recovered = store.fail_lost_tasks(100).expect("recover lost task");
+
+        assert_eq!(recovered, 1);
+        let task = store
+            .inspect_task("task-lost-custom-window")
+            .expect("inspect task");
+        assert_eq!(task.status, "lost");
+        assert_eq!(
+            task.failure_reason.as_deref(),
+            Some("task supervisor lost after daemon restart")
+        );
+        assert_eq!(task.max_delivery_attempts, 7);
+        assert_eq!(task.redelivery_window_seconds, 11);
+        let job = store
+            .inspect_job("job-lost-custom-window")
+            .expect("inspect job");
+        assert_eq!(job.status, "failed");
+        let head = store
+            .inspect_head("thread-lost-custom-window")
+            .expect("inspect head")
+            .expect("head batch");
+        assert_eq!(head.batch.max_delivery_attempts, 7);
+        assert_eq!(head.batch.redelivery_window_ends_at, 111);
+    }
+
+    #[test]
+    fn lost_task_recovery_preserves_persisted_cancel_request() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        create_test_task(
+            &mut store,
+            "job-lost-cancelled",
+            "task-lost-cancelled",
+            "thread-lost-cancelled",
+            7,
+            11,
+        );
+        store
+            .request_task_cancel("task-lost-cancelled", 20)
+            .expect("request cancel");
+
+        let recovered = store.fail_lost_tasks(100).expect("recover lost task");
+
+        assert_eq!(recovered, 1);
+        let task = store
+            .inspect_task("task-lost-cancelled")
+            .expect("inspect task");
+        assert_eq!(task.status, "cancelled");
+        assert_eq!(task.cancel_requested_at, Some(20));
+        assert_eq!(task.failure_reason.as_deref(), Some("task cancelled"));
+        let job = store
+            .inspect_job("job-lost-cancelled")
+            .expect("inspect job");
+        assert_eq!(job.status, "failed");
+        assert_eq!(job.failure_reason.as_deref(), Some("task cancelled"));
+        let head = store
+            .inspect_head("thread-lost-cancelled")
+            .expect("inspect head")
+            .expect("head batch");
+        assert_eq!(head.batch.max_delivery_attempts, 7);
+        assert_eq!(head.batch.redelivery_window_ends_at, 111);
+        assert_eq!(head.batch.summary, "Background job failed: task cancelled");
+    }
+
+    #[test]
+    fn lost_task_recovery_keeps_partial_logs_reclaimable() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        create_test_task(
+            &mut store,
+            "job-lost-log",
+            "task-lost-log",
+            "thread-lost-log",
+            7,
+            11,
+        );
+        let task_dir = layout.task_dir("task-lost-log");
+        fs::create_dir_all(&task_dir).expect("task dir");
+        fs::write(task_dir.join("stdout.log"), b"partial stdout").expect("partial stdout");
+
+        let recovered = store.fail_lost_tasks(100).expect("recover lost task");
+
+        assert_eq!(recovered, 1);
+        let task = store.inspect_task("task-lost-log").expect("inspect task");
+        assert_eq!(
+            task.stdout_log_path.as_deref(),
+            Some("tasks/task-lost-log/stdout.log")
+        );
+        assert_eq!(
+            task.stderr_log_path.as_deref(),
+            Some("tasks/task-lost-log/stderr.log")
+        );
+
+        let close_sweep = store
+            .sweep(&layout, 100 + POST_CLOSE_ARTIFACT_TTL_SECONDS + 1)
+            .expect("close sweep");
+
+        assert_eq!(close_sweep.expired_automatic_batches_closed, 1);
+        assert_eq!(close_sweep.task_log_dirs_deleted, 0);
+        assert!(task_dir.exists());
+
+        let delete_sweep = store
+            .sweep(&layout, 100 + (POST_CLOSE_ARTIFACT_TTL_SECONDS * 2) + 2)
+            .expect("delete sweep");
+
+        assert_eq!(delete_sweep.task_log_dirs_deleted, 1);
+        assert!(!task_dir.exists());
+        let task = store.inspect_task("task-lost-log").expect("inspect task");
+        assert_eq!(task.stdout_log_path, None);
+        assert_eq!(task.stderr_log_path, None);
+    }
+
+    #[test]
+    fn lost_task_recovery_terminalizes_tasks_with_closed_jobs() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        create_test_task(
+            &mut store,
+            "job-closed-completed",
+            "task-closed-completed",
+            "thread-closed-tasks",
+            5,
+            10,
+        );
+        create_test_task(
+            &mut store,
+            "job-closed-failed",
+            "task-closed-failed",
+            "thread-closed-tasks",
+            6,
+            12,
+        );
+        create_test_task(
+            &mut store,
+            "job-closed-timed-out",
+            "task-closed-timed-out",
+            "thread-closed-tasks",
+            7,
+            14,
+        );
+        store
+            .complete_job(
+                NewArtifact {
+                    artifact_id: "artifact-closed-completed".to_owned(),
+                    job_id: "job-closed-completed".to_owned(),
+                    relative_path: "artifacts/artifact-closed-completed/payload".to_owned(),
+                    original_filename: None,
+                    size_bytes: 4,
+                    sha256: "sha-completed".to_owned(),
+                    created_at: 20,
+                    retention_until: 120,
+                },
+                Some("closed completed".to_owned()),
+                20,
+                5,
+                10,
+            )
+            .expect("complete job");
+        store
+            .fail_job("job-closed-failed", "closed failure", 21, 6, 12)
+            .expect("fail job");
+        store
+            .fail_job(
+                "job-closed-timed-out",
+                "Background task timed_out.\n\nCommand timed out.",
+                22,
+                7,
+                14,
+            )
+            .expect("fail timed out job");
+
+        let recovered = store.fail_lost_tasks(30).expect("recover closed jobs");
+
+        assert_eq!(recovered, 3);
+        let completed = store
+            .inspect_task("task-closed-completed")
+            .expect("inspect completed task");
+        assert_eq!(completed.status, "succeeded");
+        assert_eq!(completed.completed_at, Some(20));
+        assert_eq!(completed.exit_code, Some(0));
+        assert_eq!(completed.failure_reason, None);
+        let failed = store
+            .inspect_task("task-closed-failed")
+            .expect("inspect failed task");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.completed_at, Some(21));
+        assert_eq!(failed.failure_reason.as_deref(), Some("closed failure"));
+        let timed_out = store
+            .inspect_task("task-closed-timed-out")
+            .expect("inspect timed out task");
+        assert_eq!(timed_out.status, "timed_out");
+        assert_eq!(timed_out.completed_at, Some(22));
+        assert_eq!(
+            timed_out.failure_reason.as_deref(),
+            Some("Background task timed_out.\n\nCommand timed out.")
+        );
+    }
+
+    #[test]
+    fn supervised_error_fallback_preserves_completed_job_task_status() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        create_test_task(
+            &mut store,
+            "job-fallback-completed",
+            "task-fallback-completed",
+            "thread-fallback-completed",
+            5,
+            10,
+        );
+        store
+            .complete_job(
+                NewArtifact {
+                    artifact_id: "artifact-fallback-completed".to_owned(),
+                    job_id: "job-fallback-completed".to_owned(),
+                    relative_path: "artifacts/artifact-fallback-completed/payload".to_owned(),
+                    original_filename: None,
+                    size_bytes: 4,
+                    sha256: "sha-completed".to_owned(),
+                    created_at: 20,
+                    retention_until: 120,
+                },
+                Some("Background task succeeded.".to_owned()),
+                20,
+                5,
+                10,
+            )
+            .expect("complete job");
+
+        store
+            .fail_supervised_task_with_job(
+                "job-fallback-completed",
+                "task supervisor error: finish task failed",
+                TaskFinishUpdate {
+                    task_id: "task-fallback-completed",
+                    status: "failed",
+                    completed_at: 30,
+                    exit_code: None,
+                    signal: None,
+                    failure_reason: Some("task supervisor error: finish task failed"),
+                    stdout_log_path: Some("tasks/task-fallback-completed/stdout.log"),
+                    stderr_log_path: Some("tasks/task-fallback-completed/stderr.log"),
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+                5,
+                10,
+            )
+            .expect("fallback terminalize");
+
+        let job = store
+            .inspect_job("job-fallback-completed")
+            .expect("inspect job");
+        assert_eq!(job.status, "completed");
+        let task = store
+            .inspect_task("task-fallback-completed")
+            .expect("inspect task");
+        assert_eq!(task.status, "succeeded");
+        assert_eq!(task.completed_at, Some(20));
+        assert_eq!(task.exit_code, Some(0));
+        assert_eq!(task.failure_reason, None);
+    }
+
+    #[test]
+    fn supervised_error_fallback_clamps_large_redelivery_window() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        create_test_task(
+            &mut store,
+            "job-fallback-large-window",
+            "task-fallback-large-window",
+            "thread-fallback-large-window",
+            5,
+            i64::MAX,
+        );
+
+        store
+            .fail_supervised_task_with_job(
+                "job-fallback-large-window",
+                "task supervisor error: terminalization failed",
+                TaskFinishUpdate {
+                    task_id: "task-fallback-large-window",
+                    status: "failed",
+                    completed_at: 100,
+                    exit_code: None,
+                    signal: None,
+                    failure_reason: Some("task supervisor error: terminalization failed"),
+                    stdout_log_path: Some("tasks/task-fallback-large-window/stdout.log"),
+                    stderr_log_path: Some("tasks/task-fallback-large-window/stderr.log"),
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+                5,
+                i64::MAX,
+            )
+            .expect("fallback terminalize");
+
+        let head = store
+            .inspect_head("thread-fallback-large-window")
+            .expect("inspect head")
+            .expect("head batch");
+        assert_eq!(head.batch.redelivery_window_ends_at, i64::MAX);
+        let task = store
+            .inspect_task("task-fallback-large-window")
+            .expect("inspect task");
+        assert_eq!(task.status, "failed");
     }
 
     #[test]

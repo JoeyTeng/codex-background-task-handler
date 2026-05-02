@@ -19,19 +19,21 @@
 - [x] 增加 ignored / opt-in live Codex shared `app-server` smoke，保持编译与 lint-clean，但不进入默认 CI 执行。
 - [x] 增加 ignored / opt-in live CLI trusted-all full e2e，验证真实 `cbth cli run --auto-delivery-policy trusted-all` 能在 existing thread idle 后自动投递 head batch 并关闭为 `delivered`。
 - [x] 单独沉淀 CLI Dogfood V1 完成计划，见 [CLI_DOGFOOD_V1_COMPLETION_PLAN.md](CLI_DOGFOOD_V1_COMPLETION_PLAN.md)。
-- [ ] 合入 Phase 12 `cbth cli run --new-thread` PR 后，从最新 `master` 开始 CLI Dogfood V1 后续 PR。
-- [ ] 实现 daemon-owned CLI task supervisor：
-  - `cbth task run --source-thread-id ... --summary ... -- <cmd> [args...]`
-  - `cbth task inspect --task-id ...`
-  - `cbth task list [--source-thread-id ...]`
-  - `cbth task cancel --task-id ...`
-  - daemon 创建 job、监督 child/process group，并在任务结束后自动 complete/fail job
-  - stdout/stderr 写 managed task log artifacts，prompt 只放退出状态、tail summary、truncation flags 和 artifact refs
-  - active supervised tasks 阻止 daemon idle exit；完成后恢复正常 idle exit
+- [x] 合入 Phase 12 `cbth cli run --new-thread` PR 后，从最新 `master` 开始 CLI Dogfood V1 后续 PR。
+- [ ] 合入 daemon-owned CLI task supervisor PR：
+  - [x] `cbth task run --source-thread-id ... --summary ... -- <cmd> [args...]`
+  - [x] `cbth task inspect --task-id ...`
+  - [x] `cbth task list [--source-thread-id ...]`
+  - [x] `cbth task cancel --task-id ...`
+  - [x] daemon 创建 job、监督 child/process group，并在任务结束后自动 complete/fail job
+  - [x] stdout/stderr 写 managed task log files/result artifact，prompt 只放退出状态、tail preview、truncation flags 和 artifact refs
+  - [x] active supervised tasks 阻止 daemon idle exit；完成后恢复正常 idle exit
+  - [x] 增加 deterministic fake e2e 覆盖 trusted-all task auto delivery
+  - [x] 增加 ignored / opt-in live task-supervisor e2e 入口；真实本机复测命令已记录在 [LIVE_E2E.md](LIVE_E2E.md)
 - [ ] 增加 `cbth doctor cli`，检查 codex binary、app-server listener parsing、same-user daemon IPC、store permissions、SQLite open、platform support 和 optional live smoke prerequisites。
 - [ ] 补齐 CLI operator recovery 文档：batch inspect/manual close、audit、task logs、`manual_resolution_only` 处理。
 - [ ] 补齐 local binary dogfood 部署文档：`cargo install --path .`、PATH 检查、`cbth doctor cli`、最小端到端 walkthrough。
-- [ ] 增加 opt-in live task-supervisor e2e：`CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture`。
+- [x] 增加 opt-in live task-supervisor e2e：`CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture`。
 - [ ] 文档化 active-turn `turn/steer` 后续进入自动路径前需要的 risk/capability proof；当前自动投递继续只允许 idle `turn/start`。
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
 - [x] 确认桌面端私有 `app-server` 当前正持有该 rollout 文件。

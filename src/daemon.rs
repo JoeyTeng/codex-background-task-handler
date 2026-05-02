@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::mem;
@@ -8,9 +9,9 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -21,10 +22,13 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::artifact::{ingest_result_file, remove_ingest_marker_best_effort};
 use crate::cli_app_server_client::AppServerJsonRpcClient;
-use crate::fs_layout::{FsLayout, sync_dir};
-use crate::models::{DaemonLifecycleStatus, SweepReport};
-use crate::store::{Store, new_id};
+use crate::fs_layout::{FsLayout, create_private_file, ensure_private_dir, sync_dir};
+use crate::models::{
+    DaemonLifecycleStatus, DeliveryPolicy, NewJob, NewTask, SweepReport, TaskRecord,
+};
+use crate::store::{Store, TaskFinishUpdate, new_id};
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -43,6 +47,19 @@ const CLI_APP_SERVER_KILL_GRACE: Duration = Duration::from_secs(2);
 const CLI_APP_SERVER_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CLI_APP_SERVER_LISTENER_SCAN_BYTES: usize = 8 * 1024;
 const CLI_APP_SERVER_DRAIN_CHUNK_BYTES: usize = 4 * 1024;
+const TASK_STREAM_TAIL_BYTES: usize = 64 * 1024;
+const TASK_PROMPT_TAIL_PREVIEW_BYTES: usize = 2 * 1024;
+const TASK_PROMPT_COMMAND_PREVIEW_BYTES: usize = 4 * 1024;
+const TASK_STREAM_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TASK_TERM_GRACE: Duration = Duration::from_secs(5);
+const TASK_STREAM_DRAIN_HARD_GRACE: Duration = Duration::from_secs(1);
+const TASK_SPAWN_EXEC_GATE_FD: RawFd = 3;
+const TASK_SPAWN_EXEC_GATE_SCRIPT: &str =
+    "if IFS= read -r _ <&3; then exec 3<&-; exec \"$@\"; else exit 127; fi";
+const MAX_SUPERVISED_TASKS: usize = 16;
+const MAX_TASK_ENV_VARS: usize = 4096;
+const MAX_TASK_ENV_BYTES: usize = 1024 * 1024;
 const DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS: u64 = 60;
 const DAEMON_PROTOCOL_VERSION: u64 = 1;
 const DAEMON_CAPABILITIES: &[&str] = &[
@@ -55,6 +72,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "cli-session-proof-invalidation-dispatch",
     "cli-turn-observation-dispatch",
     "cli-auto-delivery-dispatch",
+    "task-supervisor",
 ];
 const MAX_DISPATCH_WORKERS: usize = 32;
 const RESERVED_CONTROL_WORKERS: usize = 8;
@@ -120,6 +138,11 @@ impl Drop for FdGuard {
     }
 }
 
+struct TaskSpawnExecGate {
+    read_fd: FdGuard,
+    write_fd: FdGuard,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct DaemonRequest {
@@ -131,6 +154,26 @@ struct DaemonRequest {
 #[derive(Debug, Deserialize)]
 struct DispatchPayload {
     argv: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskRunPayload {
+    source_thread_id: String,
+    summary: String,
+    metadata_json: String,
+    policy: DeliveryPolicy,
+    cwd: String,
+    timeout_seconds: Option<i64>,
+    max_delivery_attempts: i64,
+    redelivery_window_seconds: i64,
+    command: Vec<Vec<u8>>,
+    #[serde(default)]
+    environment: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskCancelPayload {
+    task_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +285,15 @@ struct DaemonState {
     cli_app_servers: Mutex<HashMap<String, ManagedCliAppServer>>,
     cli_app_server_reservations: Mutex<HashMap<String, CliAppServerReservation>>,
     cli_thread_start_bootstraps: Mutex<HashMap<String, ManagedCliAppServer>>,
+    supervised_tasks: Arc<Mutex<HashMap<String, Arc<SupervisedTaskControl>>>>,
+}
+
+#[derive(Default)]
+struct SupervisedTaskControl {
+    pid: Mutex<Option<u32>>,
+    cancel_requested: AtomicBool,
+    cancel_requested_at: Mutex<Option<Instant>>,
+    spawn_gate: Mutex<()>,
 }
 
 struct ManagedCliAppServer {
@@ -323,13 +375,6 @@ impl DaemonLifecycleCache {
 
 pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Value> {
     layout.ensure_run_dir()?;
-    let startup_sweep = if let Some(now) = options.startup_sweep_now {
-        let mut store = Store::open(layout)?;
-        store.sweep(layout, now)?
-    } else {
-        SweepReport::default()
-    };
-
     let socket_path = layout.daemon_socket_path();
     prepare_socket_path(&socket_path)?;
 
@@ -340,6 +385,19 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
     listener
         .set_nonblocking(true)
         .with_context(|| format!("set nonblocking {}", socket_path.display()))?;
+    recover_lost_task_process_groups(layout)?;
+    let recovery_now = match options.startup_sweep_now {
+        Some(now) => now,
+        None => current_epoch_seconds()?,
+    };
+    let mut store = Store::open(layout)?;
+    let _ = store.fail_lost_tasks(recovery_now)?;
+    let startup_sweep = if let Some(now) = options.startup_sweep_now {
+        store.sweep(layout, now)?
+    } else {
+        SweepReport::default()
+    };
+    drop(store);
 
     let started_at = current_epoch_seconds()?;
     let state = Arc::new(DaemonState {
@@ -356,6 +414,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         cli_app_servers: Mutex::new(HashMap::new()),
         cli_app_server_reservations: Mutex::new(HashMap::new()),
         cli_thread_start_bootstraps: Mutex::new(HashMap::new()),
+        supervised_tasks: Arc::new(Mutex::new(HashMap::new())),
     });
     let mut last_activity = Instant::now();
     let mut last_activity_epoch = started_at;
@@ -447,6 +506,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
                         && !has_active_cli_app_servers(&state)
                         && !has_active_cli_app_server_reservations(&state)
                         && !has_active_cli_thread_start_bootstraps(&state)
+                        && !has_active_supervised_tasks(&state)
                     {
                         shutdown_reason = "idle_timeout";
                         break;
@@ -459,6 +519,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
     }
     join_workers(workers);
     join_lifecycle_maintenance(lifecycle_maintenance_worker);
+    stop_all_supervised_tasks(&state);
     stop_all_cli_app_servers(&state);
     stop_all_cli_thread_start_bootstraps(&state);
     clear_cli_app_server_reservations(&state);
@@ -645,6 +706,7 @@ fn daemon_request_until(
     payload: Value,
     deadline: Instant,
 ) -> Result<Value> {
+    let request = daemon_request_bytes(command, payload)?;
     validate_socket_endpoint(layout)?;
     let socket_path = layout.daemon_socket_path();
     let mut stream = connect_unix_stream_until(&socket_path, deadline)
@@ -653,10 +715,6 @@ fn daemon_request_until(
         .set_nonblocking(true)
         .context("set daemon client nonblocking")?;
 
-    let request = serde_json::to_vec(&json!({
-        "command": command,
-        "payload": payload,
-    }))?;
     write_all_until(&mut stream, &request, deadline).context("write daemon request")?;
     write_all_until(&mut stream, b"\n", deadline).context("write daemon request")?;
     stream.shutdown(std::net::Shutdown::Write).ok();
@@ -672,6 +730,21 @@ fn daemon_request_until(
             .unwrap_or("daemon returned an unknown error");
         bail!("{message}")
     }
+}
+
+fn daemon_request_bytes(command: &str, payload: Value) -> Result<Vec<u8>> {
+    let request = serde_json::to_vec(&json!({
+        "command": command,
+        "payload": payload,
+    }))?;
+    if request.len().saturating_add(1) > MAX_REQUEST_BYTES {
+        bail!(
+            "daemon request is too large after JSON encoding: {} bytes plus newline exceeds {} bytes",
+            request.len(),
+            MAX_REQUEST_BYTES
+        );
+    }
+    Ok(request)
 }
 
 fn connect_unix_stream_until(path: &Path, deadline: Instant) -> Result<UnixStream> {
@@ -758,6 +831,19 @@ fn set_fd_nonblocking(fd: RawFd, enabled: bool) -> Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error()).context("set socket nonblocking")
+    }
+}
+
+fn set_fd_cloexec(fd: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error()).context("read fd flags");
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error()).context("set fd close-on-exec")
     }
 }
 
@@ -963,6 +1049,177 @@ fn join_lifecycle_maintenance(worker: Option<thread::JoinHandle<()>>) {
     }
 }
 
+fn stop_all_supervised_tasks(state: &DaemonState) {
+    let term_deadline = Instant::now() + TASK_TERM_GRACE + Duration::from_secs(2);
+    let kill_deadline = term_deadline + TASK_TERM_GRACE + Duration::from_secs(2);
+    let mut sent_kill = false;
+    loop {
+        let controls = match state.supervised_tasks.lock() {
+            Ok(tasks) => tasks.values().cloned().collect::<Vec<_>>(),
+            Err(_) => return,
+        };
+        if controls.is_empty() {
+            return;
+        }
+        for control in &controls {
+            request_supervised_task_cancel(control);
+            if let Ok(guard) = control.pid.lock()
+                && let Some(pid) = *guard
+            {
+                signal_process_group(
+                    pid,
+                    if sent_kill {
+                        libc::SIGKILL
+                    } else {
+                        libc::SIGTERM
+                    },
+                );
+            }
+        }
+        let now = Instant::now();
+        if now >= kill_deadline {
+            return;
+        }
+        if now >= term_deadline {
+            sent_kill = true;
+        }
+        thread::sleep(TASK_WAIT_POLL_INTERVAL);
+    }
+}
+
+fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
+    let store = Store::open(layout)?;
+    for process in store.lost_pending_task_processes()? {
+        let Some(expected_identity) = process.pid_identity.as_deref() else {
+            continue;
+        };
+        if !lost_task_process_group_is_recoverable(process.pid, expected_identity) {
+            continue;
+        }
+        signal_process_group(process.pid, libc::SIGTERM);
+        thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        if process_group_exists(process.pid) {
+            signal_process_group(process.pid, libc::SIGKILL);
+        }
+    }
+    Ok(())
+}
+
+fn lost_task_process_group_is_recoverable(pid: u32, expected_identity: &str) -> bool {
+    match process_start_identity(pid) {
+        Ok(Some(current_identity)) => current_identity == expected_identity,
+        Ok(None) => process_group_has_live_members_after_leader_exit(pid),
+        Err(_) => false,
+    }
+}
+
+fn request_supervised_task_cancel(control: &SupervisedTaskControl) {
+    if let Ok(mut cancel_requested_at) = control.cancel_requested_at.lock()
+        && cancel_requested_at.is_none()
+    {
+        *cancel_requested_at = Some(Instant::now());
+    }
+    control.cancel_requested.store(true, Ordering::Release);
+}
+
+fn task_spawn_exec_gate() -> Result<TaskSpawnExecGate> {
+    let mut fds = [0 as RawFd; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error()).context("create task spawn exec gate");
+    }
+    let mut read_fd = FdGuard::new(fds[0]);
+    let mut write_fd = FdGuard::new(fds[1]);
+    if write_fd.fd == TASK_SPAWN_EXEC_GATE_FD {
+        write_fd = dup_fd_min_cloexec(write_fd.fd, TASK_SPAWN_EXEC_GATE_FD + 1)
+            .context("move task spawn write fd away from exec gate fd")?;
+    }
+    if read_fd.fd == TASK_SPAWN_EXEC_GATE_FD {
+        read_fd = dup_fd_min_cloexec(read_fd.fd, TASK_SPAWN_EXEC_GATE_FD + 1)
+            .context("move task spawn read fd away from exec gate fd")?;
+    }
+    debug_assert_ne!(read_fd.fd, TASK_SPAWN_EXEC_GATE_FD);
+    debug_assert_ne!(write_fd.fd, TASK_SPAWN_EXEC_GATE_FD);
+    set_fd_cloexec(read_fd.fd).context("set task spawn read fd close-on-exec")?;
+    set_fd_cloexec(write_fd.fd).context("set task spawn write fd close-on-exec")?;
+    Ok(TaskSpawnExecGate { read_fd, write_fd })
+}
+
+fn dup_fd_min_cloexec(fd: RawFd, min_fd: RawFd) -> Result<FdGuard> {
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD, min_fd) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error()).context("duplicate fd");
+    }
+    let guard = FdGuard::new(duplicated);
+    set_fd_cloexec(guard.fd)?;
+    Ok(guard)
+}
+
+fn install_task_spawn_exec_gate(command: &mut Command, gate: &TaskSpawnExecGate) {
+    let read_fd = gate.read_fd.fd;
+    let write_fd = gate.write_fd.fd;
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(read_fd, TASK_SPAWN_EXEC_GATE_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let _ = libc::close(read_fd);
+            let _ = libc::close(write_fd);
+            Ok(())
+        });
+    }
+}
+
+fn release_task_spawn_exec_gate(gate: TaskSpawnExecGate) -> Result<()> {
+    drop(gate.read_fd);
+    let bytes = b"go\n";
+    let mut written = 0;
+    while written < bytes.len() {
+        let rc = unsafe {
+            libc::write(
+                gate.write_fd.fd,
+                bytes[written..].as_ptr().cast(),
+                bytes.len() - written,
+            )
+        };
+        if rc > 0 {
+            written += usize::try_from(rc).unwrap_or(0);
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error).context("write task spawn exec gate");
+        }
+    }
+    Ok(())
+}
+
+fn supervised_task_cancel_requested_by(control: &SupervisedTaskControl, deadline: Instant) -> bool {
+    control
+        .cancel_requested_at
+        .lock()
+        .ok()
+        .and_then(|requested_at| *requested_at)
+        .is_some_and(|requested_at| requested_at <= deadline)
+}
+
+fn task_wait_poll_sleep_duration(
+    start: Instant,
+    timeout: Option<Duration>,
+    now: Instant,
+    termination_started: bool,
+) -> Duration {
+    if termination_started {
+        return TASK_WAIT_POLL_INTERVAL;
+    }
+    let Some(timeout) = timeout else {
+        return TASK_WAIT_POLL_INTERVAL;
+    };
+    timeout
+        .checked_sub(now.duration_since(start))
+        .map(|remaining| remaining.min(TASK_WAIT_POLL_INTERVAL))
+        .unwrap_or(Duration::ZERO)
+}
+
 fn refresh_lifecycle_cache_if_due(
     state: &DaemonState,
     cache: &mut DaemonLifecycleCache,
@@ -1150,6 +1407,26 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
                 serde_json::from_value(request.payload).context("parse dispatch payload")?;
             crate::cli::dispatch_daemon_argv(&state.layout, payload.argv)?
         }
+        "task_run" => {
+            state
+                .lifecycle_maintenance_suppressed
+                .store(false, Ordering::Release);
+            let payload: TaskRunPayload =
+                serde_json::from_value(request.payload).context("parse task run payload")?;
+            json!({
+                "task": start_supervised_task(state, payload)?,
+            })
+        }
+        "task_cancel" => {
+            state
+                .lifecycle_maintenance_suppressed
+                .store(false, Ordering::Release);
+            let payload: TaskCancelPayload =
+                serde_json::from_value(request.payload).context("parse task cancel payload")?;
+            json!({
+                "task": cancel_supervised_task(state, payload)?,
+            })
+        }
         other => bail!("unknown daemon command: {other}"),
     };
     write_ok_response(stream, response)
@@ -1164,6 +1441,1028 @@ fn daemon_info(state: &DaemonState) -> DaemonInfo {
         idle_timeout_seconds: state.idle_timeout.as_secs(),
         stop_requested: state.stop_requested.load(Ordering::Acquire),
     }
+}
+
+fn start_supervised_task(state: &DaemonState, payload: TaskRunPayload) -> Result<TaskRecord> {
+    validate_daemon_nonempty("source_thread_id", &payload.source_thread_id)?;
+    validate_daemon_nonempty("summary", &payload.summary)?;
+    validate_daemon_nonempty("cwd", &payload.cwd)?;
+    validate_daemon_positive("max_delivery_attempts", payload.max_delivery_attempts)?;
+    validate_daemon_positive(
+        "redelivery_window_seconds",
+        payload.redelivery_window_seconds,
+    )?;
+    validate_task_environment(&payload.environment)?;
+    if let Some(timeout_seconds) = payload.timeout_seconds {
+        validate_daemon_positive("timeout_seconds", timeout_seconds)?;
+    }
+    if payload.command.is_empty() {
+        bail!("task command must not be empty");
+    }
+    validate_daemon_nonempty_bytes("task command argv[0]", &payload.command[0])?;
+
+    let task_id = new_id();
+    let job_id = new_id();
+    let now = current_epoch_seconds()?;
+    if now.checked_add(payload.redelivery_window_seconds).is_none() {
+        bail!("redelivery_window_seconds overflows timestamp range");
+    }
+    let command_json = serde_json::to_string(
+        &payload
+            .command
+            .iter()
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect::<Vec<_>>(),
+    )?;
+    let mut store = Store::open(&state.layout)?;
+    let control = Arc::new(SupervisedTaskControl::default());
+    {
+        let mut supervised_tasks = state
+            .supervised_tasks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervised task map lock poisoned"))?;
+        if supervised_tasks.len() >= MAX_SUPERVISED_TASKS {
+            bail!("maximum supervised task limit reached ({MAX_SUPERVISED_TASKS})");
+        }
+        supervised_tasks.insert(task_id.clone(), control.clone());
+    }
+    let job = NewJob {
+        job_id: job_id.clone(),
+        source_thread_id: payload.source_thread_id.clone(),
+        summary: payload.summary.clone(),
+        metadata_json: payload.metadata_json,
+        policy: payload.policy,
+        created_at: now,
+    };
+    let task = NewTask {
+        task_id: task_id.clone(),
+        job_id: job_id.clone(),
+        source_thread_id: payload.source_thread_id,
+        summary: payload.summary,
+        command_json,
+        cwd: payload.cwd,
+        timeout_seconds: payload.timeout_seconds,
+        max_delivery_attempts: payload.max_delivery_attempts,
+        redelivery_window_seconds: payload.redelivery_window_seconds,
+        created_at: now,
+    };
+    let (_job, task) = match store.create_task_with_job(job, task) {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = state
+                .supervised_tasks
+                .lock()
+                .map(|mut tasks| tasks.remove(&task_id));
+            return Err(error);
+        }
+    };
+
+    let layout = state.layout.clone();
+    let command = payload.command;
+    let environment = payload.environment;
+    let cwd = PathBuf::from(task.cwd.clone());
+    let timeout_seconds = task.timeout_seconds;
+    let max_delivery_attempts = payload.max_delivery_attempts;
+    let redelivery_window_seconds = payload.redelivery_window_seconds;
+    let task_registry = state.supervised_tasks.clone();
+    thread::spawn(move || {
+        run_supervised_task_worker(
+            layout,
+            task_id,
+            job_id,
+            command,
+            environment,
+            cwd,
+            timeout_seconds,
+            max_delivery_attempts,
+            redelivery_window_seconds,
+            control,
+            task_registry,
+        );
+    });
+
+    Ok(task)
+}
+
+fn cancel_supervised_task(state: &DaemonState, payload: TaskCancelPayload) -> Result<TaskRecord> {
+    validate_daemon_nonempty("task_id", &payload.task_id)?;
+    let control = state
+        .supervised_tasks
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task map lock poisoned"))?
+        .get(&payload.task_id)
+        .cloned();
+    if let Some(control) = control {
+        let spawn_guard = control
+            .spawn_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervised task spawn gate lock poisoned"))?;
+        if let Some(pid) = *control
+            .pid
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?
+        {
+            request_supervised_task_cancel(&control);
+            signal_process_group(pid, libc::SIGTERM);
+            drop(spawn_guard);
+            let now = current_epoch_seconds()?;
+            let mut store = Store::open(&state.layout)?;
+            return store.request_task_cancel(&payload.task_id, now);
+        }
+        let task = (|| -> Result<TaskRecord> {
+            let now = current_epoch_seconds()?;
+            let mut store = Store::open(&state.layout)?;
+            store.request_task_cancel(&payload.task_id, now)
+        })()?;
+        request_supervised_task_cancel(&control);
+        drop(spawn_guard);
+        return Ok(task);
+    }
+    let now = current_epoch_seconds()?;
+    let mut store = Store::open(&state.layout)?;
+    let task = store.request_task_cancel(&payload.task_id, now)?;
+    Ok(task)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_supervised_task_worker(
+    layout: FsLayout,
+    task_id: String,
+    job_id: String,
+    command: Vec<Vec<u8>>,
+    environment: Vec<(Vec<u8>, Vec<u8>)>,
+    cwd: PathBuf,
+    timeout_seconds: Option<i64>,
+    max_delivery_attempts: i64,
+    redelivery_window_seconds: i64,
+    control: Arc<SupervisedTaskControl>,
+    task_registry: Arc<Mutex<HashMap<String, Arc<SupervisedTaskControl>>>>,
+) {
+    if let Err(error) = run_supervised_task_worker_inner(
+        &layout,
+        &task_id,
+        &job_id,
+        command,
+        environment,
+        &cwd,
+        timeout_seconds,
+        max_delivery_attempts,
+        redelivery_window_seconds,
+        &control,
+    ) {
+        let reason = format!("task supervisor error: {error:#}");
+        let cancelled = control.cancel_requested.load(Ordering::Acquire);
+        let task_status = if cancelled { "cancelled" } else { "failed" };
+        let terminal_reason = if cancelled {
+            "task cancelled"
+        } else {
+            reason.as_str()
+        };
+        terminalize_supervised_task_error(
+            &layout,
+            &task_id,
+            &job_id,
+            task_status,
+            terminal_reason,
+            max_delivery_attempts,
+            redelivery_window_seconds,
+        );
+    }
+    if let Ok(mut tasks) = task_registry.lock() {
+        tasks.remove(&task_id);
+    }
+}
+
+fn terminalize_supervised_task_error(
+    layout: &FsLayout,
+    task_id: &str,
+    job_id: &str,
+    task_status: &str,
+    reason: &str,
+    max_delivery_attempts: i64,
+    redelivery_window_seconds: i64,
+) {
+    let stdout_log_path = format!("tasks/{task_id}/stdout.log");
+    let stderr_log_path = format!("tasks/{task_id}/stderr.log");
+    let mut retry_delay = Duration::from_millis(100);
+    loop {
+        if let Ok(now) = current_epoch_seconds()
+            && let Ok(mut store) = Store::open(layout)
+        {
+            let update = TaskFinishUpdate {
+                task_id,
+                status: task_status,
+                completed_at: now,
+                exit_code: None,
+                signal: None,
+                failure_reason: Some(reason),
+                stdout_log_path: Some(&stdout_log_path),
+                stderr_log_path: Some(&stderr_log_path),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            };
+            if store
+                .fail_supervised_task_with_job(
+                    job_id,
+                    reason,
+                    update,
+                    max_delivery_attempts,
+                    redelivery_window_seconds,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+        thread::sleep(retry_delay);
+        retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_supervised_task_worker_inner(
+    layout: &FsLayout,
+    task_id: &str,
+    job_id: &str,
+    command: Vec<Vec<u8>>,
+    environment: Vec<(Vec<u8>, Vec<u8>)>,
+    cwd: &Path,
+    timeout_seconds: Option<i64>,
+    max_delivery_attempts: i64,
+    redelivery_window_seconds: i64,
+    control: &Arc<SupervisedTaskControl>,
+) -> Result<()> {
+    let task_dir = layout.task_dir(task_id);
+    ensure_private_dir(&task_dir)?;
+    let stdout_path = task_dir.join("stdout.log");
+    let stderr_path = task_dir.join("stderr.log");
+    let result_path = task_dir.join("result.txt");
+    let command_display = task_command_display(&command);
+
+    let program = OsString::from_vec(command[0].clone());
+    let args = command
+        .iter()
+        .skip(1)
+        .map(|arg| OsString::from_vec(arg.clone()))
+        .collect::<Vec<_>>();
+    let mut command_builder = Command::new("/bin/sh");
+    command_builder.env_clear();
+    let mut saw_pwd = false;
+    for (key, value) in environment {
+        if key == b"PWD" {
+            saw_pwd = true;
+            command_builder.env(OsString::from_vec(key), cwd.as_os_str());
+        } else {
+            command_builder.env(OsString::from_vec(key), OsString::from_vec(value));
+        }
+    }
+    if !saw_pwd {
+        command_builder.env("PWD", cwd.as_os_str());
+    }
+    let spawn_guard = control
+        .spawn_gate
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task spawn gate lock poisoned"))?;
+    if control.cancel_requested.load(Ordering::Acquire) {
+        finish_unspawned_cancelled_task(
+            layout,
+            task_id,
+            job_id,
+            max_delivery_attempts,
+            redelivery_window_seconds,
+        )?;
+        return Ok(());
+    }
+    let exec_gate = task_spawn_exec_gate()?;
+    install_task_spawn_exec_gate(&mut command_builder, &exec_gate);
+    let mut child = command_builder
+        .arg("-c")
+        .arg(TASK_SPAWN_EXEC_GATE_SCRIPT)
+        .arg("cbth-task-gate")
+        .arg(&program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("spawn task command {:?}", program))?;
+    let pid = child.id();
+    *control
+        .pid
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = Some(pid);
+    let pid_identity = process_start_identity(pid).unwrap_or(None);
+    let started_at = match current_epoch_seconds() {
+        Ok(started_at) => started_at,
+        Err(error) => {
+            terminate_task_child_best_effort(&mut child, pid);
+            *control
+                .pid
+                .lock()
+                .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+            return Err(error);
+        }
+    };
+    let mut store = match Store::open_for_task_supervisor_setup(layout) {
+        Ok(store) => store,
+        Err(error) => {
+            terminate_task_child_best_effort(&mut child, pid);
+            *control
+                .pid
+                .lock()
+                .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+            return Err(error);
+        }
+    };
+    if let Err(error) =
+        store.mark_task_started(task_id, i64::from(pid), pid_identity.as_deref(), started_at)
+    {
+        terminate_task_child_best_effort(&mut child, pid);
+        *control
+            .pid
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+        return Err(error);
+    }
+    drop(store);
+    if let Err(error) = release_task_spawn_exec_gate(exec_gate) {
+        terminate_task_child_best_effort(&mut child, pid);
+        *control
+            .pid
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+        return Err(error).with_context(|| format!("release task {task_id}"));
+    }
+    let start = Instant::now();
+    drop(spawn_guard);
+    let result = run_supervised_spawned_task(
+        layout,
+        task_id,
+        job_id,
+        &command_display,
+        cwd,
+        timeout_seconds,
+        max_delivery_attempts,
+        redelivery_window_seconds,
+        control,
+        &mut child,
+        pid,
+        start,
+        stdout_path,
+        stderr_path,
+        result_path,
+    );
+    if result.is_err() {
+        terminate_task_child_best_effort(&mut child, pid);
+    }
+    *control
+        .pid
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+    result
+}
+
+fn finish_unspawned_cancelled_task(
+    layout: &FsLayout,
+    task_id: &str,
+    job_id: &str,
+    max_delivery_attempts: i64,
+    redelivery_window_seconds: i64,
+) -> Result<()> {
+    let now = current_epoch_seconds()?;
+    let mut store = Store::open(layout)?;
+    store.fail_job(
+        job_id,
+        "task cancelled",
+        now,
+        max_delivery_attempts,
+        redelivery_window_seconds,
+    )?;
+    store.finish_task(TaskFinishUpdate {
+        task_id,
+        status: "cancelled",
+        completed_at: now,
+        exit_code: None,
+        signal: None,
+        failure_reason: Some("task cancelled"),
+        stdout_log_path: Some(&format!("tasks/{task_id}/stdout.log")),
+        stderr_log_path: Some(&format!("tasks/{task_id}/stderr.log")),
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        stdout_truncated: false,
+        stderr_truncated: false,
+    })?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_supervised_spawned_task(
+    layout: &FsLayout,
+    task_id: &str,
+    job_id: &str,
+    command_display: &str,
+    cwd: &Path,
+    timeout_seconds: Option<i64>,
+    max_delivery_attempts: i64,
+    redelivery_window_seconds: i64,
+    control: &Arc<SupervisedTaskControl>,
+    child: &mut Child,
+    pid: u32,
+    start: Instant,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    result_path: PathBuf,
+) -> Result<()> {
+    let stdout = child
+        .stdout
+        .take()
+        .context("task child stdout was not piped")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("task child stderr was not piped")?;
+    set_fd_nonblocking(stdout.as_raw_fd(), true).context("set task stdout nonblocking")?;
+    set_fd_nonblocking(stderr.as_raw_fd(), true).context("set task stderr nonblocking")?;
+    let stdout_worker = spawn_task_stream_spool(stdout, stdout_path);
+    let stderr_worker = spawn_task_stream_spool(stderr, stderr_path);
+    let timeout = timeout_seconds
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .map(Duration::from_secs);
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let mut termination_started_at: Option<Instant> = None;
+    let mut sent_kill = false;
+    loop {
+        match child_status_without_reaping(pid).context("poll task child without reaping")? {
+            ChildStatusWithoutReaping::Exited => {
+                let exit_observed_at = Instant::now();
+                if supervised_task_cancel_requested_by(control, exit_observed_at) {
+                    cancelled = true;
+                }
+                break;
+            }
+            ChildStatusWithoutReaping::Running => {}
+            ChildStatusWithoutReaping::NotWaitable => {
+                bail!("task child is no longer waitable before completion");
+            }
+        }
+        if termination_started_at.is_none() && control.cancel_requested.load(Ordering::Acquire) {
+            cancelled = true;
+            signal_process_group(pid, libc::SIGTERM);
+            termination_started_at = Some(Instant::now());
+        }
+        if termination_started_at.is_none()
+            && timeout.is_some_and(|timeout| start.elapsed() >= timeout)
+        {
+            timed_out = true;
+            signal_process_group(pid, libc::SIGTERM);
+            termination_started_at = Some(Instant::now());
+        }
+        if let Some(started_at) = termination_started_at
+            && !sent_kill
+            && started_at.elapsed() >= TASK_TERM_GRACE
+        {
+            signal_process_group(pid, libc::SIGKILL);
+            sent_kill = true;
+        }
+        thread::sleep(task_wait_poll_sleep_duration(
+            start,
+            timeout,
+            Instant::now(),
+            termination_started_at.is_some(),
+        ));
+    }
+    let (stdout_capture, stderr_capture) = join_task_stream_spools_with_control(
+        stdout_worker,
+        stderr_worker,
+        pid,
+        control,
+        start,
+        timeout,
+        &mut cancelled,
+        &mut timed_out,
+    )?;
+    wait_process_group_exit_with_control(
+        pid,
+        control,
+        start,
+        timeout,
+        &mut cancelled,
+        &mut timed_out,
+    )?;
+    let status = match child.wait().context("wait task child") {
+        Ok(status) => status,
+        Err(error) => {
+            *control
+                .pid
+                .lock()
+                .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+            return Err(error);
+        }
+    };
+    *control
+        .pid
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+    let completed_at = current_epoch_seconds()?;
+    let exit_code = status.code().map(i64::from);
+    let signal = status.signal().map(i64::from);
+    let task_status = task_status_for_exit(status, cancelled, timed_out);
+    let failure_reason = task_failure_reason(task_status, exit_code, signal);
+    let delivery_summary = build_task_delivery_summary(TaskDeliverySummaryInput {
+        task_status,
+        command: command_display,
+        cwd,
+        exit_code,
+        signal,
+        stdout: &stdout_capture,
+        stderr: &stderr_capture,
+    });
+    write_task_result_file(
+        &result_path,
+        task_id,
+        job_id,
+        command_display,
+        cwd,
+        task_status,
+        exit_code,
+        signal,
+        &stdout_capture,
+        &stderr_capture,
+    )?;
+    close_task_job_with_result(
+        layout,
+        job_id,
+        &result_path,
+        task_status,
+        &delivery_summary,
+        completed_at,
+        max_delivery_attempts,
+        redelivery_window_seconds,
+    )?;
+    Store::open(layout)?.finish_task(TaskFinishUpdate {
+        task_id,
+        status: task_status,
+        completed_at,
+        exit_code,
+        signal,
+        failure_reason: failure_reason.as_deref(),
+        stdout_log_path: Some(&format!("tasks/{task_id}/stdout.log")),
+        stderr_log_path: Some(&format!("tasks/{task_id}/stderr.log")),
+        stdout_bytes: i64::try_from(stdout_capture.bytes_seen).unwrap_or(i64::MAX),
+        stderr_bytes: i64::try_from(stderr_capture.bytes_seen).unwrap_or(i64::MAX),
+        stdout_truncated: stdout_capture.truncated,
+        stderr_truncated: stderr_capture.truncated,
+    })?;
+    Ok(())
+}
+
+fn task_command_display(command: &[Vec<u8>]) -> String {
+    let mut rendered = command
+        .iter()
+        .map(|arg| format!("{:?}", OsStr::from_bytes(arg)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_string_bytes(&mut rendered, TASK_PROMPT_COMMAND_PREVIEW_BYTES);
+    rendered
+}
+
+fn terminate_task_child(child: &mut Child, pid: u32) -> Result<()> {
+    signal_process_group(pid, libc::SIGTERM);
+    let deadline = Instant::now() + TASK_TERM_GRACE;
+    while Instant::now() < deadline {
+        if task_process_group_is_gone(child, pid)? {
+            return Ok(());
+        }
+        thread::sleep(TASK_WAIT_POLL_INTERVAL);
+    }
+    signal_process_group(pid, libc::SIGKILL);
+    let kill_deadline = Instant::now() + TASK_STREAM_DRAIN_HARD_GRACE + Duration::from_secs(1);
+    while Instant::now() < kill_deadline {
+        if task_process_group_is_gone(child, pid)? {
+            return Ok(());
+        }
+        thread::sleep(TASK_WAIT_POLL_INTERVAL);
+    }
+    bail!("task process group did not stop after SIGKILL")
+}
+
+fn terminate_task_child_best_effort(child: &mut Child, pid: u32) {
+    let _ = terminate_task_child(child, pid);
+    let _ = child.wait();
+}
+
+fn task_process_group_is_gone(child: &mut Child, pid: u32) -> Result<bool> {
+    let leader_exited = child
+        .try_wait()
+        .context("poll terminating task child")?
+        .is_some();
+    if !leader_exited {
+        return Ok(false);
+    }
+    Ok(!process_group_has_live_members_after_leader_exit(pid))
+}
+
+struct TaskStreamCapture {
+    bytes_seen: u64,
+    truncated: bool,
+    tail: Vec<u8>,
+}
+
+struct TaskStreamWorker {
+    handle: thread::JoinHandle<Result<TaskStreamCapture>>,
+    abort: Arc<AtomicBool>,
+}
+
+fn spawn_task_stream_spool<R>(reader: R, path: PathBuf) -> TaskStreamWorker
+where
+    R: Read + Send + 'static,
+{
+    spawn_task_stream_spool_with_limits(
+        reader,
+        path,
+        TASK_STREAM_SPOOL_MAX_BYTES,
+        TASK_STREAM_TAIL_BYTES,
+    )
+}
+
+fn spawn_task_stream_spool_with_limits<R>(
+    mut reader: R,
+    path: PathBuf,
+    spool_max_bytes: u64,
+    tail_bytes: usize,
+) -> TaskStreamWorker
+where
+    R: Read + Send + 'static,
+{
+    let abort = Arc::new(AtomicBool::new(false));
+    let worker_abort = abort.clone();
+    let handle = thread::spawn(move || {
+        let mut file = create_private_file(&path)?;
+        let mut tail = VecDeque::new();
+        let mut bytes_seen = 0_u64;
+        let mut truncated = false;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            if worker_abort.load(Ordering::Acquire) {
+                truncated = true;
+                break;
+            }
+            let read = match reader.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(READ_POLL_INTERVAL);
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("read task stream {}", path.display()));
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            bytes_seen = bytes_seen.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            let remaining = spool_max_bytes.saturating_sub(file.metadata()?.len());
+            if remaining > 0 {
+                let write_len = read.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                file.write_all(&buffer[..write_len])
+                    .with_context(|| format!("write task stream {}", path.display()))?;
+                if write_len < read {
+                    truncated = true;
+                }
+            } else {
+                truncated = true;
+            }
+            for byte in &buffer[..read] {
+                if tail.len() == tail_bytes {
+                    tail.pop_front();
+                }
+                if tail_bytes > 0 {
+                    tail.push_back(*byte);
+                }
+            }
+        }
+        if !worker_abort.load(Ordering::Acquire) {
+            file.sync_all()
+                .with_context(|| format!("sync task stream {}", path.display()))?;
+            if let Some(parent) = path.parent() {
+                sync_dir(parent)?;
+            }
+        }
+        Ok(TaskStreamCapture {
+            bytes_seen,
+            truncated,
+            tail: tail.into_iter().collect(),
+        })
+    });
+    TaskStreamWorker { handle, abort }
+}
+
+fn join_task_stream_spool(worker: TaskStreamWorker) -> Result<TaskStreamCapture> {
+    worker
+        .handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("task stream worker panicked"))?
+}
+
+fn wait_process_group_exit_with_control(
+    pid: u32,
+    control: &SupervisedTaskControl,
+    start: Instant,
+    timeout: Option<Duration>,
+    cancelled: &mut bool,
+    timed_out: &mut bool,
+) -> Result<()> {
+    let mut termination_started_at = None;
+    let mut sent_kill = false;
+    loop {
+        if !process_group_has_live_members_after_leader_exit(pid) {
+            return Ok(());
+        }
+        if termination_started_at.is_none() && control.cancel_requested.load(Ordering::Acquire) {
+            *cancelled = true;
+            signal_process_group(pid, libc::SIGTERM);
+            termination_started_at = Some(Instant::now());
+        }
+        if termination_started_at.is_none()
+            && timeout.is_some_and(|timeout| start.elapsed() >= timeout)
+        {
+            *timed_out = true;
+            signal_process_group(pid, libc::SIGTERM);
+            termination_started_at = Some(Instant::now());
+        }
+        if let Some(started_at) = termination_started_at
+            && !sent_kill
+            && started_at.elapsed() >= TASK_TERM_GRACE
+        {
+            signal_process_group(pid, libc::SIGKILL);
+            sent_kill = true;
+        }
+        if sent_kill
+            && termination_started_at.is_some_and(|started_at| {
+                started_at.elapsed() >= TASK_TERM_GRACE + TASK_STREAM_DRAIN_HARD_GRACE
+            })
+            && process_group_has_live_members_after_leader_exit(pid)
+        {
+            bail!("task process group did not stop after SIGKILL");
+        }
+        thread::sleep(TASK_WAIT_POLL_INTERVAL);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn join_task_stream_spools_with_control(
+    stdout_worker: TaskStreamWorker,
+    stderr_worker: TaskStreamWorker,
+    pid: u32,
+    control: &SupervisedTaskControl,
+    start: Instant,
+    timeout: Option<Duration>,
+    cancelled: &mut bool,
+    timed_out: &mut bool,
+) -> Result<(TaskStreamCapture, TaskStreamCapture)> {
+    let mut termination_started_at = None;
+    let mut sent_kill = false;
+    let mut stream_abort_started_at = None;
+    let mut process_group_gone_at = None;
+    loop {
+        if stdout_worker.handle.is_finished() && stderr_worker.handle.is_finished() {
+            break;
+        }
+        let process_group_alive = process_group_has_live_members_after_leader_exit(pid);
+        if process_group_alive {
+            process_group_gone_at = None;
+        } else if process_group_gone_at.is_none() {
+            process_group_gone_at = Some(Instant::now());
+        }
+        if termination_started_at.is_none()
+            && process_group_alive
+            && control.cancel_requested.load(Ordering::Acquire)
+        {
+            *cancelled = true;
+            signal_process_group(pid, libc::SIGTERM);
+            termination_started_at = Some(Instant::now());
+        }
+        if termination_started_at.is_none()
+            && process_group_alive
+            && timeout.is_some_and(|timeout| start.elapsed() >= timeout)
+        {
+            *timed_out = true;
+            signal_process_group(pid, libc::SIGTERM);
+            termination_started_at = Some(Instant::now());
+        }
+        if termination_started_at.is_none()
+            && !process_group_alive
+            && stream_abort_started_at.is_none()
+            && (control.cancel_requested.load(Ordering::Acquire)
+                || timeout.is_some_and(|timeout| start.elapsed() >= timeout)
+                || process_group_gone_at
+                    .is_some_and(|gone_at| gone_at.elapsed() >= TASK_STREAM_DRAIN_HARD_GRACE))
+        {
+            stdout_worker.abort.store(true, Ordering::Release);
+            stderr_worker.abort.store(true, Ordering::Release);
+            stream_abort_started_at = Some(Instant::now());
+        }
+        if let Some(started_at) = termination_started_at
+            && !sent_kill
+            && started_at.elapsed() >= TASK_TERM_GRACE
+        {
+            signal_process_group(pid, libc::SIGKILL);
+            sent_kill = true;
+        }
+        if sent_kill
+            && stream_abort_started_at.is_none()
+            && termination_started_at.is_some_and(|started_at| {
+                started_at.elapsed() >= TASK_TERM_GRACE + TASK_STREAM_DRAIN_HARD_GRACE
+            })
+        {
+            stdout_worker.abort.store(true, Ordering::Release);
+            stderr_worker.abort.store(true, Ordering::Release);
+            stream_abort_started_at = Some(Instant::now());
+        }
+        thread::sleep(TASK_WAIT_POLL_INTERVAL);
+    }
+
+    Ok((
+        join_task_stream_spool(stdout_worker)?,
+        join_task_stream_spool(stderr_worker)?,
+    ))
+}
+
+fn task_status_for_exit(status: ExitStatus, cancelled: bool, timed_out: bool) -> &'static str {
+    if cancelled {
+        "cancelled"
+    } else if timed_out {
+        "timed_out"
+    } else if status.success() {
+        "succeeded"
+    } else {
+        "failed"
+    }
+}
+
+fn task_failure_reason(
+    task_status: &str,
+    exit_code: Option<i64>,
+    signal: Option<i64>,
+) -> Option<String> {
+    match task_status {
+        "succeeded" => None,
+        "cancelled" => Some("task cancelled".to_owned()),
+        "timed_out" => Some("task timed out".to_owned()),
+        "failed" => Some(match (exit_code, signal) {
+            (Some(code), _) => format!("task exited with status {code}"),
+            (_, Some(signal)) => format!("task terminated by signal {signal}"),
+            _ => "task failed".to_owned(),
+        }),
+        other => Some(format!("task ended with status {other}")),
+    }
+}
+
+struct TaskDeliverySummaryInput<'a> {
+    task_status: &'a str,
+    command: &'a str,
+    cwd: &'a Path,
+    exit_code: Option<i64>,
+    signal: Option<i64>,
+    stdout: &'a TaskStreamCapture,
+    stderr: &'a TaskStreamCapture,
+}
+
+fn build_task_delivery_summary(input: TaskDeliverySummaryInput<'_>) -> String {
+    let stdout_tail = task_tail_preview(&input.stdout.tail);
+    let stderr_tail = task_tail_preview(&input.stderr.tail);
+    format!(
+        "Background task {status}.\n\
+         Command: {command}\n\
+         Cwd: {cwd}\n\
+         Exit code: {exit_code:?}\n\
+         Signal: {signal:?}\n\
+         stdout bytes: {stdout_bytes} (truncated: {stdout_truncated})\n\
+         stderr bytes: {stderr_bytes} (truncated: {stderr_truncated})\n\
+         stdout tail preview:\n{stdout_tail}\n\
+         stderr tail preview:\n{stderr_tail}",
+        status = input.task_status,
+        command = input.command,
+        cwd = input.cwd.display(),
+        exit_code = input.exit_code,
+        signal = input.signal,
+        stdout_bytes = input.stdout.bytes_seen,
+        stdout_truncated = input.stdout.truncated,
+        stderr_bytes = input.stderr.bytes_seen,
+        stderr_truncated = input.stderr.truncated,
+    )
+}
+
+fn task_tail_preview(tail: &[u8]) -> String {
+    let start = tail.len().saturating_sub(TASK_PROMPT_TAIL_PREVIEW_BYTES);
+    String::from_utf8_lossy(&tail[start..]).into_owned()
+}
+
+fn truncate_string_bytes(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value.truncate(end);
+    value.push_str("...");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_task_result_file(
+    path: &Path,
+    task_id: &str,
+    job_id: &str,
+    command: &str,
+    cwd: &Path,
+    task_status: &str,
+    exit_code: Option<i64>,
+    signal: Option<i64>,
+    stdout: &TaskStreamCapture,
+    stderr: &TaskStreamCapture,
+) -> Result<()> {
+    let mut file = create_private_file(path)?;
+    writeln!(file, "task_id: {task_id}")?;
+    writeln!(file, "job_id: {job_id}")?;
+    writeln!(file, "command: {command}")?;
+    writeln!(file, "cwd: {}", cwd.display())?;
+    writeln!(file, "status: {task_status}")?;
+    writeln!(file, "exit_code: {:?}", exit_code)?;
+    writeln!(file, "signal: {:?}", signal)?;
+    writeln!(file, "stdout_bytes: {}", stdout.bytes_seen)?;
+    writeln!(file, "stdout_truncated: {}", stdout.truncated)?;
+    writeln!(file, "stderr_bytes: {}", stderr.bytes_seen)?;
+    writeln!(file, "stderr_truncated: {}", stderr.truncated)?;
+    writeln!(file, "\n--- stdout tail ---")?;
+    file.write_all(&stdout.tail)?;
+    writeln!(file, "\n--- stderr tail ---")?;
+    file.write_all(&stderr.tail)?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn close_task_job_with_result(
+    layout: &FsLayout,
+    job_id: &str,
+    result_path: &Path,
+    task_status: &str,
+    delivery_summary: &str,
+    now: i64,
+    max_delivery_attempts: i64,
+    redelivery_window_seconds: i64,
+) -> Result<()> {
+    let artifact_id = new_id();
+    let mut store = Store::open(layout)?;
+    store.begin_artifact_ingest(job_id, &artifact_id, now)?;
+    let ingested = ingest_result_file(layout, &artifact_id, job_id, result_path, now)?;
+    let redelivery_window_seconds =
+        clamp_redelivery_window_seconds_for_timestamp(now, redelivery_window_seconds);
+    let result = if task_status == "succeeded" {
+        store.complete_job(
+            ingested.record,
+            Some(delivery_summary.to_owned()),
+            now,
+            max_delivery_attempts,
+            redelivery_window_seconds,
+        )
+    } else {
+        store.fail_job_with_artifact(
+            ingested.record,
+            delivery_summary,
+            now,
+            max_delivery_attempts,
+            redelivery_window_seconds,
+        )
+    };
+    match result {
+        Ok(_) => {
+            remove_ingest_marker_best_effort(&ingested.artifact_dir);
+            Ok(())
+        }
+        Err(error) => {
+            if crate::fs_layout::remove_dir_all_durable(&ingested.artifact_dir).is_ok() {
+                let _ = store.abandon_artifact_ingest(&artifact_id);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn clamp_redelivery_window_seconds_for_timestamp(now: i64, redelivery_window_seconds: i64) -> i64 {
+    redelivery_window_seconds.min(i64::MAX.saturating_sub(now))
 }
 
 fn reserve_cli_app_server(
@@ -1957,6 +3256,13 @@ fn has_active_cli_thread_start_bootstraps(state: &DaemonState) -> bool {
         .is_ok_and(|bootstraps| !bootstraps.is_empty())
 }
 
+fn has_active_supervised_tasks(state: &DaemonState) -> bool {
+    state
+        .supervised_tasks
+        .lock()
+        .is_ok_and(|tasks| !tasks.is_empty())
+}
+
 fn reap_expired_cli_app_servers(state: &DaemonState) {
     let Ok(servers) = state.cli_app_servers.lock() else {
         return;
@@ -2162,6 +3468,165 @@ fn signal_process_group(pid: u32, signal: libc::c_int) {
     let _ = unsafe { libc::killpg(pgid, signal) };
 }
 
+fn process_group_exists(pid: u32) -> bool {
+    let pgid = pid as libc::pid_t;
+    if unsafe { libc::killpg(pgid, 0) } == 0 {
+        return true;
+    }
+    !matches!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
+}
+
+fn process_group_has_live_members_after_leader_exit(leader_pid: u32) -> bool {
+    match process_group_has_live_members_except_leader(leader_pid) {
+        Ok(has_live_members) => has_live_members,
+        Err(_) => process_group_exists(leader_pid),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_has_live_members_except_leader(leader_pid: u32) -> Result<bool> {
+    let pgid = leader_pid;
+    for entry in fs::read_dir("/proc").context("read /proc")? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Ok(member_pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if member_pid == leader_pid {
+            continue;
+        }
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(_) => continue,
+        };
+        let Some((state, member_pgid)) = linux_stat_state_and_pgrp(&stat) else {
+            continue;
+        };
+        if member_pgid == pgid && state != 'Z' {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_stat_state_and_pgrp(stat: &str) -> Option<(char, u32)> {
+    let (_, suffix) = stat.rsplit_once(") ")?;
+    let mut fields = suffix.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let _ppid = fields.next()?;
+    let pgrp = fields.next()?.parse::<u32>().ok()?;
+    Some((state, pgrp))
+}
+
+#[cfg(target_os = "macos")]
+fn process_group_has_live_members_except_leader(leader_pid: u32) -> Result<bool> {
+    let mut pids = vec![0 as libc::pid_t; 4096];
+    let buffer_bytes = pids
+        .len()
+        .checked_mul(mem::size_of::<libc::pid_t>())
+        .context("process group pid buffer size overflow")?;
+    let result = unsafe {
+        libc::proc_listpgrppids(
+            leader_pid as libc::pid_t,
+            pids.as_mut_ptr().cast(),
+            buffer_bytes as libc::c_int,
+        )
+    };
+    if result <= 0 {
+        return Ok(false);
+    }
+    let result = usize::try_from(result).unwrap_or(0);
+    let count = if result <= pids.len() {
+        result
+    } else {
+        result / mem::size_of::<libc::pid_t>()
+    }
+    .min(pids.len());
+    for member_pid in pids.into_iter().take(count) {
+        if member_pid <= 0 || member_pid as u32 == leader_pid {
+            continue;
+        }
+        let Some(info) = macos_process_bsd_info(member_pid as u32)? else {
+            continue;
+        };
+        if info.pbi_pgid == leader_pid && info.pbi_status != libc::SZOMB {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_bsd_info(pid: u32) -> Result<Option<libc::proc_bsdinfo>> {
+    let mut info = mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+        )
+    };
+    if result <= 0 {
+        return Ok(None);
+    }
+    if usize::try_from(result).unwrap_or(0) < mem::size_of::<libc::proc_bsdinfo>() {
+        bail!("short proc_pidinfo response for pid {pid}");
+    }
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != pid {
+        return Ok(None);
+    }
+    Ok(Some(info))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_group_has_live_members_except_leader(_leader_pid: u32) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_identity(pid: u32) -> Result<Option<String>> {
+    let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let stat = match fs::read_to_string(&stat_path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", stat_path.display())),
+    };
+    let (_, suffix) = stat
+        .rsplit_once(") ")
+        .with_context(|| format!("parse {}", stat_path.display()))?;
+    let start_ticks = suffix
+        .split_whitespace()
+        .nth(19)
+        .with_context(|| format!("read process start ticks from {}", stat_path.display()))?;
+    Ok(Some(format!("linux:{start_ticks}")))
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_identity(pid: u32) -> Result<Option<String>> {
+    let Some(info) = macos_process_bsd_info(pid)? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "macos:{}:{}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    )))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_identity(_pid: u32) -> Result<Option<String>> {
+    Ok(None)
+}
+
 fn wait_child_until(child: &mut Child, deadline: Instant) -> bool {
     loop {
         match child.try_wait() {
@@ -2197,6 +3662,29 @@ fn validate_daemon_nonempty_bytes(name: &str, value: &[u8]) -> Result<()> {
 fn validate_daemon_positive(name: &str, value: i64) -> Result<()> {
     if value <= 0 {
         bail!("{name} must be positive");
+    }
+    Ok(())
+}
+
+fn validate_task_environment(environment: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+    if environment.len() > MAX_TASK_ENV_VARS {
+        bail!("task environment exceeds {MAX_TASK_ENV_VARS} variables");
+    }
+    let mut total_bytes = 0usize;
+    for (key, value) in environment {
+        if key.is_empty() {
+            bail!("task environment contains an empty key");
+        }
+        if key.contains(&b'=') || key.contains(&0) || value.contains(&0) {
+            bail!("task environment contains an invalid key or value");
+        }
+        total_bytes = total_bytes
+            .checked_add(key.len())
+            .and_then(|total| total.checked_add(value.len()))
+            .ok_or_else(|| anyhow::anyhow!("task environment byte count overflow"))?;
+        if total_bytes > MAX_TASK_ENV_BYTES {
+            bail!("task environment exceeds {MAX_TASK_ENV_BYTES} bytes");
+        }
     }
     Ok(())
 }
@@ -2495,6 +3983,7 @@ mod tests {
                 cli_app_servers: Mutex::new(HashMap::new()),
                 cli_app_server_reservations: Mutex::new(HashMap::new()),
                 cli_thread_start_bootstraps: Mutex::new(HashMap::new()),
+                supervised_tasks: Arc::new(Mutex::new(HashMap::new())),
             },
         )
     }
@@ -2876,6 +4365,20 @@ mod tests {
     }
 
     #[test]
+    fn daemon_request_bytes_rejects_encoded_oversized_payload() {
+        let payload = json!({
+            "environment": [(vec![b'x'; MAX_REQUEST_BYTES / 2], Vec::<u8>::new())],
+        });
+        let error = daemon_request_bytes("task_run", payload)
+            .expect_err("oversized request should fail")
+            .to_string();
+        assert!(
+            error.contains("daemon request is too large after JSON encoding"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn app_server_listener_parser_waits_for_complete_line() {
         assert_eq!(
             parse_app_server_listener_url(b"  listening on: ws://127.0.0.1:"),
@@ -2910,5 +4413,778 @@ mod tests {
             "drain worker did not observe stop flag"
         );
         worker.join().expect("join drain worker");
+    }
+
+    #[test]
+    fn task_wait_poll_sleep_caps_at_timeout_deadline() {
+        let start = Instant::now();
+        assert_eq!(
+            task_wait_poll_sleep_duration(
+                start,
+                Some(Duration::from_secs(1)),
+                start + Duration::from_millis(950),
+                false,
+            ),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            task_wait_poll_sleep_duration(
+                start,
+                Some(Duration::from_secs(1)),
+                start + Duration::from_millis(1001),
+                false,
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(
+            task_wait_poll_sleep_duration(
+                start,
+                Some(Duration::from_secs(1)),
+                start + Duration::from_millis(1001),
+                true,
+            ),
+            TASK_WAIT_POLL_INTERVAL
+        );
+        assert_eq!(
+            task_wait_poll_sleep_duration(start, None, start + Duration::from_secs(2), false),
+            TASK_WAIT_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn task_stream_spool_enforces_file_cap_and_tail_bound() {
+        let home = tempfile::tempdir().expect("temp home");
+        let path = home.path().join("stdout.log");
+        let worker = spawn_task_stream_spool_with_limits(
+            io::Cursor::new(b"abcdef".to_vec()),
+            path.clone(),
+            3,
+            4,
+        );
+
+        let capture = join_task_stream_spool(worker).expect("join spool worker");
+        assert_eq!(capture.bytes_seen, 6);
+        assert!(capture.truncated);
+        assert_eq!(capture.tail, b"cdef");
+        assert_eq!(fs::read(&path).expect("spool file"), b"abc");
+    }
+
+    #[test]
+    fn task_stream_spool_abort_stops_held_nonblocking_pipe() {
+        let home = tempfile::tempdir().expect("temp home");
+        let path = home.path().join("stdout.log");
+        let (reader, mut writer) = UnixStream::pair().expect("stream pair");
+        set_fd_nonblocking(reader.as_raw_fd(), true).expect("set nonblocking");
+        writer.write_all(b"ready").expect("write stream");
+
+        let worker = spawn_task_stream_spool_with_limits(reader, path.clone(), 1024, 16);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !worker.handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(READ_POLL_INTERVAL);
+        }
+        assert!(
+            !worker.handle.is_finished(),
+            "worker should stay alive while writer holds the stream open"
+        );
+
+        worker.abort.store(true, Ordering::Release);
+        let capture = join_task_stream_spool(worker).expect("join aborted spool");
+        assert!(capture.truncated);
+        assert_eq!(fs::read(&path).expect("spool file"), b"ready");
+        drop(writer);
+    }
+
+    #[test]
+    fn cancelled_before_spawn_does_not_execute_command() {
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let marker = home.path().join("pre-spawn-cancel-marker");
+        {
+            let mut store = Store::open(&layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-pre-spawn-cancel".to_owned(),
+                        source_thread_id: "thread-pre-spawn-cancel".to_owned(),
+                        summary: "pre spawn cancel".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-pre-spawn-cancel".to_owned(),
+                        job_id: "job-pre-spawn-cancel".to_owned(),
+                        source_thread_id: "thread-pre-spawn-cancel".to_owned(),
+                        summary: "pre spawn cancel".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+            store
+                .request_task_cancel("task-pre-spawn-cancel", 11)
+                .expect("request cancel");
+        }
+        let control = Arc::new(SupervisedTaskControl::default());
+        request_supervised_task_cancel(&control);
+        let command = vec![
+            b"/bin/sh".to_vec(),
+            b"-c".to_vec(),
+            format!("printf ran > '{}'", marker.display()).into_bytes(),
+        ];
+
+        run_supervised_task_worker_inner(
+            &layout,
+            "task-pre-spawn-cancel",
+            "job-pre-spawn-cancel",
+            command,
+            Vec::new(),
+            home.path(),
+            None,
+            3,
+            60,
+            &control,
+        )
+        .expect("cancel before spawn");
+
+        assert!(!marker.exists(), "cancelled task command was executed");
+        let store = Store::open(&layout).expect("store");
+        let task = store
+            .inspect_task("task-pre-spawn-cancel")
+            .expect("inspect task");
+        assert_eq!(task.status, "cancelled");
+        assert_eq!(task.pid, None);
+        let job = store.inspect_job("job-pre-spawn-cancel").expect("job");
+        assert_eq!(job.status, "failed");
+    }
+
+    #[test]
+    fn startup_recovery_skips_process_group_when_pid_identity_mismatches() {
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        {
+            let mut store = Store::open(&layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-pid-identity-mismatch".to_owned(),
+                        source_thread_id: "thread-pid-identity-mismatch".to_owned(),
+                        summary: "pid identity mismatch".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-pid-identity-mismatch".to_owned(),
+                        job_id: "job-pid-identity-mismatch".to_owned(),
+                        source_thread_id: "thread-pid-identity-mismatch".to_owned(),
+                        summary: "pid identity mismatch".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+            store
+                .mark_task_started(
+                    "task-pid-identity-mismatch",
+                    i64::from(pid),
+                    Some("not-the-current-process"),
+                    11,
+                )
+                .expect("mark task started");
+        }
+
+        recover_lost_task_process_groups(&layout).expect("recover lost tasks");
+
+        assert!(
+            process_group_exists(pid),
+            "identity mismatch should not kill this process group"
+        );
+        terminate_task_child_best_effort(&mut child, pid);
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn startup_recovery_kills_group_after_leader_exits_on_term() {
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "trap 'exit 0' TERM; /bin/sh -c 'trap \"\" TERM; while true; do sleep 1; done' & wait",
+            )
+            .process_group(0)
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("process identity available");
+        {
+            let mut store = Store::open(&layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-leader-exits-on-term".to_owned(),
+                        source_thread_id: "thread-leader-exits-on-term".to_owned(),
+                        summary: "leader exits on term".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-leader-exits-on-term".to_owned(),
+                        job_id: "job-leader-exits-on-term".to_owned(),
+                        source_thread_id: "thread-leader-exits-on-term".to_owned(),
+                        summary: "leader exits on term".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+            store
+                .mark_task_started(
+                    "task-leader-exits-on-term",
+                    i64::from(pid),
+                    Some(&pid_identity),
+                    11,
+                )
+                .expect("mark task started");
+        }
+
+        recover_lost_task_process_groups(&layout).expect("recover lost tasks");
+
+        let _ = child.wait();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_group_exists(pid) && Instant::now() < deadline {
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
+        assert!(
+            !process_group_exists(pid),
+            "startup recovery should kill surviving same-group descendants"
+        );
+    }
+
+    #[test]
+    fn startup_recovery_kills_group_when_leader_already_exited() {
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let release_path = home.path().join("release-leader");
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "while [ ! -f '{}' ]; do sleep 0.01; done; /bin/sh -c 'trap \"\" TERM; while true; do sleep 1; done' & exit 0",
+                release_path.display()
+            ))
+            .process_group(0)
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("process identity available");
+        {
+            let mut store = Store::open(&layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-leader-already-exited".to_owned(),
+                        source_thread_id: "thread-leader-already-exited".to_owned(),
+                        summary: "leader already exited".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-leader-already-exited".to_owned(),
+                        job_id: "job-leader-already-exited".to_owned(),
+                        source_thread_id: "thread-leader-already-exited".to_owned(),
+                        summary: "leader already exited".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+            store
+                .mark_task_started(
+                    "task-leader-already-exited",
+                    i64::from(pid),
+                    Some(&pid_identity),
+                    11,
+                )
+                .expect("mark task started");
+        }
+
+        fs::write(&release_path, b"go").expect("release leader");
+        let _ = child.wait();
+        let live_deadline = Instant::now() + Duration::from_secs(2);
+        while !process_group_has_live_members_after_leader_exit(pid)
+            && Instant::now() < live_deadline
+        {
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
+        assert!(
+            process_group_has_live_members_after_leader_exit(pid),
+            "background member should keep the original process group alive"
+        );
+
+        recover_lost_task_process_groups(&layout).expect("recover lost tasks");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_group_exists(pid) && Instant::now() < deadline {
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
+        let recovered = !process_group_exists(pid);
+        if !recovered {
+            signal_process_group(pid, libc::SIGKILL);
+        }
+        assert!(
+            recovered,
+            "startup recovery should kill a surviving group whose leader already exited"
+        );
+    }
+
+    #[test]
+    fn task_setup_store_lock_fails_closed_without_long_unmonitored_run() {
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        {
+            let mut store = Store::open(&layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-setup-lock".to_owned(),
+                        source_thread_id: "thread-setup-lock".to_owned(),
+                        summary: "setup lock".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-setup-lock".to_owned(),
+                        job_id: "job-setup-lock".to_owned(),
+                        source_thread_id: "thread-setup-lock".to_owned(),
+                        summary: "setup lock".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: Some(1),
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+        }
+        let lock = Connection::open(layout.db_path()).expect("lock connection");
+        lock.execute_batch("BEGIN EXCLUSIVE")
+            .expect("hold exclusive lock");
+        let marker = home.path().join("setup-lock-escaped");
+        let marker_arg = marker.to_string_lossy().into_owned();
+        let control = Arc::new(SupervisedTaskControl::default());
+        let task_registry = Arc::new(Mutex::new(HashMap::from([(
+            "task-setup-lock".to_owned(),
+            Arc::clone(&control),
+        )])));
+        let worker_registry = Arc::clone(&task_registry);
+        let worker_layout = layout.clone();
+        let worker_cwd = home.path().to_path_buf();
+        let started = Instant::now();
+
+        let worker = thread::spawn(move || {
+            run_supervised_task_worker(
+                worker_layout,
+                "task-setup-lock".to_owned(),
+                "job-setup-lock".to_owned(),
+                vec![
+                    b"/bin/sh".to_vec(),
+                    b"-c".to_vec(),
+                    b"sleep 1; printf escaped > \"$1\"".to_vec(),
+                    b"cbth-task".to_vec(),
+                    marker_arg.into_bytes(),
+                ],
+                Vec::new(),
+                worker_cwd,
+                Some(1),
+                3,
+                60,
+                control,
+                worker_registry,
+            );
+        });
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            task_registry
+                .lock()
+                .expect("task registry")
+                .contains_key("task-setup-lock"),
+            "worker must retain ownership until it writes a terminal task state"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "started update should not leave the task unmonitored for the default SQLite busy timeout"
+        );
+        drop(lock);
+        worker.join().expect("worker joins");
+        assert!(
+            !task_registry
+                .lock()
+                .expect("task registry")
+                .contains_key("task-setup-lock"),
+            "worker should release ownership after terminalizing the task"
+        );
+        let store = Store::open(&layout).expect("store");
+        let task = store.inspect_task("task-setup-lock").expect("task");
+        assert_eq!(task.status, "failed");
+        let job = store.inspect_job("job-setup-lock").expect("job");
+        assert_eq!(job.status, "failed");
+        thread::sleep(Duration::from_secs(2));
+        assert!(
+            !marker.exists(),
+            "task process escaped after started update failed"
+        );
+    }
+
+    #[test]
+    fn task_cancel_records_durable_cancel_before_spawn() {
+        let (home, state) = test_state();
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-cancel-before-spawn-race".to_owned(),
+                        source_thread_id: "thread-cancel-before-spawn-race".to_owned(),
+                        summary: "cancel before spawn race".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-cancel-before-spawn-race".to_owned(),
+                        job_id: "job-cancel-before-spawn-race".to_owned(),
+                        source_thread_id: "thread-cancel-before-spawn-race".to_owned(),
+                        summary: "cancel before spawn race".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+        }
+        let control = Arc::new(SupervisedTaskControl::default());
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert(
+                "task-cancel-before-spawn-race".to_owned(),
+                Arc::clone(&control),
+            );
+        let state = Arc::new(state);
+        let cancelled = cancel_supervised_task(
+            &state,
+            TaskCancelPayload {
+                task_id: "task-cancel-before-spawn-race".to_owned(),
+            },
+        )
+        .expect("cancel task");
+        assert!(
+            cancelled.cancel_requested_at.is_some(),
+            "cancel should be durable before it is visible to the worker"
+        );
+        assert!(
+            control.cancel_requested.load(Ordering::Acquire),
+            "cancel flag should be visible after durable cancel is recorded"
+        );
+        let marker = home.path().join("cancel-before-spawn-race-escaped");
+        let marker_arg = marker.to_string_lossy().into_owned();
+        let worker_layout = state.layout.clone();
+        let worker_registry = Arc::clone(&state.supervised_tasks);
+        let worker_cwd = home.path().to_path_buf();
+        let worker_control = Arc::clone(&control);
+        let worker = thread::spawn(move || {
+            run_supervised_task_worker(
+                worker_layout,
+                "task-cancel-before-spawn-race".to_owned(),
+                "job-cancel-before-spawn-race".to_owned(),
+                vec![
+                    b"/bin/sh".to_vec(),
+                    b"-c".to_vec(),
+                    b"printf escaped > \"$1\"".to_vec(),
+                    b"cbth-task".to_vec(),
+                    marker_arg.into_bytes(),
+                ],
+                Vec::new(),
+                worker_cwd,
+                None,
+                3,
+                60,
+                worker_control,
+                worker_registry,
+            );
+        });
+
+        worker.join().expect("worker joins");
+        let store = Store::open(&state.layout).expect("store");
+        let task = store
+            .inspect_task("task-cancel-before-spawn-race")
+            .expect("task");
+        assert_eq!(task.status, "cancelled");
+        let job = store
+            .inspect_job("job-cancel-before-spawn-race")
+            .expect("job");
+        assert_eq!(job.status, "failed");
+        assert!(
+            !marker.exists(),
+            "pre-spawn cancelled task command should never run"
+        );
+    }
+
+    #[test]
+    fn terminate_task_child_kills_group_after_leader_exits_on_term() {
+        let home = tempfile::tempdir().expect("temp home");
+        let marker = home.path().join("terminate-child-escaped");
+        let marker_arg = marker.to_string_lossy().into_owned();
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "trap 'exit 0' TERM; /bin/sh -c 'trap \"\" TERM; sleep 30; printf escaped > \"$1\"' child \"$1\" & wait",
+            )
+            .arg("cbth-task")
+            .arg(&marker_arg)
+            .process_group(0)
+            .spawn()
+            .expect("spawn process group");
+        let pid = child.id();
+        thread::sleep(Duration::from_millis(100));
+
+        terminate_task_child_best_effort(&mut child, pid);
+
+        assert!(
+            !process_group_has_live_members_after_leader_exit(pid),
+            "terminating task child should clean surviving same-group descendants"
+        );
+        assert!(
+            !marker.exists(),
+            "surviving same-group descendant escaped task cleanup"
+        );
+    }
+
+    #[test]
+    fn late_cancel_during_stream_drain_does_not_override_gone_process_group() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("true")
+            .process_group(0)
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        child.wait().expect("wait child");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process_group_exists(pid) && Instant::now() < deadline {
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
+        assert!(!process_group_exists(pid), "process group should be gone");
+
+        let delayed_worker = || {
+            let abort = Arc::new(AtomicBool::new(false));
+            let handle = thread::spawn(|| {
+                thread::sleep(Duration::from_millis(50));
+                Ok(TaskStreamCapture {
+                    bytes_seen: 0,
+                    truncated: false,
+                    tail: Vec::new(),
+                })
+            });
+            TaskStreamWorker { handle, abort }
+        };
+        let control = SupervisedTaskControl::default();
+        request_supervised_task_cancel(&control);
+        let mut cancelled = false;
+        let mut timed_out = false;
+
+        let (stdout_capture, stderr_capture) = join_task_stream_spools_with_control(
+            delayed_worker(),
+            delayed_worker(),
+            pid,
+            &control,
+            Instant::now(),
+            Some(Duration::ZERO),
+            &mut cancelled,
+            &mut timed_out,
+        )
+        .expect("join stream workers");
+
+        assert!(!cancelled);
+        assert!(!timed_out);
+        assert!(!stdout_capture.truncated);
+        assert!(!stderr_capture.truncated);
+    }
+
+    #[test]
+    fn stream_drain_aborts_after_process_group_is_gone_without_cancel_or_timeout() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("true")
+            .process_group(0)
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        child.wait().expect("wait child");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process_group_exists(pid) && Instant::now() < deadline {
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
+        assert!(!process_group_exists(pid), "process group should be gone");
+
+        let blocking_worker = || {
+            let abort = Arc::new(AtomicBool::new(false));
+            let worker_abort = Arc::clone(&abort);
+            let handle = thread::spawn(move || {
+                while !worker_abort.load(Ordering::Acquire) {
+                    thread::sleep(READ_POLL_INTERVAL);
+                }
+                Ok(TaskStreamCapture {
+                    bytes_seen: 0,
+                    truncated: true,
+                    tail: Vec::new(),
+                })
+            });
+            TaskStreamWorker { handle, abort }
+        };
+        let control = SupervisedTaskControl::default();
+        let mut cancelled = false;
+        let mut timed_out = false;
+
+        let (stdout_capture, stderr_capture) = join_task_stream_spools_with_control(
+            blocking_worker(),
+            blocking_worker(),
+            pid,
+            &control,
+            Instant::now(),
+            None,
+            &mut cancelled,
+            &mut timed_out,
+        )
+        .expect("join stream workers");
+
+        assert!(!cancelled);
+        assert!(!timed_out);
+        assert!(stdout_capture.truncated);
+        assert!(stderr_capture.truncated);
+    }
+
+    #[test]
+    fn cancel_during_stream_drain_terminates_live_process_group() {
+        let leader_pid = unsafe { libc::fork() };
+        assert!(leader_pid >= 0, "fork leader failed");
+        if leader_pid == 0 {
+            unsafe {
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(2);
+                }
+                let member_pid = libc::fork();
+                if member_pid < 0 {
+                    libc::_exit(3);
+                }
+                if member_pid == 0 {
+                    loop {
+                        libc::sleep(30);
+                    }
+                }
+                libc::_exit(0);
+            }
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(leader_pid, &mut status, 0) };
+        assert_eq!(waited, leader_pid, "wait leader");
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "leader exited unsuccessfully"
+        );
+        let pid = u32::try_from(leader_pid).expect("leader pid");
+        assert!(process_group_exists(pid), "member should keep group alive");
+
+        let delayed_worker = || {
+            let abort = Arc::new(AtomicBool::new(false));
+            let handle = thread::spawn(|| {
+                thread::sleep(Duration::from_millis(50));
+                Ok(TaskStreamCapture {
+                    bytes_seen: 0,
+                    truncated: false,
+                    tail: Vec::new(),
+                })
+            });
+            TaskStreamWorker { handle, abort }
+        };
+        let control = SupervisedTaskControl::default();
+        request_supervised_task_cancel(&control);
+        let mut cancelled = false;
+        let mut timed_out = false;
+
+        let _captures = join_task_stream_spools_with_control(
+            delayed_worker(),
+            delayed_worker(),
+            pid,
+            &control,
+            Instant::now(),
+            None,
+            &mut cancelled,
+            &mut timed_out,
+        )
+        .expect("join stream workers");
+        wait_process_group_exit_with_control(
+            pid,
+            &control,
+            Instant::now(),
+            None,
+            &mut cancelled,
+            &mut timed_out,
+        )
+        .expect("wait process group");
+
+        assert!(cancelled);
+        assert!(!timed_out);
+        assert!(
+            !process_group_exists(pid),
+            "cancel should terminate live process group"
+        );
     }
 }

@@ -59,9 +59,18 @@ impl FsLayout {
         self.artifacts_dir().join(artifact_id)
     }
 
+    pub fn tasks_dir(&self) -> PathBuf {
+        self.home.join("tasks")
+    }
+
+    pub fn task_dir(&self, task_id: &str) -> PathBuf {
+        self.tasks_dir().join(task_id)
+    }
+
     pub fn ensure(&self) -> Result<()> {
         ensure_private_dir(&self.home)?;
         ensure_private_dir(&self.artifacts_dir())?;
+        ensure_private_dir(&self.tasks_dir())?;
         Ok(())
     }
 

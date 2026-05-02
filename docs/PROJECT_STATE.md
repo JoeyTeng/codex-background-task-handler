@@ -48,9 +48,10 @@
   - 复测流程、env 和失败排查记录在 [docs/LIVE_E2E.md](LIVE_E2E.md)
 - CLI Dogfood V1 的收敛计划已单独记录在 [docs/CLI_DOGFOOD_V1_COMPLETION_PLAN.md](CLI_DOGFOOD_V1_COMPLETION_PLAN.md)：
   - 当前边界是本机 macOS/Linux dedicated single-user workstation dogfood，不是多用户服务器产品
-  - 下一步先 land Phase 12，再实现 daemon-owned `cbth task run/list/inspect/cancel`
+  - Phase 12 `cbth cli run --new-thread` 已合入；当前分支 `codex/cli-task-supervisor` 正在实现后续 daemon-owned `cbth task run/list/inspect/cancel`
   - 自动投递仍只走 idle `turn/start`；active-turn `turn/steer` 当前只补设计，不进入自动路径
-  - 后续还需要 `cbth doctor cli`、operator recovery 文档、local binary 安装/复测文档和 task-supervisor live e2e
+  - 本轮 task supervisor slice 已在本地实现 daemon-owned child/process-group supervision、bounded stdout/stderr spool、task inspect/list/cancel、task result artifact、task fake e2e 和 ignored live task-supervisor e2e；可靠性边界覆盖 active-task cap、restart lost-pgid cleanup with persisted process identity、direct-child-exit 后的 process-group 等待、cancel request precedence、late cancel/timeout 裁决和 task log retention cleanup；本机已通过 `CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture`
+  - 后续还需要 `cbth doctor cli`、operator recovery 文档、local binary 安装/复测文档和 active-turn steer 设计文档
 - #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
 - 当前修复分支 `codex/review-gate-resolved-threads` 正在补兼容：GitHub REST 可能把已 resolved / outdated 的旧 inline review comment `commit_id` 映射到后续 head；gate 现在会额外读取 GraphQL `reviewThreads`，只把未 resolved、未 outdated 的 current-head Codex inline threads 算作 blocker。Codex review-body findings 仍按 `PullRequestReview.commit_id` 和 current-head blob link 判定，因为它们没有可 resolve 的 thread。
 

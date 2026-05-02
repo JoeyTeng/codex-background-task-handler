@@ -91,6 +91,55 @@ pub struct NewJob {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct TaskRecord {
+    pub task_id: String,
+    pub job_id: String,
+    pub source_thread_id: String,
+    pub status: String,
+    pub summary: String,
+    pub command: Value,
+    pub cwd: String,
+    pub timeout_seconds: Option<i64>,
+    pub max_delivery_attempts: i64,
+    pub redelivery_window_seconds: i64,
+    pub pid: Option<i64>,
+    pub pid_identity: Option<String>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub signal: Option<i64>,
+    pub failure_reason: Option<String>,
+    pub stdout_log_path: Option<String>,
+    pub stderr_log_path: Option<String>,
+    pub stdout_bytes: i64,
+    pub stderr_bytes: i64,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub cancel_requested_at: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewTask {
+    pub task_id: String,
+    pub job_id: String,
+    pub source_thread_id: String,
+    pub summary: String,
+    pub command_json: String,
+    pub cwd: String,
+    pub timeout_seconds: Option<i64>,
+    pub max_delivery_attempts: i64,
+    pub redelivery_window_seconds: i64,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct LostPendingTaskProcess {
+    pub pid: u32,
+    pub pid_identity: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ArtifactRecord {
     pub artifact_id: String,
     pub job_id: String,
@@ -312,6 +361,8 @@ pub struct SweepReport {
     pub orphan_artifact_delete_failures: usize,
     pub artifact_manifests_synced: usize,
     pub artifact_manifest_sync_failures: usize,
+    pub task_log_dirs_deleted: usize,
+    pub task_log_delete_failures: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

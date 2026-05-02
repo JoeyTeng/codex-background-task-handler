@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 #[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
@@ -58,6 +60,73 @@ fn cbth_failure(home: &TempDir, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn cbth_daemon(home: &TempDir, args: &[&str]) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .args(args)
+        .output()
+        .expect("run cbth through daemon");
+
+    assert!(
+        output.status.success(),
+        "cbth daemon command failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    serde_json::from_slice(&output.stdout).expect("valid json output")
+}
+
+fn cbth_daemon_failure(home: &TempDir, args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .args(args)
+        .output()
+        .expect("run cbth through daemon");
+
+    assert!(
+        !output.status.success(),
+        "cbth daemon command unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn hold_exclusive_db_lock(home: &TempDir) -> Connection {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+        match conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;") {
+            Ok(()) => return conn,
+            Err(error) if Instant::now() < deadline => {
+                drop(conn);
+                thread::sleep(Duration::from_millis(20));
+                let _ = error;
+            }
+            Err(error) => panic!("hold exclusive db lock: {error}"),
+        }
+    }
+}
+
+fn wait_for_task_status(home: &TempDir, task_id: &str, status: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let task = cbth(home, &["task", "inspect", "--task-id", task_id]);
+        if task["task"]["status"] == status {
+            return task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task {task_id} did not reach {status}: {task}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn bind_cli_session(home: &TempDir, bound_thread_id: &str) -> String {
@@ -261,7 +330,8 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "cli-session-capability-dispatch",
             "cli-session-proof-invalidation-dispatch",
             "cli-turn-observation-dispatch",
-            "cli-auto-delivery-dispatch"
+            "cli-auto-delivery-dispatch",
+            "task-supervisor"
         ])
     );
     assert_eq!(ping["daemon"]["idle_timeout_seconds"], 10);
@@ -280,7 +350,8 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "cli-session-capability-dispatch",
             "cli-session-proof-invalidation-dispatch",
             "cli-turn-observation-dispatch",
-            "cli-auto-delivery-dispatch"
+            "cli-auto-delivery-dispatch",
+            "task-supervisor"
         ])
     );
     assert!(status["startup_sweep"].is_object());
@@ -365,7 +436,8 @@ fn daemon_ensure_restarts_incompatible_daemon() {
             "cli-session-capability-dispatch",
             "cli-session-proof-invalidation-dispatch",
             "cli-turn-observation-dispatch",
-            "cli-auto-delivery-dispatch"
+            "cli-auto-delivery-dispatch",
+            "task-supervisor"
         ])
     );
 
@@ -420,7 +492,7 @@ fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
         ],
     );
     assert_eq!(ensured["started"], true);
-    assert!(ensured["daemon"]["pid"].as_u64().expect("pid") > 1313);
+    assert_ne!(ensured["daemon"]["pid"].as_u64().expect("pid"), 1313);
     handle.join().expect("old daemon thread");
 
     let ping = cbth(&home, &["daemon", "ping"]);
@@ -435,7 +507,8 @@ fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
             "cli-session-capability-dispatch",
             "cli-session-proof-invalidation-dispatch",
             "cli-turn-observation-dispatch",
-            "cli-auto-delivery-dispatch"
+            "cli-auto-delivery-dispatch",
+            "task-supervisor"
         ])
     );
 
@@ -490,7 +563,7 @@ fn daemon_ensure_restarts_daemon_missing_auto_delivery_capability() {
         ],
     );
     assert_eq!(ensured["started"], true);
-    assert!(ensured["daemon"]["pid"].as_u64().expect("pid") > 1323);
+    assert_ne!(ensured["daemon"]["pid"].as_u64().expect("pid"), 1323);
     handle.join().expect("old daemon thread");
 
     let ping = cbth(&home, &["daemon", "ping"]);
@@ -505,7 +578,8 @@ fn daemon_ensure_restarts_daemon_missing_auto_delivery_capability() {
             "cli-session-capability-dispatch",
             "cli-session-proof-invalidation-dispatch",
             "cli-turn-observation-dispatch",
-            "cli-auto-delivery-dispatch"
+            "cli-auto-delivery-dispatch",
+            "task-supervisor"
         ])
     );
 
@@ -560,7 +634,7 @@ fn daemon_ensure_restarts_daemon_missing_session_capability_dispatch() {
         ],
     );
     assert_eq!(ensured["started"], true);
-    assert!(ensured["daemon"]["pid"].as_u64().expect("pid") > 1414);
+    assert_ne!(ensured["daemon"]["pid"].as_u64().expect("pid"), 1414);
     handle.join().expect("old daemon thread");
 
     let ping = cbth(&home, &["daemon", "ping"]);
@@ -575,7 +649,8 @@ fn daemon_ensure_restarts_daemon_missing_session_capability_dispatch() {
             "cli-session-capability-dispatch",
             "cli-session-proof-invalidation-dispatch",
             "cli-turn-observation-dispatch",
-            "cli-auto-delivery-dispatch"
+            "cli-auto-delivery-dispatch",
+            "task-supervisor"
         ])
     );
 
@@ -642,7 +717,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
                     let request = String::from_utf8_lossy(&request[..request_len]);
                     assert!(request.contains("\"ping\""));
                     if let Err(error) = stream.write_all(
-                        br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-thread-start-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-proof-invalidation-dispatch","cli-turn-observation-dispatch","cli-auto-delivery-dispatch"],"message":"pong"}}"#,
+                        br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-thread-start-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-proof-invalidation-dispatch","cli-turn-observation-dispatch","cli-auto-delivery-dispatch","task-supervisor"],"message":"pong"}}"#,
                     ) {
                         if error.kind() == std::io::ErrorKind::BrokenPipe {
                             continue;
@@ -708,7 +783,7 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
             } else if index == 1 {
                 r#"{"ok":false,"error":"daemon connection limit reached"}"#
             } else {
-                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-thread-start-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-proof-invalidation-dispatch","cli-turn-observation-dispatch","cli-auto-delivery-dispatch"],"message":"pong"}}"#
+                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-thread-start-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-proof-invalidation-dispatch","cli-turn-observation-dispatch","cli-auto-delivery-dispatch","task-supervisor"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())
@@ -727,7 +802,7 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
             "--idle-timeout-seconds",
             "10",
             "--startup-timeout-seconds",
-            "5",
+            "15",
         ],
     );
     assert_eq!(ensured["started"], false);
@@ -750,10 +825,7 @@ fn daemon_ensure_timeout_does_not_publish_socket_when_startup_is_blocked() {
         ],
     );
 
-    let db_path = home.path().join("cbth.sqlite3");
-    let conn = Connection::open(&db_path).expect("open db");
-    conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
-        .expect("hold exclusive db lock");
+    let conn = hold_exclusive_db_lock(&home);
 
     let stderr = cbth_failure(
         &home,
@@ -791,10 +863,7 @@ fn daemon_lifecycle_refresh_does_not_block_control_requests_when_db_is_locked() 
     let ping = wait_for_ping(&home);
     assert_eq!(ping["message"], "pong");
 
-    let db_path = home.path().join("cbth.sqlite3");
-    let conn = Connection::open(&db_path).expect("open db");
-    conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
-        .expect("hold exclusive db lock");
+    let conn = hold_exclusive_db_lock(&home);
 
     thread::sleep(Duration::from_secs(2));
     assert!(
@@ -1421,6 +1490,1029 @@ fn daemon_keeps_alive_for_active_cli_observation_then_expires_it() {
         batch["batch"]["batch"]["replay_policy"],
         "manual_resolution_only"
     );
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_task_run_success_creates_completed_job_and_log_artifact() {
+    let home = temp_home();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-success",
+            "--summary",
+            "successful task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'hello stdout'; printf 'hello stderr' >&2",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let job_id = started["task"]["job_id"].as_str().expect("job id");
+
+    let task = wait_for_task_status(&home, task_id, "succeeded");
+    assert_eq!(task["task"]["job_id"], job_id);
+    assert_eq!(task["task"]["exit_code"], 0);
+    assert_eq!(task["task"]["stdout_truncated"], false);
+    assert_eq!(task["task"]["stderr_truncated"], false);
+
+    let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
+    assert_eq!(job["job"]["status"], "completed");
+    assert!(job["job"]["result_artifact_id"].as_str().is_some());
+
+    let head = cbth(
+        &home,
+        &[
+            "batch",
+            "inspect-head",
+            "--source-thread-id",
+            "thread-task-success",
+        ],
+    );
+    assert_eq!(head["batch"]["batch"]["state"], "open");
+    assert_eq!(head["batch"]["batch"]["requires_artifact_read"], true);
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_task_run_nonzero_fails_job_with_log_artifact() {
+    let home = temp_home();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-fail",
+            "--summary",
+            "failing task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'failure details'; exit 7",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let job_id = started["task"]["job_id"].as_str().expect("job id");
+
+    let task = wait_for_task_status(&home, task_id, "failed");
+    assert_eq!(task["task"]["exit_code"], 7);
+    assert!(
+        task["task"]["failure_reason"]
+            .as_str()
+            .expect("failure reason")
+            .contains("status 7")
+    );
+
+    let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
+    assert_eq!(job["job"]["status"], "failed");
+    assert!(job["job"]["result_artifact_id"].as_str().is_some());
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_task_cancel_terminates_process_group_and_fails_job() {
+    let home = temp_home();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-cancel",
+            "--summary",
+            "cancel task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let job_id = started["task"]["job_id"].as_str().expect("job id");
+    cbth_daemon(&home, &["task", "cancel", "--task-id", task_id]);
+
+    let task = wait_for_task_status(&home, task_id, "cancelled");
+    assert_eq!(task["task"]["failure_reason"], "task cancelled");
+    let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
+    assert_eq!(job["job"]["status"], "failed");
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_task_cancel_wins_when_sigterm_trap_exits_zero() {
+    let home = temp_home();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-cancel-trap",
+            "--summary",
+            "cancel trap task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap 'exit 0' TERM; while true; do sleep 1; done",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let job_id = started["task"]["job_id"].as_str().expect("job id");
+    wait_for_task_status(&home, task_id, "running");
+
+    cbth_daemon(&home, &["task", "cancel", "--task-id", task_id]);
+
+    let task = wait_for_task_status(&home, task_id, "cancelled");
+    assert_eq!(task["task"]["failure_reason"], "task cancelled");
+    assert_eq!(task["task"]["exit_code"], 0);
+    let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
+    assert_eq!(job["job"]["status"], "failed");
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_task_cancel_signals_running_task_before_store_lock_wait() {
+    let home = temp_home();
+    let marker = home.path().join("cancel-before-store-marker");
+    let marker_arg = marker.to_string_lossy().to_string();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-cancel-store-lock",
+            "--summary",
+            "cancel under store lock",
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap 'printf term > \"$1\"; exit 0' TERM; while true; do sleep 1; done",
+            "cbth-task",
+            &marker_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+
+    let conn = hold_exclusive_db_lock(&home);
+
+    let cancel = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .args(["task", "cancel", "--task-id", task_id])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cancel");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        marker.exists(),
+        "running task was not signaled while cancel persistence waited on the store lock"
+    );
+
+    drop(conn);
+    let output = cancel.wait_with_output().expect("wait cancel");
+    assert!(
+        output.status.success(),
+        "cancel failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let task = wait_for_task_status(&home, task_id, "cancelled");
+    assert_eq!(task["task"]["failure_reason"], "task cancelled");
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_task_timeout_terminates_process_group_and_fails_job() {
+    let home = temp_home();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-timeout",
+            "--summary",
+            "timeout task",
+            "--timeout-seconds",
+            "1",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let job_id = started["task"]["job_id"].as_str().expect("job id");
+
+    let task = wait_for_task_status(&home, task_id, "timed_out");
+    assert_eq!(task["task"]["failure_reason"], "task timed out");
+    let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
+    assert_eq!(job["job"]["status"], "failed");
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_stop_cancels_active_supervised_task() {
+    let home = temp_home();
+    let marker = home.path().join("daemon-stop-orphan-marker");
+    let marker_arg = marker.to_string_lossy().to_string();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-daemon-stop",
+            "--summary",
+            "daemon stop task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 2; printf done > \"$1\"",
+            "cbth-task",
+            &marker_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let job_id = started["task"]["job_id"].as_str().expect("job id");
+    wait_for_task_status(&home, task_id, "running");
+
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+
+    let task = wait_for_task_status(&home, task_id, "cancelled");
+    assert_eq!(task["task"]["failure_reason"], "task cancelled");
+    let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
+    assert_eq!(job["job"]["status"], "failed");
+    thread::sleep(Duration::from_secs(3));
+    assert!(!marker.exists(), "supervised child escaped daemon stop");
+}
+
+#[test]
+fn daemon_task_run_rejects_above_supervisor_limit_without_creating_job() {
+    let home = temp_home();
+    let mut task_ids = Vec::new();
+    for index in 0..16 {
+        let summary = format!("limit task {index}");
+        let started = cbth_daemon(
+            &home,
+            &[
+                "task",
+                "run",
+                "--source-thread-id",
+                "thread-task-limit",
+                "--summary",
+                &summary,
+                "--",
+                "/bin/sh",
+                "-c",
+                "sleep 30",
+            ],
+        );
+        task_ids.push(
+            started["task"]["task_id"]
+                .as_str()
+                .expect("task id")
+                .to_owned(),
+        );
+    }
+    for task_id in &task_ids {
+        wait_for_task_status(&home, task_id, "running");
+    }
+
+    let stderr = cbth_daemon_failure(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-limit",
+            "--summary",
+            "limit overflow task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+
+    assert!(stderr.contains("maximum supervised task limit reached (16)"));
+    let jobs = cbth(
+        &home,
+        &[
+            "job",
+            "list",
+            "--source-thread-id",
+            "thread-task-limit",
+            "--status",
+            "pending",
+            "--limit",
+            "100",
+        ],
+    );
+    assert_eq!(jobs["jobs"].as_array().expect("jobs").len(), 16);
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_task_run_rejects_redelivery_window_overflow_before_creating_job() {
+    let home = temp_home();
+    let stderr = cbth_daemon_failure(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-overflow",
+            "--summary",
+            "overflow task",
+            "--redelivery-window-seconds",
+            "9223372036854775807",
+            "--",
+            "/bin/sh",
+            "-c",
+            "true",
+        ],
+    );
+
+    assert!(stderr.contains("redelivery_window_seconds overflows timestamp range"));
+    let jobs = cbth(
+        &home,
+        &[
+            "job",
+            "list",
+            "--source-thread-id",
+            "thread-task-overflow",
+            "--limit",
+            "100",
+        ],
+    );
+    assert_eq!(jobs["jobs"].as_array().expect("jobs").len(), 0);
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_task_run_resolves_bare_command_with_caller_path() {
+    let home = temp_home();
+    let bin_dir = home.path().join("caller-bin");
+    fs::create_dir(&bin_dir).expect("create caller bin");
+    let tool_path = bin_dir.join("cbth-caller-path-tool");
+    fs::write(&tool_path, "#!/bin/sh\nprintf caller-path-ok\n").expect("write tool");
+    fs::set_permissions(&tool_path, fs::Permissions::from_mode(0o755)).expect("chmod tool");
+
+    let ensure = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env("PATH", "/usr/bin:/bin")
+        .arg("--home")
+        .arg(home.path())
+        .args([
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "30",
+            "--startup-timeout-seconds",
+            "5",
+        ])
+        .output()
+        .expect("start daemon");
+    assert!(
+        ensure.status.success(),
+        "daemon ensure failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&ensure.stdout),
+        String::from_utf8_lossy(&ensure.stderr)
+    );
+
+    let client_path = format!("{}:/usr/bin:/bin", bin_dir.display());
+    let started_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env("PATH", client_path)
+        .arg("--home")
+        .arg(home.path())
+        .args([
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-caller-path",
+            "--summary",
+            "caller path task",
+            "--",
+            "cbth-caller-path-tool",
+        ])
+        .output()
+        .expect("run task");
+    assert!(
+        started_output.status.success(),
+        "task run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&started_output.stdout),
+        String::from_utf8_lossy(&started_output.stderr)
+    );
+    let started: Value = serde_json::from_slice(&started_output.stdout).expect("task json");
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let task = wait_for_task_status(&home, task_id, "succeeded");
+    let stdout_log_path = task["task"]["stdout_log_path"]
+        .as_str()
+        .expect("stdout log path");
+    let stdout = fs::read_to_string(home.path().join(stdout_log_path)).expect("stdout log");
+    assert_eq!(stdout, "caller-path-ok");
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_task_run_resolves_relative_path_entries_against_task_cwd() {
+    let home = temp_home();
+    let caller_cwd = home.path().join("caller-cwd");
+    let caller_bin = caller_cwd.join("bin");
+    let task_cwd = home.path().join("task-cwd");
+    let task_bin = task_cwd.join("bin");
+    fs::create_dir_all(&caller_bin).expect("create caller bin");
+    fs::create_dir_all(&task_bin).expect("create task bin");
+    let caller_tool = caller_bin.join("cbth-relative-path-tool");
+    let task_tool = task_bin.join("cbth-relative-path-tool");
+    fs::write(&caller_tool, "#!/bin/sh\nprintf wrong-cwd\n").expect("write caller tool");
+    fs::write(&task_tool, "#!/bin/sh\nprintf task-cwd-ok\n").expect("write task tool");
+    fs::set_permissions(&caller_tool, fs::Permissions::from_mode(0o755))
+        .expect("chmod caller tool");
+    fs::set_permissions(&task_tool, fs::Permissions::from_mode(0o755)).expect("chmod task tool");
+
+    let ensure = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env("PATH", "/usr/bin:/bin")
+        .arg("--home")
+        .arg(home.path())
+        .args([
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "30",
+            "--startup-timeout-seconds",
+            "5",
+        ])
+        .output()
+        .expect("start daemon");
+    assert!(
+        ensure.status.success(),
+        "daemon ensure failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&ensure.stdout),
+        String::from_utf8_lossy(&ensure.stderr)
+    );
+
+    let started_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .current_dir(&caller_cwd)
+        .env("PATH", "bin:/usr/bin:/bin")
+        .arg("--home")
+        .arg(home.path())
+        .args([
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-relative-path",
+            "--summary",
+            "relative path task",
+            "--cwd",
+        ])
+        .arg(&task_cwd)
+        .args(["--", "cbth-relative-path-tool"])
+        .output()
+        .expect("run task");
+    assert!(
+        started_output.status.success(),
+        "task run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&started_output.stdout),
+        String::from_utf8_lossy(&started_output.stderr)
+    );
+    let started: Value = serde_json::from_slice(&started_output.stdout).expect("task json");
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let task = wait_for_task_status(&home, task_id, "succeeded");
+    let stdout_log_path = task["task"]["stdout_log_path"]
+        .as_str()
+        .expect("stdout log path");
+    let stdout = fs::read_to_string(home.path().join(stdout_log_path)).expect("stdout log");
+    assert_eq!(stdout, "task-cwd-ok");
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_task_run_rejects_non_utf8_cwd_without_panic() {
+    let home = temp_home();
+    let invalid_name = std::ffi::OsString::from_vec(b"invalid-\xff".to_vec());
+    let invalid_cwd = home.path().join(invalid_name);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .args([
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-invalid-cwd",
+            "--summary",
+            "invalid cwd task",
+            "--cwd",
+        ])
+        .arg(&invalid_cwd)
+        .args(["--", "/bin/sh", "-c", "true"])
+        .output()
+        .expect("run task");
+
+    assert!(
+        !output.status.success(),
+        "task run unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("task cwd must be valid UTF-8"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "CLI panicked: {stderr}");
+}
+
+#[test]
+fn daemon_task_run_uses_caller_environment_with_existing_daemon() {
+    let home = temp_home();
+    let ensure = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env_remove("CBTH_TASK_ENV_PROBE")
+        .arg("--home")
+        .arg(home.path())
+        .args([
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "30",
+            "--startup-timeout-seconds",
+            "5",
+        ])
+        .output()
+        .expect("start daemon");
+    assert!(
+        ensure.status.success(),
+        "daemon ensure failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&ensure.stdout),
+        String::from_utf8_lossy(&ensure.stderr)
+    );
+
+    let started_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env("CBTH_TASK_ENV_PROBE", "caller-env-ok")
+        .arg("--home")
+        .arg(home.path())
+        .args([
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-caller-env",
+            "--summary",
+            "caller env task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s' \"$CBTH_TASK_ENV_PROBE\"",
+        ])
+        .output()
+        .expect("run task");
+    assert!(
+        started_output.status.success(),
+        "task run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&started_output.stdout),
+        String::from_utf8_lossy(&started_output.stderr)
+    );
+    let started: Value = serde_json::from_slice(&started_output.stdout).expect("task json");
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let task = wait_for_task_status(&home, task_id, "succeeded");
+    let stdout_log_path = task["task"]["stdout_log_path"]
+        .as_str()
+        .expect("stdout log path");
+    let stdout = fs::read_to_string(home.path().join(stdout_log_path)).expect("stdout log");
+    assert_eq!(stdout, "caller-env-ok");
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_task_run_rewrites_pwd_to_task_cwd() {
+    let home = temp_home();
+    let caller_cwd = home.path().join("caller-pwd");
+    let task_cwd = home.path().join("task-pwd");
+    fs::create_dir(&caller_cwd).expect("create caller cwd");
+    fs::create_dir(&task_cwd).expect("create task cwd");
+    let ensure = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .args([
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "30",
+            "--startup-timeout-seconds",
+            "5",
+        ])
+        .output()
+        .expect("start daemon");
+    assert!(
+        ensure.status.success(),
+        "daemon ensure failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&ensure.stdout),
+        String::from_utf8_lossy(&ensure.stderr)
+    );
+
+    let started_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .current_dir(&caller_cwd)
+        .env("PWD", &caller_cwd)
+        .arg("--home")
+        .arg(home.path())
+        .args([
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-pwd",
+            "--summary",
+            "pwd task",
+            "--cwd",
+        ])
+        .arg(&task_cwd)
+        .args(["--", "/bin/sh", "-c", "printf '%s' \"$PWD\""])
+        .output()
+        .expect("run task");
+    assert!(
+        started_output.status.success(),
+        "task run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&started_output.stdout),
+        String::from_utf8_lossy(&started_output.stderr)
+    );
+    let started: Value = serde_json::from_slice(&started_output.stdout).expect("task json");
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let task = wait_for_task_status(&home, task_id, "succeeded");
+    let stdout_log_path = task["task"]["stdout_log_path"]
+        .as_str()
+        .expect("stdout log path");
+    let stdout = fs::read_to_string(home.path().join(stdout_log_path)).expect("stdout log");
+    assert_eq!(stdout, task_cwd.to_string_lossy());
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_task_run_does_not_leak_exec_gate_fd() {
+    let home = temp_home();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-gate-fd",
+            "--summary",
+            "gate fd task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "if /bin/sh -c 'true <&3' 2>/dev/null; then printf leaked; else printf closed; fi",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let task = wait_for_task_status(&home, task_id, "succeeded");
+    let stdout_log_path = task["task"]["stdout_log_path"]
+        .as_str()
+        .expect("stdout log path");
+    let stdout = fs::read_to_string(home.path().join(stdout_log_path)).expect("stdout log");
+    assert_eq!(stdout, "closed");
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_startup_recovery_terminates_lost_task_process_group() {
+    let home = temp_home();
+    let marker = home.path().join("lost-task-marker");
+    let marker_arg = marker.to_string_lossy().to_string();
+    let mut daemon = spawn_daemon(&home, "300", &[]);
+    wait_for_ping(&home);
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-lost-pgid",
+            "--summary",
+            "lost pgid task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 3; printf done > \"$1\"",
+            "cbth-task",
+            &marker_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+
+    daemon.kill().expect("kill daemon");
+    let _ = daemon.wait().expect("wait daemon");
+    cbth_daemon(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "30",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+
+    let task = wait_for_task_status(&home, task_id, "lost");
+    assert_eq!(
+        task["task"]["failure_reason"],
+        "task supervisor lost after daemon restart"
+    );
+    thread::sleep(Duration::from_secs(4));
+    assert!(
+        !marker.exists(),
+        "lost supervised process group survived daemon startup recovery"
+    );
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_startup_recovery_terminates_lost_task_process_group_for_closed_job() {
+    let home = temp_home();
+    let marker = home.path().join("lost-task-closed-job-marker");
+    let marker_arg = marker.to_string_lossy().to_string();
+    let mut daemon = spawn_daemon(&home, "300", &[]);
+    wait_for_ping(&home);
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-lost-closed-job-pgid",
+            "--summary",
+            "lost pgid task whose job was closed",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 3; printf done > \"$1\"",
+            "cbth-task",
+            &marker_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let job_id = started["task"]["job_id"].as_str().expect("job id");
+    wait_for_task_status(&home, task_id, "running");
+    cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "external job failure before daemon restart",
+        ],
+    );
+
+    daemon.kill().expect("kill daemon");
+    let _ = daemon.wait().expect("wait daemon");
+    cbth_daemon(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "30",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+
+    let task = wait_for_task_status(&home, task_id, "failed");
+    assert_eq!(
+        task["task"]["failure_reason"],
+        "external job failure before daemon restart"
+    );
+    thread::sleep(Duration::from_secs(4));
+    assert!(
+        !marker.exists(),
+        "lost process group for externally closed job survived daemon startup recovery"
+    );
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn maintenance_sweep_autostart_recovers_lost_task_process_group() {
+    let home = temp_home();
+    let marker = home.path().join("lost-task-maintenance-marker");
+    let marker_arg = marker.to_string_lossy().to_string();
+    let mut daemon = spawn_daemon(&home, "300", &[]);
+    wait_for_ping(&home);
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-lost-maintenance-pgid",
+            "--summary",
+            "lost pgid task before maintenance sweep",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 3; printf done > \"$1\"",
+            "cbth-task",
+            &marker_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+
+    daemon.kill().expect("kill daemon");
+    let _ = daemon.wait().expect("wait daemon");
+    cbth_daemon(&home, &["maintenance", "sweep"]);
+
+    let task = wait_for_task_status(&home, task_id, "lost");
+    assert_eq!(
+        task["task"]["failure_reason"],
+        "task supervisor lost after daemon restart"
+    );
+    thread::sleep(Duration::from_secs(4));
+    assert!(
+        !marker.exists(),
+        "lost supervised process group survived maintenance autostart recovery"
+    );
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn duplicate_daemon_serve_does_not_recover_tasks_before_socket_exclusivity() {
+    let home = temp_home();
+    cbth_daemon(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "30",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-duplicate-daemon",
+            "--summary",
+            "duplicate daemon task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("serve")
+        .arg("--idle-timeout-seconds")
+        .arg("30")
+        .arg("--now")
+        .arg("100")
+        .output()
+        .expect("run duplicate daemon");
+
+    assert!(
+        !duplicate.status.success(),
+        "duplicate daemon unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&duplicate.stderr);
+    assert!(
+        stderr.contains("daemon socket is already active"),
+        "unexpected duplicate daemon stderr: {stderr}"
+    );
+    let task = cbth(&home, &["task", "inspect", "--task-id", task_id]);
+    assert_eq!(task["task"]["status"], "running");
+
+    cbth_daemon(&home, &["task", "cancel", "--task-id", task_id]);
+    wait_for_task_status(&home, task_id, "cancelled");
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn maintenance_sweep_removes_expired_task_log_dirs() {
+    let home = temp_home();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-log-retention",
+            "--summary",
+            "log retention task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf task-log-retention",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let task = wait_for_task_status(&home, task_id, "succeeded");
+    let completed_at = task["task"]["completed_at"].as_i64().expect("completed_at");
+    let stdout_log_path = task["task"]["stdout_log_path"]
+        .as_str()
+        .expect("stdout log path");
+    let task_dir = home.path().join("tasks").join(task_id);
+    assert!(home.path().join(stdout_log_path).exists());
+
+    let batch_close_now = completed_at + 72 * 60 * 60 + 1;
+    let batch_close_now_arg = batch_close_now.to_string();
+    let report = cbth(
+        &home,
+        &["maintenance", "sweep", "--now", &batch_close_now_arg],
+    );
+
+    assert_eq!(report["sweep"]["expired_automatic_batches_closed"], 1);
+    assert_eq!(report["sweep"]["task_log_dirs_deleted"], 0);
+    assert!(task_dir.exists());
+
+    let log_delete_now = batch_close_now + 72 * 60 * 60 + 1;
+    let log_delete_now_arg = log_delete_now.to_string();
+    let report = cbth(
+        &home,
+        &["maintenance", "sweep", "--now", &log_delete_now_arg],
+    );
+
+    assert_eq!(report["sweep"]["task_log_dirs_deleted"], 1);
+    assert!(!task_dir.exists());
+    let inspected = cbth(&home, &["task", "inspect", "--task-id", task_id]);
+    assert!(inspected["task"]["stdout_log_path"].is_null());
+    assert!(inspected["task"]["stderr_log_path"].is_null());
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_task_timeout_works_after_direct_child_exits_but_pipe_is_held() {
+    let home = temp_home();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-held-pipe-timeout",
+            "--summary",
+            "held pipe timeout task",
+            "--timeout-seconds",
+            "1",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf started; exec 3>&1; trap '' HUP; (sleep 30; printf late >&3) &",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let job_id = started["task"]["job_id"].as_str().expect("job id");
+
+    let task = wait_for_task_status(&home, task_id, "timed_out");
+    assert_eq!(task["task"]["failure_reason"], "task timed out");
+    let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
+    assert_eq!(job["job"]["status"], "failed");
+    cbth(&home, &["daemon", "stop"]);
     wait_for_socket_removed(&home);
 }
 

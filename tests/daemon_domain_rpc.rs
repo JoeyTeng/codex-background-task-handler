@@ -49,6 +49,22 @@ fn cbth_in_dir(home: &TempDir, args: &[&str], cwd: Option<&Path>, direct_store: 
     serde_json::from_slice(&output.stdout).expect("valid json output")
 }
 
+fn hold_exclusive_db_lock(home: &TempDir) -> Connection {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db lock");
+        match conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;") {
+            Ok(()) => return conn,
+            Err(error) if Instant::now() < deadline => {
+                drop(conn);
+                thread::sleep(Duration::from_millis(20));
+                let _ = error;
+            }
+            Err(error) => panic!("hold exclusive db lock: {error}"),
+        }
+    }
+}
+
 fn bind_idle_cli_session_direct(home: &TempDir, bound_thread_id: &str) -> String {
     let session = cbth_direct(
         home,
@@ -485,9 +501,7 @@ fn daemon_routed_cli_session_proof_writes_use_short_store_timeout() {
     let managed_session_id = bind_idle_cli_session_direct(&home, "thread-short-passive-write");
     cbth(&home, &["daemon", "ensure"]);
 
-    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db lock");
-    conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
-        .expect("hold exclusive db lock");
+    let conn = hold_exclusive_db_lock(&home);
 
     let (stderr, elapsed) = cbth_failure_elapsed(
         &home,

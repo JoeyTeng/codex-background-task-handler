@@ -22,6 +22,7 @@ cargo --version
 - `CBTH_LIVE_CODEX_E2E_TIMEOUT_MS`: shared app-server smoke 超时，默认 `180000`。
 - `CBTH_LIVE_TRUSTED_ALL_E2E_TIMEOUT_SECONDS`: trusted-all full e2e 超时，默认 `360`。
 - `CBTH_LIVE_NEW_THREAD_E2E_TIMEOUT_SECONDS`: `--new-thread` full e2e 超时，默认 `360`。
+- `CBTH_LIVE_TASK_SUPERVISOR_E2E_TIMEOUT_SECONDS`: task-supervisor full e2e 超时，默认 `360`。
 
 ## Shared App-Server Smoke
 
@@ -77,11 +78,37 @@ test live_codex_new_thread_trusted_all_auto_delivery_is_opt_in ... ok
 test result: ok. 1 passed; finished in 15.54s
 ```
 
+## Task Supervisor Full Live E2E
+
+该 e2e 验证真实 daemon-owned `cbth task run` 可以触发完整 trusted-all 自动投递闭环：
+
+- 启动真实 `cbth cli run --new-thread --auto-delivery-policy trusted-all`，并从 stderr 的 `cbth: bound thread id: <thread-id>` 读取 caller thread id。
+- 等待 sidecar 记录 idle proof 和自动投递能力。
+- 通过真实 `cbth task run --source-thread-id <thread-id> ... -- /bin/sh -c ...` 创建 daemon-supervised task。
+- daemon 负责 child/process-group lifecycle，把 stdout/stderr 写到 `~/.cbth/tasks/<task-id>/` 下的 bounded log files。
+- task 成功退出后，daemon 写 result artifact、自动 complete 关联 job、创建 head batch。
+- sidecar 在 idle 时发送带 marker 的 `turn/start`，观察 notification 或 reconcile 后把 batch 关闭为 `delivered`。
+- 测试同时校验 task stdout log、result artifact payload 和 audit records。
+
+```bash
+CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture
+```
+
+该测试仍不进入默认 CI；它需要真实 `codex` 登录态、模型/网络访问和本机 shell execution。默认 CI 只编译该 ignored test，并通过 deterministic fake e2e 覆盖生产状态机。
+
+本机已验证一次成功运行：
+
+```text
+test live_codex_task_supervisor_e2e_is_opt_in ... ok
+test result: ok. 1 passed; finished in 23.47s
+```
+
 ## Failure Notes
 
 - 如果卡在 listener bootstrap，先单独运行 shared app-server smoke；它能快速暴露 `codex app-server` 输出流、登录态或 Node PoC 问题。
 - 如果 `--new-thread` 没打印 `cbth: bound thread id: ...`，优先看 bootstrap `thread/start` 是否被当前 `codex app-server` 支持；该失败会发生在 foreground 启动前。
 - 如果卡在 session readiness，通常说明 pending app-server 没有被成功 promote，或 passive adapter 没拿到 fresh `thread_start` / current-state / capability proof。测试失败信息会打印最后观察到的 session proof 字段。
+- 如果 task-supervisor e2e 卡在 task completion，先用 `cbth task inspect --task-id <task-id>` 看 `status`、`pid`、`stdout_log_path`、`stderr_log_path` 和 truncation flags；如果 daemon 被异常终止，下一次 daemon startup 会把 lost queued/running task fail-closed。
 - 如果 rollout 显示 assistant 已完成 marker turn，但 batch 进入 `manual_resolution_only`，检查 `turn/start` acceptance 是否超过 60 秒；也要检查 accepted observation 是否遇到 proof-only `thread/status/changed` noise 或 fresh first-turn `thread/read(includeTurns=true)` materialization error。
 - 如果卡在 batch delivered，优先看 `cbth audit list --source-thread-id <thread-id>`：`accepted` 后长时间没有 `observed/reconciled` 说明真实 model turn 还没有 terminal evidence，或 websocket continuity 已丢失。terminal audit 是 batch close 后的 best-effort 记录，live harness 会短暂轮询，避免把 close/audit 的事务边界当成同步点。
 - 测试使用临时 `CBTH_HOME`，结束时会 stop daemon 并清理临时目录；异常中断后可用 `pgrep -af "codex app-server"` 和 `pgrep -af cbth` 检查是否有遗留进程。
