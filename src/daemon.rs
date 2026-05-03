@@ -2206,7 +2206,14 @@ fn run_supervised_task_worker_inner(
         result_path,
     );
     if result.is_err() {
-        terminate_task_child_best_effort(&mut child, pid);
+        let should_terminate = control
+            .pid
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?
+            .is_some_and(|active_pid| active_pid == pid);
+        if should_terminate {
+            terminate_task_child_best_effort(&mut child, pid);
+        }
     }
     *control
         .pid
@@ -2383,6 +2390,10 @@ fn run_supervised_spawned_task(
             return Err(error);
         }
     };
+    *control
+        .pid
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
     if !timed_out && control.cancel_signal_sent.load(Ordering::Acquire) {
         cancelled = true;
     }
@@ -3245,20 +3256,19 @@ fn start_cli_thread(
         &state.stop_requested,
     )?;
     let mut server = Some(server);
-    {
-        let mut bootstraps = state
-            .cli_thread_start_bootstraps
-            .lock()
-            .map_err(|_| anyhow::anyhow!("CLI thread/start bootstrap registry lock is poisoned"))?;
-        ensure_daemon_not_stopping(state)?;
-        bootstraps.insert(
-            bootstrap_id.clone(),
-            server
-                .take()
-                .expect("bootstrap app-server is still available"),
-        );
-    }
     let result = (|| {
+        {
+            let mut bootstraps = state.cli_thread_start_bootstraps.lock().map_err(|_| {
+                anyhow::anyhow!("CLI thread/start bootstrap registry lock is poisoned")
+            })?;
+            ensure_daemon_not_stopping(state)?;
+            bootstraps.insert(
+                bootstrap_id.clone(),
+                server
+                    .take()
+                    .expect("bootstrap app-server is still available"),
+            );
+        }
         ensure_daemon_not_stopping(state)?;
         let url = {
             let bootstraps = state.cli_thread_start_bootstraps.lock().map_err(|_| {
@@ -3303,13 +3313,17 @@ fn start_cli_thread(
         })
     })();
     if result.is_err() {
-        let server = state
-            .cli_thread_start_bootstraps
-            .lock()
-            .ok()
-            .and_then(|mut bootstraps| bootstraps.remove(&bootstrap_id));
-        if let Some(server) = server {
+        if let Some(server) = server.take() {
             stop_managed_cli_app_server_process(server);
+        } else {
+            let server = state
+                .cli_thread_start_bootstraps
+                .lock()
+                .ok()
+                .and_then(|mut bootstraps| bootstraps.remove(&bootstrap_id));
+            if let Some(server) = server {
+                stop_managed_cli_app_server_process(server);
+            }
         }
     }
     result
@@ -5031,6 +5045,73 @@ mod tests {
     }
 
     #[test]
+    fn thread_start_stop_before_bootstrap_registration_kills_candidate_server() {
+        let (home, state) = test_state();
+        let state = Arc::new(state);
+        let fake_codex = home.path().join("fake-codex");
+        let pid_file = home.path().join("fake-codex.pid");
+        let pid_file_quoted = pid_file.display().to_string().replace('\'', "'\\''");
+        fs::write(
+            &fake_codex,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{pid_file_quoted}'\nprintf 'listening on: ws://127.0.0.1:1234\\n'\nwhile :; do sleep 1; done\n"
+            ),
+        )
+        .expect("write fake codex");
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700))
+            .expect("chmod fake codex");
+        let bootstrap_guard = state
+            .cli_thread_start_bootstraps
+            .lock()
+            .expect("bootstrap lock");
+        let task_state = Arc::clone(&state);
+        let task = thread::spawn(move || {
+            start_cli_thread(
+                &task_state,
+                CliThreadStartPayload {
+                    codex_binary: fake_codex.into_os_string().into_vec(),
+                    cwd: home.path().display().to_string(),
+                    lease_id: "lease-stopped-thread-start-registration".to_owned(),
+                    lease_ttl_seconds: None,
+                },
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_file.exists() {
+            assert!(Instant::now() < deadline, "fake app-server did not start");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let pid = fs::read_to_string(&pid_file)
+            .expect("read fake pid")
+            .trim()
+            .parse::<u32>()
+            .expect("fake pid");
+        state.stop_requested.store(true, Ordering::Release);
+        drop(bootstrap_guard);
+        let error = task
+            .join()
+            .expect("thread/start worker joins")
+            .expect_err("stopped daemon should reject bootstrap registration");
+
+        assert!(
+            error.to_string().contains("daemon is stopping"),
+            "{error:#}"
+        );
+        assert!(
+            state
+                .cli_thread_start_bootstraps
+                .lock()
+                .expect("bootstrap lock")
+                .is_empty()
+        );
+        assert!(
+            !process_group_exists(pid),
+            "candidate bootstrap app-server survived stopped registration"
+        );
+    }
+
+    #[test]
     fn stopped_daemon_does_not_promote_removed_bootstrap_after_cleanup() {
         let (_home, state) = test_state();
         let state = Arc::new(state);
@@ -6116,6 +6197,101 @@ mod tests {
             .list_tasks(Some("thread-stop-fenced-task-run"), None, 10)
             .expect("list tasks");
         assert!(tasks.is_empty(), "stopped daemon should not create task");
+    }
+
+    #[test]
+    fn task_pid_clears_after_child_wait_before_store_retry() {
+        let (home, state) = test_state();
+        let task_id = "task-clear-pid-after-wait".to_owned();
+        let job_id = "job-clear-pid-after-wait".to_owned();
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: job_id.clone(),
+                        source_thread_id: "thread-clear-pid-after-wait".to_owned(),
+                        summary: "clear pid after wait".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: task_id.clone(),
+                        job_id: job_id.clone(),
+                        source_thread_id: "thread-clear-pid-after-wait".to_owned(),
+                        summary: "clear pid after wait".to_owned(),
+                        command_json: "[\"/bin/sh\",\"-c\",\"true\"]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+        }
+        let task_dir = state.layout.task_dir(&task_id);
+        ensure_private_dir(&task_dir).expect("task dir");
+        let stdout_path = task_dir.join("stdout.log");
+        let stderr_path = task_dir.join("stderr.log");
+        let result_path = task_dir.join("result.txt");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("true")
+            .current_dir(home.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
+        let pid = child.id();
+        let control = Arc::new(SupervisedTaskControl::default());
+        *control.pid.lock().expect("pid lock") = Some(pid);
+        let lock = Connection::open(state.layout.db_path()).expect("lock connection");
+        lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .expect("hold exclusive lock");
+        let layout = state.layout.clone();
+        let cwd = home.path().to_path_buf();
+        let control_for_worker = Arc::clone(&control);
+        let worker = thread::spawn(move || {
+            run_supervised_spawned_task(
+                &layout,
+                &task_id,
+                &job_id,
+                "/bin/sh -c true",
+                &cwd,
+                None,
+                3,
+                60,
+                &control_for_worker,
+                &mut child,
+                pid,
+                Instant::now(),
+                stdout_path,
+                stderr_path,
+                result_path,
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control.pid.lock().expect("pid lock").is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "task pid was not cleared while completion store write was blocked"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !worker.is_finished(),
+            "worker should still be blocked on the held store lock after clearing pid"
+        );
+        drop(lock);
+        worker
+            .join()
+            .expect("task worker joins")
+            .expect("task completes after lock release");
     }
 
     #[test]
