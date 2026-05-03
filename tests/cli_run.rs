@@ -2623,7 +2623,8 @@ fn cli_run_trusted_all_task_run_auto_delivery_closes_delivered() {
         .arg("--")
         .arg("/bin/sh")
         .arg("-c")
-        .arg("printf task-output")
+        .arg("printf '%s' \"$CBTH_TEST_TASK_OUTPUT\"")
+        .env("CBTH_TEST_TASK_OUTPUT", "task-output")
         .output()
         .expect("run supervised task");
     assert!(
@@ -2639,8 +2640,17 @@ fn cli_run_trusted_all_task_run_auto_delivery_closes_delivered() {
     wait_for_job_batch_close_reason(&home, job_id, "delivered");
     let summary = job_batch_summary(&home, job_id);
     assert!(summary.contains("Background task succeeded."));
-    assert!(summary.contains("Command: \"/bin/sh\" \"-c\" \"printf task-output\""));
-    assert!(summary.contains("stdout tail preview:\ntask-output"));
+    assert!(
+        summary
+            .contains("Command: \"/bin/sh\" \"-c\" \"printf '%s' \\\"$CBTH_TEST_TASK_OUTPUT\\\"\"")
+    );
+    assert!(
+        summary.contains("stdout/stderr tails are omitted from this automatic-delivery prompt")
+    );
+    assert!(
+        !summary.contains("task-output"),
+        "task stdout must not be embedded into auto-delivery prompt text"
+    );
 
     let output = cli_run.wait_with_output().expect("wait cli run");
     assert!(

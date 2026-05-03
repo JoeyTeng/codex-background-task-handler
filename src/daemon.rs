@@ -49,11 +49,11 @@ const CLI_APP_SERVER_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CLI_APP_SERVER_LISTENER_SCAN_BYTES: usize = 8 * 1024;
 const CLI_APP_SERVER_DRAIN_CHUNK_BYTES: usize = 4 * 1024;
 const TASK_STREAM_TAIL_BYTES: usize = 64 * 1024;
-const TASK_PROMPT_TAIL_PREVIEW_BYTES: usize = 2 * 1024;
 const TASK_PROMPT_COMMAND_PREVIEW_BYTES: usize = 4 * 1024;
 const TASK_STREAM_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TASK_TERM_GRACE: Duration = Duration::from_secs(5);
+const TASK_LEADER_EXITED_PROCESS_GROUP_GRACE: Duration = Duration::from_secs(5);
 const TASK_SHUTDOWN_DURABLE_CANCEL_GRACE: Duration = Duration::from_secs(1);
 const TASK_STREAM_DRAIN_HARD_GRACE: Duration = Duration::from_secs(1);
 const TASK_SPAWN_EXEC_GATE_FD: RawFd = 3;
@@ -1113,10 +1113,36 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
             let _ = signal_current_supervised_task_process_group(control, signal);
         }
         if now >= kill_deadline {
+            wait_for_supervised_task_process_groups_gone(&controls);
             return;
         }
         thread::sleep(TASK_WAIT_POLL_INTERVAL);
     }
+}
+
+fn wait_for_supervised_task_process_groups_gone(controls: &[(String, Arc<SupervisedTaskControl>)]) {
+    let deadline = Instant::now() + TASK_STREAM_DRAIN_HARD_GRACE + Duration::from_secs(1);
+    loop {
+        let mut all_gone = true;
+        for (_, control) in controls {
+            if current_supervised_task_process_group_exists(control).unwrap_or(false) {
+                all_gone = false;
+                let _ = signal_current_supervised_task_process_group(control, libc::SIGKILL);
+            }
+        }
+        if all_gone || Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(TASK_WAIT_POLL_INTERVAL);
+    }
+}
+
+fn current_supervised_task_process_group_exists(control: &SupervisedTaskControl) -> Result<bool> {
+    let pid = *control
+        .pid
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?;
+    Ok(pid.is_some_and(process_group_exists))
 }
 
 fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
@@ -1911,7 +1937,19 @@ fn run_supervised_task_worker_inner(
         .pid
         .lock()
         .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = Some(pid);
-    let pid_identity = process_start_identity(pid).unwrap_or(None);
+    let pid_identity = match process_start_identity(pid)
+        .and_then(|identity| identity.with_context(|| format!("task process {pid} disappeared")))
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            terminate_task_child_best_effort(&mut child, pid);
+            *control
+                .pid
+                .lock()
+                .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+            return Err(error).with_context(|| format!("record task process identity for {pid}"));
+        }
+    };
     let started_at = match current_epoch_seconds() {
         Ok(started_at) => started_at,
         Err(error) => {
@@ -1935,7 +1973,7 @@ fn run_supervised_task_worker_inner(
         }
     };
     if let Err(error) =
-        store.mark_task_started(task_id, i64::from(pid), pid_identity.as_deref(), started_at)
+        store.mark_task_started(task_id, i64::from(pid), Some(&pid_identity), started_at)
     {
         terminate_task_child_best_effort(&mut child, pid);
         *control
@@ -2107,14 +2145,14 @@ fn run_supervised_spawned_task(
     let mut cancelled = false;
     let mut termination_started_at: Option<Instant> = None;
     let mut sent_kill = false;
-    loop {
+    let child_exited_at = loop {
         match child_status_without_reaping(pid).context("poll task child without reaping")? {
             ChildStatusWithoutReaping::Exited => {
                 let exit_observed_at = Instant::now();
                 if !timed_out && supervised_task_cancel_requested_by(control, exit_observed_at) {
                     cancelled = true;
                 }
-                break;
+                break exit_observed_at;
             }
             ChildStatusWithoutReaping::Running => {}
             ChildStatusWithoutReaping::NotWaitable => {
@@ -2149,13 +2187,14 @@ fn run_supervised_spawned_task(
             Instant::now(),
             termination_started_at.is_some(),
         ));
-    }
+    };
     let (stdout_capture, stderr_capture) = join_task_stream_spools_with_control(
         stdout_worker,
         stderr_worker,
         pid,
         control,
         start,
+        child_exited_at,
         timeout,
         &mut cancelled,
         &mut timed_out,
@@ -2164,6 +2203,7 @@ fn run_supervised_spawned_task(
         pid,
         control,
         start,
+        child_exited_at,
         timeout,
         &mut cancelled,
         &mut timed_out,
@@ -2397,6 +2437,7 @@ fn wait_process_group_exit_with_control(
     pid: u32,
     control: &SupervisedTaskControl,
     start: Instant,
+    child_exited_at: Instant,
     timeout: Option<Duration>,
     cancelled: &mut bool,
     timed_out: &mut bool,
@@ -2419,6 +2460,12 @@ fn wait_process_group_exit_with_control(
             && timeout.is_some_and(|timeout| start.elapsed() >= timeout)
         {
             *timed_out = true;
+            signal_process_group(pid, libc::SIGTERM);
+            termination_started_at = Some(Instant::now());
+        }
+        if termination_started_at.is_none()
+            && child_exited_at.elapsed() >= TASK_LEADER_EXITED_PROCESS_GROUP_GRACE
+        {
             signal_process_group(pid, libc::SIGTERM);
             termination_started_at = Some(Instant::now());
         }
@@ -2448,6 +2495,7 @@ fn join_task_stream_spools_with_control(
     pid: u32,
     control: &SupervisedTaskControl,
     start: Instant,
+    child_exited_at: Instant,
     timeout: Option<Duration>,
     cancelled: &mut bool,
     timed_out: &mut bool,
@@ -2480,6 +2528,13 @@ fn join_task_stream_spools_with_control(
             && timeout.is_some_and(|timeout| start.elapsed() >= timeout)
         {
             *timed_out = true;
+            signal_process_group(pid, libc::SIGTERM);
+            termination_started_at = Some(Instant::now());
+        }
+        if termination_started_at.is_none()
+            && process_group_alive
+            && child_exited_at.elapsed() >= TASK_LEADER_EXITED_PROCESS_GROUP_GRACE
+        {
             signal_process_group(pid, libc::SIGTERM);
             termination_started_at = Some(Instant::now());
         }
@@ -2562,8 +2617,6 @@ struct TaskDeliverySummaryInput<'a> {
 }
 
 fn build_task_delivery_summary(input: TaskDeliverySummaryInput<'_>) -> String {
-    let stdout_tail = task_tail_preview(&input.stdout.tail);
-    let stderr_tail = task_tail_preview(&input.stderr.tail);
     format!(
         "Background task {status}.\n\
          Command: {command}\n\
@@ -2572,8 +2625,7 @@ fn build_task_delivery_summary(input: TaskDeliverySummaryInput<'_>) -> String {
          Signal: {signal:?}\n\
          stdout bytes: {stdout_bytes} (truncated: {stdout_truncated})\n\
          stderr bytes: {stderr_bytes} (truncated: {stderr_truncated})\n\
-         stdout tail preview:\n{stdout_tail}\n\
-         stderr tail preview:\n{stderr_tail}",
+         stdout/stderr tails are omitted from this automatic-delivery prompt because task output is untrusted. Read the result artifact if the logs are needed.",
         status = input.task_status,
         command = input.command,
         cwd = input.cwd.display(),
@@ -2584,11 +2636,6 @@ fn build_task_delivery_summary(input: TaskDeliverySummaryInput<'_>) -> String {
         stderr_bytes = input.stderr.bytes_seen,
         stderr_truncated = input.stderr.truncated,
     )
-}
-
-fn task_tail_preview(tail: &[u8]) -> String {
-    let start = tail.len().saturating_sub(TASK_PROMPT_TAIL_PREVIEW_BYTES);
-    String::from_utf8_lossy(&tail[start..]).into_owned()
 }
 
 fn truncate_string_bytes(value: &mut String, max_bytes: usize) {
@@ -5591,6 +5638,7 @@ mod tests {
             pid,
             &control,
             Instant::now(),
+            Instant::now(),
             Some(Duration::ZERO),
             &mut cancelled,
             &mut timed_out,
@@ -5640,6 +5688,7 @@ mod tests {
             blocking_worker(),
             pid,
             &control,
+            Instant::now(),
             Instant::now(),
             None,
             &mut cancelled,
@@ -5708,6 +5757,7 @@ mod tests {
             pid,
             &control,
             Instant::now(),
+            Instant::now(),
             None,
             &mut cancelled,
             &mut timed_out,
@@ -5716,6 +5766,7 @@ mod tests {
         wait_process_group_exit_with_control(
             pid,
             &control,
+            Instant::now(),
             Instant::now(),
             None,
             &mut cancelled,
@@ -5728,6 +5779,62 @@ mod tests {
         assert!(
             !process_group_exists(pid),
             "cancel should terminate live process group"
+        );
+    }
+
+    #[test]
+    fn leader_exit_cleanup_terminates_live_process_group_without_cancel_or_timeout() {
+        let leader_pid = unsafe { libc::fork() };
+        assert!(leader_pid >= 0, "fork leader failed");
+        if leader_pid == 0 {
+            unsafe {
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(2);
+                }
+                let member_pid = libc::fork();
+                if member_pid < 0 {
+                    libc::_exit(3);
+                }
+                if member_pid == 0 {
+                    loop {
+                        libc::sleep(30);
+                    }
+                }
+                libc::_exit(0);
+            }
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(leader_pid, &mut status, 0) };
+        assert_eq!(waited, leader_pid, "wait leader");
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "leader exited unsuccessfully"
+        );
+        let pid = u32::try_from(leader_pid).expect("leader pid");
+        assert!(process_group_exists(pid), "member should keep group alive");
+
+        let control = SupervisedTaskControl::default();
+        let mut cancelled = false;
+        let mut timed_out = false;
+        let leader_exited_at = Instant::now() - TASK_LEADER_EXITED_PROCESS_GROUP_GRACE;
+
+        wait_process_group_exit_with_control(
+            pid,
+            &control,
+            Instant::now(),
+            leader_exited_at,
+            None,
+            &mut cancelled,
+            &mut timed_out,
+        )
+        .expect("wait process group");
+
+        assert!(!cancelled);
+        assert!(!timed_out);
+        assert!(
+            !process_group_exists(pid),
+            "leader-exit cleanup should terminate live descendants"
         );
     }
 }
