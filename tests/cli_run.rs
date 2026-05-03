@@ -2354,7 +2354,7 @@ fn cli_run_passive_adapter_records_app_server_activity() {
         .arg(&fake_codex)
         .env("FAKE_CODEX_LOG", &log_path)
         .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
-        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "7")
         .output()
         .expect("run cbth cli run");
 

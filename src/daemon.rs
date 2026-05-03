@@ -1393,7 +1393,7 @@ fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
 fn lost_task_process_group_is_recoverable(pid: u32, expected_identity: &str) -> bool {
     match process_start_identity(pid) {
         Ok(Some(current_identity)) => current_identity == expected_identity,
-        Ok(None) => process_group_has_live_members_after_leader_exit(pid),
+        Ok(None) => false,
         Err(_) => false,
     }
 }
@@ -2704,6 +2704,7 @@ fn task_process_group_is_gone(child: &mut Child, pid: u32) -> Result<bool> {
     Ok(!process_group_has_live_members_after_leader_exit(pid))
 }
 
+#[derive(Debug)]
 struct TaskStreamCapture {
     bytes_seen: u64,
     truncated: bool,
@@ -2808,6 +2809,41 @@ fn join_task_stream_spool(worker: TaskStreamWorker) -> Result<TaskStreamCapture>
         .map_err(|_| anyhow::anyhow!("task stream worker panicked"))?
 }
 
+fn join_finished_task_stream_spool(
+    worker: &mut Option<TaskStreamWorker>,
+) -> Option<Result<TaskStreamCapture>> {
+    if worker
+        .as_ref()
+        .is_some_and(|worker| worker.handle.is_finished())
+    {
+        return Some(join_task_stream_spool(
+            worker.take().expect("stream worker is present"),
+        ));
+    }
+    None
+}
+
+fn abort_task_stream_worker(worker: &Option<TaskStreamWorker>) {
+    if let Some(worker) = worker {
+        worker.abort.store(true, Ordering::Release);
+    }
+}
+
+fn record_finished_task_stream_spool(
+    label: &str,
+    result: Result<TaskStreamCapture>,
+    capture: &mut Option<TaskStreamCapture>,
+    stream_error: &mut Option<anyhow::Error>,
+) {
+    match result {
+        Ok(value) => *capture = Some(value),
+        Err(error) if stream_error.is_none() => {
+            *stream_error = Some(error.context(format!("{label} task stream failed")));
+        }
+        Err(_) => {}
+    }
+}
+
 fn wait_process_group_exit_with_control(
     pid: u32,
     control: &SupervisedTaskControl,
@@ -2876,12 +2912,33 @@ fn join_task_stream_spools_with_control(
     cancelled: &mut bool,
     timed_out: &mut bool,
 ) -> Result<(TaskStreamCapture, TaskStreamCapture)> {
+    let mut stdout_worker = Some(stdout_worker);
+    let mut stderr_worker = Some(stderr_worker);
+    let mut stdout_capture = None;
+    let mut stderr_capture = None;
+    let mut stream_error = None;
     let mut termination_started_at = None;
     let mut sent_kill = false;
     let mut stream_abort_started_at = None;
     let mut process_group_gone_at = None;
     loop {
-        if stdout_worker.handle.is_finished() && stderr_worker.handle.is_finished() {
+        if let Some(result) = join_finished_task_stream_spool(&mut stdout_worker) {
+            record_finished_task_stream_spool(
+                "stdout",
+                result,
+                &mut stdout_capture,
+                &mut stream_error,
+            );
+        }
+        if let Some(result) = join_finished_task_stream_spool(&mut stderr_worker) {
+            record_finished_task_stream_spool(
+                "stderr",
+                result,
+                &mut stderr_capture,
+                &mut stream_error,
+            );
+        }
+        if stdout_worker.is_none() && stderr_worker.is_none() {
             break;
         }
         let process_group_alive = process_group_has_live_members_after_leader_exit(pid);
@@ -2889,6 +2946,19 @@ fn join_task_stream_spools_with_control(
             process_group_gone_at = None;
         } else if process_group_gone_at.is_none() {
             process_group_gone_at = Some(Instant::now());
+        }
+        if stream_error.is_some() {
+            abort_task_stream_worker(&stdout_worker);
+            abort_task_stream_worker(&stderr_worker);
+            if stream_abort_started_at.is_none() {
+                stream_abort_started_at = Some(Instant::now());
+            }
+            if termination_started_at.is_none()
+                && process_group_alive
+                && signal_process_group(pid, libc::SIGTERM)
+            {
+                termination_started_at = Some(Instant::now());
+            }
         }
         if termination_started_at.is_none()
             && process_group_alive
@@ -2923,8 +2993,8 @@ fn join_task_stream_spools_with_control(
                 || process_group_gone_at
                     .is_some_and(|gone_at| gone_at.elapsed() >= TASK_STREAM_DRAIN_HARD_GRACE))
         {
-            stdout_worker.abort.store(true, Ordering::Release);
-            stderr_worker.abort.store(true, Ordering::Release);
+            abort_task_stream_worker(&stdout_worker);
+            abort_task_stream_worker(&stderr_worker);
             stream_abort_started_at = Some(Instant::now());
         }
         if let Some(started_at) = termination_started_at
@@ -2940,16 +3010,19 @@ fn join_task_stream_spools_with_control(
                 started_at.elapsed() >= TASK_TERM_GRACE + TASK_STREAM_DRAIN_HARD_GRACE
             })
         {
-            stdout_worker.abort.store(true, Ordering::Release);
-            stderr_worker.abort.store(true, Ordering::Release);
+            abort_task_stream_worker(&stdout_worker);
+            abort_task_stream_worker(&stderr_worker);
             stream_abort_started_at = Some(Instant::now());
         }
         thread::sleep(TASK_WAIT_POLL_INTERVAL);
     }
 
+    if let Some(error) = stream_error {
+        return Err(error);
+    }
     Ok((
-        join_task_stream_spool(stdout_worker)?,
-        join_task_stream_spool(stderr_worker)?,
+        stdout_capture.context("stdout task stream did not produce a capture")?,
+        stderr_capture.context("stderr task stream did not produce a capture")?,
     ))
 }
 
@@ -5976,7 +6049,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_kills_group_when_leader_already_exited() {
+    fn startup_recovery_skips_group_when_leader_identity_is_unavailable() {
         let home = tempfile::tempdir().expect("temp home");
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
             .expect("chmod temp home");
@@ -6046,13 +6119,18 @@ mod tests {
 
         recover_lost_task_process_groups(&layout).expect("recover lost tasks");
 
-        let gone_deadline = Instant::now() + Duration::from_secs(2);
-        while process_group_exists(pid) && Instant::now() < gone_deadline {
+        assert!(
+            process_group_exists(pid),
+            "startup recovery must not signal a group after the leader identity is no longer available"
+        );
+        signal_process_group(pid, libc::SIGKILL);
+        let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+        while process_group_exists(pid) && Instant::now() < cleanup_deadline {
             thread::sleep(TASK_WAIT_POLL_INTERVAL);
         }
         assert!(
             !process_group_exists(pid),
-            "startup recovery should clean surviving same-group descendants after the leader exits"
+            "test cleanup should kill the skipped process group"
         );
     }
 
@@ -7651,6 +7729,88 @@ mod tests {
         assert!(!timed_out);
         assert!(stdout_capture.truncated);
         assert!(stderr_capture.truncated);
+    }
+
+    #[test]
+    fn stream_drain_fails_fast_when_one_stream_worker_errors() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("/bin/sh -c 'trap \"exit 0\" TERM; while true; do sleep 1; done' >/dev/null 2>&1 & exit 0")
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn process group");
+        let pid = child.id();
+        child.wait().expect("wait leader");
+        let live_deadline = Instant::now() + Duration::from_secs(2);
+        while !process_group_has_live_members_after_leader_exit(pid)
+            && Instant::now() < live_deadline
+        {
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
+        assert!(
+            process_group_exists(pid),
+            "descendant should keep group alive"
+        );
+
+        let failing_worker = || {
+            let abort = Arc::new(AtomicBool::new(false));
+            let handle = thread::spawn(|| -> Result<TaskStreamCapture> {
+                thread::sleep(Duration::from_millis(50));
+                Err(anyhow::anyhow!("simulated stream spool failure"))
+            });
+            TaskStreamWorker { handle, abort }
+        };
+        let blocking_worker = || {
+            let abort = Arc::new(AtomicBool::new(false));
+            let worker_abort = Arc::clone(&abort);
+            let handle = thread::spawn(move || {
+                while !worker_abort.load(Ordering::Acquire) {
+                    thread::sleep(READ_POLL_INTERVAL);
+                }
+                Ok(TaskStreamCapture {
+                    bytes_seen: 0,
+                    truncated: true,
+                    tail: Vec::new(),
+                })
+            });
+            TaskStreamWorker { handle, abort }
+        };
+        let control = SupervisedTaskControl::default();
+        let mut cancelled = false;
+        let mut timed_out = false;
+
+        let started = Instant::now();
+        let error = join_task_stream_spools_with_control(
+            failing_worker(),
+            blocking_worker(),
+            pid,
+            &control,
+            Instant::now(),
+            Instant::now(),
+            None,
+            &mut cancelled,
+            &mut timed_out,
+        )
+        .expect_err("stream worker failure should fail the task");
+
+        assert!(
+            started.elapsed() < TASK_TERM_GRACE,
+            "stream worker failure should not wait for the other stream forever"
+        );
+        assert!(
+            format!("{error:#}").contains("stdout task stream failed"),
+            "{error:#}"
+        );
+        assert!(!cancelled);
+        assert!(!timed_out);
+        let gone_deadline = Instant::now() + Duration::from_secs(2);
+        while process_group_exists(pid) && Instant::now() < gone_deadline {
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
+        assert!(
+            !process_group_exists(pid),
+            "stream worker failure should terminate the live process group"
+        );
     }
 
     #[test]
