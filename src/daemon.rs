@@ -1396,7 +1396,9 @@ fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
 fn lost_task_process_group_is_recoverable(pid: u32, expected_identity: &str) -> bool {
     match process_start_identity(pid) {
         Ok(Some(current_identity)) => current_identity == expected_identity,
-        Ok(None) => false,
+        // An exited leader cannot prove identity, so require an enumerated
+        // live same-PGID member before startup recovery signals the group.
+        Ok(None) => process_group_has_enumerated_live_members_after_leader_exit(pid),
         Err(_) => false,
     }
 }
@@ -4374,6 +4376,10 @@ fn process_group_has_live_members_after_leader_exit(leader_pid: u32) -> bool {
     }
 }
 
+fn process_group_has_enumerated_live_members_after_leader_exit(leader_pid: u32) -> bool {
+    process_group_has_live_members_except_leader(leader_pid).unwrap_or(false)
+}
+
 #[cfg(target_os = "linux")]
 fn process_group_has_live_members_except_leader(leader_pid: u32) -> Result<bool> {
     let pgid = leader_pid;
@@ -6063,7 +6069,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_skips_group_when_leader_identity_is_unavailable() {
+    fn startup_recovery_kills_group_when_leader_identity_is_unavailable_but_members_remain() {
         let home = tempfile::tempdir().expect("temp home");
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
             .expect("chmod temp home");
@@ -6133,18 +6139,13 @@ mod tests {
 
         recover_lost_task_process_groups(&layout).expect("recover lost tasks");
 
-        assert!(
-            process_group_exists(pid),
-            "startup recovery must not signal a group after the leader identity is no longer available"
-        );
-        signal_process_group(pid, libc::SIGKILL);
         let cleanup_deadline = Instant::now() + Duration::from_secs(2);
         while process_group_exists(pid) && Instant::now() < cleanup_deadline {
             thread::sleep(TASK_WAIT_POLL_INTERVAL);
         }
         assert!(
             !process_group_exists(pid),
-            "test cleanup should kill the skipped process group"
+            "startup recovery should kill verified live members after the leader exits"
         );
     }
 
