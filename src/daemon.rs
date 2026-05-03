@@ -1387,7 +1387,7 @@ fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
         }
         signal_process_group(process.pid, libc::SIGTERM);
         thread::sleep(TASK_WAIT_POLL_INTERVAL);
-        if process_group_exists(process.pid) {
+        if lost_task_process_group_is_recoverable(process.pid, expected_identity) {
             signal_process_group(process.pid, libc::SIGKILL);
         }
     }
