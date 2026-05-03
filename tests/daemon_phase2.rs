@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -247,6 +248,52 @@ fn wait_for_socket_removed(home: &TempDir) {
         assert!(Instant::now() < deadline, "daemon socket was not removed");
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} did not appear",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_nonempty_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} did not become non-empty",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_socket_removed_with_timeout(home: &TempDir, timeout: Duration) {
+    let socket_path = home.path().join("run").join("cbth.sock");
+    let deadline = Instant::now() + timeout;
+    while socket_path.exists() {
+        assert!(Instant::now() < deadline, "daemon socket was not removed");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn process_group_exists(pid: u32) -> bool {
+    if unsafe { libc::killpg(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    !matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    )
 }
 
 #[test]
@@ -1768,6 +1815,49 @@ fn daemon_stop_cancels_active_supervised_task() {
     assert_eq!(job["job"]["status"], "failed");
     thread::sleep(Duration::from_secs(3));
     assert!(!marker.exists(), "supervised child escaped daemon stop");
+}
+
+#[test]
+fn daemon_stop_kills_term_ignoring_task_when_cancel_store_is_locked() {
+    let home = temp_home();
+    let pid_file = home.path().join("daemon-stop-locked-task.pid");
+    let pid_file_arg = pid_file.to_string_lossy().to_string();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-daemon-stop-locked",
+            "--summary",
+            "daemon stop locked task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s\n' \"$$\" > \"$1\"; trap '' TERM; while :; do sleep 1; done",
+            "cbth-task",
+            &pid_file_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+    wait_for_path(&pid_file);
+    wait_for_nonempty_file(&pid_file);
+    let pid = fs::read_to_string(&pid_file)
+        .expect("read pid file")
+        .trim()
+        .parse::<u32>()
+        .expect("task pid");
+
+    let conn = hold_exclusive_db_lock(&home);
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
+    drop(conn);
+
+    assert!(
+        !process_group_exists(pid),
+        "TERM-ignoring supervised process group survived daemon stop"
+    );
 }
 
 #[test]

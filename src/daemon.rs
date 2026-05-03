@@ -19,6 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use rusqlite::ErrorCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -53,10 +54,14 @@ const TASK_PROMPT_COMMAND_PREVIEW_BYTES: usize = 4 * 1024;
 const TASK_STREAM_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TASK_TERM_GRACE: Duration = Duration::from_secs(5);
+const TASK_SHUTDOWN_DURABLE_CANCEL_GRACE: Duration = Duration::from_secs(1);
 const TASK_STREAM_DRAIN_HARD_GRACE: Duration = Duration::from_secs(1);
 const TASK_SPAWN_EXEC_GATE_FD: RawFd = 3;
 const TASK_SPAWN_EXEC_GATE_SCRIPT: &str =
     "if IFS= read -r _ <&3; then exec 3<&-; exec \"$@\"; else exit 127; fi";
+const TASK_STORE_COMPLETION_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
+const TASK_STORE_COMPLETION_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
+const TASK_STORE_COMPLETION_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
 const MAX_SUPERVISED_TASKS: usize = 16;
 const MAX_TASK_ENV_VARS: usize = 4096;
 const MAX_TASK_ENV_BYTES: usize = 1024 * 1024;
@@ -1050,9 +1055,8 @@ fn join_lifecycle_maintenance(worker: Option<thread::JoinHandle<()>>) {
 }
 
 fn stop_all_supervised_tasks(state: &DaemonState) {
-    let term_deadline = Instant::now() + TASK_TERM_GRACE + Duration::from_secs(2);
-    let kill_deadline = term_deadline + TASK_TERM_GRACE + Duration::from_secs(2);
-    let mut sent_kill = false;
+    let term_deadline = Instant::now() + TASK_SHUTDOWN_DURABLE_CANCEL_GRACE;
+    let kill_deadline = term_deadline + TASK_TERM_GRACE;
     loop {
         let controls = match state.supervised_tasks.lock() {
             Ok(tasks) => tasks
@@ -1064,31 +1068,34 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
         if controls.is_empty() {
             return;
         }
+        let now = Instant::now();
+        let force_signal_without_durable_cancel = now >= term_deadline;
+        let signal = if now >= kill_deadline {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
         for (task_id, control) in &controls {
-            if durably_request_supervised_task_cancel(&state.layout, task_id, control).is_err()
-                && Instant::now() < kill_deadline
-            {
-                continue;
+            let durable_cancelled = durably_request_supervised_task_cancel_for_shutdown(
+                &state.layout,
+                task_id,
+                control,
+            )
+            .is_ok();
+            if !durable_cancelled {
+                if !force_signal_without_durable_cancel {
+                    continue;
+                }
+                request_supervised_task_cancel(control);
             }
             if let Ok(guard) = control.pid.lock()
                 && let Some(pid) = *guard
             {
-                signal_process_group(
-                    pid,
-                    if sent_kill {
-                        libc::SIGKILL
-                    } else {
-                        libc::SIGTERM
-                    },
-                );
+                signal_process_group(pid, signal);
             }
         }
-        let now = Instant::now();
         if now >= kill_deadline {
             return;
-        }
-        if now >= term_deadline {
-            sent_kill = true;
         }
         thread::sleep(TASK_WAIT_POLL_INTERVAL);
     }
@@ -1130,8 +1137,23 @@ fn request_supervised_task_cancel(control: &SupervisedTaskControl) {
 }
 
 fn persist_task_cancel_request(layout: &FsLayout, task_id: &str) -> Result<TaskRecord> {
+    persist_task_cancel_request_with_open(layout, task_id, Store::open)
+}
+
+fn persist_task_cancel_request_for_shutdown(
+    layout: &FsLayout,
+    task_id: &str,
+) -> Result<TaskRecord> {
+    persist_task_cancel_request_with_open(layout, task_id, Store::open_for_daemon_lifecycle)
+}
+
+fn persist_task_cancel_request_with_open(
+    layout: &FsLayout,
+    task_id: &str,
+    open_store: fn(&FsLayout) -> Result<Store>,
+) -> Result<TaskRecord> {
     let now = current_epoch_seconds()?;
-    let mut store = Store::open(layout)?;
+    let mut store = open_store(layout)?;
     store.request_task_cancel(task_id, now)
 }
 
@@ -1141,6 +1163,16 @@ fn durably_request_supervised_task_cancel(
     control: &SupervisedTaskControl,
 ) -> Result<TaskRecord> {
     let task = persist_task_cancel_request(layout, task_id)?;
+    request_supervised_task_cancel(control);
+    Ok(task)
+}
+
+fn durably_request_supervised_task_cancel_for_shutdown(
+    layout: &FsLayout,
+    task_id: &str,
+    control: &SupervisedTaskControl,
+) -> Result<TaskRecord> {
+    let task = persist_task_cancel_request_for_shutdown(layout, task_id)?;
     request_supervised_task_cancel(control);
     Ok(task)
 }
@@ -2010,29 +2042,37 @@ fn run_supervised_spawned_task(
         &stdout_capture,
         &stderr_capture,
     )?;
-    close_task_job_with_result(
-        layout,
-        job_id,
-        &result_path,
-        task_status,
-        &delivery_summary,
-        completed_at,
-        max_delivery_attempts,
-        redelivery_window_seconds,
-    )?;
-    Store::open(layout)?.finish_task(TaskFinishUpdate {
-        task_id,
-        status: task_status,
-        completed_at,
-        exit_code,
-        signal,
-        failure_reason: failure_reason.as_deref(),
-        stdout_log_path: Some(&format!("tasks/{task_id}/stdout.log")),
-        stderr_log_path: Some(&format!("tasks/{task_id}/stderr.log")),
-        stdout_bytes: i64::try_from(stdout_capture.bytes_seen).unwrap_or(i64::MAX),
-        stderr_bytes: i64::try_from(stderr_capture.bytes_seen).unwrap_or(i64::MAX),
-        stdout_truncated: stdout_capture.truncated,
-        stderr_truncated: stderr_capture.truncated,
+    retry_task_store_completion("close task job with result", || {
+        close_task_job_with_result(
+            layout,
+            job_id,
+            &result_path,
+            task_status,
+            &delivery_summary,
+            completed_at,
+            max_delivery_attempts,
+            redelivery_window_seconds,
+        )
+    })?;
+    let stdout_log_path = format!("tasks/{task_id}/stdout.log");
+    let stderr_log_path = format!("tasks/{task_id}/stderr.log");
+    retry_task_store_completion("finish task", || {
+        Store::open(layout)?
+            .finish_task(TaskFinishUpdate {
+                task_id,
+                status: task_status,
+                completed_at,
+                exit_code,
+                signal,
+                failure_reason: failure_reason.as_deref(),
+                stdout_log_path: Some(&stdout_log_path),
+                stderr_log_path: Some(&stderr_log_path),
+                stdout_bytes: i64::try_from(stdout_capture.bytes_seen).unwrap_or(i64::MAX),
+                stderr_bytes: i64::try_from(stderr_capture.bytes_seen).unwrap_or(i64::MAX),
+                stdout_truncated: stdout_capture.truncated,
+                stderr_truncated: stderr_capture.truncated,
+            })
+            .map(|_| ())
     })?;
     Ok(())
 }
@@ -2475,6 +2515,44 @@ fn close_task_job_with_result(
             Err(error)
         }
     }
+}
+
+fn retry_task_store_completion<T>(
+    operation: &str,
+    mut action: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let started_at = Instant::now();
+    let mut retry_delay = TASK_STORE_COMPLETION_RETRY_INITIAL_DELAY;
+    loop {
+        match action() {
+            Ok(value) => return Ok(value),
+            Err(error) if task_store_error_is_busy_or_locked(&error) => {
+                let elapsed = started_at.elapsed();
+                if elapsed >= TASK_STORE_COMPLETION_RETRY_TIMEOUT {
+                    return Err(error).with_context(|| format!("{operation} after retry timeout"));
+                }
+                let remaining = TASK_STORE_COMPLETION_RETRY_TIMEOUT.saturating_sub(elapsed);
+                thread::sleep(retry_delay.min(remaining));
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(TASK_STORE_COMPLETION_RETRY_MAX_DELAY);
+            }
+            Err(error) => return Err(error).with_context(|| operation.to_owned()),
+        }
+    }
+}
+
+fn task_store_error_is_busy_or_locked(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(|sqlite_error| {
+                matches!(
+                    sqlite_error.sqlite_error_code(),
+                    Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+                )
+            })
+    })
 }
 
 fn clamp_redelivery_window_seconds_for_timestamp(now: i64, redelivery_window_seconds: i64) -> i64 {
@@ -4060,6 +4138,29 @@ mod tests {
             .note_cli_managed_session_activity(&managed_session_id, 1, "idle", 1, 102)
             .expect("note activity");
         managed_session_id
+    }
+
+    #[test]
+    fn task_store_completion_retry_retries_sqlite_lock_errors() {
+        let mut attempts = 0;
+        let result = retry_task_store_completion("test retry", || {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: ErrorCode::DatabaseLocked,
+                        extended_code: 0,
+                    },
+                    None,
+                )
+                .into());
+            }
+            Ok("retried")
+        })
+        .expect("retry succeeds");
+
+        assert_eq!(result, "retried");
+        assert_eq!(attempts, 2);
     }
 
     fn test_managed_cli_app_server(
