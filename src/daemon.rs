@@ -612,7 +612,12 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
                 Ok(_) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    stop_incompatible_daemon(layout, startup_deadline)?;
+                    if let Some(response) = stop_incompatible_daemon(layout, startup_deadline)? {
+                        return Ok(json!({
+                            "started": false,
+                            "daemon": response["daemon"].clone(),
+                        }));
+                    }
                     break;
                 }
                 Err(last_error) => {
@@ -946,8 +951,7 @@ fn probe_existing_daemon_for_ensure(
         match daemon_request_with_timeout(layout, "ping", remaining_budget(startup_deadline)?) {
             Ok(response) if daemon_response_is_compatible(&response) => return Ok(Some(response)),
             Ok(_) => {
-                stop_incompatible_daemon(layout, startup_deadline)?;
-                return Ok(None);
+                return stop_incompatible_daemon(layout, startup_deadline);
             }
             Err(error) if error_is_daemon_busy(&error) => {
                 thread::sleep(STARTUP_POLL_INTERVAL);
@@ -1003,7 +1007,7 @@ fn daemon_response_is_compatible(response: &Value) -> bool {
     has_protocol && has_capabilities
 }
 
-fn stop_incompatible_daemon(layout: &FsLayout, startup_deadline: Instant) -> Result<()> {
+fn stop_incompatible_daemon(layout: &FsLayout, startup_deadline: Instant) -> Result<Option<Value>> {
     daemon_request_with_timeout(layout, "stop", remaining_budget(startup_deadline)?)
         .context("stop incompatible daemon")?;
     wait_for_incompatible_daemon_replaced_or_removed_until(layout, startup_deadline)
@@ -1012,17 +1016,17 @@ fn stop_incompatible_daemon(layout: &FsLayout, startup_deadline: Instant) -> Res
 fn wait_for_incompatible_daemon_replaced_or_removed_until(
     layout: &FsLayout,
     deadline: Instant,
-) -> Result<()> {
+) -> Result<Option<Value>> {
     let socket_path = layout.daemon_socket_path();
     let mut saw_socket_absent = false;
     loop {
         if !socket_path.exists() {
             if saw_socket_absent {
-                return Ok(());
+                return Ok(None);
             }
             saw_socket_absent = true;
             if Instant::now() >= deadline {
-                return Ok(());
+                return Ok(None);
             }
             thread::sleep(
                 remaining_budget(deadline)
@@ -1034,9 +1038,9 @@ fn wait_for_incompatible_daemon_replaced_or_removed_until(
         saw_socket_absent = false;
         let probe_budget = remaining_budget(deadline).unwrap_or(STARTUP_POLL_INTERVAL);
         match daemon_request_with_timeout(layout, "ping", probe_budget.min(STARTUP_POLL_INTERVAL)) {
-            Ok(response) if daemon_response_is_compatible(&response) => return Ok(()),
+            Ok(response) if daemon_response_is_compatible(&response) => return Ok(Some(response)),
             Ok(_) => {}
-            Err(error) if error_is_daemon_busy(&error) => return Ok(()),
+            Err(error) if error_is_daemon_busy(&error) => return Ok(None),
             Err(_) => {}
         }
         if Instant::now() >= deadline {

@@ -3384,12 +3384,16 @@ fn task_status_from_failure_reason(reason: &str) -> Option<&'static str> {
     if reason == "task timed out" {
         return Some("timed_out");
     }
+    if reason == "task supervisor lost after daemon restart" {
+        return Some("lost");
+    }
     let status = reason.strip_prefix("Background task ")?.split_once('.')?.0;
     match status {
         "succeeded" => Some("succeeded"),
         "failed" => Some("failed"),
         "cancelled" => Some("cancelled"),
         "timed_out" => Some("timed_out"),
+        "lost" => Some("lost"),
         _ => None,
     }
 }
@@ -4432,6 +4436,43 @@ mod tests {
         assert_eq!(
             timed_out.failure_reason.as_deref(),
             Some("Background task timed_out.\n\nCommand timed out.")
+        );
+    }
+
+    #[test]
+    fn lost_task_recovery_preserves_partial_lost_job_recovery() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        create_test_task(
+            &mut store,
+            "job-partial-lost",
+            "task-partial-lost",
+            "thread-partial-lost",
+            5,
+            10,
+        );
+        store
+            .fail_job(
+                "job-partial-lost",
+                "task supervisor lost after daemon restart",
+                20,
+                5,
+                10,
+            )
+            .expect("partially recover lost job");
+
+        let recovered = store.fail_lost_tasks(30).expect("recover lost task");
+
+        assert_eq!(recovered, 1);
+        let task = store
+            .inspect_task("task-partial-lost")
+            .expect("inspect task");
+        assert_eq!(task.status, "lost");
+        assert_eq!(task.completed_at, Some(20));
+        assert_eq!(
+            task.failure_reason.as_deref(),
+            Some("task supervisor lost after daemon restart")
         );
     }
 
