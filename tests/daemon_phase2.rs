@@ -1781,6 +1781,40 @@ fn daemon_task_timeout_terminates_process_group_and_fails_job() {
 }
 
 #[test]
+fn daemon_task_timeout_wins_over_later_cancel() {
+    let home = temp_home();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-timeout-then-cancel",
+            "--summary",
+            "timeout then cancel task",
+            "--timeout-seconds",
+            "1",
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap '' TERM; while :; do sleep 1; done",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let job_id = started["task"]["job_id"].as_str().expect("job id");
+
+    thread::sleep(Duration::from_secs(2));
+    cbth_daemon(&home, &["task", "cancel", "--task-id", task_id]);
+
+    let task = wait_for_task_status(&home, task_id, "timed_out");
+    assert_eq!(task["task"]["failure_reason"], "task timed out");
+    let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
+    assert_eq!(job["job"]["status"], "failed");
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
 fn daemon_stop_cancels_active_supervised_task() {
     let home = temp_home();
     let marker = home.path().join("daemon-stop-orphan-marker");
@@ -2582,9 +2616,12 @@ fn maintenance_sweep_removes_expired_task_log_dirs() {
 #[test]
 fn daemon_task_run_rejects_transport_oversized_environment_before_daemon_start() {
     let home = temp_home();
-    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
-        .env_clear()
-        .env("CBTH_HUGE_ENV", "x".repeat(600 * 1024))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cbth"));
+    command.env_clear();
+    for index in 0..150 {
+        command.env(format!("CBTH_HUGE_ENV_{index}"), "x".repeat(4096));
+    }
+    let output = command
         .arg("--home")
         .arg(home.path())
         .args([

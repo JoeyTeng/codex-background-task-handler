@@ -1841,6 +1841,19 @@ fn run_supervised_task_worker_inner(
         return Err(error);
     }
     drop(store);
+    if control.cancel_requested.load(Ordering::Acquire) {
+        finish_cancelled_before_exec_gate_release(
+            layout,
+            task_id,
+            job_id,
+            max_delivery_attempts,
+            redelivery_window_seconds,
+            control,
+            &mut child,
+            pid,
+        )?;
+        return Ok(());
+    }
     if let Err(error) = release_task_spawn_exec_gate(exec_gate) {
         terminate_task_child_best_effort(&mut child, pid);
         *control
@@ -1876,6 +1889,31 @@ fn run_supervised_task_worker_inner(
         .lock()
         .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_cancelled_before_exec_gate_release(
+    layout: &FsLayout,
+    task_id: &str,
+    job_id: &str,
+    max_delivery_attempts: i64,
+    redelivery_window_seconds: i64,
+    control: &SupervisedTaskControl,
+    child: &mut Child,
+    pid: u32,
+) -> Result<()> {
+    terminate_task_child_best_effort(child, pid);
+    *control
+        .pid
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+    finish_unspawned_cancelled_task(
+        layout,
+        task_id,
+        job_id,
+        max_delivery_attempts,
+        redelivery_window_seconds,
+    )
 }
 
 fn finish_unspawned_cancelled_task(
@@ -1952,7 +1990,7 @@ fn run_supervised_spawned_task(
         match child_status_without_reaping(pid).context("poll task child without reaping")? {
             ChildStatusWithoutReaping::Exited => {
                 let exit_observed_at = Instant::now();
-                if supervised_task_cancel_requested_by(control, exit_observed_at) {
+                if !timed_out && supervised_task_cancel_requested_by(control, exit_observed_at) {
                     cancelled = true;
                 }
                 break;
@@ -1962,7 +2000,10 @@ fn run_supervised_spawned_task(
                 bail!("task child is no longer waitable before completion");
             }
         }
-        if termination_started_at.is_none() && control.cancel_requested.load(Ordering::Acquire) {
+        if termination_started_at.is_none()
+            && !timed_out
+            && control.cancel_requested.load(Ordering::Acquire)
+        {
             cancelled = true;
             signal_process_group(pid, libc::SIGTERM);
             termination_started_at = Some(Instant::now());
@@ -2245,7 +2286,10 @@ fn wait_process_group_exit_with_control(
         if !process_group_has_live_members_after_leader_exit(pid) {
             return Ok(());
         }
-        if termination_started_at.is_none() && control.cancel_requested.load(Ordering::Acquire) {
+        if termination_started_at.is_none()
+            && !*timed_out
+            && control.cancel_requested.load(Ordering::Acquire)
+        {
             *cancelled = true;
             signal_process_group(pid, libc::SIGTERM);
             termination_started_at = Some(Instant::now());
@@ -2303,6 +2347,7 @@ fn join_task_stream_spools_with_control(
         }
         if termination_started_at.is_none()
             && process_group_alive
+            && !*timed_out
             && control.cancel_requested.load(Ordering::Acquire)
         {
             *cancelled = true;
@@ -2356,10 +2401,10 @@ fn join_task_stream_spools_with_control(
 }
 
 fn task_status_for_exit(status: ExitStatus, cancelled: bool, timed_out: bool) -> &'static str {
-    if cancelled {
-        "cancelled"
-    } else if timed_out {
+    if timed_out {
         "timed_out"
+    } else if cancelled {
+        "cancelled"
     } else if status.success() {
         "succeeded"
     } else {
@@ -4682,6 +4727,92 @@ mod tests {
         assert_eq!(task.status, "cancelled");
         assert_eq!(task.pid, None);
         let job = store.inspect_job("job-pre-spawn-cancel").expect("job");
+        assert_eq!(job.status, "failed");
+    }
+
+    #[test]
+    fn cancelled_after_started_before_exec_gate_release_does_not_execute_command() {
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let marker = home.path().join("pre-exec-cancel-marker");
+        {
+            let mut store = Store::open(&layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-pre-exec-cancel".to_owned(),
+                        source_thread_id: "thread-pre-exec-cancel".to_owned(),
+                        summary: "pre exec cancel".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-pre-exec-cancel".to_owned(),
+                        job_id: "job-pre-exec-cancel".to_owned(),
+                        source_thread_id: "thread-pre-exec-cancel".to_owned(),
+                        summary: "pre exec cancel".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+        }
+        let control = SupervisedTaskControl::default();
+        let exec_gate = task_spawn_exec_gate().expect("exec gate");
+        let mut command = Command::new("/bin/sh");
+        install_task_spawn_exec_gate(&mut command, &exec_gate);
+        let mut child = command
+            .arg("-c")
+            .arg(TASK_SPAWN_EXEC_GATE_SCRIPT)
+            .arg("cbth-task-gate")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("printf ran > \"$1\"")
+            .arg("cbth-task")
+            .arg(&marker)
+            .current_dir(home.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn gated child");
+        let pid = child.id();
+        *control.pid.lock().expect("pid lock") = Some(pid);
+        {
+            let mut store = Store::open(&layout).expect("store");
+            store
+                .mark_task_started("task-pre-exec-cancel", i64::from(pid), None, 11)
+                .expect("mark started");
+        }
+        request_supervised_task_cancel(&control);
+
+        finish_cancelled_before_exec_gate_release(
+            &layout,
+            "task-pre-exec-cancel",
+            "job-pre-exec-cancel",
+            3,
+            60,
+            &control,
+            &mut child,
+            pid,
+        )
+        .expect("finish pre-exec cancel");
+        drop(exec_gate);
+
+        assert!(!marker.exists(), "cancelled task command was executed");
+        assert_eq!(*control.pid.lock().expect("pid lock"), None);
+        let store = Store::open(&layout).expect("store");
+        let task = store.inspect_task("task-pre-exec-cancel").expect("task");
+        assert_eq!(task.status, "cancelled");
+        let job = store.inspect_job("job-pre-exec-cancel").expect("job");
         assert_eq!(job.status, "failed");
     }
 
