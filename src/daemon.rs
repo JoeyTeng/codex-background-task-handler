@@ -308,13 +308,26 @@ struct DaemonState {
 
 #[derive(Default)]
 struct SupervisedTaskControl {
-    pid: Mutex<Option<u32>>,
-    pid_identity: Mutex<Option<String>>,
+    process: Mutex<SupervisedTaskProcessState>,
     cancel_intents: AtomicUsize,
     cancel_requested: AtomicBool,
     cancel_signal_sent: AtomicBool,
     spawn_gate: Mutex<()>,
     exec_release_decision: Mutex<()>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SupervisedTaskProcess {
+    pid: u32,
+    pid_identity: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum SupervisedTaskProcessState {
+    #[default]
+    Pending,
+    Running(SupervisedTaskProcess),
+    Completing,
 }
 
 struct ManagedCliAppServer {
@@ -551,7 +564,10 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         stop_all_cli_thread_start_bootstraps(&state);
         clear_cli_app_server_reservations(&state);
         reap_finished_workers(&mut workers);
-        join_lifecycle_maintenance(lifecycle_maintenance_worker);
+        drain_lifecycle_maintenance_until(
+            &mut lifecycle_maintenance_worker,
+            Instant::now() + DAEMON_STOP_WORKER_DRAIN_GRACE,
+        );
     } else {
         join_workers(workers);
         join_lifecycle_maintenance(lifecycle_maintenance_worker);
@@ -1103,6 +1119,19 @@ fn join_lifecycle_maintenance(worker: Option<thread::JoinHandle<()>>) {
     }
 }
 
+fn drain_lifecycle_maintenance_until(
+    worker: &mut Option<thread::JoinHandle<()>>,
+    deadline: Instant,
+) {
+    loop {
+        reap_finished_lifecycle_maintenance(worker);
+        if worker.is_none() || Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(READ_POLL_INTERVAL);
+    }
+}
+
 fn stop_all_supervised_tasks(state: &DaemonState) {
     let term_deadline = Instant::now() + TASK_SHUTDOWN_DURABLE_CANCEL_GRACE;
     let kill_deadline = term_deadline + TASK_TERM_GRACE;
@@ -1177,62 +1206,62 @@ fn wait_for_supervised_task_registry_empty(state: &DaemonState, timeout: Duratio
 }
 
 fn current_supervised_task_process_group_exists(control: &SupervisedTaskControl) -> Result<bool> {
-    let Some((pid, expected_identity)) = supervised_task_process_snapshot(control)? else {
+    let Some(process) = supervised_task_process_snapshot(control)? else {
         return Ok(false);
     };
-    if !supervised_task_process_identity_matches(pid, expected_identity.as_deref()) {
+    if !supervised_task_process_identity_matches(process.pid, &process.pid_identity) {
         return Ok(false);
     }
-    Ok(process_group_exists(pid))
+    Ok(process_group_exists(process.pid))
 }
 
 fn current_supervised_task_process_group_has_live_members_after_leader_exit(
     control: &SupervisedTaskControl,
 ) -> Result<bool> {
-    let Some((pid, expected_identity)) = supervised_task_process_snapshot(control)? else {
+    let Some(process) = supervised_task_process_snapshot(control)? else {
         return Ok(false);
     };
-    if !supervised_task_process_identity_matches(pid, expected_identity.as_deref()) {
+    if !supervised_task_process_identity_matches(process.pid, &process.pid_identity) {
         return Ok(false);
     }
-    Ok(process_group_has_live_members_after_leader_exit(pid))
+    Ok(process_group_has_live_members_after_leader_exit(
+        process.pid,
+    ))
 }
 
 fn current_supervised_task_child_has_exited(control: &SupervisedTaskControl) -> Result<bool> {
-    let Some((pid, expected_identity)) = supervised_task_process_snapshot(control)? else {
+    let Some(process) = supervised_task_process_snapshot(control)? else {
         return Ok(false);
     };
-    if !supervised_task_process_identity_matches(pid, expected_identity.as_deref()) {
+    if !supervised_task_process_identity_matches(process.pid, &process.pid_identity) {
         return Ok(true);
     }
-    match child_status_without_reaping(pid).context("poll supervised task child")? {
+    match child_status_without_reaping(process.pid).context("poll supervised task child")? {
         ChildStatusWithoutReaping::Running => Ok(false),
         ChildStatusWithoutReaping::Exited | ChildStatusWithoutReaping::NotWaitable => Ok(true),
     }
 }
 
-fn supervised_task_process_snapshot(
+fn supervised_task_process_state(
     control: &SupervisedTaskControl,
-) -> Result<Option<(u32, Option<String>)>> {
-    let pid = *control
-        .pid
+) -> Result<SupervisedTaskProcessState> {
+    control
+        .process
         .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?;
-    let Some(pid) = pid else {
-        return Ok(None);
-    };
-    let identity = control
-        .pid_identity
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid identity lock poisoned"))?
-        .clone();
-    Ok(Some((pid, identity)))
+        .map_err(|_| anyhow::anyhow!("supervised task process lock poisoned"))
+        .map(|process| process.clone())
 }
 
-fn supervised_task_process_identity_matches(pid: u32, expected_identity: Option<&str>) -> bool {
-    let Some(expected_identity) = expected_identity else {
-        return true;
-    };
+fn supervised_task_process_snapshot(
+    control: &SupervisedTaskControl,
+) -> Result<Option<SupervisedTaskProcess>> {
+    match supervised_task_process_state(control)? {
+        SupervisedTaskProcessState::Running(process) => Ok(Some(process)),
+        SupervisedTaskProcessState::Pending | SupervisedTaskProcessState::Completing => Ok(None),
+    }
+}
+
+fn supervised_task_process_identity_matches(pid: u32, expected_identity: &str) -> bool {
     match process_start_identity(pid) {
         Ok(Some(current_identity)) => current_identity == expected_identity,
         Ok(None) => process_group_has_live_members_after_leader_exit(pid),
@@ -1246,26 +1275,29 @@ fn set_supervised_task_process(
     pid_identity: String,
 ) -> Result<()> {
     *control
-        .pid_identity
+        .process
         .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid identity lock poisoned"))? =
-        Some(pid_identity);
-    *control
-        .pid
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = Some(pid);
+        .map_err(|_| anyhow::anyhow!("supervised task process lock poisoned"))? =
+        SupervisedTaskProcessState::Running(SupervisedTaskProcess { pid, pid_identity });
     Ok(())
 }
 
+#[cfg(test)]
 fn clear_supervised_task_process(control: &SupervisedTaskControl) -> Result<()> {
     *control
-        .pid
+        .process
         .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+        .map_err(|_| anyhow::anyhow!("supervised task process lock poisoned"))? =
+        SupervisedTaskProcessState::Pending;
+    Ok(())
+}
+
+fn mark_supervised_task_process_completing(control: &SupervisedTaskControl) -> Result<()> {
     *control
-        .pid_identity
+        .process
         .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid identity lock poisoned"))? = None;
+        .map_err(|_| anyhow::anyhow!("supervised task process lock poisoned"))? =
+        SupervisedTaskProcessState::Completing;
     Ok(())
 }
 
@@ -1356,17 +1388,17 @@ fn signal_current_supervised_task_process_group(
     control: &SupervisedTaskControl,
     signal: libc::c_int,
 ) -> Result<Option<u32>> {
-    let Some((pid, expected_identity)) = supervised_task_process_snapshot(control)? else {
+    let Some(process) = supervised_task_process_snapshot(control)? else {
         return Ok(None);
     };
-    if !supervised_task_process_identity_matches(pid, expected_identity.as_deref()) {
+    if !supervised_task_process_identity_matches(process.pid, &process.pid_identity) {
         return Ok(None);
     }
-    if signal_process_group(pid, signal) {
+    if signal_process_group(process.pid, signal) {
         if signal == libc::SIGTERM && control.cancel_requested.load(Ordering::Acquire) {
             control.cancel_signal_sent.store(true, Ordering::Release);
         }
-        return Ok(Some(pid));
+        return Ok(Some(process.pid));
     }
     Ok(None)
 }
@@ -1562,12 +1594,21 @@ fn maybe_spawn_lifecycle_maintenance(
     let state = Arc::clone(state);
     *next_attempt_at = now + DAEMON_MAINTENANCE_RETRY_INTERVAL;
     *worker = Some(thread::spawn(move || {
+        if state.stop_requested.load(Ordering::Acquire) {
+            return;
+        }
         let _ = recover_registryless_lost_tasks(&state);
+        if state.stop_requested.load(Ordering::Acquire) {
+            return;
+        }
         if should_sweep {
             let Ok(now) = current_epoch_seconds() else {
                 return;
             };
-            let Ok(mut store) = Store::open(&state.layout) else {
+            let Ok(mut store) = Store::open_for_daemon_lifecycle(&state.layout) else {
+                return;
+            };
+            if state.stop_requested.load(Ordering::Acquire) {
                 return;
             };
             let _ = store.sweep(&state.layout, now);
@@ -1874,7 +1915,7 @@ where
         }
         return Err(error).context("spawn task supervisor worker");
     }
-    let mut store = match Store::open(&state.layout) {
+    let mut store = match Store::open_for_task_supervisor_setup(&state.layout) {
         Ok(store) => store,
         Err(error) => {
             let _ = state
@@ -1884,6 +1925,13 @@ where
             return Err(error);
         }
     };
+    if let Err(error) = ensure_daemon_not_stopping(state) {
+        let _ = state
+            .supervised_tasks
+            .lock()
+            .map(|mut tasks| tasks.remove(&task_id));
+        return Err(error);
+    }
     let (_job, task) = match store.create_task_with_job(job, task) {
         Ok(created) => created,
         Err(error) => {
@@ -1894,6 +1942,20 @@ where
             return Err(error);
         }
     };
+    drop(store);
+    if let Err(error) = ensure_daemon_not_stopping(state) {
+        drop(worker_start_tx);
+        cleanup_failed_supervised_task_worker_spawn(
+            &state.layout,
+            &task_id,
+            &job_id,
+            &task_registry,
+            max_delivery_attempts,
+            redelivery_window_seconds,
+            "daemon stopped before task supervisor worker start",
+        );
+        return Err(error);
+    }
     if worker_start_tx.send(()).is_err() {
         let reason = "task supervisor worker exited before start signal";
         cleanup_failed_supervised_task_worker_spawn(
@@ -1944,16 +2006,24 @@ fn cancel_supervised_task(state: &DaemonState, payload: TaskCancelPayload) -> Re
         .cloned();
     if let Some(control) = control {
         let _cancel_intent = SupervisedTaskCancelIntent::begin(&control)?;
-        let has_pid = supervised_task_process_snapshot(&control)?.is_some();
-        if !has_pid {
-            let _spawn_guard = control
-                .spawn_gate
-                .lock()
-                .map_err(|_| anyhow::anyhow!("supervised task spawn gate lock poisoned"))?;
-            let task =
-                durably_request_supervised_task_cancel(&state.layout, &payload.task_id, &control)?;
-            signal_current_supervised_task_process_group(&control, libc::SIGTERM)?;
-            return Ok(task);
+        match supervised_task_process_state(&control)? {
+            SupervisedTaskProcessState::Pending => {
+                let _spawn_guard = control
+                    .spawn_gate
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("supervised task spawn gate lock poisoned"))?;
+                let task = durably_request_supervised_task_cancel(
+                    &state.layout,
+                    &payload.task_id,
+                    &control,
+                )?;
+                signal_current_supervised_task_process_group(&control, libc::SIGTERM)?;
+                return Ok(task);
+            }
+            SupervisedTaskProcessState::Completing => {
+                return Store::open(&state.layout)?.inspect_task(&payload.task_id);
+            }
+            SupervisedTaskProcessState::Running(_) => {}
         }
         if current_supervised_task_child_has_exited(&control)?
             && !current_supervised_task_process_group_has_live_members_after_leader_exit(&control)?
@@ -2161,6 +2231,7 @@ fn run_supervised_task_worker_inner(
         Ok(identity) => identity,
         Err(error) => {
             terminate_task_child_best_effort(&mut child, pid);
+            mark_supervised_task_process_completing(control)?;
             return Err(error).with_context(|| format!("record task process identity for {pid}"));
         }
     };
@@ -2169,7 +2240,7 @@ fn run_supervised_task_worker_inner(
         Ok(started_at) => started_at,
         Err(error) => {
             terminate_task_child_best_effort(&mut child, pid);
-            clear_supervised_task_process(control)?;
+            mark_supervised_task_process_completing(control)?;
             return Err(error);
         }
     };
@@ -2177,7 +2248,7 @@ fn run_supervised_task_worker_inner(
         Ok(store) => store,
         Err(error) => {
             terminate_task_child_best_effort(&mut child, pid);
-            clear_supervised_task_process(control)?;
+            mark_supervised_task_process_completing(control)?;
             return Err(error);
         }
     };
@@ -2185,7 +2256,7 @@ fn run_supervised_task_worker_inner(
         store.mark_task_started(task_id, i64::from(pid), Some(&pid_identity), started_at)
     {
         terminate_task_child_best_effort(&mut child, pid);
-        clear_supervised_task_process(control)?;
+        mark_supervised_task_process_completing(control)?;
         return Err(error);
     }
     drop(store);
@@ -2221,7 +2292,7 @@ fn run_supervised_task_worker_inner(
     }
     if let Err(error) = release_task_spawn_exec_gate(exec_gate) {
         terminate_task_child_best_effort(&mut child, pid);
-        clear_supervised_task_process(control)?;
+        mark_supervised_task_process_completing(control)?;
         return Err(error).with_context(|| format!("release task {task_id}"));
     }
     drop(exec_release_decision);
@@ -2244,13 +2315,13 @@ fn run_supervised_task_worker_inner(
         result_path,
     );
     if result.is_err() {
-        let should_terminate = supervised_task_process_snapshot(control)?
-            .is_some_and(|(active_pid, _)| active_pid == pid);
+        let should_terminate =
+            supervised_task_process_snapshot(control)?.is_some_and(|process| process.pid == pid);
         if should_terminate {
             terminate_task_child_best_effort(&mut child, pid);
+            mark_supervised_task_process_completing(control)?;
         }
     }
-    clear_supervised_task_process(control)?;
     result
 }
 
@@ -2266,7 +2337,7 @@ fn finish_cancelled_before_exec_gate_release(
     pid: u32,
 ) -> Result<()> {
     terminate_task_child_best_effort(child, pid);
-    clear_supervised_task_process(control)?;
+    mark_supervised_task_process_completing(control)?;
     finish_unspawned_cancelled_task(
         layout,
         task_id,
@@ -2412,11 +2483,11 @@ fn run_supervised_spawned_task(
     let status = match child.wait().context("wait task child") {
         Ok(status) => status,
         Err(error) => {
-            clear_supervised_task_process(control)?;
+            mark_supervised_task_process_completing(control)?;
             return Err(error);
         }
     };
-    clear_supervised_task_process(control)?;
+    mark_supervised_task_process_completing(control)?;
     if !timed_out && control.cancel_signal_sent.load(Ordering::Acquire) {
         cancelled = true;
     }
@@ -3396,37 +3467,66 @@ fn promote_cli_thread_start_app_server(
         server_ref.lease_id = payload.lease_id.clone();
         server_ref.lease_expires_at = Instant::now() + lease_ttl;
 
-        let mut servers = state
-            .cli_app_servers
-            .lock()
-            .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
-        ensure_daemon_not_stopping(state)?;
-        if let Some(existing) = servers.get_mut(&payload.managed_session_id) {
-            let proof = cli_app_server_proof(existing);
-            drop(servers);
-            if let Some(server) = server.take() {
-                stop_managed_cli_app_server_process(server);
+        loop {
+            let mut servers = state
+                .cli_app_servers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+            ensure_daemon_not_stopping(state)?;
+            if let Some(existing) = servers.get_mut(&payload.managed_session_id) {
+                if existing.bound_thread_id != payload.bound_thread_id {
+                    let attached_thread = existing.bound_thread_id.clone();
+                    drop(servers);
+                    if let Some(server) = server.take() {
+                        stop_managed_cli_app_server_process(server);
+                    }
+                    bail!(
+                        "managed session {} is already attached to app-server for thread {}",
+                        payload.managed_session_id,
+                        attached_thread
+                    );
+                }
+                match cli_app_server_child_is_running(existing) {
+                    Ok(true) => {
+                        drop(servers);
+                        if let Some(server) = server.take() {
+                            stop_managed_cli_app_server_process(server);
+                        }
+                        bail!(
+                            "managed session {} already has a registered CLI app-server",
+                            payload.managed_session_id
+                        );
+                    }
+                    Ok(false) => {
+                        let proof = cli_app_server_proof(existing);
+                        drop(servers);
+                        invalidate_and_stop_registered_cli_app_server(state, &proof)?;
+                        continue;
+                    }
+                    Err(error) => {
+                        drop(servers);
+                        if let Some(server) = server.take() {
+                            stop_managed_cli_app_server_process(server);
+                        }
+                        return Err(error);
+                    }
+                }
             }
-            invalidate_and_stop_registered_cli_app_server(state, &proof)?;
-            bail!(
-                "managed session {} already has a registered CLI app-server",
-                payload.managed_session_id
+            let server_to_insert = server
+                .take()
+                .expect("bootstrap app-server is still available");
+            let info = cli_app_server_info(&server_to_insert);
+            servers.insert(payload.managed_session_id.clone(), server_to_insert);
+            drop(servers);
+            let _ = release_cli_app_server_reservation(
+                state,
+                CliAppServerReleasePayload {
+                    bound_thread_id: payload.bound_thread_id,
+                    lease_id: payload.lease_id,
+                },
             );
+            return Ok(info);
         }
-        let server_to_insert = server
-            .take()
-            .expect("bootstrap app-server is still available");
-        let info = cli_app_server_info(&server_to_insert);
-        servers.insert(payload.managed_session_id.clone(), server_to_insert);
-        drop(servers);
-        let _ = release_cli_app_server_reservation(
-            state,
-            CliAppServerReleasePayload {
-                bound_thread_id: payload.bound_thread_id,
-                lease_id: payload.lease_id,
-            },
-        );
-        Ok(info)
     })();
     if let Some(server) = server.take() {
         stop_managed_cli_app_server_process(server);
@@ -4801,6 +4901,31 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_stop_drain_is_bounded_for_busy_worker() {
+        let release_worker = Arc::new(AtomicBool::new(false));
+        let release_worker_for_thread = Arc::clone(&release_worker);
+        let mut worker = Some(thread::spawn(move || {
+            while !release_worker_for_thread.load(Ordering::Acquire) {
+                thread::sleep(READ_POLL_INTERVAL);
+            }
+        }));
+
+        let started = Instant::now();
+        drain_lifecycle_maintenance_until(&mut worker, started + Duration::from_millis(100));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stop path lifecycle drain should be bounded"
+        );
+        assert!(
+            worker.is_some(),
+            "busy lifecycle worker should be left detached for stop-path shutdown"
+        );
+        release_worker.store(true, Ordering::Release);
+        join_lifecycle_maintenance(worker);
+    }
+
+    #[test]
     fn daemon_shutdown_invalidates_registered_cli_app_server_proof() {
         let (_home, state) = test_state();
         let managed_session_id = create_proven_cli_session(&state, "thread-daemon-shutdown");
@@ -5101,15 +5226,20 @@ mod tests {
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !pid_file.exists() {
+        let pid = loop {
+            if let Ok(pid) = fs::read_to_string(&pid_file)
+                .map(|pid| pid.trim().to_owned())
+                .and_then(|pid| {
+                    pid.parse::<u32>().map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })
+                })
+            {
+                break pid;
+            }
             assert!(Instant::now() < deadline, "fake app-server did not start");
             thread::sleep(Duration::from_millis(20));
-        }
-        let pid = fs::read_to_string(&pid_file)
-            .expect("read fake pid")
-            .trim()
-            .parse::<u32>()
-            .expect("fake pid");
+        };
         state.stop_requested.store(true, Ordering::Release);
         drop(bootstrap_guard);
         let error = task
@@ -5215,6 +5345,87 @@ mod tests {
             child_status_without_reaping(pid).unwrap_or(ChildStatusWithoutReaping::NotWaitable),
             ChildStatusWithoutReaping::Running
         );
+    }
+
+    #[test]
+    fn promote_conflict_preserves_running_registered_app_server() {
+        let (_home, state) = test_state();
+        let managed_session_id = create_proven_cli_session(&state, "thread-promote-conflict");
+        reserve_cli_app_server(
+            &state,
+            CliAppServerReservePayload {
+                bound_thread_id: "thread-promote-conflict".to_owned(),
+                lease_id: "lease-test".to_owned(),
+                lease_ttl_seconds: None,
+            },
+        )
+        .expect("reserve app-server");
+        let existing = test_managed_cli_app_server(
+            &managed_session_id,
+            "thread-promote-conflict",
+            Instant::now() + Duration::from_secs(60),
+        );
+        let existing_pid = existing.child.id();
+        state
+            .cli_app_servers
+            .lock()
+            .expect("servers lock")
+            .insert(managed_session_id.clone(), existing);
+        let bootstrap_id = "bootstrap-promote-conflict".to_owned();
+        let candidate = test_managed_cli_app_server(
+            &bootstrap_id,
+            "thread-promote-conflict",
+            Instant::now() + Duration::from_secs(60),
+        );
+        let candidate_pid = candidate.child.id();
+        state
+            .cli_thread_start_bootstraps
+            .lock()
+            .expect("bootstrap lock")
+            .insert(bootstrap_id.clone(), candidate);
+
+        let error = promote_cli_thread_start_app_server(
+            &state,
+            CliThreadStartPromotePayload {
+                bootstrap_id,
+                managed_session_id: managed_session_id.clone(),
+                bound_thread_id: "thread-promote-conflict".to_owned(),
+                session_epoch: 1,
+                lease_id: "lease-test".to_owned(),
+                lease_ttl_seconds: None,
+            },
+        )
+        .expect_err("promote should reject a live registered app-server");
+
+        assert!(
+            error
+                .to_string()
+                .contains("already has a registered CLI app-server"),
+            "{error:#}"
+        );
+        assert!(
+            state
+                .cli_thread_start_bootstraps
+                .lock()
+                .expect("bootstrap lock")
+                .is_empty(),
+            "conflicting promote should consume and stop only the candidate bootstrap"
+        );
+        let servers = state.cli_app_servers.lock().expect("servers lock");
+        let existing = servers
+            .get(&managed_session_id)
+            .expect("existing app-server remains registered");
+        assert_eq!(existing.child.id(), existing_pid);
+        assert!(
+            process_group_exists(existing_pid),
+            "running registered app-server should not be stopped by a duplicate promote"
+        );
+        drop(servers);
+        assert!(
+            !process_group_exists(candidate_pid),
+            "duplicate promote candidate should be stopped"
+        );
+        stop_all_cli_app_servers(&state);
     }
 
     #[test]
@@ -5489,11 +5700,14 @@ mod tests {
             .process_group(0);
         let mut child = spawn_command_locked(&mut command).expect("spawn gated child");
         let pid = child.id();
-        *control.pid.lock().expect("pid lock") = Some(pid);
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("process identity available");
+        set_supervised_task_process(&control, pid, pid_identity).expect("set process");
         {
             let mut store = Store::open(&layout).expect("store");
             store
-                .mark_task_started("task-pre-exec-cancel", i64::from(pid), None, 11)
+                .mark_task_started("task-pre-exec-cancel", i64::from(pid), Some("test-pid"), 11)
                 .expect("mark started");
         }
         request_supervised_task_cancel(&control);
@@ -5512,7 +5726,10 @@ mod tests {
         drop(exec_gate);
 
         assert!(!marker.exists(), "cancelled task command was executed");
-        assert_eq!(*control.pid.lock().expect("pid lock"), None);
+        assert_eq!(
+            supervised_task_process_state(&control).expect("process state"),
+            SupervisedTaskProcessState::Completing
+        );
         let store = Store::open(&layout).expect("store");
         let task = store.inspect_task("task-pre-exec-cancel").expect("task");
         assert_eq!(task.status, "cancelled");
@@ -6006,7 +6223,7 @@ mod tests {
         let pid = child.id();
         child.wait().expect("wait child");
         let control = Arc::new(SupervisedTaskControl::default());
-        *control.pid.lock().expect("pid lock") = Some(pid);
+        mark_supervised_task_process_completing(&control).expect("mark completing");
         state
             .supervised_tasks
             .lock()
@@ -6071,9 +6288,8 @@ mod tests {
         let mut child = spawn_command_locked(&mut command).expect("spawn child");
         let pid = child.id();
         let control = Arc::new(SupervisedTaskControl::default());
-        *control.pid.lock().expect("pid lock") = Some(pid);
-        *control.pid_identity.lock().expect("pid identity lock") =
-            Some("different-process-identity".to_owned());
+        set_supervised_task_process(&control, pid, "different-process-identity".to_owned())
+            .expect("set mismatched process");
         state
             .supervised_tasks
             .lock()
@@ -6248,6 +6464,74 @@ mod tests {
     }
 
     #[test]
+    fn task_run_initial_store_lock_fails_fast_and_releases_worker() {
+        let (home, state) = test_state();
+        Store::open(&state.layout).expect("initialize store");
+        let lock = Connection::open(state.layout.db_path()).expect("lock connection");
+        lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .expect("hold exclusive db lock");
+        let payload = TaskRunPayload {
+            source_thread_id: "thread-task-run-initial-store-lock".to_owned(),
+            summary: "initial store lock".to_owned(),
+            metadata_json: "{}".to_owned(),
+            policy: DeliveryPolicy::fail_closed(),
+            cwd: home.path().display().to_string(),
+            timeout_seconds: None,
+            max_delivery_attempts: 3,
+            redelivery_window_seconds: 60,
+            command: vec![b"/bin/true".to_vec()],
+            environment: Vec::new(),
+        };
+        let worker_done = Arc::new(AtomicBool::new(false));
+        let worker_done_for_spawner = Arc::clone(&worker_done);
+
+        let started = Instant::now();
+        let error = start_supervised_task_with_spawner(&state, payload, |_name, worker| {
+            Ok(thread::spawn(move || {
+                worker();
+                worker_done_for_spawner.store(true, Ordering::Release);
+            }))
+        })
+        .expect_err("locked initial task store should fail");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "initial task store open should not wait for the default SQLite busy timeout"
+        );
+        let error_details = format!("{error:#}");
+        assert!(
+            error_details.contains("database is locked")
+                || error_details.contains("database file is locked")
+                || error_details.contains("database table is locked"),
+            "{error_details}"
+        );
+        let worker_deadline = Instant::now() + Duration::from_secs(2);
+        while !worker_done.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < worker_deadline,
+                "worker did not exit after start signal was dropped"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            state
+                .supervised_tasks
+                .lock()
+                .expect("task registry")
+                .is_empty()
+        );
+        drop(lock);
+        let store = Store::open(&state.layout).expect("store");
+        let tasks = store
+            .list_tasks(Some("thread-task-run-initial-store-lock"), None, 10)
+            .expect("list tasks");
+        assert!(
+            tasks.is_empty(),
+            "failed initial store create should not create a task"
+        );
+    }
+
+    #[test]
     fn task_run_blocked_on_registry_lock_fails_after_stop_request() {
         let (home, state) = test_state();
         let state = Arc::new(state);
@@ -6349,8 +6633,11 @@ mod tests {
             .process_group(0);
         let mut child = spawn_command_locked(&mut command).expect("spawn child");
         let pid = child.id();
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("process identity available");
         let control = Arc::new(SupervisedTaskControl::default());
-        *control.pid.lock().expect("pid lock") = Some(pid);
+        set_supervised_task_process(&control, pid, pid_identity).expect("set process");
         let lock = Connection::open(state.layout.db_path()).expect("lock connection");
         lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
             .expect("hold exclusive lock");
@@ -6378,10 +6665,13 @@ mod tests {
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while control.pid.lock().expect("pid lock").is_some() {
+        while matches!(
+            supervised_task_process_state(&control).expect("process state"),
+            SupervisedTaskProcessState::Running(_)
+        ) {
             assert!(
                 Instant::now() < deadline,
-                "task pid was not cleared while completion store write was blocked"
+                "task process was not moved to completing while completion store write was blocked"
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -6416,8 +6706,11 @@ mod tests {
         let mut child = spawn_command_locked(&mut command).expect("spawn stale pid guard");
         let pid = child.id();
         let control = Arc::new(SupervisedTaskControl::default());
-        *control.pid.lock().expect("pid lock") = Some(pid);
-        *control.pid.lock().expect("pid lock") = None;
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("process identity available");
+        set_supervised_task_process(&control, pid, pid_identity).expect("set process");
+        clear_supervised_task_process(&control).expect("clear process");
 
         let signaled = signal_current_supervised_task_process_group(&control, libc::SIGTERM)
             .expect("signal current process group");
