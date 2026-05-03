@@ -56,6 +56,7 @@ const TASK_LEADER_EXITED_PROCESS_GROUP_GRACE: Duration = Duration::from_secs(5);
 const TASK_SHUTDOWN_DURABLE_CANCEL_GRACE: Duration = Duration::from_secs(1);
 const TASK_SHUTDOWN_WORKER_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const TASK_STREAM_DRAIN_HARD_GRACE: Duration = Duration::from_secs(1);
+const DAEMON_STOP_WORKER_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const TASK_SPAWN_EXEC_GATE_FD: RawFd = 3;
 const TASK_SPAWN_EXEC_GATE_SCRIPT: &str =
     "if IFS= read -r _ <&3; then exec 3<&-; exec \"$@\"; else exit 127; fi";
@@ -538,6 +539,13 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
     }
     if shutdown_reason == "stop_requested" {
         stop_all_supervised_tasks(&state);
+        stop_all_cli_app_servers(&state);
+        stop_all_cli_thread_start_bootstraps(&state);
+        clear_cli_app_server_reservations(&state);
+        drain_workers_until(
+            &mut workers,
+            Instant::now() + DAEMON_STOP_WORKER_DRAIN_GRACE,
+        );
         stop_all_cli_app_servers(&state);
         stop_all_cli_thread_start_bootstraps(&state);
         clear_cli_app_server_reservations(&state);
@@ -1068,6 +1076,16 @@ fn reap_finished_workers(workers: &mut Vec<thread::JoinHandle<()>>) {
         } else {
             index += 1;
         }
+    }
+}
+
+fn drain_workers_until(workers: &mut Vec<thread::JoinHandle<()>>, deadline: Instant) {
+    loop {
+        reap_finished_workers(workers);
+        if workers.is_empty() || Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(READ_POLL_INTERVAL);
     }
 }
 
@@ -1668,6 +1686,13 @@ fn daemon_info(state: &DaemonState) -> DaemonInfo {
     }
 }
 
+fn ensure_daemon_not_stopping(state: &DaemonState) -> Result<()> {
+    if state.stop_requested.load(Ordering::Acquire) {
+        bail!("daemon is stopping");
+    }
+    Ok(())
+}
+
 type SupervisedTaskWorker = Box<dyn FnOnce() + Send + 'static>;
 
 fn start_supervised_task(state: &DaemonState, payload: TaskRunPayload) -> Result<TaskRecord> {
@@ -1700,9 +1725,7 @@ where
         bail!("task command must not be empty");
     }
     validate_daemon_nonempty_bytes("task command argv[0]", &payload.command[0])?;
-    if state.stop_requested.load(Ordering::Acquire) {
-        bail!("daemon is stopping");
-    }
+    ensure_daemon_not_stopping(state)?;
 
     let task_id = new_id();
     let job_id = new_id();
@@ -1723,9 +1746,7 @@ where
             .supervised_tasks
             .lock()
             .map_err(|_| anyhow::anyhow!("supervised task map lock poisoned"))?;
-        if state.stop_requested.load(Ordering::Acquire) {
-            bail!("daemon is stopping");
-        }
+        ensure_daemon_not_stopping(state)?;
         if supervised_tasks.len() >= MAX_SUPERVISED_TASKS {
             bail!("maximum supervised task limit reached ({MAX_SUPERVISED_TASKS})");
         }
@@ -3012,11 +3033,13 @@ fn ensure_cli_app_server(
     validate_daemon_nonempty_bytes("codex_binary", &payload.codex_binary)?;
     validate_daemon_nonempty("lease_id", &payload.lease_id)?;
     let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
+    ensure_daemon_not_stopping(state)?;
     let existing_dead_proof = {
         let mut servers = state
             .cli_app_servers
             .lock()
             .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+        ensure_daemon_not_stopping(state)?;
         if let Some(existing) = servers.get_mut(&payload.managed_session_id) {
             if existing.bound_thread_id != payload.bound_thread_id {
                 bail!(
@@ -3049,6 +3072,7 @@ fn ensure_cli_app_server(
     }
 
     ensure_cli_app_server_reservation_matches(state, &payload.bound_thread_id, &payload.lease_id)?;
+    ensure_daemon_not_stopping(state)?;
 
     let server = spawn_cli_app_server(
         &payload.managed_session_id,
@@ -3057,6 +3081,7 @@ fn ensure_cli_app_server(
         &payload.codex_binary,
         &payload.lease_id,
         lease_ttl,
+        &state.stop_requested,
     )?;
     let mut server = Some(server);
     loop {
@@ -3064,6 +3089,13 @@ fn ensure_cli_app_server(
             .cli_app_servers
             .lock()
             .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+        if let Err(error) = ensure_daemon_not_stopping(state) {
+            drop(servers);
+            if let Some(server) = server.take() {
+                stop_managed_cli_app_server_process(server);
+            }
+            return Err(error);
+        }
         if let Some(existing) = servers.get_mut(&payload.managed_session_id) {
             if existing.bound_thread_id != payload.bound_thread_id {
                 let attached_thread = existing.bound_thread_id.clone();
@@ -3201,6 +3233,7 @@ fn start_cli_thread(
     validate_daemon_nonempty("cwd", &payload.cwd)?;
     validate_daemon_nonempty("lease_id", &payload.lease_id)?;
     let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
+    ensure_daemon_not_stopping(state)?;
     let bootstrap_id = new_id();
     let server = spawn_cli_app_server(
         &bootstrap_id,
@@ -3209,14 +3242,33 @@ fn start_cli_thread(
         &payload.codex_binary,
         &payload.lease_id,
         lease_ttl,
+        &state.stop_requested,
     )?;
     let mut server = Some(server);
+    {
+        let mut bootstraps = state
+            .cli_thread_start_bootstraps
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CLI thread/start bootstrap registry lock is poisoned"))?;
+        ensure_daemon_not_stopping(state)?;
+        bootstraps.insert(
+            bootstrap_id.clone(),
+            server
+                .take()
+                .expect("bootstrap app-server is still available"),
+        );
+    }
     let result = (|| {
-        let url = server
-            .as_ref()
-            .expect("bootstrap app-server is available")
-            .url
-            .clone();
+        ensure_daemon_not_stopping(state)?;
+        let url = {
+            let bootstraps = state.cli_thread_start_bootstraps.lock().map_err(|_| {
+                anyhow::anyhow!("CLI thread/start bootstrap registry lock is poisoned")
+            })?;
+            let server = bootstraps
+                .get(&bootstrap_id)
+                .ok_or_else(|| anyhow::anyhow!("CLI thread/start bootstrap stopped"))?;
+            server.url.clone()
+        };
         let mut client = AppServerJsonRpcClient::connect(&url, CLI_APP_SERVER_STARTUP_TIMEOUT)
             .context("connect bootstrap cli app-server")?;
         client
@@ -3236,26 +3288,29 @@ fn start_cli_thread(
             )
             .context("bootstrap cli thread/start")?;
         let thread_id = parse_cli_thread_start_id(&started)?;
-        if let Some(server) = server.as_mut() {
-            server.bound_thread_id = thread_id.clone();
-        }
         let mut bootstraps = state
             .cli_thread_start_bootstraps
             .lock()
             .map_err(|_| anyhow::anyhow!("CLI thread/start bootstrap registry lock is poisoned"))?;
-        bootstraps.insert(
-            bootstrap_id.clone(),
-            server
-                .take()
-                .expect("bootstrap app-server is still available"),
-        );
+        ensure_daemon_not_stopping(state)?;
+        let server = bootstraps
+            .get_mut(&bootstrap_id)
+            .ok_or_else(|| anyhow::anyhow!("CLI thread/start bootstrap stopped"))?;
+        server.bound_thread_id = thread_id.clone();
         Ok(CliThreadStartInfo {
-            bootstrap_id,
+            bootstrap_id: bootstrap_id.clone(),
             thread_id,
         })
     })();
-    if let Some(server) = server.take() {
-        stop_managed_cli_app_server_process(server);
+    if result.is_err() {
+        let server = state
+            .cli_thread_start_bootstraps
+            .lock()
+            .ok()
+            .and_then(|mut bootstraps| bootstraps.remove(&bootstrap_id));
+        if let Some(server) = server {
+            stop_managed_cli_app_server_process(server);
+        }
     }
     result
 }
@@ -3270,9 +3325,10 @@ fn promote_cli_thread_start_app_server(
     validate_daemon_positive("session_epoch", payload.session_epoch)?;
     validate_daemon_nonempty("lease_id", &payload.lease_id)?;
     let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
+    ensure_daemon_not_stopping(state)?;
     ensure_cli_app_server_reservation_matches(state, &payload.bound_thread_id, &payload.lease_id)?;
 
-    let mut server = {
+    let server = {
         let mut bootstraps = state
             .cli_thread_start_bootstraps
             .lock()
@@ -3281,49 +3337,64 @@ fn promote_cli_thread_start_app_server(
             .remove(&payload.bootstrap_id)
             .ok_or_else(|| anyhow::anyhow!("CLI thread/start bootstrap is not running"))?
     };
-    if server.bound_thread_id != payload.bound_thread_id {
-        let started_thread = server.bound_thread_id.clone();
-        stop_managed_cli_app_server_process(server);
-        bail!(
-            "CLI thread/start bootstrap created thread {}, not {}",
-            started_thread,
-            payload.bound_thread_id
-        );
-    }
-    if !cli_app_server_child_is_running(&mut server)? {
-        stop_managed_cli_app_server_process(server);
-        bail!("CLI thread/start bootstrap app-server has exited");
-    }
-    server.managed_session_id = payload.managed_session_id.clone();
-    server.session_epoch = payload.session_epoch;
-    server.lease_id = payload.lease_id.clone();
-    server.lease_expires_at = Instant::now() + lease_ttl;
+    let mut server = Some(server);
+    let result = (|| {
+        let server_ref = server
+            .as_mut()
+            .expect("bootstrap app-server is still available");
+        ensure_daemon_not_stopping(state)?;
+        if server_ref.bound_thread_id != payload.bound_thread_id {
+            let started_thread = server_ref.bound_thread_id.clone();
+            bail!(
+                "CLI thread/start bootstrap created thread {}, not {}",
+                started_thread,
+                payload.bound_thread_id
+            );
+        }
+        if !cli_app_server_child_is_running(server_ref)? {
+            bail!("CLI thread/start bootstrap app-server has exited");
+        }
+        server_ref.managed_session_id = payload.managed_session_id.clone();
+        server_ref.session_epoch = payload.session_epoch;
+        server_ref.lease_id = payload.lease_id.clone();
+        server_ref.lease_expires_at = Instant::now() + lease_ttl;
 
-    let mut servers = state
-        .cli_app_servers
-        .lock()
-        .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
-    if let Some(existing) = servers.get_mut(&payload.managed_session_id) {
-        let proof = cli_app_server_proof(existing);
+        let mut servers = state
+            .cli_app_servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+        ensure_daemon_not_stopping(state)?;
+        if let Some(existing) = servers.get_mut(&payload.managed_session_id) {
+            let proof = cli_app_server_proof(existing);
+            drop(servers);
+            if let Some(server) = server.take() {
+                stop_managed_cli_app_server_process(server);
+            }
+            invalidate_and_stop_registered_cli_app_server(state, &proof)?;
+            bail!(
+                "managed session {} already has a registered CLI app-server",
+                payload.managed_session_id
+            );
+        }
+        let server_to_insert = server
+            .take()
+            .expect("bootstrap app-server is still available");
+        let info = cli_app_server_info(&server_to_insert);
+        servers.insert(payload.managed_session_id.clone(), server_to_insert);
         drop(servers);
-        stop_managed_cli_app_server_process(server);
-        invalidate_and_stop_registered_cli_app_server(state, &proof)?;
-        bail!(
-            "managed session {} already has a registered CLI app-server",
-            payload.managed_session_id
+        let _ = release_cli_app_server_reservation(
+            state,
+            CliAppServerReleasePayload {
+                bound_thread_id: payload.bound_thread_id,
+                lease_id: payload.lease_id,
+            },
         );
+        Ok(info)
+    })();
+    if let Some(server) = server.take() {
+        stop_managed_cli_app_server_process(server);
     }
-    let info = cli_app_server_info(&server);
-    servers.insert(payload.managed_session_id.clone(), server);
-    drop(servers);
-    let _ = release_cli_app_server_reservation(
-        state,
-        CliAppServerReleasePayload {
-            bound_thread_id: payload.bound_thread_id,
-            lease_id: payload.lease_id,
-        },
-    );
-    Ok(info)
+    result
 }
 
 fn abort_cli_thread_start_app_server(
@@ -3368,6 +3439,7 @@ fn spawn_cli_app_server(
     codex_binary: &[u8],
     lease_id: &str,
     lease_ttl: Duration,
+    stop_requested: &AtomicBool,
 ) -> Result<ManagedCliAppServer> {
     let codex_binary = OsString::from_vec(codex_binary.to_vec());
     let mut command = Command::new(&codex_binary);
@@ -3402,14 +3474,34 @@ fn spawn_cli_app_server(
     let stderr_worker = thread::spawn(move || {
         drain_app_server_listener_stream(stderr, stderr_url_sender, stderr_drain_running)
     });
-    let url = match url_receiver.recv_timeout(CLI_APP_SERVER_STARTUP_TIMEOUT) {
-        Ok(url) => url,
-        Err(error) => {
+    let startup_deadline = Instant::now() + CLI_APP_SERVER_STARTUP_TIMEOUT;
+    let url = loop {
+        if stop_requested.load(Ordering::Acquire) {
             drain_running.store(false, Ordering::Release);
             stop_cli_app_server_process(&mut child);
             join_worker(stdout_worker);
             join_worker(stderr_worker);
-            bail!("codex app-server did not report a websocket listener: {error}");
+            bail!("daemon is stopping");
+        }
+        let now = Instant::now();
+        if now >= startup_deadline {
+            drain_running.store(false, Ordering::Release);
+            stop_cli_app_server_process(&mut child);
+            join_worker(stdout_worker);
+            join_worker(stderr_worker);
+            bail!("codex app-server did not report a websocket listener: timed out");
+        }
+        let wait = READ_POLL_INTERVAL.min(startup_deadline.saturating_duration_since(now));
+        match url_receiver.recv_timeout(wait) {
+            Ok(url) => break url,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                drain_running.store(false, Ordering::Release);
+                stop_cli_app_server_process(&mut child);
+                join_worker(stdout_worker);
+                join_worker(stderr_worker);
+                bail!("codex app-server did not report a websocket listener: output closed");
+            }
         }
     };
     if !app_server_listener_url_is_loopback(&url) {
@@ -4898,6 +4990,127 @@ mod tests {
                 .is_empty()
         );
         assert_cli_session_proof_invalidated(&state, &managed_session_id);
+    }
+
+    #[test]
+    fn app_server_spawn_commands_reject_after_stop_request() {
+        let (_home, state) = test_state();
+        state.stop_requested.store(true, Ordering::Release);
+
+        let ensure_error = ensure_cli_app_server(
+            &state,
+            CliAppServerEnsurePayload {
+                managed_session_id: "session-stopped-ensure".to_owned(),
+                bound_thread_id: "thread-stopped-ensure".to_owned(),
+                session_epoch: 1,
+                codex_binary: b"/definitely/missing/codex".to_vec(),
+                lease_id: "lease-stopped-ensure".to_owned(),
+                lease_ttl_seconds: None,
+            },
+        )
+        .expect_err("stopped daemon should reject app-server ensure");
+        assert!(
+            ensure_error.to_string().contains("daemon is stopping"),
+            "{ensure_error:#}"
+        );
+
+        let start_error = start_cli_thread(
+            &state,
+            CliThreadStartPayload {
+                codex_binary: b"/definitely/missing/codex".to_vec(),
+                cwd: "/tmp".to_owned(),
+                lease_id: "lease-stopped-thread-start".to_owned(),
+                lease_ttl_seconds: None,
+            },
+        )
+        .expect_err("stopped daemon should reject thread/start bootstrap");
+        assert!(
+            start_error.to_string().contains("daemon is stopping"),
+            "{start_error:#}"
+        );
+    }
+
+    #[test]
+    fn stopped_daemon_does_not_promote_removed_bootstrap_after_cleanup() {
+        let (_home, state) = test_state();
+        let state = Arc::new(state);
+        let bootstrap_id = "bootstrap-stop-promote-race".to_owned();
+        let managed_session_id = "session-stop-promote-race".to_owned();
+        let bound_thread_id = "thread-stop-promote-race".to_owned();
+        reserve_cli_app_server(
+            &state,
+            CliAppServerReservePayload {
+                bound_thread_id: bound_thread_id.clone(),
+                lease_id: "lease-test".to_owned(),
+                lease_ttl_seconds: None,
+            },
+        )
+        .expect("reserve app-server");
+        let server = test_managed_cli_app_server(
+            &bootstrap_id,
+            &bound_thread_id,
+            Instant::now() + Duration::from_secs(60),
+        );
+        let pid = server.child.id();
+        state
+            .cli_thread_start_bootstraps
+            .lock()
+            .expect("bootstrap lock")
+            .insert(bootstrap_id.clone(), server);
+        let app_server_guard = state.cli_app_servers.lock().expect("app-server lock");
+        let promote_state = Arc::clone(&state);
+        let promote = thread::spawn(move || {
+            promote_cli_thread_start_app_server(
+                &promote_state,
+                CliThreadStartPromotePayload {
+                    bootstrap_id,
+                    managed_session_id,
+                    bound_thread_id,
+                    session_epoch: 1,
+                    lease_id: "lease-test".to_owned(),
+                    lease_ttl_seconds: None,
+                },
+            )
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            state
+                .cli_thread_start_bootstraps
+                .lock()
+                .expect("bootstrap lock")
+                .is_empty(),
+            "promote should remove bootstrap before blocking on app-server registry"
+        );
+        state.stop_requested.store(true, Ordering::Release);
+        drop(app_server_guard);
+        let error = promote
+            .join()
+            .expect("promote worker joins")
+            .expect_err("stopped daemon should reject promotion");
+
+        assert!(
+            error.to_string().contains("daemon is stopping"),
+            "{error:#}"
+        );
+        assert!(
+            state
+                .cli_thread_start_bootstraps
+                .lock()
+                .expect("bootstrap lock")
+                .is_empty()
+        );
+        assert!(
+            state
+                .cli_app_servers
+                .lock()
+                .expect("app-server lock")
+                .is_empty()
+        );
+        assert_ne!(
+            child_status_without_reaping(pid).unwrap_or(ChildStatusWithoutReaping::NotWaitable),
+            ChildStatusWithoutReaping::Running
+        );
     }
 
     #[test]
