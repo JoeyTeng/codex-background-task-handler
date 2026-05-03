@@ -307,6 +307,19 @@ fn wait_for_process_group_gone(pid: u32) {
     }
 }
 
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("check child status").is_some() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn concurrent_daemon_ensure_uses_one_daemon() {
     let home = temp_home();
@@ -2000,6 +2013,67 @@ fn daemon_stop_kills_term_ignoring_task_when_cancel_store_is_locked() {
         !process_group_exists(pid),
         "TERM-ignoring supervised process group survived daemon stop"
     );
+}
+
+#[test]
+fn daemon_stop_terminates_task_before_joining_blocked_cancel_worker() {
+    let home = temp_home();
+    let pid_file = home.path().join("daemon-stop-blocked-cancel.pid");
+    let pid_file_arg = pid_file.to_string_lossy().to_string();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-daemon-stop-blocked-cancel",
+            "--summary",
+            "daemon stop with blocked cancel",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s\n' \"$$\" > \"$1\"; trap '' TERM; while :; do sleep 1; done",
+            "cbth-task",
+            &pid_file_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+    wait_for_path(&pid_file);
+    wait_for_nonempty_file(&pid_file);
+    let pid = fs::read_to_string(&pid_file)
+        .expect("read pid file")
+        .trim()
+        .parse::<u32>()
+        .expect("task pid");
+
+    let conn = hold_exclusive_db_lock(&home);
+    let mut cancel = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .args(["task", "cancel", "--task-id", task_id])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cancel");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        cancel.try_wait().expect("check cancel status").is_none(),
+        "cancel worker should be blocked by the held database lock"
+    );
+
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
+    assert!(
+        !process_group_exists(pid),
+        "shutdown should kill the supervised process before waiting on blocked clients"
+    );
+    drop(conn);
+    if !wait_for_child_exit(&mut cancel, Duration::from_secs(2)) {
+        let _ = cancel.kill();
+        let _ = cancel.wait();
+        panic!("blocked cancel client did not exit after daemon shutdown");
+    }
 }
 
 #[test]

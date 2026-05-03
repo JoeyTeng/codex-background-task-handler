@@ -536,12 +536,21 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
             Err(error) => return Err(error).context("accept daemon connection"),
         }
     }
-    join_workers(workers);
-    join_lifecycle_maintenance(lifecycle_maintenance_worker);
-    stop_all_supervised_tasks(&state);
-    stop_all_cli_app_servers(&state);
-    stop_all_cli_thread_start_bootstraps(&state);
-    clear_cli_app_server_reservations(&state);
+    if shutdown_reason == "stop_requested" {
+        join_lifecycle_maintenance(lifecycle_maintenance_worker);
+        stop_all_supervised_tasks(&state);
+        stop_all_cli_app_servers(&state);
+        stop_all_cli_thread_start_bootstraps(&state);
+        clear_cli_app_server_reservations(&state);
+        reap_finished_workers(&mut workers);
+    } else {
+        join_workers(workers);
+        join_lifecycle_maintenance(lifecycle_maintenance_worker);
+        stop_all_supervised_tasks(&state);
+        stop_all_cli_app_servers(&state);
+        stop_all_cli_thread_start_bootstraps(&state);
+        clear_cli_app_server_reservations(&state);
+    }
 
     Ok(json!({
         "daemon": daemon_info(&state),
@@ -1705,7 +1714,6 @@ where
             .map(|arg| String::from_utf8_lossy(arg).into_owned())
             .collect::<Vec<_>>(),
     )?;
-    let mut store = Store::open(&state.layout)?;
     let control = Arc::new(SupervisedTaskControl::default());
     {
         let mut supervised_tasks = state
@@ -1737,17 +1745,6 @@ where
         redelivery_window_seconds: payload.redelivery_window_seconds,
         created_at: now,
     };
-    let (_job, task) = match store.create_task_with_job(job, task) {
-        Ok(created) => created,
-        Err(error) => {
-            let _ = state
-                .supervised_tasks
-                .lock()
-                .map(|mut tasks| tasks.remove(&task_id));
-            return Err(error);
-        }
-    };
-
     let layout = state.layout.clone();
     let command = payload.command;
     let environment = payload.environment;
@@ -1761,7 +1758,14 @@ where
     let worker_control = control.clone();
     let worker_registry = task_registry.clone();
     let worker_name = format!("cbth-task-{task_id}");
+    let (worker_start_tx, worker_start_rx) = mpsc::channel();
     let worker: SupervisedTaskWorker = Box::new(move || {
+        if worker_start_rx.recv().is_err() {
+            if let Ok(mut tasks) = worker_registry.lock() {
+                tasks.remove(&worker_task_id);
+            }
+            return;
+        }
         run_supervised_task_worker(
             layout,
             worker_task_id,
@@ -1777,7 +1781,33 @@ where
         );
     });
     if let Err(error) = spawn_worker(worker_name, worker) {
-        let reason = format!("task supervisor worker spawn failed: {error}");
+        if let Ok(mut tasks) = task_registry.lock() {
+            tasks.remove(&task_id);
+        }
+        return Err(error).context("spawn task supervisor worker");
+    }
+    let mut store = match Store::open(&state.layout) {
+        Ok(store) => store,
+        Err(error) => {
+            let _ = state
+                .supervised_tasks
+                .lock()
+                .map(|mut tasks| tasks.remove(&task_id));
+            return Err(error);
+        }
+    };
+    let (_job, task) = match store.create_task_with_job(job, task) {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = state
+                .supervised_tasks
+                .lock()
+                .map(|mut tasks| tasks.remove(&task_id));
+            return Err(error);
+        }
+    };
+    if worker_start_tx.send(()).is_err() {
+        let reason = "task supervisor worker exited before start signal";
         cleanup_failed_supervised_task_worker_spawn(
             &state.layout,
             &task_id,
@@ -1785,9 +1815,9 @@ where
             &task_registry,
             max_delivery_attempts,
             redelivery_window_seconds,
-            &reason,
+            reason,
         );
-        return Err(error).context("spawn task supervisor worker");
+        bail!("task supervisor worker exited before start signal");
     }
 
     Ok(task)
@@ -5776,7 +5806,7 @@ mod tests {
     }
 
     #[test]
-    fn task_worker_spawn_error_fails_closed_and_releases_registry() {
+    fn task_worker_spawn_error_fails_closed_before_db_create() {
         let (home, state) = test_state();
         let payload = TaskRunPayload {
             source_thread_id: "thread-worker-spawn-fail".to_owned(),
@@ -5812,16 +5842,7 @@ mod tests {
         let tasks = store
             .list_tasks(Some("thread-worker-spawn-fail"), None, 10)
             .expect("list tasks");
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].status, "failed");
-        assert!(
-            tasks[0]
-                .failure_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("worker spawn failed"))
-        );
-        let job = store.inspect_job(&tasks[0].job_id).expect("job");
-        assert_eq!(job.status, "failed");
+        assert!(tasks.is_empty(), "spawn failure should not create a task");
     }
 
     #[test]
