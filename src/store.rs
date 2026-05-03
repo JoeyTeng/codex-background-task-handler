@@ -499,6 +499,17 @@ impl Store {
         now: i64,
         active_task_ids: &HashSet<String>,
     ) -> Result<usize> {
+        self.fail_lost_tasks_excluding_with(now, |task_id| Ok(active_task_ids.contains(task_id)))
+    }
+
+    pub fn fail_lost_tasks_excluding_with<F>(
+        &mut self,
+        now: i64,
+        mut is_active_task: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> Result<bool>,
+    {
         let tasks = {
             let mut stmt = self.conn.prepare(
                 "SELECT tasks.task_id, tasks.job_id, jobs.status, jobs.completed_at,
@@ -526,10 +537,10 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut recovered = 0;
-        for task in tasks
-            .iter()
-            .filter(|task| !active_task_ids.contains(&task.task_id))
-        {
+        for task in &tasks {
+            if is_active_task(&task.task_id)? {
+                continue;
+            }
             let stdout_log_path = format!("tasks/{}/stdout.log", task.task_id);
             let stderr_log_path = format!("tasks/{}/stderr.log", task.task_id);
             match task.job_status.as_str() {
@@ -4321,6 +4332,54 @@ mod tests {
             .expect("head batch");
         assert_eq!(head.batch.max_delivery_attempts, 7);
         assert_eq!(head.batch.redelivery_window_ends_at, 111);
+    }
+
+    #[test]
+    fn lost_task_recovery_rechecks_dynamic_active_tasks_before_terminalize() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        create_test_task(
+            &mut store,
+            "job-became-active",
+            "task-became-active",
+            "thread-became-active",
+            3,
+            60,
+        );
+        create_test_task(
+            &mut store,
+            "job-still-lost",
+            "task-still-lost",
+            "thread-still-lost",
+            3,
+            60,
+        );
+
+        let mut checked = Vec::new();
+        let recovered = store
+            .fail_lost_tasks_excluding_with(100, |task_id| {
+                checked.push(task_id.to_owned());
+                Ok(task_id == "task-became-active")
+            })
+            .expect("recover lost tasks");
+
+        assert_eq!(
+            checked,
+            vec![
+                "task-became-active".to_owned(),
+                "task-still-lost".to_owned()
+            ]
+        );
+        assert_eq!(recovered, 1);
+        let active = store
+            .inspect_task("task-became-active")
+            .expect("inspect active task");
+        assert_eq!(active.status, "queued");
+        let lost = store
+            .inspect_task("task-still-lost")
+            .expect("inspect lost task");
+        assert_eq!(lost.status, "lost");
     }
 
     #[test]

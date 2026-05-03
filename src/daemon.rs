@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -1382,23 +1382,33 @@ fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
         let Some(expected_identity) = process.pid_identity.as_deref() else {
             continue;
         };
-        if !lost_task_process_group_is_recoverable(process.pid, expected_identity) {
+        if !lost_task_process_leader_identity_matches(process.pid, expected_identity) {
             continue;
         }
         signal_process_group(process.pid, libc::SIGTERM);
         thread::sleep(TASK_WAIT_POLL_INTERVAL);
-        if lost_task_process_group_is_recoverable(process.pid, expected_identity) {
+        if lost_task_process_group_needs_kill_after_verified_term(process.pid, expected_identity) {
             signal_process_group(process.pid, libc::SIGKILL);
         }
     }
     Ok(())
 }
 
-fn lost_task_process_group_is_recoverable(pid: u32, expected_identity: &str) -> bool {
+fn lost_task_process_leader_identity_matches(pid: u32, expected_identity: &str) -> bool {
+    matches!(
+        process_start_identity(pid),
+        Ok(Some(current_identity)) if current_identity == expected_identity
+    )
+}
+
+fn lost_task_process_group_needs_kill_after_verified_term(
+    pid: u32,
+    expected_identity: &str,
+) -> bool {
     match process_start_identity(pid) {
         Ok(Some(current_identity)) => current_identity == expected_identity,
-        // An exited leader cannot prove identity, so require an enumerated
-        // live same-PGID member before startup recovery signals the group.
+        // This check is only used after a SIGTERM whose leader identity was
+        // verified, so same-PGID members are follow-up cleanup evidence.
         Ok(None) => process_group_has_enumerated_live_members_after_leader_exit(pid),
         Err(_) => false,
     }
@@ -1711,18 +1721,17 @@ fn maybe_spawn_lifecycle_maintenance(
 }
 
 fn recover_registryless_lost_tasks(state: &DaemonState) -> Result<usize> {
-    let active_task_ids = active_supervised_task_ids(state)?;
     let now = current_epoch_seconds()?;
     let mut store = Store::open_for_daemon_lifecycle(&state.layout)?;
-    store.fail_lost_tasks_excluding(now, &active_task_ids)
+    store.fail_lost_tasks_excluding_with(now, |task_id| supervised_task_is_active(state, task_id))
 }
 
-fn active_supervised_task_ids(state: &DaemonState) -> Result<HashSet<String>> {
+fn supervised_task_is_active(state: &DaemonState, task_id: &str) -> Result<bool> {
     let tasks = state
         .supervised_tasks
         .lock()
         .map_err(|_| anyhow::anyhow!("supervised task map lock poisoned"))?;
-    Ok(tasks.keys().cloned().collect())
+    Ok(tasks.contains_key(task_id))
 }
 
 fn checked_epoch_add(now: i64, seconds: u64, name: &str) -> Result<i64> {
@@ -6070,7 +6079,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_kills_group_when_leader_identity_is_unavailable_but_members_remain() {
+    fn startup_recovery_skips_group_when_leader_identity_is_unavailable_but_members_remain() {
         let home = tempfile::tempdir().expect("temp home");
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
             .expect("chmod temp home");
@@ -6140,14 +6149,16 @@ mod tests {
 
         recover_lost_task_process_groups(&layout).expect("recover lost tasks");
 
+        assert!(
+            process_group_exists(pid),
+            "startup recovery must not signal a group after leader identity becomes unavailable"
+        );
+        signal_process_group(pid, libc::SIGKILL);
         let cleanup_deadline = Instant::now() + Duration::from_secs(2);
         while process_group_exists(pid) && Instant::now() < cleanup_deadline {
             thread::sleep(TASK_WAIT_POLL_INTERVAL);
         }
-        assert!(
-            !process_group_exists(pid),
-            "startup recovery should kill verified live members after the leader exits"
-        );
+        assert!(!process_group_exists(pid), "test cleanup should kill group");
     }
 
     #[cfg(target_os = "linux")]
