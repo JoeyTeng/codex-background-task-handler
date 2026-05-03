@@ -64,6 +64,7 @@ const TASK_SPAWN_EXEC_GATE_FD: RawFd = 3;
 const TASK_SPAWN_EXEC_GATE_SCRIPT: &str =
     "if IFS= read -r _ <&3; then exec 3<&-; exec \"$@\"; else exit 127; fi";
 const TASK_STORE_COMPLETION_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
+const TASK_STORE_SETUP_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const TASK_STORE_COMPLETION_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const TASK_STORE_COMPLETION_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
 const MAX_SUPERVISED_TASKS: usize = 16;
@@ -2003,7 +2004,9 @@ where
         }
         return Err(error).context("spawn task supervisor worker");
     }
-    let mut store = match Store::open_for_task_supervisor_setup(&state.layout) {
+    let mut store = match retry_task_store_setup("open task setup store", || {
+        Store::open_for_task_supervisor_setup(&state.layout)
+    }) {
         Ok(store) => store,
         Err(error) => {
             let _ = state
@@ -2020,7 +2023,9 @@ where
             .map(|mut tasks| tasks.remove(&task_id));
         return Err(error);
     }
-    let (_job, task) = match store.create_task_with_job(job, task) {
+    let (_job, task) = match retry_task_store_setup("create supervised task", || {
+        store.create_task_with_job(job.clone(), task.clone())
+    }) {
         Ok(created) => created,
         Err(error) => {
             let _ = state
@@ -2329,22 +2334,14 @@ fn run_supervised_task_worker_inner(
             return Err(error);
         }
     };
-    let mut store = match Store::open_for_task_supervisor_setup(layout) {
-        Ok(store) => store,
-        Err(error) => {
-            terminate_task_child_best_effort(&mut child, pid);
-            mark_supervised_task_process_completing(control)?;
-            return Err(error);
-        }
-    };
-    if let Err(error) =
+    if let Err(error) = retry_task_store_setup("mark task started", || {
+        let mut store = Store::open_for_task_supervisor_setup(layout)?;
         store.mark_task_started(task_id, i64::from(pid), Some(&pid_identity), started_at)
-    {
+    }) {
         terminate_task_child_best_effort(&mut child, pid);
         mark_supervised_task_process_completing(control)?;
         return Err(error);
     }
-    drop(store);
     drop(spawn_guard);
     let exec_release_decision = match acquire_supervised_task_exec_release(control)? {
         Some(exec_release_decision) => exec_release_decision,
@@ -3209,6 +3206,10 @@ fn retry_task_store_completion<T>(
         TASK_STORE_COMPLETION_RETRY_TIMEOUT,
         &mut action,
     )
+}
+
+fn retry_task_store_setup<T>(operation: &str, mut action: impl FnMut() -> Result<T>) -> Result<T> {
+    retry_task_store_completion_with_timeout(operation, TASK_STORE_SETUP_RETRY_TIMEOUT, &mut action)
 }
 
 fn retry_task_store_completion_with_timeout<T>(
@@ -6164,7 +6165,7 @@ mod tests {
     }
 
     #[test]
-    fn task_setup_store_lock_fails_closed_without_long_unmonitored_run() {
+    fn task_setup_store_lock_retries_before_exec_release() {
         let home = tempfile::tempdir().expect("temp home");
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
             .expect("chmod temp home");
@@ -6188,7 +6189,7 @@ mod tests {
                         summary: "setup lock".to_owned(),
                         command_json: "[]".to_owned(),
                         cwd: home.path().display().to_string(),
-                        timeout_seconds: Some(1),
+                        timeout_seconds: Some(5),
                         max_delivery_attempts: 3,
                         redelivery_window_seconds: 60,
                         created_at: 10,
@@ -6220,7 +6221,7 @@ mod tests {
                 vec![
                     b"/bin/sh".to_vec(),
                     b"-c".to_vec(),
-                    b"sleep 1; printf escaped > \"$1\"".to_vec(),
+                    b"printf escaped > \"$1\"".to_vec(),
                     b"cbth-task".to_vec(),
                     marker_arg.into_bytes(),
                 ],
@@ -6258,6 +6259,10 @@ mod tests {
             "worker must retain ownership until it writes a terminal task state"
         );
         assert!(
+            !marker.exists(),
+            "task command must not execute before the started update is durable"
+        );
+        assert!(
             started.elapsed() < Duration::from_secs(3),
             "started update should not leave the task unmonitored for the default SQLite busy timeout"
         );
@@ -6272,13 +6277,12 @@ mod tests {
         );
         let store = Store::open(&layout).expect("store");
         let task = store.inspect_task("task-setup-lock").expect("task");
-        assert_eq!(task.status, "failed");
+        assert_eq!(task.status, "succeeded");
         let job = store.inspect_job("job-setup-lock").expect("job");
-        assert_eq!(job.status, "failed");
-        thread::sleep(Duration::from_secs(2));
+        assert_eq!(job.status, "completed");
         assert!(
-            !marker.exists(),
-            "task process escaped after started update failed"
+            marker.exists(),
+            "task process should execute after the started update succeeds"
         );
     }
 
@@ -7100,7 +7104,7 @@ mod tests {
     }
 
     #[test]
-    fn task_run_initial_store_lock_fails_fast_and_releases_worker() {
+    fn task_run_initial_store_lock_fails_after_bounded_setup_retry_and_releases_worker() {
         let (home, state) = test_state();
         Store::open(&state.layout).expect("initialize store");
         let lock = Connection::open(state.layout.db_path()).expect("lock connection");
@@ -7132,8 +7136,8 @@ mod tests {
         .expect_err("locked initial task store should fail");
 
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "initial task store open should not wait for the default SQLite busy timeout"
+            started.elapsed() < Duration::from_secs(8),
+            "initial task store open should use the bounded setup retry, not the default SQLite busy timeout"
         );
         let error_details = format!("{error:#}");
         assert!(
