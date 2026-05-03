@@ -1548,6 +1548,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             state
                 .lifecycle_maintenance_suppressed
                 .store(false, Ordering::Release);
+            let _dispatch_slot = try_acquire_dispatch_slot(state)?;
             let payload: TaskRunPayload =
                 serde_json::from_value(request.payload).context("parse task run payload")?;
             json!({
@@ -1558,6 +1559,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             state
                 .lifecycle_maintenance_suppressed
                 .store(false, Ordering::Release);
+            let _dispatch_slot = try_acquire_dispatch_slot(state)?;
             let payload: TaskCancelPayload =
                 serde_json::from_value(request.payload).context("parse task cancel payload")?;
             json!({
@@ -4460,6 +4462,14 @@ mod tests {
         let dispatch = handle_test_request(&state, "dispatch", Value::Null);
         assert_eq!(dispatch["ok"], false);
         assert_eq!(dispatch["error"], "daemon is busy");
+
+        let task_run = handle_test_request(&state, "task_run", Value::Null);
+        assert_eq!(task_run["ok"], false);
+        assert_eq!(task_run["error"], "daemon is busy");
+
+        let task_cancel = handle_test_request(&state, "task_cancel", Value::Null);
+        assert_eq!(task_cancel["ok"], false);
+        assert_eq!(task_cancel["error"], "daemon is busy");
 
         drop(dispatch_slots);
         let _slot = try_acquire_dispatch_slot(&state).expect("released dispatch slot");
