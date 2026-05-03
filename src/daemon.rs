@@ -309,6 +309,7 @@ struct DaemonState {
 #[derive(Default)]
 struct SupervisedTaskControl {
     pid: Mutex<Option<u32>>,
+    pid_identity: Mutex<Option<String>>,
     cancel_intents: AtomicUsize,
     cancel_requested: AtomicBool,
     cancel_signal_sent: AtomicBool,
@@ -1176,35 +1177,96 @@ fn wait_for_supervised_task_registry_empty(state: &DaemonState, timeout: Duratio
 }
 
 fn current_supervised_task_process_group_exists(control: &SupervisedTaskControl) -> Result<bool> {
-    let pid = *control
-        .pid
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?;
-    Ok(pid.is_some_and(process_group_exists))
+    let Some((pid, expected_identity)) = supervised_task_process_snapshot(control)? else {
+        return Ok(false);
+    };
+    if !supervised_task_process_identity_matches(pid, expected_identity.as_deref()) {
+        return Ok(false);
+    }
+    Ok(process_group_exists(pid))
 }
 
 fn current_supervised_task_process_group_has_live_members_after_leader_exit(
     control: &SupervisedTaskControl,
 ) -> Result<bool> {
-    let pid = *control
-        .pid
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?;
-    Ok(pid.is_some_and(process_group_has_live_members_after_leader_exit))
+    let Some((pid, expected_identity)) = supervised_task_process_snapshot(control)? else {
+        return Ok(false);
+    };
+    if !supervised_task_process_identity_matches(pid, expected_identity.as_deref()) {
+        return Ok(false);
+    }
+    Ok(process_group_has_live_members_after_leader_exit(pid))
 }
 
 fn current_supervised_task_child_has_exited(control: &SupervisedTaskControl) -> Result<bool> {
+    let Some((pid, expected_identity)) = supervised_task_process_snapshot(control)? else {
+        return Ok(false);
+    };
+    if !supervised_task_process_identity_matches(pid, expected_identity.as_deref()) {
+        return Ok(true);
+    }
+    match child_status_without_reaping(pid).context("poll supervised task child")? {
+        ChildStatusWithoutReaping::Running => Ok(false),
+        ChildStatusWithoutReaping::Exited | ChildStatusWithoutReaping::NotWaitable => Ok(true),
+    }
+}
+
+fn supervised_task_process_snapshot(
+    control: &SupervisedTaskControl,
+) -> Result<Option<(u32, Option<String>)>> {
     let pid = *control
         .pid
         .lock()
         .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?;
     let Some(pid) = pid else {
-        return Ok(false);
+        return Ok(None);
     };
-    match child_status_without_reaping(pid).context("poll supervised task child")? {
-        ChildStatusWithoutReaping::Running => Ok(false),
-        ChildStatusWithoutReaping::Exited | ChildStatusWithoutReaping::NotWaitable => Ok(true),
+    let identity = control
+        .pid_identity
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid identity lock poisoned"))?
+        .clone();
+    Ok(Some((pid, identity)))
+}
+
+fn supervised_task_process_identity_matches(pid: u32, expected_identity: Option<&str>) -> bool {
+    let Some(expected_identity) = expected_identity else {
+        return true;
+    };
+    match process_start_identity(pid) {
+        Ok(Some(current_identity)) => current_identity == expected_identity,
+        Ok(None) => process_group_has_live_members_after_leader_exit(pid),
+        Err(_) => false,
     }
+}
+
+fn set_supervised_task_process(
+    control: &SupervisedTaskControl,
+    pid: u32,
+    pid_identity: String,
+) -> Result<()> {
+    *control
+        .pid_identity
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid identity lock poisoned"))? =
+        Some(pid_identity);
+    *control
+        .pid
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = Some(pid);
+    Ok(())
+}
+
+fn clear_supervised_task_process(control: &SupervisedTaskControl) -> Result<()> {
+    *control
+        .pid
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+    *control
+        .pid_identity
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid identity lock poisoned"))? = None;
+    Ok(())
 }
 
 fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
@@ -1294,20 +1356,19 @@ fn signal_current_supervised_task_process_group(
     control: &SupervisedTaskControl,
     signal: libc::c_int,
 ) -> Result<Option<u32>> {
-    let pid = *control
-        .pid
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?;
-    if let Some(pid) = pid {
-        if signal_process_group(pid, signal) {
-            if signal == libc::SIGTERM && control.cancel_requested.load(Ordering::Acquire) {
-                control.cancel_signal_sent.store(true, Ordering::Release);
-            }
-            return Ok(Some(pid));
-        }
+    let Some((pid, expected_identity)) = supervised_task_process_snapshot(control)? else {
+        return Ok(None);
+    };
+    if !supervised_task_process_identity_matches(pid, expected_identity.as_deref()) {
         return Ok(None);
     }
-    Ok(pid)
+    if signal_process_group(pid, signal) {
+        if signal == libc::SIGTERM && control.cancel_requested.load(Ordering::Acquire) {
+            control.cancel_signal_sent.store(true, Ordering::Release);
+        }
+        return Ok(Some(pid));
+    }
+    Ok(None)
 }
 
 fn persist_task_cancel_request(layout: &FsLayout, task_id: &str) -> Result<TaskRecord> {
@@ -1883,11 +1944,7 @@ fn cancel_supervised_task(state: &DaemonState, payload: TaskCancelPayload) -> Re
         .cloned();
     if let Some(control) = control {
         let _cancel_intent = SupervisedTaskCancelIntent::begin(&control)?;
-        let has_pid = control
-            .pid
-            .lock()
-            .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?
-            .is_some();
+        let has_pid = supervised_task_process_snapshot(&control)?.is_some();
         if !has_pid {
             let _spawn_guard = control
                 .spawn_gate
@@ -2098,31 +2155,21 @@ fn run_supervised_task_worker_inner(
     let mut child = spawn_command_locked(&mut command_builder)
         .with_context(|| format!("spawn task command {:?}", program))?;
     let pid = child.id();
-    *control
-        .pid
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = Some(pid);
     let pid_identity = match process_start_identity(pid)
         .and_then(|identity| identity.with_context(|| format!("task process {pid} disappeared")))
     {
         Ok(identity) => identity,
         Err(error) => {
             terminate_task_child_best_effort(&mut child, pid);
-            *control
-                .pid
-                .lock()
-                .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
             return Err(error).with_context(|| format!("record task process identity for {pid}"));
         }
     };
+    set_supervised_task_process(control, pid, pid_identity.clone())?;
     let started_at = match current_epoch_seconds() {
         Ok(started_at) => started_at,
         Err(error) => {
             terminate_task_child_best_effort(&mut child, pid);
-            *control
-                .pid
-                .lock()
-                .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+            clear_supervised_task_process(control)?;
             return Err(error);
         }
     };
@@ -2130,10 +2177,7 @@ fn run_supervised_task_worker_inner(
         Ok(store) => store,
         Err(error) => {
             terminate_task_child_best_effort(&mut child, pid);
-            *control
-                .pid
-                .lock()
-                .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+            clear_supervised_task_process(control)?;
             return Err(error);
         }
     };
@@ -2141,10 +2185,7 @@ fn run_supervised_task_worker_inner(
         store.mark_task_started(task_id, i64::from(pid), Some(&pid_identity), started_at)
     {
         terminate_task_child_best_effort(&mut child, pid);
-        *control
-            .pid
-            .lock()
-            .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+        clear_supervised_task_process(control)?;
         return Err(error);
     }
     drop(store);
@@ -2180,10 +2221,7 @@ fn run_supervised_task_worker_inner(
     }
     if let Err(error) = release_task_spawn_exec_gate(exec_gate) {
         terminate_task_child_best_effort(&mut child, pid);
-        *control
-            .pid
-            .lock()
-            .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+        clear_supervised_task_process(control)?;
         return Err(error).with_context(|| format!("release task {task_id}"));
     }
     drop(exec_release_decision);
@@ -2206,19 +2244,13 @@ fn run_supervised_task_worker_inner(
         result_path,
     );
     if result.is_err() {
-        let should_terminate = control
-            .pid
-            .lock()
-            .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?
-            .is_some_and(|active_pid| active_pid == pid);
+        let should_terminate = supervised_task_process_snapshot(control)?
+            .is_some_and(|(active_pid, _)| active_pid == pid);
         if should_terminate {
             terminate_task_child_best_effort(&mut child, pid);
         }
     }
-    *control
-        .pid
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+    clear_supervised_task_process(control)?;
     result
 }
 
@@ -2234,10 +2266,7 @@ fn finish_cancelled_before_exec_gate_release(
     pid: u32,
 ) -> Result<()> {
     terminate_task_child_best_effort(child, pid);
-    *control
-        .pid
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+    clear_supervised_task_process(control)?;
     finish_unspawned_cancelled_task(
         layout,
         task_id,
@@ -2383,17 +2412,11 @@ fn run_supervised_spawned_task(
     let status = match child.wait().context("wait task child") {
         Ok(status) => status,
         Err(error) => {
-            *control
-                .pid
-                .lock()
-                .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+            clear_supervised_task_process(control)?;
             return Err(error);
         }
     };
-    *control
-        .pid
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
+    clear_supervised_task_process(control)?;
     if !timed_out && control.cancel_signal_sent.load(Ordering::Acquire) {
         cancelled = true;
     }
@@ -6032,6 +6055,85 @@ mod tests {
         assert_eq!(task.cancel_requested_at, None);
         assert!(!control.cancel_requested.load(Ordering::Acquire));
         assert!(!control.cancel_signal_sent.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn task_cancel_does_not_signal_pid_identity_mismatch() {
+        let (home, state) = test_state();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
+        let pid = child.id();
+        let control = Arc::new(SupervisedTaskControl::default());
+        *control.pid.lock().expect("pid lock") = Some(pid);
+        *control.pid_identity.lock().expect("pid identity lock") =
+            Some("different-process-identity".to_owned());
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert(
+                "task-mismatched-pid-cancel".to_owned(),
+                Arc::clone(&control),
+            );
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-mismatched-pid-cancel".to_owned(),
+                        source_thread_id: "thread-mismatched-pid-cancel".to_owned(),
+                        summary: "mismatched pid cancel".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-mismatched-pid-cancel".to_owned(),
+                        job_id: "job-mismatched-pid-cancel".to_owned(),
+                        source_thread_id: "thread-mismatched-pid-cancel".to_owned(),
+                        summary: "mismatched pid cancel".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+            store
+                .mark_task_started(
+                    "task-mismatched-pid-cancel",
+                    i64::from(pid),
+                    Some("different-process-identity"),
+                    11,
+                )
+                .expect("mark started");
+        }
+
+        let task = cancel_supervised_task(
+            &state,
+            TaskCancelPayload {
+                task_id: "task-mismatched-pid-cancel".to_owned(),
+            },
+        )
+        .expect("cancel mismatched pid");
+
+        assert_eq!(task.status, "running");
+        assert!(!control.cancel_signal_sent.load(Ordering::Acquire));
+        assert!(
+            child.try_wait().expect("check child").is_none(),
+            "mismatched pid process should not be signaled"
+        );
+        let _ = signal_process_group(pid, libc::SIGKILL);
+        let _ = child.wait();
     }
 
     #[test]
