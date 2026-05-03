@@ -135,6 +135,7 @@ pub struct NewTask {
 
 #[derive(Clone, Debug)]
 pub struct LostPendingTaskProcess {
+    pub task_id: String,
     pub pid: u32,
     pub pid_identity: Option<String>,
 }

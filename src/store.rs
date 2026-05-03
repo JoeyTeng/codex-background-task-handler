@@ -466,7 +466,7 @@ impl Store {
 
     pub fn lost_pending_task_processes(&self) -> Result<Vec<LostPendingTaskProcess>> {
         let mut stmt = self.conn.prepare(
-            "SELECT tasks.pid, tasks.pid_identity
+            "SELECT tasks.task_id, tasks.pid, tasks.pid_identity
              FROM tasks
              JOIN jobs ON jobs.job_id = tasks.job_id
              WHERE tasks.status IN ('queued', 'running')
@@ -475,13 +475,18 @@ impl Store {
         )?;
         let processes = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         processes
             .into_iter()
-            .map(|(pid, pid_identity)| {
+            .map(|(task_id, pid, pid_identity)| {
                 Ok(LostPendingTaskProcess {
+                    task_id,
                     pid: u32::try_from(pid)
                         .with_context(|| format!("stored task pid {pid} is invalid"))?,
                     pid_identity,

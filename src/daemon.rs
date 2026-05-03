@@ -1721,9 +1721,36 @@ fn maybe_spawn_lifecycle_maintenance(
 }
 
 fn recover_registryless_lost_tasks(state: &DaemonState) -> Result<usize> {
+    recover_registryless_lost_task_process_groups(state)?;
     let now = current_epoch_seconds()?;
     let mut store = Store::open_for_daemon_lifecycle(&state.layout)?;
     store.fail_lost_tasks_excluding_with(now, |task_id| supervised_task_is_active(state, task_id))
+}
+
+fn recover_registryless_lost_task_process_groups(state: &DaemonState) -> Result<()> {
+    let store = Store::open_for_daemon_lifecycle(&state.layout)?;
+    for process in store.lost_pending_task_processes()? {
+        if supervised_task_is_active(state, &process.task_id)? {
+            continue;
+        }
+        let Some(expected_identity) = process.pid_identity.as_deref() else {
+            continue;
+        };
+        if !lost_task_process_leader_identity_matches(process.pid, expected_identity) {
+            continue;
+        }
+        signal_process_group(process.pid, libc::SIGTERM);
+        thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        if !supervised_task_is_active(state, &process.task_id)?
+            && lost_task_process_group_needs_kill_after_verified_term(
+                process.pid,
+                expected_identity,
+            )
+        {
+            signal_process_group(process.pid, libc::SIGKILL);
+        }
+    }
+    Ok(())
 }
 
 fn supervised_task_is_active(state: &DaemonState, task_id: &str) -> Result<bool> {
@@ -2504,11 +2531,25 @@ fn run_supervised_spawned_task(
     let timeout = timeout_seconds
         .and_then(|seconds| u64::try_from(seconds).ok())
         .map(Duration::from_secs);
+    let mut stream_state = TaskStreamJoinState::new(stdout_worker, stderr_worker);
     let mut timed_out = false;
     let mut cancelled = false;
     let mut termination_started_at: Option<Instant> = None;
     let mut sent_kill = false;
     let child_exited_at = loop {
+        stream_state.poll_finished();
+        if stream_state.stream_error.is_some() {
+            return fail_spawned_task_after_stream_spool_error(
+                stream_state,
+                child,
+                pid,
+                control,
+                start,
+                timeout,
+                &mut cancelled,
+                &mut timed_out,
+            );
+        }
         match child_status_without_reaping(pid).context("poll task child without reaping")? {
             ChildStatusWithoutReaping::Exited => {
                 if !timed_out && control.cancel_signal_sent.load(Ordering::Acquire) {
@@ -2568,9 +2609,8 @@ fn run_supervised_spawned_task(
             termination_started_at.is_some(),
         ));
     };
-    let (stdout_capture, stderr_capture) = join_task_stream_spools_with_control(
-        stdout_worker,
-        stderr_worker,
+    let (stdout_capture, stderr_capture) = join_task_stream_spools_with_control_state(
+        stream_state,
         pid,
         control,
         start,
@@ -2660,6 +2700,41 @@ fn run_supervised_spawned_task(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn fail_spawned_task_after_stream_spool_error(
+    stream_state: TaskStreamJoinState,
+    child: &mut Child,
+    pid: u32,
+    control: &SupervisedTaskControl,
+    start: Instant,
+    timeout: Option<Duration>,
+    cancelled: &mut bool,
+    timed_out: &mut bool,
+) -> Result<()> {
+    stream_state.abort_workers();
+    let terminate_result = terminate_task_child(child, pid)
+        .with_context(|| format!("terminate task {pid} after stream spool failure"));
+    mark_supervised_task_child_exit_observed(control);
+    let _ = child.wait();
+    mark_supervised_task_process_completing(control)?;
+    let join_result = join_task_stream_spools_with_control_state(
+        stream_state,
+        pid,
+        control,
+        start,
+        Instant::now(),
+        timeout,
+        cancelled,
+        timed_out,
+    )
+    .map(|_| ());
+    match (join_result, terminate_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => bail!("task stream failed without an error"),
+    }
+}
+
 fn task_command_display(command: &[Vec<u8>]) -> String {
     let mut rendered = command
         .iter()
@@ -2725,6 +2800,50 @@ struct TaskStreamCapture {
 struct TaskStreamWorker {
     handle: thread::JoinHandle<Result<TaskStreamCapture>>,
     abort: Arc<AtomicBool>,
+}
+
+struct TaskStreamJoinState {
+    stdout_worker: Option<TaskStreamWorker>,
+    stderr_worker: Option<TaskStreamWorker>,
+    stdout_capture: Option<TaskStreamCapture>,
+    stderr_capture: Option<TaskStreamCapture>,
+    stream_error: Option<anyhow::Error>,
+}
+
+impl TaskStreamJoinState {
+    fn new(stdout_worker: TaskStreamWorker, stderr_worker: TaskStreamWorker) -> Self {
+        Self {
+            stdout_worker: Some(stdout_worker),
+            stderr_worker: Some(stderr_worker),
+            stdout_capture: None,
+            stderr_capture: None,
+            stream_error: None,
+        }
+    }
+
+    fn poll_finished(&mut self) {
+        if let Some(result) = join_finished_task_stream_spool(&mut self.stdout_worker) {
+            record_finished_task_stream_spool(
+                "stdout",
+                result,
+                &mut self.stdout_capture,
+                &mut self.stream_error,
+            );
+        }
+        if let Some(result) = join_finished_task_stream_spool(&mut self.stderr_worker) {
+            record_finished_task_stream_spool(
+                "stderr",
+                result,
+                &mut self.stderr_capture,
+                &mut self.stream_error,
+            );
+        }
+    }
+
+    fn abort_workers(&self) {
+        abort_task_stream_worker(&self.stdout_worker);
+        abort_task_stream_worker(&self.stderr_worker);
+    }
 }
 
 fn spawn_task_stream_spool<R>(reader: R, path: PathBuf) -> TaskStreamWorker
@@ -2911,6 +3030,7 @@ fn wait_process_group_exit_with_control(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn join_task_stream_spools_with_control(
     stdout_worker: TaskStreamWorker,
@@ -2923,33 +3043,36 @@ fn join_task_stream_spools_with_control(
     cancelled: &mut bool,
     timed_out: &mut bool,
 ) -> Result<(TaskStreamCapture, TaskStreamCapture)> {
-    let mut stdout_worker = Some(stdout_worker);
-    let mut stderr_worker = Some(stderr_worker);
-    let mut stdout_capture = None;
-    let mut stderr_capture = None;
-    let mut stream_error = None;
+    join_task_stream_spools_with_control_state(
+        TaskStreamJoinState::new(stdout_worker, stderr_worker),
+        pid,
+        control,
+        start,
+        child_exited_at,
+        timeout,
+        cancelled,
+        timed_out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn join_task_stream_spools_with_control_state(
+    mut stream_state: TaskStreamJoinState,
+    pid: u32,
+    control: &SupervisedTaskControl,
+    start: Instant,
+    child_exited_at: Instant,
+    timeout: Option<Duration>,
+    cancelled: &mut bool,
+    timed_out: &mut bool,
+) -> Result<(TaskStreamCapture, TaskStreamCapture)> {
     let mut termination_started_at = None;
     let mut sent_kill = false;
     let mut stream_abort_started_at = None;
     let mut process_group_gone_at = None;
     loop {
-        if let Some(result) = join_finished_task_stream_spool(&mut stdout_worker) {
-            record_finished_task_stream_spool(
-                "stdout",
-                result,
-                &mut stdout_capture,
-                &mut stream_error,
-            );
-        }
-        if let Some(result) = join_finished_task_stream_spool(&mut stderr_worker) {
-            record_finished_task_stream_spool(
-                "stderr",
-                result,
-                &mut stderr_capture,
-                &mut stream_error,
-            );
-        }
-        if stdout_worker.is_none() && stderr_worker.is_none() {
+        stream_state.poll_finished();
+        if stream_state.stdout_worker.is_none() && stream_state.stderr_worker.is_none() {
             break;
         }
         let process_group_alive = process_group_has_live_members_after_leader_exit(pid);
@@ -2958,9 +3081,8 @@ fn join_task_stream_spools_with_control(
         } else if process_group_gone_at.is_none() {
             process_group_gone_at = Some(Instant::now());
         }
-        if stream_error.is_some() {
-            abort_task_stream_worker(&stdout_worker);
-            abort_task_stream_worker(&stderr_worker);
+        if stream_state.stream_error.is_some() {
+            stream_state.abort_workers();
             if stream_abort_started_at.is_none() {
                 stream_abort_started_at = Some(Instant::now());
             }
@@ -3004,8 +3126,7 @@ fn join_task_stream_spools_with_control(
                 || process_group_gone_at
                     .is_some_and(|gone_at| gone_at.elapsed() >= TASK_STREAM_DRAIN_HARD_GRACE))
         {
-            abort_task_stream_worker(&stdout_worker);
-            abort_task_stream_worker(&stderr_worker);
+            stream_state.abort_workers();
             stream_abort_started_at = Some(Instant::now());
         }
         if let Some(started_at) = termination_started_at
@@ -3021,15 +3142,14 @@ fn join_task_stream_spools_with_control(
                 started_at.elapsed() >= TASK_TERM_GRACE + TASK_STREAM_DRAIN_HARD_GRACE
             })
         {
-            abort_task_stream_worker(&stdout_worker);
-            abort_task_stream_worker(&stderr_worker);
+            stream_state.abort_workers();
             stream_abort_started_at = Some(Instant::now());
         }
         if stream_abort_started_at
             .is_some_and(|started_at| started_at.elapsed() >= TASK_STREAM_DRAIN_HARD_GRACE)
-            && (stdout_worker.is_some() || stderr_worker.is_some())
+            && (stream_state.stdout_worker.is_some() || stream_state.stderr_worker.is_some())
         {
-            return match stream_error.take() {
+            return match stream_state.stream_error.take() {
                 Some(error) => {
                     Err(error.context("task stream workers did not stop after abort deadline"))
                 }
@@ -3039,12 +3159,16 @@ fn join_task_stream_spools_with_control(
         thread::sleep(TASK_WAIT_POLL_INTERVAL);
     }
 
-    if let Some(error) = stream_error {
+    if let Some(error) = stream_state.stream_error {
         return Err(error);
     }
     Ok((
-        stdout_capture.context("stdout task stream did not produce a capture")?,
-        stderr_capture.context("stderr task stream did not produce a capture")?,
+        stream_state
+            .stdout_capture
+            .context("stdout task stream did not produce a capture")?,
+        stream_state
+            .stderr_capture
+            .context("stderr task stream did not produce a capture")?,
     ))
 }
 
@@ -6982,6 +7106,80 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_recovery_terminates_registryless_lost_task_process_group() {
+        let (home, state) = test_state();
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30").process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
+        let pid = child.id();
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("process identity available");
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-registryless-process".to_owned(),
+                        source_thread_id: "thread-registryless-process".to_owned(),
+                        summary: "registryless process".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-registryless-process".to_owned(),
+                        job_id: "job-registryless-process".to_owned(),
+                        source_thread_id: "thread-registryless-process".to_owned(),
+                        summary: "registryless process".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+            store
+                .mark_task_started(
+                    "task-registryless-process",
+                    i64::from(pid),
+                    Some(&pid_identity),
+                    11,
+                )
+                .expect("mark task started");
+        }
+
+        let recovered = recover_registryless_lost_tasks(&state).expect("recover lost task");
+
+        assert_eq!(recovered, 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if child.try_wait().expect("poll child").is_some() {
+                exited = true;
+                break;
+            }
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
+        if !exited {
+            terminate_task_child_best_effort(&mut child, pid);
+        }
+        let _ = child.wait();
+        assert!(exited, "registryless recovery should terminate task child");
+        assert!(
+            !process_group_exists(pid),
+            "registryless recovery should clean up the task process group"
+        );
+        let store = Store::open(&state.layout).expect("store");
+        let task = store
+            .inspect_task("task-registryless-process")
+            .expect("inspect task");
+        assert_eq!(task.status, "lost");
+    }
+
+    #[test]
     fn lifecycle_maintenance_recovers_nonterminal_task_after_job_closed() {
         let (home, state) = test_state();
         let state = Arc::new(state);
@@ -8062,6 +8260,67 @@ mod tests {
         assert!(
             !process_group_exists(pid),
             "stream worker failure should terminate the live process group"
+        );
+    }
+
+    #[test]
+    fn stream_spool_failure_terminates_running_task_before_child_exit() {
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let missing_dir = home.path().join("missing-log-dir");
+        fs::write(&missing_dir, b"not a directory").expect("create non-directory log parent");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("while true; do sleep 1; done")
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
+        let pid = child.id();
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("process identity available");
+        let control = Arc::new(SupervisedTaskControl::default());
+        set_supervised_task_process(&control, pid, pid_identity).expect("set process");
+
+        let started = Instant::now();
+        let error = run_supervised_spawned_task(
+            &layout,
+            "task-stream-spool-start-failure",
+            "job-stream-spool-start-failure",
+            "long-running command",
+            home.path(),
+            None,
+            3,
+            60,
+            &control,
+            &mut child,
+            pid,
+            Instant::now(),
+            missing_dir.join("stdout.log"),
+            missing_dir.join("stderr.log"),
+            home.path().join("result.txt"),
+        )
+        .expect_err("stream spool failure should fail the task");
+
+        assert!(
+            started.elapsed() < TASK_TERM_GRACE,
+            "stream spool failure should not wait for natural child exit"
+        );
+        assert!(
+            format!("{error:#}").contains("task stream failed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            supervised_task_process_state(&control).expect("process state"),
+            SupervisedTaskProcessState::Completing
+        );
+        assert!(
+            !process_group_exists(pid),
+            "stream spool failure should terminate the running task group"
         );
     }
 
