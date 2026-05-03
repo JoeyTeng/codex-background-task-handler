@@ -55,6 +55,8 @@ const TASK_TERM_GRACE: Duration = Duration::from_secs(5);
 const TASK_LEADER_EXITED_PROCESS_GROUP_GRACE: Duration = Duration::from_secs(5);
 const TASK_SHUTDOWN_DURABLE_CANCEL_GRACE: Duration = Duration::from_secs(1);
 const TASK_SHUTDOWN_WORKER_DRAIN_GRACE: Duration = Duration::from_secs(1);
+const TASK_SHUTDOWN_COMPLETION_DRAIN_GRACE: Duration =
+    Duration::from_secs(TASK_STORE_COMPLETION_RETRY_TIMEOUT.as_secs() + 5);
 const TASK_STREAM_DRAIN_HARD_GRACE: Duration = Duration::from_secs(1);
 const DAEMON_STOP_WORKER_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const TASK_SPAWN_EXEC_GATE_FD: RawFd = 3;
@@ -1178,7 +1180,7 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
             let _ = signal_current_supervised_task_process_group(control, signal);
         }
         if !saw_cancel_target {
-            wait_for_supervised_task_registry_empty(state, TASK_SHUTDOWN_WORKER_DRAIN_GRACE);
+            wait_for_supervised_task_registry_empty(state, TASK_SHUTDOWN_COMPLETION_DRAIN_GRACE);
             return;
         }
         if now >= kill_deadline {
@@ -1220,14 +1222,15 @@ fn wait_for_supervised_task_process_groups_gone(controls: &[(String, Arc<Supervi
     }
 }
 
-fn wait_for_supervised_task_registry_empty(state: &DaemonState, timeout: Duration) {
+fn wait_for_supervised_task_registry_empty(state: &DaemonState, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if !has_active_supervised_tasks(state) {
-            return;
+            return true;
         }
         thread::sleep(TASK_WAIT_POLL_INTERVAL);
     }
+    !has_active_supervised_tasks(state)
 }
 
 fn current_supervised_task_process_group_exists(control: &SupervisedTaskControl) -> Result<bool> {
@@ -1860,13 +1863,7 @@ where
     if now.checked_add(payload.redelivery_window_seconds).is_none() {
         bail!("redelivery_window_seconds overflows timestamp range");
     }
-    let command_json = serde_json::to_string(
-        &payload
-            .command
-            .iter()
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect::<Vec<_>>(),
-    )?;
+    let command_json = task_command_persistence_json(&payload.command)?;
     let control = Arc::new(SupervisedTaskControl::default());
     {
         let mut supervised_tasks = state
@@ -2464,9 +2461,20 @@ fn run_supervised_spawned_task(
         if termination_started_at.is_none()
             && timeout.is_some_and(|timeout| start.elapsed() >= timeout)
         {
-            timed_out = true;
-            signal_process_group(pid, libc::SIGTERM);
-            termination_started_at = Some(Instant::now());
+            match child_status_without_reaping(pid)
+                .context("re-check task child before timeout termination")?
+            {
+                ChildStatusWithoutReaping::Exited => break Instant::now(),
+                ChildStatusWithoutReaping::Running => {
+                    if signal_process_group(pid, libc::SIGTERM) {
+                        timed_out = true;
+                        termination_started_at = Some(Instant::now());
+                    }
+                }
+                ChildStatusWithoutReaping::NotWaitable => {
+                    bail!("task child is no longer waitable before timeout termination");
+                }
+            }
         }
         if let Some(started_at) = termination_started_at
             && !sent_kill
@@ -2582,6 +2590,15 @@ fn task_command_display(command: &[Vec<u8>]) -> String {
         .join(" ");
     truncate_string_bytes(&mut rendered, TASK_PROMPT_COMMAND_PREVIEW_BYTES);
     rendered
+}
+
+fn task_command_persistence_json(command: &[Vec<u8>]) -> Result<String> {
+    serde_json::to_string(&json!({
+        "format": "argv-bytes-v1",
+        "argv": command,
+        "display": task_command_display(command),
+    }))
+    .context("serialize task command")
 }
 
 fn terminate_task_child(child: &mut Child, pid: u32) -> Result<()> {
@@ -6336,8 +6353,17 @@ mod tests {
                 .mark_task_started("task-stop-completing", 12345, Some("test-pid"), 11)
                 .expect("mark started");
         }
+        let registry = state.supervised_tasks.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            registry
+                .lock()
+                .expect("task registry")
+                .remove("task-stop-completing");
+        });
 
         stop_all_supervised_tasks(&state);
+        worker.join().expect("join completing worker");
 
         let store = Store::open(&state.layout).expect("store");
         let task = store.inspect_task("task-stop-completing").expect("task");
@@ -6535,6 +6561,39 @@ mod tests {
     }
 
     #[test]
+    fn task_run_persists_raw_command_bytes() {
+        let (home, state) = test_state();
+        let command = vec![
+            b"/bin/sh".to_vec(),
+            b"-c".to_vec(),
+            b"true".to_vec(),
+            vec![b'a', 0xFF, b'z'],
+        ];
+        let payload = TaskRunPayload {
+            source_thread_id: "thread-raw-command-bytes".to_owned(),
+            summary: "raw command bytes".to_owned(),
+            metadata_json: "{}".to_owned(),
+            policy: DeliveryPolicy::fail_closed(),
+            cwd: home.path().display().to_string(),
+            timeout_seconds: None,
+            max_delivery_attempts: 3,
+            redelivery_window_seconds: 60,
+            command: command.clone(),
+            environment: Vec::new(),
+        };
+
+        let task = start_supervised_task_with_spawner(&state, payload, |name, worker| {
+            thread::Builder::new().name(name).spawn(worker)
+        })
+        .expect("start task");
+
+        assert_eq!(task.command["format"], json!("argv-bytes-v1"));
+        assert_eq!(task.command["argv"], json!(command));
+        assert!(task.command["display"].is_string());
+        wait_for_supervised_task_registry_empty(&state, Duration::from_secs(2));
+    }
+
+    #[test]
     fn task_run_initial_store_lock_fails_fast_and_releases_worker() {
         let (home, state) = test_state();
         Store::open(&state.layout).expect("initialize store");
@@ -6630,6 +6689,9 @@ mod tests {
                 },
             )
             .expect("create task");
+        store
+            .request_task_cancel("task-unstarted-cleanup", 11)
+            .expect("mark unstarted task cancelled during shutdown");
 
         store
             .delete_unstarted_task_with_job("task-unstarted-cleanup", "job-unstarted-cleanup")
@@ -6697,6 +6759,43 @@ mod tests {
             .list_tasks(Some("thread-stop-fenced-task-run"), None, 10)
             .expect("list tasks");
         assert!(tasks.is_empty(), "stopped daemon should not create task");
+    }
+
+    #[test]
+    fn daemon_stop_waits_for_completing_task_worker() {
+        let (_home, state) = test_state();
+        let control = Arc::new(SupervisedTaskControl::default());
+        mark_supervised_task_process_completing(&control).expect("mark completing");
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert("task-completing-drain".to_owned(), control);
+        let registry = state.supervised_tasks.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(TASK_SHUTDOWN_WORKER_DRAIN_GRACE + Duration::from_millis(500));
+            registry
+                .lock()
+                .expect("task registry")
+                .remove("task-completing-drain");
+        });
+
+        let started = Instant::now();
+        stop_all_supervised_tasks(&state);
+        let elapsed = started.elapsed();
+        worker.join().expect("join completing worker");
+
+        assert!(
+            elapsed >= TASK_SHUTDOWN_WORKER_DRAIN_GRACE,
+            "stop returned before the completing worker had enough time to finish"
+        );
+        assert!(
+            state
+                .supervised_tasks
+                .lock()
+                .expect("task registry")
+                .is_empty()
+        );
     }
 
     #[test]

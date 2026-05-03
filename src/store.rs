@@ -226,11 +226,7 @@ impl Store {
                 task.job_id
             );
         }
-        if task.status != "queued"
-            || task.started_at.is_some()
-            || task.completed_at.is_some()
-            || task.cancel_requested_at.is_some()
-        {
+        if task.status != "queued" || task.started_at.is_some() || task.completed_at.is_some() {
             bail!("task {task_id} is no longer an unstarted queued task");
         }
         let job = query_job_tx(&tx, job_id)?;
