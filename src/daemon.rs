@@ -537,12 +537,12 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         }
     }
     if shutdown_reason == "stop_requested" {
-        join_lifecycle_maintenance(lifecycle_maintenance_worker);
         stop_all_supervised_tasks(&state);
         stop_all_cli_app_servers(&state);
         stop_all_cli_thread_start_bootstraps(&state);
         clear_cli_app_server_reservations(&state);
         reap_finished_workers(&mut workers);
+        join_lifecycle_maintenance(lifecycle_maintenance_worker);
     } else {
         join_workers(workers);
         join_lifecycle_maintenance(lifecycle_maintenance_worker);
@@ -1700,6 +1700,9 @@ where
         bail!("task command must not be empty");
     }
     validate_daemon_nonempty_bytes("task command argv[0]", &payload.command[0])?;
+    if state.stop_requested.load(Ordering::Acquire) {
+        bail!("daemon is stopping");
+    }
 
     let task_id = new_id();
     let job_id = new_id();
@@ -1720,6 +1723,9 @@ where
             .supervised_tasks
             .lock()
             .map_err(|_| anyhow::anyhow!("supervised task map lock poisoned"))?;
+        if state.stop_requested.load(Ordering::Acquire) {
+            bail!("daemon is stopping");
+        }
         if supervised_tasks.len() >= MAX_SUPERVISED_TASKS {
             bail!("maximum supervised task limit reached ({MAX_SUPERVISED_TASKS})");
         }
@@ -5843,6 +5849,60 @@ mod tests {
             .list_tasks(Some("thread-worker-spawn-fail"), None, 10)
             .expect("list tasks");
         assert!(tasks.is_empty(), "spawn failure should not create a task");
+    }
+
+    #[test]
+    fn task_run_blocked_on_registry_lock_fails_after_stop_request() {
+        let (home, state) = test_state();
+        let state = Arc::new(state);
+        let registry_guard = state.supervised_tasks.lock().expect("task registry");
+        let spawner_called = Arc::new(AtomicBool::new(false));
+        let spawner_called_for_task = Arc::clone(&spawner_called);
+        let task_state = Arc::clone(&state);
+        let payload = TaskRunPayload {
+            source_thread_id: "thread-stop-fenced-task-run".to_owned(),
+            summary: "stop fenced task run".to_owned(),
+            metadata_json: "{}".to_owned(),
+            policy: DeliveryPolicy::fail_closed(),
+            cwd: home.path().display().to_string(),
+            timeout_seconds: None,
+            max_delivery_attempts: 3,
+            redelivery_window_seconds: 60,
+            command: vec![b"/bin/true".to_vec()],
+            environment: Vec::new(),
+        };
+        let task = thread::spawn(move || {
+            start_supervised_task_with_spawner(&task_state, payload, |_name, _worker| {
+                spawner_called_for_task.store(true, Ordering::Release);
+                Err(io::Error::from_raw_os_error(libc::EAGAIN))
+            })
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        state.stop_requested.store(true, Ordering::Release);
+        drop(registry_guard);
+        let error = task
+            .join()
+            .expect("task runner joins")
+            .expect_err("task run");
+
+        assert!(
+            error.to_string().contains("daemon is stopping"),
+            "{error:#}"
+        );
+        assert!(!spawner_called.load(Ordering::Acquire));
+        assert!(
+            state
+                .supervised_tasks
+                .lock()
+                .expect("task registry")
+                .is_empty()
+        );
+        let store = Store::open(&state.layout).expect("store");
+        let tasks = store
+            .list_tasks(Some("thread-stop-fenced-task-run"), None, 10)
+            .expect("list tasks");
+        assert!(tasks.is_empty(), "stopped daemon should not create task");
     }
 
     #[test]
