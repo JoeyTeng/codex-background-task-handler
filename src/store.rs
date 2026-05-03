@@ -1611,7 +1611,7 @@ impl Store {
         }
         let orphan_report = self.cleanup_stale_artifact_ingests(layout)?;
         let task_log_report =
-            cleanup_expired_task_log_dirs(&self.conn, layout, &expired_task_log_task_ids)?;
+            cleanup_expired_task_log_dirs(&self.conn, layout, &expired_task_log_task_ids, now)?;
 
         if !deleted_artifact_ids.is_empty() {
             let tx = self.conn.transaction()?;
@@ -1805,6 +1805,14 @@ fn mark_artifact_gc_attempted(conn: &Connection, artifact_id: &str, now: i64) ->
     Ok(())
 }
 
+fn mark_task_log_gc_attempted(conn: &Connection, task_id: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks SET task_log_gc_attempted_at = ? WHERE task_id = ?",
+        params![now, task_id],
+    )?;
+    Ok(())
+}
+
 fn is_sqlite_busy_or_locked(error: &anyhow::Error) -> bool {
     let Some(sqlite_error) = error.downcast_ref::<rusqlite::Error>() else {
         return false;
@@ -1888,11 +1896,13 @@ fn cleanup_expired_task_log_dirs(
     conn: &Connection,
     layout: &FsLayout,
     task_ids: &[String],
+    now: i64,
 ) -> Result<CleanupReport> {
     let mut report = CleanupReport::default();
     let mut deleted_task_ids = Vec::new();
     for task_id in task_ids {
         if validate_id_path_component(task_id, "task_id").is_err() {
+            mark_task_log_gc_attempted(conn, task_id, now)?;
             report.failed += 1;
             continue;
         }
@@ -1905,6 +1915,7 @@ fn cleanup_expired_task_log_dirs(
                 deleted_task_ids.push(task_id.clone());
             }
             Err(_) => {
+                mark_task_log_gc_attempted(conn, task_id, now)?;
                 report.failed += 1;
             }
         }
@@ -1974,7 +1985,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             stderr_bytes INTEGER NOT NULL DEFAULT 0,
             stdout_truncated INTEGER NOT NULL DEFAULT 0,
             stderr_truncated INTEGER NOT NULL DEFAULT 0,
-            cancel_requested_at INTEGER
+            cancel_requested_at INTEGER,
+            task_log_gc_attempted_at INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE INDEX IF NOT EXISTS idx_tasks_thread_created
@@ -2144,6 +2156,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         "artifacts",
         "gc_attempted_at",
         "ALTER TABLE artifacts ADD COLUMN gc_attempted_at INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "tasks",
+        "task_log_gc_attempted_at",
+        "ALTER TABLE tasks ADD COLUMN task_log_gc_attempted_at INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
         conn,
@@ -2961,7 +2979,8 @@ fn query_deletable_task_log_dirs_tx(tx: &Transaction<'_>, now: i64) -> Result<Ve
              JOIN batches ON batches.batch_id = batch_jobs.batch_id
              WHERE batch_jobs.job_id = tasks.job_id
            ), completed_at) <= ?
-         ORDER BY COALESCE((
+         ORDER BY task_log_gc_attempted_at ASC,
+           COALESCE((
              SELECT max(batches.closed_at)
              FROM batch_jobs
              JOIN batches ON batches.batch_id = batch_jobs.batch_id
@@ -4913,6 +4932,47 @@ mod tests {
         assert!(!good_artifact_dir.exists());
     }
 
+    #[test]
+    fn task_log_gc_failures_do_not_starve_later_task_logs() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+
+        for index in 0..MAX_DELETABLE_TASK_LOG_DIRS_PER_SWEEP {
+            let job_id = format!("bad-task-log-job-{index}");
+            let task_id = format!("bad/task-log-{index:03}");
+            insert_completed_job(&store.conn, &job_id);
+            insert_completed_task_log_record(&store.conn, &job_id, &task_id);
+        }
+
+        let good_job_id = "good-task-log-job";
+        let good_task_id = "good-task-log-task";
+        let good_task_dir = layout.task_dir(good_task_id);
+        fs::create_dir_all(&good_task_dir).expect("task dir");
+        fs::write(good_task_dir.join("stdout.log"), b"stdout").expect("stdout log");
+        insert_completed_job(&store.conn, good_job_id);
+        insert_completed_task_log_record(&store.conn, good_job_id, good_task_id);
+
+        let first = store
+            .sweep(&layout, POST_CLOSE_ARTIFACT_TTL_SECONDS + 1000)
+            .expect("first sweep");
+        assert_eq!(
+            first.task_log_delete_failures,
+            MAX_DELETABLE_TASK_LOG_DIRS_PER_SWEEP as usize
+        );
+        assert_eq!(first.task_log_dirs_deleted, 0);
+        assert!(good_task_dir.exists());
+
+        let second = store
+            .sweep(&layout, POST_CLOSE_ARTIFACT_TTL_SECONDS + 1001)
+            .expect("second sweep");
+        assert_eq!(second.task_log_dirs_deleted, 1);
+        assert!(!good_task_dir.exists());
+        let good_task = store.inspect_task(good_task_id).expect("inspect task");
+        assert_eq!(good_task.stdout_log_path, None);
+        assert_eq!(good_task.stderr_log_path, None);
+    }
+
     fn insert_completed_job(conn: &Connection, job_id: &str) {
         conn.execute(
             "INSERT INTO jobs (
@@ -4924,6 +4984,21 @@ mod tests {
             params![job_id],
         )
         .expect("insert job");
+    }
+
+    fn insert_completed_task_log_record(conn: &Connection, job_id: &str, task_id: &str) {
+        conn.execute(
+            "INSERT INTO tasks (
+                task_id, job_id, source_thread_id, status, summary, command_json,
+                cwd, timeout_seconds, max_delivery_attempts,
+                redelivery_window_seconds, created_at, completed_at,
+                stdout_log_path, stderr_log_path
+            ) VALUES (?, ?, 'thread-sync', 'succeeded', 'summary', '[]',
+                '/tmp', NULL, 3, 60, 1, 1,
+                'tasks/task/stdout.log', NULL)",
+            params![task_id, job_id],
+        )
+        .expect("insert task log record");
     }
 
     fn good_manifest_synced_retention(conn: &Connection) -> i64 {
