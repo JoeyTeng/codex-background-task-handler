@@ -3014,6 +3014,17 @@ fn join_task_stream_spools_with_control(
             abort_task_stream_worker(&stderr_worker);
             stream_abort_started_at = Some(Instant::now());
         }
+        if stream_abort_started_at
+            .is_some_and(|started_at| started_at.elapsed() >= TASK_STREAM_DRAIN_HARD_GRACE)
+            && (stdout_worker.is_some() || stderr_worker.is_some())
+        {
+            return match stream_error.take() {
+                Some(error) => {
+                    Err(error.context("task stream workers did not stop after abort deadline"))
+                }
+                None => bail!("task stream workers did not stop after abort deadline"),
+            };
+        }
         thread::sleep(TASK_WAIT_POLL_INTERVAL);
     }
 
@@ -6194,6 +6205,7 @@ mod tests {
         let worker_registry = Arc::clone(&task_registry);
         let worker_layout = layout.clone();
         let worker_cwd = home.path().to_path_buf();
+        let worker_control = Arc::clone(&control);
         let started = Instant::now();
 
         let worker = thread::spawn(move || {
@@ -6213,10 +6225,26 @@ mod tests {
                 Some(1),
                 3,
                 60,
-                control,
+                worker_control,
                 worker_registry,
             );
         });
+        let spawn_observed_deadline = Instant::now() + Duration::from_secs(2);
+        while supervised_task_process_snapshot(&control)
+            .expect("process snapshot")
+            .is_none()
+            && !control.child_exit_observed.load(Ordering::Acquire)
+            && Instant::now() < spawn_observed_deadline
+        {
+            thread::sleep(READ_POLL_INTERVAL);
+        }
+        assert!(
+            supervised_task_process_snapshot(&control)
+                .expect("process snapshot")
+                .is_some()
+                || control.child_exit_observed.load(Ordering::Acquire),
+            "worker should reach the pre-exec started update while the store is locked"
+        );
         thread::sleep(Duration::from_millis(500));
         assert!(
             task_registry
@@ -7729,6 +7757,76 @@ mod tests {
         assert!(!timed_out);
         assert!(stdout_capture.truncated);
         assert!(stderr_capture.truncated);
+    }
+
+    #[test]
+    fn stream_drain_fails_when_worker_ignores_abort_deadline() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("true").process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
+        let pid = child.id();
+        child.wait().expect("wait child");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process_group_exists(pid) && Instant::now() < deadline {
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
+        assert!(!process_group_exists(pid), "process group should be gone");
+
+        let worker_stop = Arc::new(AtomicBool::new(false));
+        let (worker_done_tx, worker_done_rx) = std::sync::mpsc::channel();
+        let stuck_worker = || {
+            let abort = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&worker_stop);
+            let worker_done_tx = worker_done_tx.clone();
+            let handle = thread::spawn(move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    thread::sleep(READ_POLL_INTERVAL);
+                }
+                let _ = worker_done_tx.send(());
+                Ok(TaskStreamCapture {
+                    bytes_seen: 0,
+                    truncated: true,
+                    tail: Vec::new(),
+                })
+            });
+            TaskStreamWorker { handle, abort }
+        };
+        let control = SupervisedTaskControl::default();
+        let mut cancelled = false;
+        let mut timed_out = false;
+
+        let started = Instant::now();
+        let error = join_task_stream_spools_with_control(
+            stuck_worker(),
+            stuck_worker(),
+            pid,
+            &control,
+            Instant::now(),
+            Instant::now(),
+            None,
+            &mut cancelled,
+            &mut timed_out,
+        )
+        .expect_err("unresponsive stream workers should fail closed");
+
+        assert!(
+            started.elapsed() < TASK_TERM_GRACE,
+            "stream abort deadline should bound task worker shutdown"
+        );
+        assert!(
+            format!("{error:#}").contains("task stream workers did not stop after abort deadline"),
+            "{error:#}"
+        );
+        assert!(!cancelled);
+        assert!(!timed_out);
+
+        worker_stop.store(true, Ordering::Release);
+        worker_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first detached worker exits");
+        worker_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second detached worker exits");
     }
 
     #[test]
