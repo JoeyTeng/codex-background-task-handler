@@ -217,6 +217,32 @@ impl Store {
         Ok((job, task))
     }
 
+    pub fn delete_unstarted_task_with_job(&mut self, task_id: &str, job_id: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let task = query_task_tx(&tx, task_id)?;
+        if task.job_id != job_id {
+            bail!(
+                "task {task_id} is attached to job {}, not {job_id}",
+                task.job_id
+            );
+        }
+        if task.status != "queued"
+            || task.started_at.is_some()
+            || task.completed_at.is_some()
+            || task.cancel_requested_at.is_some()
+        {
+            bail!("task {task_id} is no longer an unstarted queued task");
+        }
+        let job = query_job_tx(&tx, job_id)?;
+        if job.status != "pending" || job.completed_at.is_some() || job.failed_at.is_some() {
+            bail!("job {job_id} is no longer pending");
+        }
+        tx.execute("DELETE FROM tasks WHERE task_id = ?", params![task_id])?;
+        tx.execute("DELETE FROM jobs WHERE job_id = ?", params![job_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn mark_task_started(
         &mut self,
         task_id: &str,

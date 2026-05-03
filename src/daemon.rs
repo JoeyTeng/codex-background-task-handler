@@ -1153,8 +1153,16 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
         } else {
             libc::SIGTERM
         };
+        let mut saw_cancel_target = false;
         for (task_id, control) in &controls {
+            if !supervised_task_should_request_stop_cancel(control).unwrap_or(true) {
+                continue;
+            }
             let _cancel_intent = SupervisedTaskCancelIntent::begin(control).ok();
+            if !supervised_task_should_request_stop_cancel(control).unwrap_or(true) {
+                continue;
+            }
+            saw_cancel_target = true;
             let durable_cancelled = durably_request_supervised_task_cancel_for_shutdown(
                 &state.layout,
                 task_id,
@@ -1169,12 +1177,29 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
             }
             let _ = signal_current_supervised_task_process_group(control, signal);
         }
+        if !saw_cancel_target {
+            wait_for_supervised_task_registry_empty(state, TASK_SHUTDOWN_WORKER_DRAIN_GRACE);
+            return;
+        }
         if now >= kill_deadline {
             wait_for_supervised_task_process_groups_gone(&controls);
             wait_for_supervised_task_registry_empty(state, TASK_SHUTDOWN_WORKER_DRAIN_GRACE);
             return;
         }
         thread::sleep(TASK_WAIT_POLL_INTERVAL);
+    }
+}
+
+fn supervised_task_should_request_stop_cancel(control: &SupervisedTaskControl) -> Result<bool> {
+    match supervised_task_process_state(control)? {
+        SupervisedTaskProcessState::Pending => Ok(true),
+        SupervisedTaskProcessState::Completing => Ok(false),
+        SupervisedTaskProcessState::Running(_) => {
+            let child_exited = current_supervised_task_child_has_exited(control)?;
+            let has_live_members =
+                current_supervised_task_process_group_has_live_members_after_leader_exit(control)?;
+            Ok(!child_exited || has_live_members)
+        }
     }
 }
 
@@ -1942,20 +1967,17 @@ where
             return Err(error);
         }
     };
-    drop(store);
     if let Err(error) = ensure_daemon_not_stopping(state) {
         drop(worker_start_tx);
-        cleanup_failed_supervised_task_worker_spawn(
-            &state.layout,
-            &task_id,
-            &job_id,
-            &task_registry,
-            max_delivery_attempts,
-            redelivery_window_seconds,
-            "daemon stopped before task supervisor worker start",
-        );
+        if let Ok(mut tasks) = task_registry.lock() {
+            tasks.remove(&task_id);
+        }
+        store
+            .delete_unstarted_task_with_job(&task_id, &job_id)
+            .context("delete unstarted task after daemon stop")?;
         return Err(error);
     }
+    drop(store);
     if worker_start_tx.send(()).is_err() {
         let reason = "task supervisor worker exited before start signal";
         cleanup_failed_supervised_task_worker_spawn(
@@ -6275,6 +6297,55 @@ mod tests {
     }
 
     #[test]
+    fn daemon_stop_does_not_persist_cancel_for_completing_task() {
+        let (home, state) = test_state();
+        let control = Arc::new(SupervisedTaskControl::default());
+        mark_supervised_task_process_completing(&control).expect("mark completing");
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert("task-stop-completing".to_owned(), control);
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-stop-completing".to_owned(),
+                        source_thread_id: "thread-stop-completing".to_owned(),
+                        summary: "stop completing".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-stop-completing".to_owned(),
+                        job_id: "job-stop-completing".to_owned(),
+                        source_thread_id: "thread-stop-completing".to_owned(),
+                        summary: "stop completing".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+            store
+                .mark_task_started("task-stop-completing", 12345, Some("test-pid"), 11)
+                .expect("mark started");
+        }
+
+        stop_all_supervised_tasks(&state);
+
+        let store = Store::open(&state.layout).expect("store");
+        let task = store.inspect_task("task-stop-completing").expect("task");
+        assert_eq!(task.cancel_requested_at, None);
+        assert_eq!(task.status, "running");
+    }
+
+    #[test]
     fn task_cancel_does_not_signal_pid_identity_mismatch() {
         let (home, state) = test_state();
         let mut command = Command::new("/bin/sh");
@@ -6528,6 +6599,49 @@ mod tests {
         assert!(
             tasks.is_empty(),
             "failed initial store create should not create a task"
+        );
+    }
+
+    #[test]
+    fn unstarted_task_cleanup_removes_job_before_worker_start() {
+        let (home, state) = test_state();
+        let mut store = Store::open(&state.layout).expect("store");
+        store
+            .create_task_with_job(
+                NewJob {
+                    job_id: "job-unstarted-cleanup".to_owned(),
+                    source_thread_id: "thread-unstarted-cleanup".to_owned(),
+                    summary: "unstarted cleanup".to_owned(),
+                    metadata_json: "{}".to_owned(),
+                    policy: DeliveryPolicy::fail_closed(),
+                    created_at: 10,
+                },
+                NewTask {
+                    task_id: "task-unstarted-cleanup".to_owned(),
+                    job_id: "job-unstarted-cleanup".to_owned(),
+                    source_thread_id: "thread-unstarted-cleanup".to_owned(),
+                    summary: "unstarted cleanup".to_owned(),
+                    command_json: "[]".to_owned(),
+                    cwd: home.path().display().to_string(),
+                    timeout_seconds: None,
+                    max_delivery_attempts: 3,
+                    redelivery_window_seconds: 60,
+                    created_at: 10,
+                },
+            )
+            .expect("create task");
+
+        store
+            .delete_unstarted_task_with_job("task-unstarted-cleanup", "job-unstarted-cleanup")
+            .expect("delete unstarted task");
+
+        assert!(
+            store.inspect_task("task-unstarted-cleanup").is_err(),
+            "unstarted task should be removed instead of becoming a hidden failed task"
+        );
+        assert!(
+            store.inspect_job("job-unstarted-cleanup").is_err(),
+            "unstarted job should be removed with its task"
         );
     }
 
