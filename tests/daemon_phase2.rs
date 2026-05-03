@@ -1973,7 +1973,7 @@ fn daemon_stop_terminalizes_term_ignoring_task_before_exit() {
 }
 
 #[test]
-fn daemon_stop_kills_term_ignoring_task_when_cancel_store_is_locked() {
+fn daemon_stop_waits_for_locked_cancel_store_before_killing_task() {
     let home = temp_home();
     let pid_file = home.path().join("daemon-stop-locked-task.pid");
     let pid_file_arg = pid_file.to_string_lossy().to_string();
@@ -2006,8 +2006,13 @@ fn daemon_stop_kills_term_ignoring_task_when_cancel_store_is_locked() {
 
     let conn = hold_exclusive_db_lock(&home);
     cbth_daemon(&home, &["daemon", "stop"]);
-    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        process_group_exists(pid),
+        "daemon stop should not kill before shutdown cancel is durable"
+    );
     drop(conn);
+    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
 
     assert!(
         !process_group_exists(pid),
@@ -2016,7 +2021,7 @@ fn daemon_stop_kills_term_ignoring_task_when_cancel_store_is_locked() {
 }
 
 #[test]
-fn daemon_stop_terminates_task_before_joining_blocked_cancel_worker() {
+fn daemon_stop_waits_for_durable_cancel_before_signaling_blocked_worker() {
     let home = temp_home();
     let pid_file = home.path().join("daemon-stop-blocked-cancel.pid");
     let pid_file_arg = pid_file.to_string_lossy().to_string();
@@ -2063,12 +2068,17 @@ fn daemon_stop_terminates_task_before_joining_blocked_cancel_worker() {
     );
 
     cbth_daemon(&home, &["daemon", "stop"]);
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        process_group_exists(pid),
+        "shutdown should not kill the supervised process before durable cancel succeeds"
+    );
+    drop(conn);
     wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
     assert!(
         !process_group_exists(pid),
-        "shutdown should kill the supervised process before waiting on blocked clients"
+        "shutdown should kill the supervised process after durable cancel succeeds"
     );
-    drop(conn);
     if !wait_for_child_exit(&mut cancel, Duration::from_secs(2)) {
         let _ = cancel.kill();
         let _ = cancel.wait();

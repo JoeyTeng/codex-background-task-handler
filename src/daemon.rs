@@ -312,6 +312,7 @@ struct DaemonState {
 struct SupervisedTaskControl {
     process: Mutex<SupervisedTaskProcessState>,
     cancel_intents: AtomicUsize,
+    exec_release_blocked: AtomicBool,
     cancel_requested: AtomicBool,
     cancel_signal_sent: AtomicBool,
     child_exit_observed: AtomicBool,
@@ -1150,13 +1151,13 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
             return;
         }
         let now = Instant::now();
-        let force_signal_without_durable_cancel = now >= term_deadline;
         let signal = if now >= kill_deadline {
             libc::SIGKILL
         } else {
             libc::SIGTERM
         };
         let mut saw_cancel_target = false;
+        let mut saw_unpersisted_cancel_target = false;
         for (task_id, control) in &controls {
             if !supervised_task_should_request_stop_cancel(control).unwrap_or(true) {
                 continue;
@@ -1166,7 +1167,7 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
                 continue;
             }
             saw_cancel_target = true;
-            request_supervised_task_cancel(control);
+            block_supervised_task_exec_release(control);
             let durable_cancelled = durably_request_supervised_task_cancel_for_shutdown(
                 &state.layout,
                 task_id,
@@ -1174,10 +1175,8 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
             )
             .is_ok();
             if !durable_cancelled {
-                if !force_signal_without_durable_cancel {
-                    continue;
-                }
-                request_supervised_task_cancel(control);
+                saw_unpersisted_cancel_target = true;
+                continue;
             }
             let _ = signal_current_supervised_task_process_group(control, signal);
         }
@@ -1188,7 +1187,7 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
             );
             return;
         }
-        if now >= kill_deadline {
+        if now >= kill_deadline && !saw_unpersisted_cancel_target {
             wait_for_supervised_task_process_groups_gone(&controls);
             wait_for_supervised_task_registry_empty(state, TASK_SHUTDOWN_WORKER_DRAIN_GRACE);
             return;
@@ -1384,10 +1383,19 @@ fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
 }
 
 fn lost_task_process_group_is_recoverable(pid: u32, expected_identity: &str) -> bool {
-    supervised_task_process_identity_matches(pid, expected_identity)
+    match process_start_identity(pid) {
+        Ok(Some(current_identity)) => current_identity == expected_identity,
+        Ok(None) => process_group_has_live_members_after_leader_exit(pid),
+        Err(_) => false,
+    }
+}
+
+fn block_supervised_task_exec_release(control: &SupervisedTaskControl) {
+    control.exec_release_blocked.store(true, Ordering::Release);
 }
 
 fn request_supervised_task_cancel(control: &SupervisedTaskControl) {
+    block_supervised_task_exec_release(control);
     control.cancel_requested.store(true, Ordering::Release);
 }
 
@@ -1416,11 +1424,17 @@ fn supervised_task_cancel_in_flight(control: &SupervisedTaskControl) -> bool {
     control.cancel_intents.load(Ordering::Acquire) > 0
 }
 
+fn supervised_task_exec_release_blocked(control: &SupervisedTaskControl) -> bool {
+    control.exec_release_blocked.load(Ordering::Acquire)
+}
+
 fn acquire_supervised_task_exec_release(
     control: &SupervisedTaskControl,
 ) -> Result<Option<std::sync::MutexGuard<'_, ()>>> {
     loop {
-        while supervised_task_cancel_in_flight(control) {
+        while supervised_task_cancel_in_flight(control)
+            || supervised_task_exec_release_blocked(control)
+        {
             if control.cancel_requested.load(Ordering::Acquire) {
                 return Ok(None);
             }
@@ -1434,6 +1448,10 @@ fn acquire_supervised_task_exec_release(
             .lock()
             .map_err(|_| anyhow::anyhow!("supervised task exec release decision lock poisoned"))?;
         if supervised_task_cancel_in_flight(control) {
+            drop(release_decision);
+            continue;
+        }
+        if supervised_task_exec_release_blocked(control) {
             drop(release_decision);
             continue;
         }
@@ -1455,7 +1473,9 @@ fn signal_current_supervised_task_process_group(
         return Ok(None);
     }
     if signal_process_group(process.pid, signal) {
-        if signal == libc::SIGTERM && control.cancel_requested.load(Ordering::Acquire) {
+        if matches!(signal, libc::SIGTERM | libc::SIGKILL)
+            && control.cancel_requested.load(Ordering::Acquire)
+        {
             control.cancel_signal_sent.store(true, Ordering::Release);
         }
         return Ok(Some(process.pid));
@@ -4370,6 +4390,7 @@ fn process_group_has_live_members_except_leader(_leader_pid: u32) -> Result<bool
 
 #[cfg(target_os = "linux")]
 fn process_start_identity(pid: u32) -> Result<Option<String>> {
+    let boot_id = linux_boot_id()?;
     let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
     let stat = match fs::read_to_string(&stat_path) {
         Ok(stat) => stat,
@@ -4383,7 +4404,15 @@ fn process_start_identity(pid: u32) -> Result<Option<String>> {
         .split_whitespace()
         .nth(19)
         .with_context(|| format!("read process start ticks from {}", stat_path.display()))?;
-    Ok(Some(format!("linux:{start_ticks}")))
+    Ok(Some(format!("linux:{boot_id}:{start_ticks}")))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_boot_id() -> Result<String> {
+    Ok(fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .context("read linux boot id")?
+        .trim()
+        .to_owned())
 }
 
 #[cfg(target_os = "macos")]
@@ -5938,7 +5967,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_skips_group_when_leader_already_exited() {
+    fn startup_recovery_kills_group_when_leader_already_exited() {
         let home = tempfile::tempdir().expect("temp home");
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
             .expect("chmod temp home");
@@ -6008,11 +6037,28 @@ mod tests {
 
         recover_lost_task_process_groups(&layout).expect("recover lost tasks");
 
+        let gone_deadline = Instant::now() + Duration::from_secs(2);
+        while process_group_exists(pid) && Instant::now() < gone_deadline {
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
         assert!(
-            process_group_exists(pid),
-            "startup recovery must not signal a group after pid identity can no longer be verified"
+            !process_group_exists(pid),
+            "startup recovery should clean surviving same-group descendants after the leader exits"
         );
-        signal_process_group(pid, libc::SIGKILL);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_identity_includes_boot_id() {
+        let boot_id = linux_boot_id().expect("boot id");
+        let identity = process_start_identity(std::process::id())
+            .expect("process identity")
+            .expect("current process identity");
+
+        assert!(
+            identity.starts_with(&format!("linux:{boot_id}:")),
+            "linux process identity should be scoped to the current boot"
+        );
     }
 
     #[test]
@@ -6403,7 +6449,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_stop_sets_memory_cancel_before_durable_shutdown_cancel() {
+    fn daemon_stop_blocks_exec_release_before_durable_shutdown_cancel() {
         let (home, state) = test_state();
         let state = Arc::new(state);
         let control = Arc::new(SupervisedTaskControl::default());
@@ -6446,13 +6492,17 @@ mod tests {
         let stopper = thread::spawn(move || stop_all_supervised_tasks(&stop_state));
 
         let deadline = Instant::now() + Duration::from_millis(750);
-        while !control.cancel_requested.load(Ordering::Acquire) && Instant::now() < deadline {
+        while !control.exec_release_blocked.load(Ordering::Acquire) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
 
         assert!(
-            control.cancel_requested.load(Ordering::Acquire),
-            "daemon stop must block exec release in memory before durable shutdown cancel succeeds"
+            control.exec_release_blocked.load(Ordering::Acquire),
+            "daemon stop must block exec release in memory while durable shutdown cancel is pending"
+        );
+        assert!(
+            !control.cancel_requested.load(Ordering::Acquire),
+            "daemon stop must not publish signal-capable cancel state before durable shutdown cancel succeeds"
         );
         state
             .supervised_tasks
@@ -6461,6 +6511,97 @@ mod tests {
             .remove("task-stop-memory-cancel");
         drop(lock);
         stopper.join().expect("stop joins");
+    }
+
+    #[test]
+    fn daemon_stop_does_not_signal_before_durable_shutdown_cancel() {
+        let (home, state) = test_state();
+        let state = Arc::new(state);
+        let marker = home.path().join("shutdown-cancel-before-durable-signal");
+        let marker_arg = marker.to_string_lossy().into_owned();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap 'printf term > \"$1\"; exit 0' TERM; while :; do sleep 1; done")
+            .arg("cbth-task")
+            .arg(&marker_arg)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
+        let pid = child.id();
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("process identity available");
+        let control = Arc::new(SupervisedTaskControl::default());
+        set_supervised_task_process(&control, pid, pid_identity.clone()).expect("set process");
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-stop-durable-before-signal".to_owned(),
+                        source_thread_id: "thread-stop-durable-before-signal".to_owned(),
+                        summary: "stop durable before signal".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-stop-durable-before-signal".to_owned(),
+                        job_id: "job-stop-durable-before-signal".to_owned(),
+                        source_thread_id: "thread-stop-durable-before-signal".to_owned(),
+                        summary: "stop durable before signal".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+            store
+                .mark_task_started(
+                    "task-stop-durable-before-signal",
+                    i64::from(pid),
+                    Some(&pid_identity),
+                    11,
+                )
+                .expect("mark started");
+        }
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert(
+                "task-stop-durable-before-signal".to_owned(),
+                Arc::clone(&control),
+            );
+        let lock = Connection::open(state.layout.db_path()).expect("lock connection");
+        lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .expect("hold exclusive lock");
+        let stop_state = Arc::clone(&state);
+        let stopper = thread::spawn(move || stop_all_supervised_tasks(&stop_state));
+
+        let deadline = Instant::now() + Duration::from_millis(750);
+        while !control.exec_release_blocked.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(200));
+
+        assert!(control.exec_release_blocked.load(Ordering::Acquire));
+        assert!(!control.cancel_requested.load(Ordering::Acquire));
+        assert!(!control.cancel_signal_sent.load(Ordering::Acquire));
+        assert!(process_group_exists(pid));
+        assert!(
+            !marker.exists(),
+            "daemon stop must not signal the task before cancel is durable"
+        );
+        drop(lock);
+        stopper.join().expect("stop joins");
+        let _ = child.wait();
     }
 
     #[test]
