@@ -296,6 +296,17 @@ fn process_group_exists(pid: u32) -> bool {
     )
 }
 
+fn wait_for_process_group_gone(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_group_exists(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "process group {pid} was not removed"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn concurrent_daemon_ensure_uses_one_daemon() {
     let home = temp_home();
@@ -1682,6 +1693,57 @@ fn daemon_task_cancel_wins_when_sigterm_trap_exits_zero() {
     assert_eq!(task["task"]["exit_code"], 0);
     let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
     assert_eq!(job["job"]["status"], "failed");
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn daemon_task_cancel_after_leader_exit_terminates_live_process_group() {
+    let home = temp_home();
+    let pid_file = home.path().join("leader-exit-cancel.pid");
+    let leader_done = home.path().join("leader-exit-cancel.done");
+    let pid_file_arg = pid_file.to_string_lossy().to_string();
+    let leader_done_arg = leader_done.to_string_lossy().to_string();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-cancel-after-leader-exit",
+            "--summary",
+            "cancel after leader exit",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s\n' \"$$\" > \"$1\"; (sleep 30) & printf done > \"$2\"; exit 0",
+            "cbth-task",
+            &pid_file_arg,
+            &leader_done_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let job_id = started["task"]["job_id"].as_str().expect("job id");
+    wait_for_path(&pid_file);
+    wait_for_nonempty_file(&pid_file);
+    wait_for_path(&leader_done);
+    let pid = fs::read_to_string(&pid_file)
+        .expect("read pid file")
+        .trim()
+        .parse::<u32>()
+        .expect("task pid");
+    assert!(
+        process_group_exists(pid),
+        "background child should keep process group alive"
+    );
+
+    cbth_daemon(&home, &["task", "cancel", "--task-id", task_id]);
+
+    let task = wait_for_task_status(&home, task_id, "cancelled");
+    assert_eq!(task["task"]["failure_reason"], "task cancelled");
+    let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
+    assert_eq!(job["job"]["status"], "failed");
+    wait_for_process_group_gone(pid);
     cbth(&home, &["daemon", "stop"]);
     wait_for_socket_removed(&home);
 }

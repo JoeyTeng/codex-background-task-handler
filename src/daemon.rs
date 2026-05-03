@@ -1156,6 +1156,16 @@ fn current_supervised_task_process_group_exists(control: &SupervisedTaskControl)
     Ok(pid.is_some_and(process_group_exists))
 }
 
+fn current_supervised_task_process_group_has_live_members_after_leader_exit(
+    control: &SupervisedTaskControl,
+) -> Result<bool> {
+    let pid = *control
+        .pid
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?;
+    Ok(pid.is_some_and(process_group_has_live_members_after_leader_exit))
+}
+
 fn current_supervised_task_child_has_exited(control: &SupervisedTaskControl) -> Result<bool> {
     let pid = *control
         .pid
@@ -1649,7 +1659,22 @@ fn daemon_info(state: &DaemonState) -> DaemonInfo {
     }
 }
 
+type SupervisedTaskWorker = Box<dyn FnOnce() + Send + 'static>;
+
 fn start_supervised_task(state: &DaemonState, payload: TaskRunPayload) -> Result<TaskRecord> {
+    start_supervised_task_with_spawner(state, payload, |name, worker| {
+        thread::Builder::new().name(name).spawn(worker)
+    })
+}
+
+fn start_supervised_task_with_spawner<F>(
+    state: &DaemonState,
+    payload: TaskRunPayload,
+    spawn_worker: F,
+) -> Result<TaskRecord>
+where
+    F: FnOnce(String, SupervisedTaskWorker) -> io::Result<thread::JoinHandle<()>>,
+{
     validate_daemon_nonempty("source_thread_id", &payload.source_thread_id)?;
     validate_daemon_nonempty("summary", &payload.summary)?;
     validate_daemon_nonempty("cwd", &payload.cwd)?;
@@ -1731,23 +1756,64 @@ fn start_supervised_task(state: &DaemonState, payload: TaskRunPayload) -> Result
     let max_delivery_attempts = payload.max_delivery_attempts;
     let redelivery_window_seconds = payload.redelivery_window_seconds;
     let task_registry = state.supervised_tasks.clone();
-    thread::spawn(move || {
+    let worker_task_id = task_id.clone();
+    let worker_job_id = job_id.clone();
+    let worker_control = control.clone();
+    let worker_registry = task_registry.clone();
+    let worker_name = format!("cbth-task-{task_id}");
+    let worker: SupervisedTaskWorker = Box::new(move || {
         run_supervised_task_worker(
             layout,
-            task_id,
-            job_id,
+            worker_task_id,
+            worker_job_id,
             command,
             environment,
             cwd,
             timeout_seconds,
             max_delivery_attempts,
             redelivery_window_seconds,
-            control,
-            task_registry,
+            worker_control,
+            worker_registry,
         );
     });
+    if let Err(error) = spawn_worker(worker_name, worker) {
+        let reason = format!("task supervisor worker spawn failed: {error}");
+        cleanup_failed_supervised_task_worker_spawn(
+            &state.layout,
+            &task_id,
+            &job_id,
+            &task_registry,
+            max_delivery_attempts,
+            redelivery_window_seconds,
+            &reason,
+        );
+        return Err(error).context("spawn task supervisor worker");
+    }
 
     Ok(task)
+}
+
+fn cleanup_failed_supervised_task_worker_spawn(
+    layout: &FsLayout,
+    task_id: &str,
+    job_id: &str,
+    task_registry: &Arc<Mutex<HashMap<String, Arc<SupervisedTaskControl>>>>,
+    max_delivery_attempts: i64,
+    redelivery_window_seconds: i64,
+    reason: &str,
+) {
+    if let Ok(mut tasks) = task_registry.lock() {
+        tasks.remove(task_id);
+    }
+    terminalize_supervised_task_error(
+        layout,
+        task_id,
+        job_id,
+        "failed",
+        reason,
+        max_delivery_attempts,
+        redelivery_window_seconds,
+    );
 }
 
 fn cancel_supervised_task(state: &DaemonState, payload: TaskCancelPayload) -> Result<TaskRecord> {
@@ -1775,7 +1841,9 @@ fn cancel_supervised_task(state: &DaemonState, payload: TaskCancelPayload) -> Re
             signal_current_supervised_task_process_group(&control, libc::SIGTERM)?;
             return Ok(task);
         }
-        if current_supervised_task_child_has_exited(&control)? {
+        if current_supervised_task_child_has_exited(&control)?
+            && !current_supervised_task_process_group_has_live_members_after_leader_exit(&control)?
+        {
             return Store::open(&state.layout)?.inspect_task(&payload.task_id);
         }
         let task =
@@ -2259,6 +2327,9 @@ fn run_supervised_spawned_task(
             return Err(error);
         }
     };
+    if !timed_out && control.cancel_signal_sent.load(Ordering::Acquire) {
+        cancelled = true;
+    }
     let completed_at = current_epoch_seconds()?;
     let exit_code = status.code().map(i64::from);
     let signal = status.signal().map(i64::from);
@@ -5705,6 +5776,55 @@ mod tests {
         assert_eq!(active_job.status, "pending");
         let registryless_job = store.inspect_job("job-registryless").expect("lost job");
         assert_eq!(registryless_job.status, "failed");
+    }
+
+    #[test]
+    fn task_worker_spawn_error_fails_closed_and_releases_registry() {
+        let (home, state) = test_state();
+        let payload = TaskRunPayload {
+            source_thread_id: "thread-worker-spawn-fail".to_owned(),
+            summary: "worker spawn failure".to_owned(),
+            metadata_json: "{}".to_owned(),
+            policy: DeliveryPolicy::fail_closed(),
+            cwd: home.path().display().to_string(),
+            timeout_seconds: None,
+            max_delivery_attempts: 3,
+            redelivery_window_seconds: 60,
+            command: vec![b"/bin/true".to_vec()],
+            environment: Vec::new(),
+        };
+
+        let error = start_supervised_task_with_spawner(&state, payload, |_name, _worker| {
+            Err(io::Error::from_raw_os_error(libc::EAGAIN))
+        })
+        .expect_err("worker spawn should fail");
+
+        assert!(
+            error.to_string().contains("spawn task supervisor worker"),
+            "{error:#}"
+        );
+        assert!(
+            state
+                .supervised_tasks
+                .lock()
+                .expect("task registry")
+                .is_empty(),
+            "failed worker spawn should release registry slot"
+        );
+        let store = Store::open(&state.layout).expect("store");
+        let tasks = store
+            .list_tasks(Some("thread-worker-spawn-fail"), None, 10)
+            .expect("list tasks");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, "failed");
+        assert!(
+            tasks[0]
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("worker spawn failed"))
+        );
+        let job = store.inspect_job(&tasks[0].job_id).expect("job");
+        assert_eq!(job.status, "failed");
     }
 
     #[test]
