@@ -54,9 +54,10 @@ const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TASK_TERM_GRACE: Duration = Duration::from_secs(5);
 const TASK_LEADER_EXITED_PROCESS_GROUP_GRACE: Duration = Duration::from_secs(5);
 const TASK_SHUTDOWN_DURABLE_CANCEL_GRACE: Duration = Duration::from_secs(1);
+const TASK_SHUTDOWN_UNPERSISTED_CANCEL_GRACE: Duration = Duration::from_secs(3);
 const TASK_SHUTDOWN_WORKER_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const TASK_SHUTDOWN_COMPLETION_DRAIN_GRACE: Duration =
-    Duration::from_secs(TASK_STORE_COMPLETION_RETRY_TIMEOUT.as_secs() + 5);
+    Duration::from_secs(TASK_STORE_COMPLETION_RETRY_TIMEOUT.as_secs() * 2 + 5);
 const TASK_STREAM_DRAIN_HARD_GRACE: Duration = Duration::from_secs(1);
 const DAEMON_STOP_WORKER_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const TASK_SPAWN_EXEC_GATE_FD: RawFd = 3;
@@ -182,7 +183,8 @@ struct TaskRunPayload {
     summary: String,
     metadata_json: String,
     policy: DeliveryPolicy,
-    cwd: String,
+    cwd: Vec<u8>,
+    cwd_display: String,
     timeout_seconds: Option<i64>,
     max_delivery_attempts: i64,
     redelivery_window_seconds: i64,
@@ -403,6 +405,7 @@ impl DaemonLifecycleCache {
     fn has_exit_blockers(&self, maintenance_suppressed: bool) -> bool {
         self.refresh_failed
             || self.status.active_jobs > 0
+            || self.status.nonterminal_tasks > 0
             || self.status.active_cli_acceptances > 0
             || self.status.active_cli_observations > 0
             || (!maintenance_suppressed && self.status.cli_acceptances_stale_now > 0)
@@ -1138,6 +1141,7 @@ fn drain_lifecycle_maintenance_until(
 
 fn stop_all_supervised_tasks(state: &DaemonState) {
     let term_deadline = Instant::now() + TASK_SHUTDOWN_DURABLE_CANCEL_GRACE;
+    let unpersisted_cancel_signal_deadline = term_deadline + TASK_SHUTDOWN_UNPERSISTED_CANCEL_GRACE;
     let kill_deadline = term_deadline + TASK_TERM_GRACE;
     loop {
         let controls = match state.supervised_tasks.lock() {
@@ -1158,6 +1162,7 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
         };
         let mut saw_cancel_target = false;
         let mut saw_unpersisted_cancel_target = false;
+        let force_unpersisted_cancel = now >= unpersisted_cancel_signal_deadline;
         for (task_id, control) in &controls {
             if !supervised_task_should_request_stop_cancel(control).unwrap_or(true) {
                 continue;
@@ -1175,8 +1180,11 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
             )
             .is_ok();
             if !durable_cancelled {
-                saw_unpersisted_cancel_target = true;
-                continue;
+                if !force_unpersisted_cancel {
+                    saw_unpersisted_cancel_target = true;
+                    continue;
+                }
+                request_supervised_task_cancel(control);
             }
             let _ = signal_current_supervised_task_process_group(control, signal);
         }
@@ -1661,7 +1669,7 @@ fn maybe_spawn_lifecycle_maintenance(
     let maintenance_suppressed = state
         .lifecycle_maintenance_suppressed
         .load(Ordering::Acquire);
-    let should_recover_lost_tasks = cache.status.active_jobs > 0;
+    let should_recover_lost_tasks = cache.status.nonterminal_tasks > 0;
     let should_sweep = !maintenance_suppressed && cache.status.has_due_maintenance();
     if worker.is_some()
         || cache.refresh_failed
@@ -1893,7 +1901,8 @@ where
 {
     validate_daemon_nonempty("source_thread_id", &payload.source_thread_id)?;
     validate_daemon_nonempty("summary", &payload.summary)?;
-    validate_daemon_nonempty("cwd", &payload.cwd)?;
+    validate_daemon_nonempty_bytes("cwd", &payload.cwd)?;
+    validate_daemon_nonempty("cwd_display", &payload.cwd_display)?;
     validate_daemon_positive("max_delivery_attempts", payload.max_delivery_attempts)?;
     validate_daemon_positive(
         "redelivery_window_seconds",
@@ -1942,7 +1951,7 @@ where
         source_thread_id: payload.source_thread_id,
         summary: payload.summary,
         command_json,
-        cwd: payload.cwd,
+        cwd: payload.cwd_display,
         timeout_seconds: payload.timeout_seconds,
         max_delivery_attempts: payload.max_delivery_attempts,
         redelivery_window_seconds: payload.redelivery_window_seconds,
@@ -1951,7 +1960,7 @@ where
     let layout = state.layout.clone();
     let command = payload.command;
     let environment = payload.environment;
-    let cwd = PathBuf::from(task.cwd.clone());
+    let cwd = PathBuf::from(OsString::from_vec(payload.cwd));
     let timeout_seconds = task.timeout_seconds;
     let max_delivery_attempts = payload.max_delivery_attempts;
     let redelivery_window_seconds = payload.redelivery_window_seconds;
@@ -6605,6 +6614,100 @@ mod tests {
     }
 
     #[test]
+    fn daemon_stop_forces_shutdown_after_unpersisted_cancel_deadline() {
+        let (home, state) = test_state();
+        let state = Arc::new(state);
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
+        let pid = child.id();
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("process identity available");
+        let control = Arc::new(SupervisedTaskControl::default());
+        set_supervised_task_process(&control, pid, pid_identity.clone()).expect("set process");
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-stop-unpersisted-cancel".to_owned(),
+                        source_thread_id: "thread-stop-unpersisted-cancel".to_owned(),
+                        summary: "stop unpersisted cancel".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-stop-unpersisted-cancel".to_owned(),
+                        job_id: "job-stop-unpersisted-cancel".to_owned(),
+                        source_thread_id: "thread-stop-unpersisted-cancel".to_owned(),
+                        summary: "stop unpersisted cancel".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+            store
+                .mark_task_started(
+                    "task-stop-unpersisted-cancel",
+                    i64::from(pid),
+                    Some(&pid_identity),
+                    11,
+                )
+                .expect("mark started");
+        }
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert(
+                "task-stop-unpersisted-cancel".to_owned(),
+                Arc::clone(&control),
+            );
+        let lock = Connection::open(state.layout.db_path()).expect("lock connection");
+        lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .expect("hold exclusive lock");
+
+        let started = Instant::now();
+        stop_all_supervised_tasks(&state);
+        let elapsed = started.elapsed();
+        drop(lock);
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .remove("task-stop-unpersisted-cancel");
+        let status = child.wait().expect("wait child");
+
+        assert!(
+            control.cancel_requested.load(Ordering::Acquire),
+            "shutdown must eventually force an in-memory cancel after durable cancel remains blocked"
+        );
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(
+            elapsed
+                < TASK_SHUTDOWN_DURABLE_CANCEL_GRACE
+                    + TASK_SHUTDOWN_UNPERSISTED_CANCEL_GRACE
+                    + TASK_TERM_GRACE
+                    + TASK_STREAM_DRAIN_HARD_GRACE
+                    + TASK_SHUTDOWN_WORKER_DRAIN_GRACE
+                    + Duration::from_secs(3),
+            "shutdown loop did not use the bounded unpersisted-cancel fallback: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn task_cancel_does_not_signal_pid_identity_mismatch() {
         let (home, state) = test_state();
         let mut command = Command::new("/bin/sh");
@@ -6754,6 +6857,64 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_maintenance_recovers_nonterminal_task_after_job_closed() {
+        let (home, state) = test_state();
+        let state = Arc::new(state);
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-closed-before-task".to_owned(),
+                        source_thread_id: "thread-closed-before-task".to_owned(),
+                        summary: "closed before task".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-closed-before-job".to_owned(),
+                        job_id: "job-closed-before-task".to_owned(),
+                        source_thread_id: "thread-closed-before-task".to_owned(),
+                        summary: "closed before task".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+            store
+                .mark_task_started("task-closed-before-job", 12345, Some("test-pid"), 11)
+                .expect("mark task started");
+            store
+                .fail_job("job-closed-before-task", "task cancelled", 12, 3, 60)
+                .expect("fail job");
+        }
+
+        let status = refresh_lifecycle_status(&state, 100).expect("refresh lifecycle");
+        assert_eq!(status.active_jobs, 0);
+        assert_eq!(status.nonterminal_tasks, 1);
+        let cache = DaemonLifecycleCache {
+            refreshed_at: Some(Instant::now()),
+            refresh_failed: false,
+            status,
+        };
+        let mut worker = None;
+        let mut next_attempt_at = Instant::now();
+
+        maybe_spawn_lifecycle_maintenance(&state, &cache, &mut worker, &mut next_attempt_at);
+        join_lifecycle_maintenance(worker);
+
+        let store = Store::open(&state.layout).expect("store");
+        let task = store.inspect_task("task-closed-before-job").expect("task");
+        assert_eq!(task.status, "cancelled");
+        assert_eq!(task.failure_reason.as_deref(), Some("task cancelled"));
+    }
+
+    #[test]
     fn task_worker_spawn_error_fails_closed_before_db_create() {
         let (home, state) = test_state();
         let payload = TaskRunPayload {
@@ -6761,7 +6922,8 @@ mod tests {
             summary: "worker spawn failure".to_owned(),
             metadata_json: "{}".to_owned(),
             policy: DeliveryPolicy::fail_closed(),
-            cwd: home.path().display().to_string(),
+            cwd: home.path().as_os_str().as_bytes().to_vec(),
+            cwd_display: home.path().display().to_string(),
             timeout_seconds: None,
             max_delivery_attempts: 3,
             redelivery_window_seconds: 60,
@@ -6807,7 +6969,8 @@ mod tests {
             summary: "raw command bytes".to_owned(),
             metadata_json: "{}".to_owned(),
             policy: DeliveryPolicy::fail_closed(),
-            cwd: home.path().display().to_string(),
+            cwd: home.path().as_os_str().as_bytes().to_vec(),
+            cwd_display: home.path().display().to_string(),
             timeout_seconds: None,
             max_delivery_attempts: 3,
             redelivery_window_seconds: 60,
@@ -6838,7 +7001,8 @@ mod tests {
             summary: "initial store lock".to_owned(),
             metadata_json: "{}".to_owned(),
             policy: DeliveryPolicy::fail_closed(),
-            cwd: home.path().display().to_string(),
+            cwd: home.path().as_os_str().as_bytes().to_vec(),
+            cwd_display: home.path().display().to_string(),
             timeout_seconds: None,
             max_delivery_attempts: 3,
             redelivery_window_seconds: 60,
@@ -6953,7 +7117,8 @@ mod tests {
             summary: "stop fenced task run".to_owned(),
             metadata_json: "{}".to_owned(),
             policy: DeliveryPolicy::fail_closed(),
-            cwd: home.path().display().to_string(),
+            cwd: home.path().as_os_str().as_bytes().to_vec(),
+            cwd_display: home.path().display().to_string(),
             timeout_seconds: None,
             max_delivery_attempts: 3,
             redelivery_window_seconds: 60,
@@ -7085,6 +7250,136 @@ mod tests {
         );
         worker.join().expect("join terminalization worker");
         child.wait().expect("wait child");
+    }
+
+    #[test]
+    fn daemon_stop_waits_for_child_exited_task_store_completion() {
+        let (home, state) = test_state();
+        let state = Arc::new(state);
+        let task_id = "task-child-exited-store-completion".to_owned();
+        let job_id = "job-child-exited-store-completion".to_owned();
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: job_id.clone(),
+                        source_thread_id: "thread-child-exited-store-completion".to_owned(),
+                        summary: "child exited store completion".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: task_id.clone(),
+                        job_id: job_id.clone(),
+                        source_thread_id: "thread-child-exited-store-completion".to_owned(),
+                        summary: "child exited store completion".to_owned(),
+                        command_json: "[\"/bin/sh\",\"-c\",\"true\"]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+        }
+        let task_dir = state.layout.task_dir(&task_id);
+        ensure_private_dir(&task_dir).expect("task dir");
+        let stdout_path = task_dir.join("stdout.log");
+        let stderr_path = task_dir.join("stderr.log");
+        let result_path = task_dir.join("result.txt");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
+        let pid = child.id();
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("process identity available");
+        let control = Arc::new(SupervisedTaskControl::default());
+        set_supervised_task_process(&control, pid, pid_identity.clone()).expect("set process");
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .mark_task_started(&task_id, i64::from(pid), Some(&pid_identity), 11)
+                .expect("mark started");
+        }
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert(task_id.clone(), Arc::clone(&control));
+        let lock = Connection::open(state.layout.db_path()).expect("lock connection");
+        lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .expect("hold exclusive lock");
+        let worker_layout = state.layout.clone();
+        let worker_registry = state.supervised_tasks.clone();
+        let worker_control = Arc::clone(&control);
+        let worker_task_id = task_id.clone();
+        let worker_job_id = job_id.clone();
+        let worker_cwd = home.path().to_path_buf();
+        let worker = thread::spawn(move || {
+            let result = run_supervised_spawned_task(
+                &worker_layout,
+                &worker_task_id,
+                &worker_job_id,
+                "/bin/sh -c true",
+                &worker_cwd,
+                None,
+                3,
+                60,
+                &worker_control,
+                &mut child,
+                pid,
+                Instant::now(),
+                stdout_path,
+                stderr_path,
+                result_path,
+            );
+            worker_registry
+                .lock()
+                .expect("task registry")
+                .remove(&worker_task_id);
+            result
+        });
+        let observed_deadline = Instant::now() + Duration::from_secs(5);
+        while !control.child_exit_observed.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < observed_deadline,
+                "worker did not observe child exit before stop"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let stop_state = Arc::clone(&state);
+        let stop_done = Arc::new(AtomicBool::new(false));
+        let stop_done_for_thread = Arc::clone(&stop_done);
+        let stopper = thread::spawn(move || {
+            stop_all_supervised_tasks(&stop_state);
+            stop_done_for_thread.store(true, Ordering::Release);
+        });
+        thread::sleep(TASK_SHUTDOWN_WORKER_DRAIN_GRACE + Duration::from_millis(500));
+        assert!(
+            !stop_done.load(Ordering::Acquire),
+            "daemon stop returned before child-exited terminalization could persist under store lock"
+        );
+
+        drop(lock);
+        worker
+            .join()
+            .expect("join terminalization worker")
+            .expect("terminalize task");
+        stopper.join().expect("join stopper");
+        let store = Store::open(&state.layout).expect("store");
+        let task = store.inspect_task(&task_id).expect("task");
+        assert_eq!(task.status, "succeeded");
     }
 
     #[test]

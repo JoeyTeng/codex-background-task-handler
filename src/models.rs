@@ -368,6 +368,7 @@ pub struct SweepReport {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct DaemonLifecycleStatus {
     pub active_jobs: i64,
+    pub nonterminal_tasks: i64,
     pub active_cli_acceptances: i64,
     pub cli_acceptances_stale_now: i64,
     pub active_cli_observations: i64,

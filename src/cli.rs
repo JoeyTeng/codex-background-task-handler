@@ -872,12 +872,9 @@ fn dispatch_daemon_task_command(
                 Some(cwd) => absolute_cli_path(&cwd)?,
                 None => absolute_cli_path(&env::current_dir()?)?,
             };
-            let cwd = cwd
-                .to_str()
-                .with_context(|| format!("task cwd must be valid UTF-8: {}", cwd.display()))?
-                .to_owned();
-            let cwd_path = Path::new(&cwd);
-            let command = resolve_task_command(args.command, cwd_path)?;
+            let cwd_display = cwd.display().to_string();
+            let cwd_bytes = cwd.as_os_str().as_bytes().to_vec();
+            let command = resolve_task_command(args.command, &cwd)?;
             let timeout_seconds = match args.timeout_seconds {
                 Some(value) => Some(i64::try_from(value).context("timeout_seconds exceeds i64")?),
                 None => None,
@@ -889,7 +886,8 @@ fn dispatch_daemon_task_command(
                     "summary": args.summary,
                     "metadata_json": metadata_json,
                     "policy": policy,
-                    "cwd": cwd,
+                    "cwd": cwd_bytes,
+                    "cwd_display": cwd_display,
                     "timeout_seconds": timeout_seconds,
                     "max_delivery_attempts": args.max_delivery_attempts,
                     "redelivery_window_seconds": args.redelivery_window_seconds,

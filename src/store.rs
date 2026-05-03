@@ -1521,6 +1521,11 @@ impl Store {
             [],
             |row| row.get::<_, i64>(0),
         )?;
+        let nonterminal_tasks = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status IN ('queued', 'running')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
         let active_cli_acceptances = count_active_cli_acceptances(&self.conn, now)?;
         let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
         let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
@@ -1529,6 +1534,7 @@ impl Store {
         let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
         Ok(DaemonLifecycleStatus {
             active_jobs,
+            nonterminal_tasks,
             active_cli_acceptances,
             cli_acceptances_stale_now,
             active_cli_observations,

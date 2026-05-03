@@ -2334,10 +2334,17 @@ fn daemon_task_run_resolves_relative_path_entries_against_task_cwd() {
 
 #[cfg(unix)]
 #[test]
-fn daemon_task_run_rejects_non_utf8_cwd_without_panic() {
+fn daemon_task_run_accepts_non_utf8_cwd() {
     let home = temp_home();
     let invalid_name = std::ffi::OsString::from_vec(b"invalid-\xff".to_vec());
     let invalid_cwd = home.path().join(invalid_name);
+    if let Err(error) = fs::create_dir(&invalid_cwd) {
+        if error.raw_os_error() == Some(libc::EILSEQ) {
+            return;
+        }
+        panic!("create non-UTF-8 cwd: {error}");
+    }
+    let marker = home.path().join("non-utf8-cwd-marker");
 
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("--home")
@@ -2352,22 +2359,23 @@ fn daemon_task_run_rejects_non_utf8_cwd_without_panic() {
             "--cwd",
         ])
         .arg(&invalid_cwd)
-        .args(["--", "/bin/sh", "-c", "true"])
+        .args(["--", "/bin/sh", "-c", "printf ok > \"$1\"", "cbth-task"])
+        .arg(&marker)
         .output()
         .expect("run task");
 
     assert!(
-        !output.status.success(),
-        "task run unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        output.status.success(),
+        "task run failed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("task cwd must be valid UTF-8"),
-        "unexpected stderr: {stderr}"
-    );
-    assert!(!stderr.contains("panicked"), "CLI panicked: {stderr}");
+    let started: Value = serde_json::from_slice(&output.stdout).expect("task json");
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "succeeded");
+    assert_eq!(fs::read_to_string(marker).expect("marker"), "ok");
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
 }
 
 #[test]
