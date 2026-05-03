@@ -84,6 +84,18 @@ const RESERVED_CONTROL_WORKERS: usize = 8;
 const MAX_CLIENT_WORKERS: usize = MAX_DISPATCH_WORKERS + RESERVED_CONTROL_WORKERS;
 const DAEMON_BUSY_ERROR: &str = "daemon is busy";
 const DAEMON_CONNECTION_LIMIT_ERROR: &str = "daemon connection limit reached";
+static PROCESS_SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+fn acquire_process_spawn_lock() -> Result<std::sync::MutexGuard<'static, ()>> {
+    PROCESS_SPAWN_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("process spawn lock poisoned"))
+}
+
+fn spawn_command_locked(command: &mut Command) -> Result<Child> {
+    let _spawn_lock = acquire_process_spawn_lock()?;
+    command.spawn().context("spawn process")
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct DaemonServeOptions {
@@ -296,9 +308,11 @@ struct DaemonState {
 #[derive(Default)]
 struct SupervisedTaskControl {
     pid: Mutex<Option<u32>>,
+    cancel_intents: AtomicUsize,
     cancel_requested: AtomicBool,
     cancel_requested_at: Mutex<Option<Instant>>,
     spawn_gate: Mutex<()>,
+    exec_release_decision: Mutex<()>,
 }
 
 struct ManagedCliAppServer {
@@ -570,12 +584,11 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
         } else {
             command.arg("--skip-startup-sweep");
         }
-        let mut child = command
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("spawn cbth daemon")?;
+            .stderr(Stdio::null());
+        let mut child = spawn_command_locked(&mut command).context("spawn cbth daemon")?;
         let child_pid = child.id();
 
         loop {
@@ -1080,6 +1093,7 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
             libc::SIGTERM
         };
         for (task_id, control) in &controls {
+            let _cancel_intent = SupervisedTaskCancelIntent::begin(control).ok();
             let durable_cancelled = durably_request_supervised_task_cancel_for_shutdown(
                 &state.layout,
                 task_id,
@@ -1092,11 +1106,7 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
                 }
                 request_supervised_task_cancel(control);
             }
-            if let Ok(guard) = control.pid.lock()
-                && let Some(pid) = *guard
-            {
-                signal_process_group(pid, signal);
-            }
+            let _ = signal_current_supervised_task_process_group(control, signal);
         }
         if now >= kill_deadline {
             return;
@@ -1138,6 +1148,73 @@ fn request_supervised_task_cancel(control: &SupervisedTaskControl) {
         *cancel_requested_at = Some(Instant::now());
     }
     control.cancel_requested.store(true, Ordering::Release);
+}
+
+struct SupervisedTaskCancelIntent<'a> {
+    control: &'a SupervisedTaskControl,
+}
+
+impl<'a> SupervisedTaskCancelIntent<'a> {
+    fn begin(control: &'a SupervisedTaskControl) -> Result<Self> {
+        let _release_decision = control
+            .exec_release_decision
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervised task exec release decision lock poisoned"))?;
+        control.cancel_intents.fetch_add(1, Ordering::AcqRel);
+        Ok(Self { control })
+    }
+}
+
+impl Drop for SupervisedTaskCancelIntent<'_> {
+    fn drop(&mut self) {
+        self.control.cancel_intents.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn supervised_task_cancel_in_flight(control: &SupervisedTaskControl) -> bool {
+    control.cancel_intents.load(Ordering::Acquire) > 0
+}
+
+fn acquire_supervised_task_exec_release(
+    control: &SupervisedTaskControl,
+) -> Result<Option<std::sync::MutexGuard<'_, ()>>> {
+    loop {
+        while supervised_task_cancel_in_flight(control) {
+            if control.cancel_requested.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
+        if control.cancel_requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let release_decision = control
+            .exec_release_decision
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervised task exec release decision lock poisoned"))?;
+        if supervised_task_cancel_in_flight(control) {
+            drop(release_decision);
+            continue;
+        }
+        if control.cancel_requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        return Ok(Some(release_decision));
+    }
+}
+
+fn signal_current_supervised_task_process_group(
+    control: &SupervisedTaskControl,
+    signal: libc::c_int,
+) -> Result<Option<u32>> {
+    let pid = *control
+        .pid
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?;
+    if let Some(pid) = pid {
+        signal_process_group(pid, signal);
+    }
+    Ok(pid)
 }
 
 fn persist_task_cancel_request(layout: &FsLayout, task_id: &str) -> Result<TaskRecord> {
@@ -1182,6 +1259,7 @@ fn durably_request_supervised_task_cancel_for_shutdown(
 }
 
 fn task_spawn_exec_gate() -> Result<TaskSpawnExecGate> {
+    let _spawn_lock = acquire_process_spawn_lock()?;
     let mut fds = [0 as RawFd; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error()).context("create task spawn exec gate");
@@ -1612,24 +1690,25 @@ fn cancel_supervised_task(state: &DaemonState, payload: TaskCancelPayload) -> Re
         .get(&payload.task_id)
         .cloned();
     if let Some(control) = control {
-        let spawn_guard = control
-            .spawn_gate
-            .lock()
-            .map_err(|_| anyhow::anyhow!("supervised task spawn gate lock poisoned"))?;
-        if let Some(pid) = *control
+        let _cancel_intent = SupervisedTaskCancelIntent::begin(&control)?;
+        let has_pid = control
             .pid
             .lock()
             .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?
-        {
+            .is_some();
+        if !has_pid {
+            let _spawn_guard = control
+                .spawn_gate
+                .lock()
+                .map_err(|_| anyhow::anyhow!("supervised task spawn gate lock poisoned"))?;
             let task =
                 durably_request_supervised_task_cancel(&state.layout, &payload.task_id, &control)?;
-            signal_process_group(pid, libc::SIGTERM);
-            drop(spawn_guard);
+            signal_current_supervised_task_process_group(&control, libc::SIGTERM)?;
             return Ok(task);
         }
         let task =
             durably_request_supervised_task_cancel(&state.layout, &payload.task_id, &control)?;
-        drop(spawn_guard);
+        signal_current_supervised_task_process_group(&control, libc::SIGTERM)?;
         return Ok(task);
     }
     let task = persist_task_cancel_request(&state.layout, &payload.task_id)?;
@@ -1789,7 +1868,7 @@ fn run_supervised_task_worker_inner(
     }
     let exec_gate = task_spawn_exec_gate()?;
     install_task_spawn_exec_gate(&mut command_builder, &exec_gate);
-    let mut child = command_builder
+    command_builder
         .arg("-c")
         .arg(TASK_SPAWN_EXEC_GATE_SCRIPT)
         .arg("cbth-task-gate")
@@ -1799,8 +1878,8 @@ fn run_supervised_task_worker_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
+        .process_group(0);
+    let mut child = spawn_command_locked(&mut command_builder)
         .with_context(|| format!("spawn task command {:?}", program))?;
     let pid = child.id();
     *control
@@ -1841,6 +1920,23 @@ fn run_supervised_task_worker_inner(
         return Err(error);
     }
     drop(store);
+    drop(spawn_guard);
+    let exec_release_decision = match acquire_supervised_task_exec_release(control)? {
+        Some(exec_release_decision) => exec_release_decision,
+        None => {
+            finish_cancelled_before_exec_gate_release(
+                layout,
+                task_id,
+                job_id,
+                max_delivery_attempts,
+                redelivery_window_seconds,
+                control,
+                &mut child,
+                pid,
+            )?;
+            return Ok(());
+        }
+    };
     if control.cancel_requested.load(Ordering::Acquire) {
         finish_cancelled_before_exec_gate_release(
             layout,
@@ -1862,8 +1958,8 @@ fn run_supervised_task_worker_inner(
             .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
         return Err(error).with_context(|| format!("release task {task_id}"));
     }
+    drop(exec_release_decision);
     let start = Instant::now();
-    drop(spawn_guard);
     let result = run_supervised_spawned_task(
         layout,
         task_id,
@@ -3045,15 +3141,16 @@ fn spawn_cli_app_server(
     lease_ttl: Duration,
 ) -> Result<ManagedCliAppServer> {
     let codex_binary = OsString::from_vec(codex_binary.to_vec());
-    let mut child = Command::new(&codex_binary)
+    let mut command = Command::new(&codex_binary);
+    command
         .arg("app-server")
         .arg("--listen")
         .arg("ws://127.0.0.1:0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
+        .process_group(0);
+    let mut child = spawn_command_locked(&mut command)
         .with_context(|| format!("spawn codex app-server via {:?}", codex_binary))?;
     let stdout = child.stdout.take().context("capture app-server stdout")?;
     let stderr = child.stderr.take().context("capture app-server stderr")?;
@@ -4217,15 +4314,15 @@ mod tests {
         bound_thread_id: &str,
         lease_expires_at: Instant,
     ) -> ManagedCliAppServer {
-        let child = Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg("while :; do sleep 1; done")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .expect("spawn test app-server child");
+            .process_group(0);
+        let child = spawn_command_locked(&mut command).expect("spawn test app-server child");
         ManagedCliAppServer {
             managed_session_id: managed_session_id.to_owned(),
             bound_thread_id: bound_thread_id.to_owned(),
@@ -4768,7 +4865,7 @@ mod tests {
         let exec_gate = task_spawn_exec_gate().expect("exec gate");
         let mut command = Command::new("/bin/sh");
         install_task_spawn_exec_gate(&mut command, &exec_gate);
-        let mut child = command
+        command
             .arg("-c")
             .arg(TASK_SPAWN_EXEC_GATE_SCRIPT)
             .arg("cbth-task-gate")
@@ -4781,9 +4878,8 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .expect("spawn gated child");
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn gated child");
         let pid = child.id();
         *control.pid.lock().expect("pid lock") = Some(pid);
         {
@@ -4822,12 +4918,9 @@ mod tests {
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
             .expect("chmod temp home");
         let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
-        let mut child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg("sleep 30")
-            .process_group(0)
-            .spawn()
-            .expect("spawn child");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30").process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
         let pid = child.id();
         {
             let mut store = Store::open(&layout).expect("store");
@@ -4881,14 +4974,14 @@ mod tests {
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
             .expect("chmod temp home");
         let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
-        let mut child = Command::new("/bin/sh")
+        let mut command = Command::new("/bin/sh");
+        command
             .arg("-c")
             .arg(
                 "trap 'exit 0' TERM; /bin/sh -c 'trap \"\" TERM; while true; do sleep 1; done' & wait",
             )
-            .process_group(0)
-            .spawn()
-            .expect("spawn child");
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
         let pid = child.id();
         let pid_identity = process_start_identity(pid)
             .expect("process identity")
@@ -4949,15 +5042,15 @@ mod tests {
             .expect("chmod temp home");
         let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
         let release_path = home.path().join("release-leader");
-        let mut child = Command::new("/bin/sh")
+        let mut command = Command::new("/bin/sh");
+        command
             .arg("-c")
             .arg(format!(
                 "while [ ! -f '{}' ]; do sleep 0.01; done; /bin/sh -c 'trap \"\" TERM; while true; do sleep 1; done' & exit 0",
                 release_path.display()
             ))
-            .process_group(0)
-            .spawn()
-            .expect("spawn child");
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
         let pid = child.id();
         let pid_identity = process_start_identity(pid)
             .expect("process identity")
@@ -5061,7 +5154,7 @@ mod tests {
                 .expect("create task");
         }
         let lock = Connection::open(layout.db_path()).expect("lock connection");
-        lock.execute_batch("BEGIN EXCLUSIVE")
+        lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
             .expect("hold exclusive lock");
         let marker = home.path().join("setup-lock-escaped");
         let marker_arg = marker.to_string_lossy().into_owned();
@@ -5229,20 +5322,125 @@ mod tests {
     }
 
     #[test]
+    fn task_cancel_marks_intent_before_waiting_for_spawn_gate() {
+        let (home, state) = test_state();
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-cancel-spawn-gate".to_owned(),
+                        source_thread_id: "thread-cancel-spawn-gate".to_owned(),
+                        summary: "cancel spawn gate".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-cancel-spawn-gate".to_owned(),
+                        job_id: "job-cancel-spawn-gate".to_owned(),
+                        source_thread_id: "thread-cancel-spawn-gate".to_owned(),
+                        summary: "cancel spawn gate".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+        }
+        let control = Arc::new(SupervisedTaskControl::default());
+        let spawn_guard = control.spawn_gate.lock().expect("spawn gate");
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert("task-cancel-spawn-gate".to_owned(), Arc::clone(&control));
+        let state = Arc::new(state);
+        let cancel_state = Arc::clone(&state);
+        let cancel = thread::spawn(move || {
+            cancel_supervised_task(
+                &cancel_state,
+                TaskCancelPayload {
+                    task_id: "task-cancel-spawn-gate".to_owned(),
+                },
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !supervised_task_cancel_in_flight(&control) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            supervised_task_cancel_in_flight(&control),
+            "cancel should publish intent before blocking on spawn gate"
+        );
+        assert!(
+            !control.cancel_requested.load(Ordering::Acquire),
+            "durable cancel should still be pending while spawn gate is held"
+        );
+        drop(spawn_guard);
+
+        let cancelled = cancel.join().expect("cancel thread").expect("cancel task");
+        assert!(cancelled.cancel_requested_at.is_some());
+        assert!(control.cancel_requested.load(Ordering::Acquire));
+        assert!(!supervised_task_cancel_in_flight(&control));
+    }
+
+    #[test]
+    fn task_cancel_signal_uses_current_pid_snapshot() {
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let marker = home.path().join("stale-pid-term-marker");
+        let marker_arg = marker.to_string_lossy().into_owned();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap 'printf term > \"$1\"; exit 0' TERM; while :; do sleep 1; done")
+            .arg("cbth-task")
+            .arg(&marker_arg)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn stale pid guard");
+        let pid = child.id();
+        let control = Arc::new(SupervisedTaskControl::default());
+        *control.pid.lock().expect("pid lock") = Some(pid);
+        *control.pid.lock().expect("pid lock") = None;
+
+        let signaled = signal_current_supervised_task_process_group(&control, libc::SIGTERM)
+            .expect("signal current process group");
+        assert_eq!(signaled, None);
+        let signal_deadline = Instant::now() + Duration::from_secs(1);
+        while !marker.exists() && Instant::now() < signal_deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !marker.exists(),
+            "cancel signaling must use the current pid snapshot, not an earlier cached pid"
+        );
+        terminate_task_child_best_effort(&mut child, pid);
+    }
+
+    #[test]
     fn terminate_task_child_kills_group_after_leader_exits_on_term() {
         let home = tempfile::tempdir().expect("temp home");
         let marker = home.path().join("terminate-child-escaped");
         let marker_arg = marker.to_string_lossy().into_owned();
-        let mut child = Command::new("/bin/sh")
+        let mut command = Command::new("/bin/sh");
+        command
             .arg("-c")
             .arg(
                 "trap 'exit 0' TERM; /bin/sh -c 'trap \"\" TERM; sleep 30; printf escaped > \"$1\"' child \"$1\" & wait",
             )
             .arg("cbth-task")
             .arg(&marker_arg)
-            .process_group(0)
-            .spawn()
-            .expect("spawn process group");
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn process group");
         let pid = child.id();
         thread::sleep(Duration::from_millis(100));
 
@@ -5260,12 +5458,9 @@ mod tests {
 
     #[test]
     fn late_cancel_during_stream_drain_does_not_override_gone_process_group() {
-        let mut child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg("true")
-            .process_group(0)
-            .spawn()
-            .expect("spawn child");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("true").process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
         let pid = child.id();
         child.wait().expect("wait child");
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -5311,12 +5506,9 @@ mod tests {
 
     #[test]
     fn stream_drain_aborts_after_process_group_is_gone_without_cancel_or_timeout() {
-        let mut child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg("true")
-            .process_group(0)
-            .spawn()
-            .expect("spawn child");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("true").process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
         let pid = child.id();
         child.wait().expect("wait child");
         let deadline = Instant::now() + Duration::from_secs(1);
