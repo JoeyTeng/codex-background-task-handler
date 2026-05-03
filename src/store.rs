@@ -469,6 +469,14 @@ impl Store {
     }
 
     pub fn fail_lost_tasks(&mut self, now: i64) -> Result<usize> {
+        self.fail_lost_tasks_excluding(now, &HashSet::new())
+    }
+
+    pub fn fail_lost_tasks_excluding(
+        &mut self,
+        now: i64,
+        active_task_ids: &HashSet<String>,
+    ) -> Result<usize> {
         let tasks = {
             let mut stmt = self.conn.prepare(
                 "SELECT tasks.task_id, tasks.job_id, jobs.status, jobs.completed_at,
@@ -495,7 +503,11 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for task in &tasks {
+        let mut recovered = 0;
+        for task in tasks
+            .iter()
+            .filter(|task| !active_task_ids.contains(&task.task_id))
+        {
             let stdout_log_path = format!("tasks/{}/stdout.log", task.task_id);
             let stderr_log_path = format!("tasks/{}/stderr.log", task.task_id);
             match task.job_status.as_str() {
@@ -569,8 +581,9 @@ impl Store {
                 }
                 other => bail!("unexpected lost task job status {other}"),
             }
+            recovered += 1;
         }
-        Ok(tasks.len())
+        Ok(recovered)
     }
 
     pub fn complete_job(

@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -1449,28 +1448,48 @@ fn maybe_spawn_lifecycle_maintenance(
     next_attempt_at: &mut Instant,
 ) {
     let now = Instant::now();
+    let maintenance_suppressed = state
+        .lifecycle_maintenance_suppressed
+        .load(Ordering::Acquire);
+    let should_recover_lost_tasks = cache.status.active_jobs > 0;
+    let should_sweep = !maintenance_suppressed && cache.status.has_due_maintenance();
     if worker.is_some()
-        || state
-            .lifecycle_maintenance_suppressed
-            .load(Ordering::Acquire)
         || cache.refresh_failed
-        || !cache.status.has_due_maintenance()
+        || (!should_recover_lost_tasks && !should_sweep)
         || now < *next_attempt_at
     {
         return;
     }
 
-    let layout = state.layout.clone();
+    let state = Arc::clone(state);
     *next_attempt_at = now + DAEMON_MAINTENANCE_RETRY_INTERVAL;
     *worker = Some(thread::spawn(move || {
-        let Ok(now) = current_epoch_seconds() else {
-            return;
-        };
-        let Ok(mut store) = Store::open(&layout) else {
-            return;
-        };
-        let _ = store.sweep(&layout, now);
+        let _ = recover_registryless_lost_tasks(&state);
+        if should_sweep {
+            let Ok(now) = current_epoch_seconds() else {
+                return;
+            };
+            let Ok(mut store) = Store::open(&state.layout) else {
+                return;
+            };
+            let _ = store.sweep(&state.layout, now);
+        }
     }));
+}
+
+fn recover_registryless_lost_tasks(state: &DaemonState) -> Result<usize> {
+    let active_task_ids = active_supervised_task_ids(state)?;
+    let now = current_epoch_seconds()?;
+    let mut store = Store::open_for_daemon_lifecycle(&state.layout)?;
+    store.fail_lost_tasks_excluding(now, &active_task_ids)
+}
+
+fn active_supervised_task_ids(state: &DaemonState) -> Result<HashSet<String>> {
+    let tasks = state
+        .supervised_tasks
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task map lock poisoned"))?;
+    Ok(tasks.keys().cloned().collect())
 }
 
 fn checked_epoch_add(now: i64, seconds: u64, name: &str) -> Result<i64> {
@@ -2184,7 +2203,9 @@ fn run_supervised_spawned_task(
             && control.cancel_requested.load(Ordering::Acquire)
         {
             cancelled = true;
-            signal_process_group(pid, libc::SIGTERM);
+            if signal_process_group(pid, libc::SIGTERM) {
+                control.cancel_signal_sent.store(true, Ordering::Release);
+            }
             termination_started_at = Some(Instant::now());
         }
         if termination_started_at.is_none()
@@ -2238,10 +2259,6 @@ fn run_supervised_spawned_task(
             return Err(error);
         }
     };
-    *control
-        .pid
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))? = None;
     let completed_at = current_epoch_seconds()?;
     let exit_code = status.code().map(i64::from);
     let signal = status.signal().map(i64::from);
@@ -2473,7 +2490,9 @@ fn wait_process_group_exit_with_control(
             && control.cancel_requested.load(Ordering::Acquire)
         {
             *cancelled = true;
-            signal_process_group(pid, libc::SIGTERM);
+            if signal_process_group(pid, libc::SIGTERM) {
+                control.cancel_signal_sent.store(true, Ordering::Release);
+            }
             termination_started_at = Some(Instant::now());
         }
         if termination_started_at.is_none()
@@ -2540,7 +2559,9 @@ fn join_task_stream_spools_with_control(
             && control.cancel_requested.load(Ordering::Acquire)
         {
             *cancelled = true;
-            signal_process_group(pid, libc::SIGTERM);
+            if signal_process_group(pid, libc::SIGTERM) {
+                control.cancel_signal_sent.store(true, Ordering::Release);
+            }
             termination_started_at = Some(Instant::now());
         }
         if termination_started_at.is_none()
@@ -5613,6 +5634,77 @@ mod tests {
         assert_eq!(task.cancel_requested_at, None);
         assert!(!control.cancel_requested.load(Ordering::Acquire));
         assert!(!control.cancel_signal_sent.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn lifecycle_recovery_fails_only_registryless_lost_tasks() {
+        let (home, state) = test_state();
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            for (task_id, job_id, thread_id) in [
+                (
+                    "task-active-registry",
+                    "job-active-registry",
+                    "thread-active-registry",
+                ),
+                (
+                    "task-registryless",
+                    "job-registryless",
+                    "thread-registryless",
+                ),
+            ] {
+                store
+                    .create_task_with_job(
+                        NewJob {
+                            job_id: job_id.to_owned(),
+                            source_thread_id: thread_id.to_owned(),
+                            summary: task_id.to_owned(),
+                            metadata_json: "{}".to_owned(),
+                            policy: DeliveryPolicy::fail_closed(),
+                            created_at: 10,
+                        },
+                        NewTask {
+                            task_id: task_id.to_owned(),
+                            job_id: job_id.to_owned(),
+                            source_thread_id: thread_id.to_owned(),
+                            summary: task_id.to_owned(),
+                            command_json: "[]".to_owned(),
+                            cwd: home.path().display().to_string(),
+                            timeout_seconds: None,
+                            max_delivery_attempts: 3,
+                            redelivery_window_seconds: 60,
+                            created_at: 10,
+                        },
+                    )
+                    .expect("create task");
+                store
+                    .mark_task_started(task_id, 12345, Some("test-pid"), 11)
+                    .expect("mark started");
+            }
+        }
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert(
+                "task-active-registry".to_owned(),
+                Arc::new(SupervisedTaskControl::default()),
+            );
+
+        let recovered = recover_registryless_lost_tasks(&state).expect("recover lost tasks");
+
+        assert_eq!(recovered, 1);
+        let store = Store::open(&state.layout).expect("store");
+        let active = store.inspect_task("task-active-registry").expect("active");
+        assert_eq!(active.status, "running");
+        let registryless = store.inspect_task("task-registryless").expect("lost");
+        assert_eq!(registryless.status, "lost");
+        let active_job = store
+            .inspect_job("job-active-registry")
+            .expect("active job");
+        assert_eq!(active_job.status, "pending");
+        let registryless_job = store.inspect_job("job-registryless").expect("lost job");
+        assert_eq!(registryless_job.status, "failed");
     }
 
     #[test]
