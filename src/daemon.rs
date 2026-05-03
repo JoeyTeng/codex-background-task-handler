@@ -314,6 +314,7 @@ struct SupervisedTaskControl {
     cancel_intents: AtomicUsize,
     cancel_requested: AtomicBool,
     cancel_signal_sent: AtomicBool,
+    child_exit_observed: AtomicBool,
     spawn_gate: Mutex<()>,
     exec_release_decision: Mutex<()>,
 }
@@ -1213,10 +1214,8 @@ fn supervised_task_completion_drain_grace(
     controls: &[(String, Arc<SupervisedTaskControl>)],
 ) -> Duration {
     let has_natural_completion = controls.iter().any(|(_, control)| {
-        matches!(
-            supervised_task_process_state(control),
-            Ok(SupervisedTaskProcessState::Completing)
-        ) && !control.cancel_requested.load(Ordering::Acquire)
+        control.child_exit_observed.load(Ordering::Acquire)
+            && !control.cancel_requested.load(Ordering::Acquire)
     });
     if has_natural_completion {
         TASK_SHUTDOWN_COMPLETION_DRAIN_GRACE
@@ -1295,7 +1294,10 @@ fn current_supervised_task_child_has_exited(control: &SupervisedTaskControl) -> 
     }
     match child_status_without_reaping(process.pid).context("poll supervised task child")? {
         ChildStatusWithoutReaping::Running => Ok(false),
-        ChildStatusWithoutReaping::Exited | ChildStatusWithoutReaping::NotWaitable => Ok(true),
+        ChildStatusWithoutReaping::Exited | ChildStatusWithoutReaping::NotWaitable => {
+            mark_supervised_task_child_exit_observed(control);
+            Ok(true)
+        }
     }
 }
 
@@ -1330,6 +1332,7 @@ fn set_supervised_task_process(
     pid: u32,
     pid_identity: String,
 ) -> Result<()> {
+    control.child_exit_observed.store(false, Ordering::Release);
     *control
         .process
         .lock()
@@ -1349,12 +1352,17 @@ fn clear_supervised_task_process(control: &SupervisedTaskControl) -> Result<()> 
 }
 
 fn mark_supervised_task_process_completing(control: &SupervisedTaskControl) -> Result<()> {
+    mark_supervised_task_child_exit_observed(control);
     *control
         .process
         .lock()
         .map_err(|_| anyhow::anyhow!("supervised task process lock poisoned"))? =
         SupervisedTaskProcessState::Completing;
     Ok(())
+}
+
+fn mark_supervised_task_child_exit_observed(control: &SupervisedTaskControl) {
+    control.child_exit_observed.store(true, Ordering::Release);
 }
 
 fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
@@ -2466,7 +2474,9 @@ fn run_supervised_spawned_task(
                 if !timed_out && control.cancel_signal_sent.load(Ordering::Acquire) {
                     cancelled = true;
                 }
-                break Instant::now();
+                let exited_at = Instant::now();
+                mark_supervised_task_child_exit_observed(control);
+                break exited_at;
             }
             ChildStatusWithoutReaping::Running => {}
             ChildStatusWithoutReaping::NotWaitable => {
@@ -2488,7 +2498,11 @@ fn run_supervised_spawned_task(
             match child_status_without_reaping(pid)
                 .context("re-check task child before timeout termination")?
             {
-                ChildStatusWithoutReaping::Exited => break Instant::now(),
+                ChildStatusWithoutReaping::Exited => {
+                    let exited_at = Instant::now();
+                    mark_supervised_task_child_exit_observed(control);
+                    break exited_at;
+                }
                 ChildStatusWithoutReaping::Running => {
                     if signal_process_group(pid, libc::SIGTERM) {
                         timed_out = true;
@@ -6874,6 +6888,62 @@ mod tests {
                 .expect("task registry")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn daemon_stop_waits_for_observed_child_exit_before_completing_state() {
+        let (_home, state) = test_state();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
+        let pid = child.id();
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("process identity available");
+        let control = Arc::new(SupervisedTaskControl::default());
+        set_supervised_task_process(&control, pid, pid_identity).expect("set process");
+        assert_eq!(
+            wait_child_observed_until(pid, Instant::now() + Duration::from_secs(5)),
+            ChildStatusWithoutReaping::Exited
+        );
+        mark_supervised_task_child_exit_observed(&control);
+        assert!(matches!(
+            supervised_task_process_state(&control).expect("process state"),
+            SupervisedTaskProcessState::Running(_)
+        ));
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert(
+                "task-observed-child-exit-drain".to_owned(),
+                Arc::clone(&control),
+            );
+        let registry = state.supervised_tasks.clone();
+        let removed = Arc::new(AtomicBool::new(false));
+        let removed_for_worker = Arc::clone(&removed);
+        let worker = thread::spawn(move || {
+            thread::sleep(TASK_SHUTDOWN_WORKER_DRAIN_GRACE + Duration::from_millis(500));
+            registry
+                .lock()
+                .expect("task registry")
+                .remove("task-observed-child-exit-drain");
+            removed_for_worker.store(true, Ordering::Release);
+        });
+
+        stop_all_supervised_tasks(&state);
+        assert!(
+            removed.load(Ordering::Acquire),
+            "stop returned before the child-exited task worker finished terminalization"
+        );
+        worker.join().expect("join terminalization worker");
+        child.wait().expect("wait child");
     }
 
     #[test]
