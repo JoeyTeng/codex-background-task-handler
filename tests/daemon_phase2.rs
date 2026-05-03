@@ -2580,6 +2580,44 @@ fn maintenance_sweep_removes_expired_task_log_dirs() {
 }
 
 #[test]
+fn daemon_task_run_rejects_transport_oversized_environment_before_daemon_start() {
+    let home = temp_home();
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env_clear()
+        .env("CBTH_HUGE_ENV", "x".repeat(600 * 1024))
+        .arg("--home")
+        .arg(home.path())
+        .args([
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-env-too-large",
+            "--summary",
+            "env too large",
+            "--",
+            "/usr/bin/true",
+        ])
+        .output()
+        .expect("run task with oversized env");
+
+    assert!(
+        !output.status.success(),
+        "task run unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("task_run request exceeds daemon IPC budget"),
+        "missing transport budget error: {stderr}"
+    );
+    assert!(
+        !home.path().join("run").join("cbth.sock").exists(),
+        "oversized task run started daemon before transport preflight"
+    );
+}
+
+#[test]
 fn daemon_task_timeout_works_after_direct_child_exits_but_pipe_is_held() {
     let home = temp_home();
     let started = cbth_daemon(

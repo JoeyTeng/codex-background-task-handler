@@ -27,6 +27,7 @@ use crate::cli_app_server_client::{
 use crate::daemon::{
     DaemonEnsureOptions, DaemonServeOptions, daemon_ensure, daemon_request, daemon_request_payload,
     daemon_request_payload_timeout, daemon_serve, validate_daemon_autostart_endpoint,
+    validate_daemon_request_budget,
 };
 use crate::fs_layout::{FsLayout, remove_dir_all_durable};
 use crate::models::{
@@ -908,6 +909,11 @@ fn dispatch_daemon_task_command(
         _ => bail!("unsupported daemon task command"),
     };
 
+    validate_daemon_request_budget(daemon_command, &payload).with_context(|| {
+        format!(
+            "{daemon_command} request exceeds daemon IPC budget; reduce task environment, command, or metadata size"
+        )
+    })?;
     validate_daemon_autostart_endpoint(layout)?;
     daemon_ensure(
         layout,

@@ -31,7 +31,7 @@ use crate::models::{
 };
 use crate::store::{Store, TaskFinishUpdate, new_id};
 
-const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const DOMAIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -750,6 +750,10 @@ fn daemon_request_bytes(command: &str, payload: Value) -> Result<Vec<u8>> {
         );
     }
     Ok(request)
+}
+
+pub(crate) fn validate_daemon_request_budget(command: &str, payload: &Value) -> Result<()> {
+    daemon_request_bytes(command, payload.clone()).map(|_| ())
 }
 
 fn connect_unix_stream_until(path: &Path, deadline: Instant) -> Result<UnixStream> {
