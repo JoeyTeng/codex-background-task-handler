@@ -1773,13 +1773,37 @@ fn terminalize_supervised_task_error(
     max_delivery_attempts: i64,
     redelivery_window_seconds: i64,
 ) {
+    let _ = terminalize_supervised_task_error_with_timeout(
+        layout,
+        task_id,
+        job_id,
+        task_status,
+        reason,
+        max_delivery_attempts,
+        redelivery_window_seconds,
+        TASK_STORE_COMPLETION_RETRY_TIMEOUT,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminalize_supervised_task_error_with_timeout(
+    layout: &FsLayout,
+    task_id: &str,
+    job_id: &str,
+    task_status: &str,
+    reason: &str,
+    max_delivery_attempts: i64,
+    redelivery_window_seconds: i64,
+    retry_timeout: Duration,
+) -> Result<()> {
     let stdout_log_path = format!("tasks/{task_id}/stdout.log");
     let stderr_log_path = format!("tasks/{task_id}/stderr.log");
-    let mut retry_delay = Duration::from_millis(100);
-    loop {
-        if let Ok(now) = current_epoch_seconds()
-            && let Ok(mut store) = Store::open(layout)
-        {
+    retry_task_store_completion_with_timeout(
+        "terminalize task supervisor error",
+        retry_timeout,
+        || {
+            let now = current_epoch_seconds()?;
+            let mut store = Store::open_for_task_supervisor_setup(layout)?;
             let update = TaskFinishUpdate {
                 task_id,
                 status: task_status,
@@ -1794,7 +1818,7 @@ fn terminalize_supervised_task_error(
                 stdout_truncated: false,
                 stderr_truncated: false,
             };
-            if store
+            store
                 .fail_supervised_task_with_job(
                     job_id,
                     reason,
@@ -1802,14 +1826,9 @@ fn terminalize_supervised_task_error(
                     max_delivery_attempts,
                     redelivery_window_seconds,
                 )
-                .is_ok()
-            {
-                return;
-            }
-        }
-        thread::sleep(retry_delay);
-        retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
-    }
+                .map(|_| ())
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2666,6 +2685,18 @@ fn retry_task_store_completion<T>(
     operation: &str,
     mut action: impl FnMut() -> Result<T>,
 ) -> Result<T> {
+    retry_task_store_completion_with_timeout(
+        operation,
+        TASK_STORE_COMPLETION_RETRY_TIMEOUT,
+        &mut action,
+    )
+}
+
+fn retry_task_store_completion_with_timeout<T>(
+    operation: &str,
+    retry_timeout: Duration,
+    mut action: impl FnMut() -> Result<T>,
+) -> Result<T> {
     let started_at = Instant::now();
     let mut retry_delay = TASK_STORE_COMPLETION_RETRY_INITIAL_DELAY;
     loop {
@@ -2673,10 +2704,10 @@ fn retry_task_store_completion<T>(
             Ok(value) => return Ok(value),
             Err(error) if task_store_error_is_busy_or_locked(&error) => {
                 let elapsed = started_at.elapsed();
-                if elapsed >= TASK_STORE_COMPLETION_RETRY_TIMEOUT {
+                if elapsed >= retry_timeout {
                     return Err(error).with_context(|| format!("{operation} after retry timeout"));
                 }
-                let remaining = TASK_STORE_COMPLETION_RETRY_TIMEOUT.saturating_sub(elapsed);
+                let remaining = retry_timeout.saturating_sub(elapsed);
                 thread::sleep(retry_delay.min(remaining));
                 retry_delay = retry_delay
                     .saturating_mul(2)
@@ -4307,6 +4338,60 @@ mod tests {
 
         assert_eq!(result, "retried");
         assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn terminalize_supervised_task_error_is_bounded_when_store_stays_locked() {
+        let (home, state) = test_state();
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-terminalize-lock".to_owned(),
+                        source_thread_id: "thread-terminalize-lock".to_owned(),
+                        summary: "terminalize lock".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-terminalize-lock".to_owned(),
+                        job_id: "job-terminalize-lock".to_owned(),
+                        source_thread_id: "thread-terminalize-lock".to_owned(),
+                        summary: "terminalize lock".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+        }
+        let lock = Connection::open(state.layout.db_path()).expect("lock connection");
+        lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .expect("hold exclusive lock");
+
+        let started = Instant::now();
+        let result = terminalize_supervised_task_error_with_timeout(
+            &state.layout,
+            "task-terminalize-lock",
+            "job-terminalize-lock",
+            "failed",
+            "task supervisor error",
+            3,
+            60,
+            Duration::from_millis(150),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "terminalization fallback must not retain the task slot forever"
+        );
+        drop(lock);
     }
 
     fn test_managed_cli_app_server(
