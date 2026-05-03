@@ -1197,7 +1197,10 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
         }
         if now >= kill_deadline && !saw_unpersisted_cancel_target {
             wait_for_supervised_task_process_groups_gone(&controls);
-            wait_for_supervised_task_registry_empty(state, TASK_SHUTDOWN_WORKER_DRAIN_GRACE);
+            wait_for_supervised_task_registry_empty(
+                state,
+                supervised_task_completion_drain_grace(&controls),
+            );
             return;
         }
         thread::sleep(TASK_WAIT_POLL_INTERVAL);
@@ -7486,6 +7489,141 @@ mod tests {
         let store = Store::open(&state.layout).expect("store");
         let task = store.inspect_task(&task_id).expect("task");
         assert_eq!(task.status, "succeeded");
+    }
+
+    #[test]
+    fn daemon_stop_preserves_completion_drain_in_mixed_cancel_batch() {
+        let (_home, state) = test_state();
+        let state = Arc::new(state);
+
+        let completing_control = Arc::new(SupervisedTaskControl::default());
+        mark_supervised_task_process_completing(&completing_control).expect("mark completing");
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert("task-mixed-completing".to_owned(), completing_control);
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
+        let pid = child.id();
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("process identity available");
+        let cancel_control = Arc::new(SupervisedTaskControl::default());
+        set_supervised_task_process(&cancel_control, pid, pid_identity.clone())
+            .expect("set process");
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-mixed-cancel".to_owned(),
+                        source_thread_id: "thread-mixed-cancel".to_owned(),
+                        summary: "mixed cancel".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-mixed-cancel".to_owned(),
+                        job_id: "job-mixed-cancel".to_owned(),
+                        source_thread_id: "thread-mixed-cancel".to_owned(),
+                        summary: "mixed cancel".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: "/tmp".to_owned(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+            store
+                .mark_task_started("task-mixed-cancel", i64::from(pid), Some(&pid_identity), 11)
+                .expect("mark started");
+        }
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert("task-mixed-cancel".to_owned(), cancel_control);
+
+        let cancel_removed = Arc::new(AtomicBool::new(false));
+        let cancel_removed_for_worker = Arc::clone(&cancel_removed);
+        let cancel_registry = state.supervised_tasks.clone();
+        let cancel_worker = thread::spawn(move || {
+            let _ = child.wait();
+            cancel_registry
+                .lock()
+                .expect("task registry")
+                .remove("task-mixed-cancel");
+            cancel_removed_for_worker.store(true, Ordering::Release);
+        });
+
+        let completion_registry = state.supervised_tasks.clone();
+        let completion_removed = Arc::new(AtomicBool::new(false));
+        let completion_removed_for_worker = Arc::clone(&completion_removed);
+        let completion_worker = thread::spawn({
+            let cancel_removed = Arc::clone(&cancel_removed);
+            move || {
+                while !cancel_removed.load(Ordering::Acquire) {
+                    thread::sleep(READ_POLL_INTERVAL);
+                }
+                thread::sleep(TASK_SHUTDOWN_WORKER_DRAIN_GRACE + Duration::from_secs(1));
+                completion_registry
+                    .lock()
+                    .expect("task registry")
+                    .remove("task-mixed-completing");
+                completion_removed_for_worker.store(true, Ordering::Release);
+            }
+        });
+
+        let stop_state = Arc::clone(&state);
+        let stop_done = Arc::new(AtomicBool::new(false));
+        let stop_done_for_thread = Arc::clone(&stop_done);
+        let stopper = thread::spawn(move || {
+            stop_all_supervised_tasks(&stop_state);
+            stop_done_for_thread.store(true, Ordering::Release);
+        });
+
+        let cancel_deadline = Instant::now()
+            + TASK_SHUTDOWN_DURABLE_CANCEL_GRACE
+            + TASK_SHUTDOWN_UNPERSISTED_CANCEL_GRACE
+            + TASK_TERM_GRACE
+            + Duration::from_secs(3);
+        while !cancel_removed.load(Ordering::Acquire) && Instant::now() < cancel_deadline {
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
+        assert!(
+            cancel_removed.load(Ordering::Acquire),
+            "stop should SIGKILL and reap the cancel target"
+        );
+        thread::sleep(TASK_SHUTDOWN_WORKER_DRAIN_GRACE + Duration::from_millis(300));
+        assert!(
+            !stop_done.load(Ordering::Acquire),
+            "mixed shutdown must not shorten the natural-completion drain to worker-drain grace"
+        );
+
+        completion_worker.join().expect("join completion worker");
+        stopper.join().expect("join stopper");
+        cancel_worker.join().expect("join cancel worker");
+        assert!(completion_removed.load(Ordering::Acquire));
+        assert!(stop_done.load(Ordering::Acquire));
+        assert!(
+            state
+                .supervised_tasks
+                .lock()
+                .expect("task registry")
+                .is_empty()
+        );
     }
 
     #[test]
