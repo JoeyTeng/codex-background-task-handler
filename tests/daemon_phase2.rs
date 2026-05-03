@@ -1640,9 +1640,9 @@ fn daemon_task_cancel_wins_when_sigterm_trap_exits_zero() {
 }
 
 #[test]
-fn daemon_task_cancel_signals_running_task_before_store_lock_wait() {
+fn daemon_task_cancel_persists_running_cancel_before_signaling() {
     let home = temp_home();
-    let marker = home.path().join("cancel-before-store-marker");
+    let marker = home.path().join("cancel-after-store-marker");
     let marker_arg = marker.to_string_lossy().to_string();
     let started = cbth_daemon(
         &home,
@@ -1650,9 +1650,9 @@ fn daemon_task_cancel_signals_running_task_before_store_lock_wait() {
             "task",
             "run",
             "--source-thread-id",
-            "thread-task-cancel-store-lock",
+            "thread-task-cancel-durable-first",
             "--summary",
-            "cancel under store lock",
+            "durable cancel before signal",
             "--",
             "/bin/sh",
             "-c",
@@ -1680,8 +1680,8 @@ fn daemon_task_cancel_signals_running_task_before_store_lock_wait() {
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        marker.exists(),
-        "running task was not signaled while cancel persistence waited on the store lock"
+        !marker.exists(),
+        "running task was signaled before cancel intent was durable"
     );
 
     drop(conn);
@@ -1694,6 +1694,10 @@ fn daemon_task_cancel_signals_running_task_before_store_lock_wait() {
     );
     let task = wait_for_task_status(&home, task_id, "cancelled");
     assert_eq!(task["task"]["failure_reason"], "task cancelled");
+    assert!(
+        marker.exists(),
+        "running task was not signaled after cancel intent became durable"
+    );
     cbth_daemon(&home, &["daemon", "stop"]);
     wait_for_socket_removed(&home);
 }

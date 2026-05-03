@@ -1055,14 +1055,21 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
     let mut sent_kill = false;
     loop {
         let controls = match state.supervised_tasks.lock() {
-            Ok(tasks) => tasks.values().cloned().collect::<Vec<_>>(),
+            Ok(tasks) => tasks
+                .iter()
+                .map(|(task_id, control)| (task_id.clone(), control.clone()))
+                .collect::<Vec<_>>(),
             Err(_) => return,
         };
         if controls.is_empty() {
             return;
         }
-        for control in &controls {
-            request_supervised_task_cancel(control);
+        for (task_id, control) in &controls {
+            if durably_request_supervised_task_cancel(&state.layout, task_id, control).is_err()
+                && Instant::now() < kill_deadline
+            {
+                continue;
+            }
             if let Ok(guard) = control.pid.lock()
                 && let Some(pid) = *guard
             {
@@ -1120,6 +1127,22 @@ fn request_supervised_task_cancel(control: &SupervisedTaskControl) {
         *cancel_requested_at = Some(Instant::now());
     }
     control.cancel_requested.store(true, Ordering::Release);
+}
+
+fn persist_task_cancel_request(layout: &FsLayout, task_id: &str) -> Result<TaskRecord> {
+    let now = current_epoch_seconds()?;
+    let mut store = Store::open(layout)?;
+    store.request_task_cancel(task_id, now)
+}
+
+fn durably_request_supervised_task_cancel(
+    layout: &FsLayout,
+    task_id: &str,
+    control: &SupervisedTaskControl,
+) -> Result<TaskRecord> {
+    let task = persist_task_cancel_request(layout, task_id)?;
+    request_supervised_task_cancel(control);
+    Ok(task)
 }
 
 fn task_spawn_exec_gate() -> Result<TaskSpawnExecGate> {
@@ -1562,25 +1585,18 @@ fn cancel_supervised_task(state: &DaemonState, payload: TaskCancelPayload) -> Re
             .lock()
             .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?
         {
-            request_supervised_task_cancel(&control);
+            let task =
+                durably_request_supervised_task_cancel(&state.layout, &payload.task_id, &control)?;
             signal_process_group(pid, libc::SIGTERM);
             drop(spawn_guard);
-            let now = current_epoch_seconds()?;
-            let mut store = Store::open(&state.layout)?;
-            return store.request_task_cancel(&payload.task_id, now);
+            return Ok(task);
         }
-        let task = (|| -> Result<TaskRecord> {
-            let now = current_epoch_seconds()?;
-            let mut store = Store::open(&state.layout)?;
-            store.request_task_cancel(&payload.task_id, now)
-        })()?;
-        request_supervised_task_cancel(&control);
+        let task =
+            durably_request_supervised_task_cancel(&state.layout, &payload.task_id, &control)?;
         drop(spawn_guard);
         return Ok(task);
     }
-    let now = current_epoch_seconds()?;
-    let mut store = Store::open(&state.layout)?;
-    let task = store.request_task_cancel(&payload.task_id, now)?;
+    let task = persist_task_cancel_request(&state.layout, &payload.task_id)?;
     Ok(task)
 }
 
