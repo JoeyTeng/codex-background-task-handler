@@ -1165,6 +1165,7 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
                 continue;
             }
             saw_cancel_target = true;
+            request_supervised_task_cancel(control);
             let durable_cancelled = durably_request_supervised_task_cancel_for_shutdown(
                 &state.layout,
                 task_id,
@@ -1180,7 +1181,10 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
             let _ = signal_current_supervised_task_process_group(control, signal);
         }
         if !saw_cancel_target {
-            wait_for_supervised_task_registry_empty(state, TASK_SHUTDOWN_COMPLETION_DRAIN_GRACE);
+            wait_for_supervised_task_registry_empty(
+                state,
+                supervised_task_completion_drain_grace(&controls),
+            );
             return;
         }
         if now >= kill_deadline {
@@ -1202,6 +1206,22 @@ fn supervised_task_should_request_stop_cancel(control: &SupervisedTaskControl) -
                 current_supervised_task_process_group_has_live_members_after_leader_exit(control)?;
             Ok(!child_exited || has_live_members)
         }
+    }
+}
+
+fn supervised_task_completion_drain_grace(
+    controls: &[(String, Arc<SupervisedTaskControl>)],
+) -> Duration {
+    let has_natural_completion = controls.iter().any(|(_, control)| {
+        matches!(
+            supervised_task_process_state(control),
+            Ok(SupervisedTaskProcessState::Completing)
+        ) && !control.cancel_requested.load(Ordering::Acquire)
+    });
+    if has_natural_completion {
+        TASK_SHUTDOWN_COMPLETION_DRAIN_GRACE
+    } else {
+        TASK_SHUTDOWN_WORKER_DRAIN_GRACE
     }
 }
 
@@ -1249,8 +1269,17 @@ fn current_supervised_task_process_group_has_live_members_after_leader_exit(
     let Some(process) = supervised_task_process_snapshot(control)? else {
         return Ok(false);
     };
-    if !supervised_task_process_identity_matches(process.pid, &process.pid_identity) {
-        return Ok(false);
+    match process_start_identity(process.pid) {
+        Ok(Some(current_identity)) => {
+            if current_identity != process.pid_identity {
+                return Ok(false);
+            }
+        }
+        // The worker still owns the child handle in this path; use the
+        // lingering group only to request cooperative cancellation, not to
+        // authorize direct shutdown/recovery signaling.
+        Ok(None) => {}
+        Err(_) => return Ok(false),
     }
     Ok(process_group_has_live_members_after_leader_exit(
         process.pid,
@@ -1290,11 +1319,10 @@ fn supervised_task_process_snapshot(
 }
 
 fn supervised_task_process_identity_matches(pid: u32, expected_identity: &str) -> bool {
-    match process_start_identity(pid) {
-        Ok(Some(current_identity)) => current_identity == expected_identity,
-        Ok(None) => process_group_has_live_members_after_leader_exit(pid),
-        Err(_) => false,
-    }
+    matches!(
+        process_start_identity(pid),
+        Ok(Some(current_identity)) if current_identity == expected_identity
+    )
 }
 
 fn set_supervised_task_process(
@@ -1348,11 +1376,7 @@ fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
 }
 
 fn lost_task_process_group_is_recoverable(pid: u32, expected_identity: &str) -> bool {
-    match process_start_identity(pid) {
-        Ok(Some(current_identity)) => current_identity == expected_identity,
-        Ok(None) => process_group_has_live_members_after_leader_exit(pid),
-        Err(_) => false,
-    }
+    supervised_task_process_identity_matches(pid, expected_identity)
 }
 
 fn request_supervised_task_cancel(control: &SupervisedTaskControl) {
@@ -5900,7 +5924,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_kills_group_when_leader_already_exited() {
+    fn startup_recovery_skips_group_when_leader_already_exited() {
         let home = tempfile::tempdir().expect("temp home");
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
             .expect("chmod temp home");
@@ -5970,18 +5994,11 @@ mod tests {
 
         recover_lost_task_process_groups(&layout).expect("recover lost tasks");
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while process_group_exists(pid) && Instant::now() < deadline {
-            thread::sleep(TASK_WAIT_POLL_INTERVAL);
-        }
-        let recovered = !process_group_exists(pid);
-        if !recovered {
-            signal_process_group(pid, libc::SIGKILL);
-        }
         assert!(
-            recovered,
-            "startup recovery should kill a surviving group whose leader already exited"
+            process_group_exists(pid),
+            "startup recovery must not signal a group after pid identity can no longer be verified"
         );
+        signal_process_group(pid, libc::SIGKILL);
     }
 
     #[test]
@@ -6369,6 +6386,67 @@ mod tests {
         let task = store.inspect_task("task-stop-completing").expect("task");
         assert_eq!(task.cancel_requested_at, None);
         assert_eq!(task.status, "running");
+    }
+
+    #[test]
+    fn daemon_stop_sets_memory_cancel_before_durable_shutdown_cancel() {
+        let (home, state) = test_state();
+        let state = Arc::new(state);
+        let control = Arc::new(SupervisedTaskControl::default());
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-stop-memory-cancel".to_owned(),
+                        source_thread_id: "thread-stop-memory-cancel".to_owned(),
+                        summary: "stop memory cancel".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-stop-memory-cancel".to_owned(),
+                        job_id: "job-stop-memory-cancel".to_owned(),
+                        source_thread_id: "thread-stop-memory-cancel".to_owned(),
+                        summary: "stop memory cancel".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+        }
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert("task-stop-memory-cancel".to_owned(), Arc::clone(&control));
+        let lock = Connection::open(state.layout.db_path()).expect("lock connection");
+        lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .expect("hold exclusive lock");
+        let stop_state = Arc::clone(&state);
+        let stopper = thread::spawn(move || stop_all_supervised_tasks(&stop_state));
+
+        let deadline = Instant::now() + Duration::from_millis(750);
+        while !control.cancel_requested.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            control.cancel_requested.load(Ordering::Acquire),
+            "daemon stop must block exec release in memory before durable shutdown cancel succeeds"
+        );
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .remove("task-stop-memory-cancel");
+        drop(lock);
+        stopper.join().expect("stop joins");
     }
 
     #[test]
