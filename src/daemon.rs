@@ -55,6 +55,7 @@ const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TASK_TERM_GRACE: Duration = Duration::from_secs(5);
 const TASK_LEADER_EXITED_PROCESS_GROUP_GRACE: Duration = Duration::from_secs(5);
 const TASK_SHUTDOWN_DURABLE_CANCEL_GRACE: Duration = Duration::from_secs(1);
+const TASK_SHUTDOWN_WORKER_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const TASK_STREAM_DRAIN_HARD_GRACE: Duration = Duration::from_secs(1);
 const TASK_SPAWN_EXEC_GATE_FD: RawFd = 3;
 const TASK_SPAWN_EXEC_GATE_SCRIPT: &str =
@@ -310,7 +311,7 @@ struct SupervisedTaskControl {
     pid: Mutex<Option<u32>>,
     cancel_intents: AtomicUsize,
     cancel_requested: AtomicBool,
-    cancel_requested_at: Mutex<Option<Instant>>,
+    cancel_signal_sent: AtomicBool,
     spawn_gate: Mutex<()>,
     exec_release_decision: Mutex<()>,
 }
@@ -1114,6 +1115,7 @@ fn stop_all_supervised_tasks(state: &DaemonState) {
         }
         if now >= kill_deadline {
             wait_for_supervised_task_process_groups_gone(&controls);
+            wait_for_supervised_task_registry_empty(state, TASK_SHUTDOWN_WORKER_DRAIN_GRACE);
             return;
         }
         thread::sleep(TASK_WAIT_POLL_INTERVAL);
@@ -1137,12 +1139,36 @@ fn wait_for_supervised_task_process_groups_gone(controls: &[(String, Arc<Supervi
     }
 }
 
+fn wait_for_supervised_task_registry_empty(state: &DaemonState, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !has_active_supervised_tasks(state) {
+            return;
+        }
+        thread::sleep(TASK_WAIT_POLL_INTERVAL);
+    }
+}
+
 fn current_supervised_task_process_group_exists(control: &SupervisedTaskControl) -> Result<bool> {
     let pid = *control
         .pid
         .lock()
         .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?;
     Ok(pid.is_some_and(process_group_exists))
+}
+
+fn current_supervised_task_child_has_exited(control: &SupervisedTaskControl) -> Result<bool> {
+    let pid = *control
+        .pid
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?;
+    let Some(pid) = pid else {
+        return Ok(false);
+    };
+    match child_status_without_reaping(pid).context("poll supervised task child")? {
+        ChildStatusWithoutReaping::Running => Ok(false),
+        ChildStatusWithoutReaping::Exited | ChildStatusWithoutReaping::NotWaitable => Ok(true),
+    }
 }
 
 fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
@@ -1172,11 +1198,6 @@ fn lost_task_process_group_is_recoverable(pid: u32, expected_identity: &str) -> 
 }
 
 fn request_supervised_task_cancel(control: &SupervisedTaskControl) {
-    if let Ok(mut cancel_requested_at) = control.cancel_requested_at.lock()
-        && cancel_requested_at.is_none()
-    {
-        *cancel_requested_at = Some(Instant::now());
-    }
     control.cancel_requested.store(true, Ordering::Release);
 }
 
@@ -1242,7 +1263,13 @@ fn signal_current_supervised_task_process_group(
         .lock()
         .map_err(|_| anyhow::anyhow!("supervised task pid lock poisoned"))?;
     if let Some(pid) = pid {
-        signal_process_group(pid, signal);
+        if signal_process_group(pid, signal) {
+            if signal == libc::SIGTERM && control.cancel_requested.load(Ordering::Acquire) {
+                control.cancel_signal_sent.store(true, Ordering::Release);
+            }
+            return Ok(Some(pid));
+        }
+        return Ok(None);
     }
     Ok(pid)
 }
@@ -1358,15 +1385,6 @@ fn release_task_spawn_exec_gate(gate: TaskSpawnExecGate) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn supervised_task_cancel_requested_by(control: &SupervisedTaskControl, deadline: Instant) -> bool {
-    control
-        .cancel_requested_at
-        .lock()
-        .ok()
-        .and_then(|requested_at| *requested_at)
-        .is_some_and(|requested_at| requested_at <= deadline)
 }
 
 fn task_wait_poll_sleep_duration(
@@ -1737,6 +1755,9 @@ fn cancel_supervised_task(state: &DaemonState, payload: TaskCancelPayload) -> Re
                 durably_request_supervised_task_cancel(&state.layout, &payload.task_id, &control)?;
             signal_current_supervised_task_process_group(&control, libc::SIGTERM)?;
             return Ok(task);
+        }
+        if current_supervised_task_child_has_exited(&control)? {
+            return Store::open(&state.layout)?.inspect_task(&payload.task_id);
         }
         let task =
             durably_request_supervised_task_cancel(&state.layout, &payload.task_id, &control)?;
@@ -2148,11 +2169,10 @@ fn run_supervised_spawned_task(
     let child_exited_at = loop {
         match child_status_without_reaping(pid).context("poll task child without reaping")? {
             ChildStatusWithoutReaping::Exited => {
-                let exit_observed_at = Instant::now();
-                if !timed_out && supervised_task_cancel_requested_by(control, exit_observed_at) {
+                if !timed_out && control.cancel_signal_sent.load(Ordering::Acquire) {
                     cancelled = true;
                 }
-                break exit_observed_at;
+                break Instant::now();
             }
             ChildStatusWithoutReaping::Running => {}
             ChildStatusWithoutReaping::NotWaitable => {
@@ -3787,9 +3807,9 @@ fn child_status_without_reaping(pid: u32) -> io::Result<ChildStatusWithoutReapin
     }
 }
 
-fn signal_process_group(pid: u32, signal: libc::c_int) {
+fn signal_process_group(pid: u32, signal: libc::c_int) -> bool {
     let pgid = pid as libc::pid_t;
-    let _ = unsafe { libc::killpg(pgid, signal) };
+    (unsafe { libc::killpg(pgid, signal) }) == 0
 }
 
 fn process_group_exists(pid: u32) -> bool {
@@ -5533,6 +5553,66 @@ mod tests {
         assert!(cancelled.cancel_requested_at.is_some());
         assert!(control.cancel_requested.load(Ordering::Acquire));
         assert!(!supervised_task_cancel_in_flight(&control));
+    }
+
+    #[test]
+    fn task_cancel_after_child_exit_does_not_mark_successful_task_cancelled() {
+        let (home, state) = test_state();
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("true").process_group(0);
+        let mut child = spawn_command_locked(&mut command).expect("spawn child");
+        let pid = child.id();
+        child.wait().expect("wait child");
+        let control = Arc::new(SupervisedTaskControl::default());
+        *control.pid.lock().expect("pid lock") = Some(pid);
+        state
+            .supervised_tasks
+            .lock()
+            .expect("task registry")
+            .insert("task-late-cancel".to_owned(), Arc::clone(&control));
+        {
+            let mut store = Store::open(&state.layout).expect("store");
+            store
+                .create_task_with_job(
+                    NewJob {
+                        job_id: "job-late-cancel".to_owned(),
+                        source_thread_id: "thread-late-cancel".to_owned(),
+                        summary: "late cancel".to_owned(),
+                        metadata_json: "{}".to_owned(),
+                        policy: DeliveryPolicy::fail_closed(),
+                        created_at: 10,
+                    },
+                    NewTask {
+                        task_id: "task-late-cancel".to_owned(),
+                        job_id: "job-late-cancel".to_owned(),
+                        source_thread_id: "thread-late-cancel".to_owned(),
+                        summary: "late cancel".to_owned(),
+                        command_json: "[]".to_owned(),
+                        cwd: home.path().display().to_string(),
+                        timeout_seconds: None,
+                        max_delivery_attempts: 3,
+                        redelivery_window_seconds: 60,
+                        created_at: 10,
+                    },
+                )
+                .expect("create task");
+            store
+                .mark_task_started("task-late-cancel", i64::from(pid), None, 11)
+                .expect("mark started");
+        }
+
+        let task = cancel_supervised_task(
+            &state,
+            TaskCancelPayload {
+                task_id: "task-late-cancel".to_owned(),
+            },
+        )
+        .expect("cancel after exit");
+
+        assert_eq!(task.status, "running");
+        assert_eq!(task.cancel_requested_at, None);
+        assert!(!control.cancel_requested.load(Ordering::Acquire));
+        assert!(!control.cancel_signal_sent.load(Ordering::Acquire));
     }
 
     #[test]

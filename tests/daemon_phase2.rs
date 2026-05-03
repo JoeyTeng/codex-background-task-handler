@@ -1746,7 +1746,7 @@ fn daemon_task_cancel_persists_running_cancel_before_signaling() {
         "running task was not signaled after cancel intent became durable"
     );
     cbth_daemon(&home, &["daemon", "stop"]);
-    wait_for_socket_removed(&home);
+    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
 }
 
 #[test]
@@ -1811,7 +1811,7 @@ fn daemon_task_timeout_wins_over_later_cancel() {
     let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
     assert_eq!(job["job"]["status"], "failed");
     cbth_daemon(&home, &["daemon", "stop"]);
-    wait_for_socket_removed(&home);
+    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
 }
 
 #[test]
@@ -1849,6 +1849,52 @@ fn daemon_stop_cancels_active_supervised_task() {
     assert_eq!(job["job"]["status"], "failed");
     thread::sleep(Duration::from_secs(3));
     assert!(!marker.exists(), "supervised child escaped daemon stop");
+}
+
+#[test]
+fn daemon_stop_terminalizes_term_ignoring_task_before_exit() {
+    let home = temp_home();
+    let pid_file = home.path().join("daemon-stop-term-ignoring-task.pid");
+    let pid_file_arg = pid_file.to_string_lossy().to_string();
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-task-daemon-stop-term-ignoring",
+            "--summary",
+            "daemon stop term ignoring task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s\n' \"$$\" > \"$1\"; trap '' TERM; while :; do sleep 1; done",
+            "cbth-task",
+            &pid_file_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let job_id = started["task"]["job_id"].as_str().expect("job id");
+    wait_for_task_status(&home, task_id, "running");
+    wait_for_path(&pid_file);
+    wait_for_nonempty_file(&pid_file);
+    let pid = fs::read_to_string(&pid_file)
+        .expect("read pid file")
+        .trim()
+        .parse::<u32>()
+        .expect("task pid");
+
+    cbth_daemon(&home, &["daemon", "stop"]);
+    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
+
+    let task = wait_for_task_status(&home, task_id, "cancelled");
+    assert_eq!(task["task"]["failure_reason"], "task cancelled");
+    let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
+    assert_eq!(job["job"]["status"], "failed");
+    assert!(
+        !process_group_exists(pid),
+        "TERM-ignoring supervised process group survived daemon stop"
+    );
 }
 
 #[test]
