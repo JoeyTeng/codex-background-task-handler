@@ -2269,11 +2269,10 @@ fn run_supervised_spawned_task(
         if termination_started_at.is_none()
             && !timed_out
             && control.cancel_requested.load(Ordering::Acquire)
+            && signal_process_group(pid, libc::SIGTERM)
         {
             cancelled = true;
-            if signal_process_group(pid, libc::SIGTERM) {
-                control.cancel_signal_sent.store(true, Ordering::Release);
-            }
+            control.cancel_signal_sent.store(true, Ordering::Release);
             termination_started_at = Some(Instant::now());
         }
         if termination_started_at.is_none()
@@ -2559,11 +2558,10 @@ fn wait_process_group_exit_with_control(
         if termination_started_at.is_none()
             && !*timed_out
             && control.cancel_requested.load(Ordering::Acquire)
+            && signal_process_group(pid, libc::SIGTERM)
         {
             *cancelled = true;
-            if signal_process_group(pid, libc::SIGTERM) {
-                control.cancel_signal_sent.store(true, Ordering::Release);
-            }
+            control.cancel_signal_sent.store(true, Ordering::Release);
             termination_started_at = Some(Instant::now());
         }
         if termination_started_at.is_none()
@@ -2628,11 +2626,10 @@ fn join_task_stream_spools_with_control(
             && process_group_alive
             && !*timed_out
             && control.cancel_requested.load(Ordering::Acquire)
+            && signal_process_group(pid, libc::SIGTERM)
         {
             *cancelled = true;
-            if signal_process_group(pid, libc::SIGTERM) {
-                control.cancel_signal_sent.store(true, Ordering::Release);
-            }
+            control.cancel_signal_sent.store(true, Ordering::Release);
             termination_started_at = Some(Instant::now());
         }
         if termination_started_at.is_none()
