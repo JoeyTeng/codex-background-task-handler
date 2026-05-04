@@ -50,7 +50,7 @@
   - 当前边界是本机 macOS/Linux dedicated single-user workstation dogfood，不是多用户服务器产品
   - Phase 12 `cbth cli run --new-thread`、daemon-owned `cbth task run/list/inspect/cancel`、`cbth doctor cli`、operator recovery 文档和 local binary dogfood 文档都已合入
   - 自动投递仍只走 idle `turn/start`；active-turn `turn/steer` 当前只补设计，不进入自动路径
-  - 当前分支 `codex/cli-active-turn-steer-design` 正在把未来 active-turn steer 的 risk/capability contract 收敛到 [docs/CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md)
+  - 当前分支 `codex/cli-active-turn-steer-design` 正在把未来 active-turn steer 的 risk/capability contract 收敛到 [CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md)
   - Desktop bridge 仍是单独后续大块
 - #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
 - 当前修复分支 `codex/review-gate-resolved-threads` 正在补兼容：GitHub REST 可能把已 resolved / outdated 的旧 inline review comment `commit_id` 映射到后续 head；gate 现在会额外读取 GraphQL `reviewThreads`，只把未 resolved、未 outdated 的 current-head Codex inline threads 算作 blocker。Codex review-body findings 仍按 `PullRequestReview.commit_id` 和 current-head blob link 判定，因为它们没有可 resolve 的 thread。
