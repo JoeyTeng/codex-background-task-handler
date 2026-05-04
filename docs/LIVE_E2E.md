@@ -13,6 +13,7 @@
 codex --version
 node --version
 cargo --version
+cargo run --bin cbth -- doctor cli
 ```
 
 可选 env：
@@ -101,6 +102,55 @@ CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --
 ```text
 test live_codex_task_supervisor_e2e_is_opt_in ... ok
 test result: ok. 1 passed; finished in 23.47s
+```
+
+## Manual Dogfood Walkthrough
+
+After installing the local binary with `cargo install --path .`, run the readiness check first:
+
+```bash
+cbth doctor cli
+```
+
+Then start a native Codex foreground session through `cbth`:
+
+```bash
+cbth cli run \
+  --new-thread \
+  --session-allows-approval false \
+  --session-allows-network false \
+  --session-allows-write-access false \
+  --auto-delivery-policy trusted-all \
+  -- --model gpt-5.5
+```
+
+Copy the thread id from the stderr line:
+
+```text
+cbth: bound thread id: <thread-id>
+```
+
+From another shell, submit a supervised background command:
+
+```bash
+cbth task run \
+  --source-thread-id <thread-id> \
+  --summary "run a slow local check" \
+  --delivery-read-only true \
+  --delivery-requires-approval false \
+  --delivery-requires-network false \
+  --delivery-requires-write-access false \
+  --cwd "$PWD" \
+  --timeout-seconds 3600 \
+  -- cargo test
+```
+
+Use the recovery surface if the batch does not close automatically:
+
+```bash
+cbth task list --source-thread-id <thread-id>
+cbth batch inspect-head --source-thread-id <thread-id>
+cbth audit list --source-thread-id <thread-id> --limit 100
 ```
 
 ## Failure Notes

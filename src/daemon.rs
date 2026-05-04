@@ -76,6 +76,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "dispatch",
     "attempt-dispatch",
     "cli-app-server-lifecycle",
+    "cli-app-server-probe",
     "cli-thread-start-bootstrap",
     "cli-session-dispatch",
     "cli-session-capability-dispatch",
@@ -208,6 +209,11 @@ struct CliAppServerEnsurePayload {
     lease_id: String,
     #[serde(default)]
     lease_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CliAppServerProbePayload {
+    codex_binary: Vec<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1820,6 +1826,13 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
                 serde_json::from_value(request.payload).context("parse cli app-server payload")?;
             json!({
                 "cli_app_server": ensure_cli_app_server(state, payload)?,
+            })
+        }
+        "cli_app_server_probe" => {
+            let payload: CliAppServerProbePayload = serde_json::from_value(request.payload)
+                .context("parse cli app-server probe payload")?;
+            json!({
+                "cli_app_server": probe_cli_app_server(state, payload)?,
             })
         }
         "cli_app_server_refresh" => {
@@ -3610,6 +3623,27 @@ fn ensure_cli_app_server(
         );
         return Ok(info);
     }
+}
+
+fn probe_cli_app_server(
+    state: &DaemonState,
+    payload: CliAppServerProbePayload,
+) -> Result<CliAppServerInfo> {
+    validate_daemon_nonempty_bytes("codex_binary", &payload.codex_binary)?;
+    ensure_daemon_not_stopping(state)?;
+    let probe_id = new_id();
+    let server = spawn_cli_app_server(
+        &format!("doctor-probe-session-{probe_id}"),
+        &format!("doctor-probe-thread-{probe_id}"),
+        1,
+        &payload.codex_binary,
+        &format!("doctor-probe-lease-{probe_id}"),
+        Duration::from_secs(DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS),
+        &state.stop_requested,
+    )?;
+    let info = cli_app_server_info(&server);
+    stop_managed_cli_app_server_process(server);
+    Ok(info)
 }
 
 fn refresh_cli_app_server_lease(

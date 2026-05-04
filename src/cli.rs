@@ -3,9 +3,10 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -29,7 +30,7 @@ use crate::daemon::{
     daemon_request_payload_timeout, daemon_serve, validate_daemon_autostart_endpoint,
     validate_daemon_request_budget,
 };
-use crate::fs_layout::{FsLayout, remove_dir_all_durable};
+use crate::fs_layout::{FsLayout, create_private_file, remove_dir_all_durable};
 use crate::models::{
     CliManagedSessionCapabilities, CliManagedSessionProfile, DEFAULT_MAX_DELIVERY_ATTEMPTS,
     DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, NewAuditDecision,
@@ -59,6 +60,21 @@ const CLI_APP_SERVER_DURABLE_WRITE_RETRY_TIMEOUT_SECONDS: u64 = 30;
 const CLI_APP_SERVER_DURABLE_WRITE_RETRY_INTERVAL_MS: u64 = 250;
 const CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS: i64 = MAX_CLI_OBSERVATION_WINDOW_SECONDS;
 const CLI_APP_SERVER_RECONCILE_INTERVAL_MS: u64 = 2_000;
+const DOCTOR_CODEX_VERSION_TIMEOUT_SECONDS: u64 = 5;
+const DOCTOR_APP_SERVER_PROBE_TIMEOUT_SECONDS: u64 = 15;
+const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
+    "dispatch",
+    "attempt-dispatch",
+    "cli-app-server-lifecycle",
+    "cli-app-server-probe",
+    "cli-thread-start-bootstrap",
+    "cli-session-dispatch",
+    "cli-session-capability-dispatch",
+    "cli-session-proof-invalidation-dispatch",
+    "cli-turn-observation-dispatch",
+    "cli-auto-delivery-dispatch",
+    "task-supervisor",
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "cbth")]
@@ -79,6 +95,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    #[command(about = "Diagnose local cbth and Codex CLI readiness")]
+    Doctor {
+        #[command(subcommand)]
+        command: DoctorCommand,
+    },
     Task {
         #[command(subcommand)]
         command: TaskCommand,
@@ -112,6 +133,25 @@ enum Commands {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DoctorCommand {
+    #[command(
+        about = "Check CLI dogfood readiness",
+        long_about = "Check local CLI dogfood readiness. This readiness check may create or repair cbth state directories, start the same-user cbth daemon, and briefly start a loopback codex app-server to verify listener parsing. It does not send a model request, create a Codex turn, or change foreground Codex interaction."
+    )]
+    Cli(DoctorCliArgs),
+}
+
+#[derive(Debug, Args)]
+struct DoctorCliArgs {
+    #[arg(
+        long,
+        default_value = "codex",
+        help = "Codex CLI executable to validate and use for the app-server listener probe"
+    )]
+    codex_bin: OsString,
 }
 
 #[derive(Debug, Subcommand)]
@@ -778,6 +818,21 @@ pub fn run() -> Result<()> {
     )?;
     let layout = FsLayout::resolve(cli.home)?;
     let output = match cli.command {
+        Commands::Doctor {
+            command: DoctorCommand::Cli(args),
+        } => {
+            if cli.direct_store {
+                bail!("doctor cli does not support --direct-store");
+            }
+            let output =
+                dispatch_doctor_cli(args, &layout, cli.auto_daemon_startup_timeout_seconds)?;
+            let ok = output["doctor"]["ok"].as_bool() == Some(true);
+            write_json(&output)?;
+            if ok {
+                return Ok(());
+            }
+            std::process::exit(1);
+        }
         Commands::Cli {
             command: CliCommand::Run(args),
         } => {
@@ -943,6 +998,9 @@ pub(crate) fn dispatch_daemon_argv(layout: &FsLayout, argv: Vec<Vec<u8>>) -> Res
 
 fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
     match command {
+        Commands::Doctor {
+            command: DoctorCommand::Cli(args),
+        } => dispatch_doctor_cli(args, layout, DEFAULT_DAEMON_STARTUP_TIMEOUT_SECONDS),
         Commands::Task { command } => dispatch_task(command, layout),
         Commands::Job { command } => dispatch_job(command, layout),
         Commands::Batch { command } => dispatch_batch(command, layout),
@@ -3253,6 +3311,7 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
                     command: CliSessionCommand::Inspect(_),
                 },
         }
+        | Commands::Doctor { .. }
         | Commands::Daemon { .. } => return Ok(None),
     };
     Ok(Some(argv))
@@ -3381,6 +3440,464 @@ fn resolve_executable_on_path(
 fn executable_file_exists(path: &Path) -> bool {
     fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+struct DoctorReportBuilder {
+    checks: Vec<Value>,
+    required_failures: usize,
+}
+
+impl DoctorReportBuilder {
+    fn new() -> Self {
+        Self {
+            checks: Vec::new(),
+            required_failures: 0,
+        }
+    }
+
+    fn push(&mut self, name: &str, required: bool, status: &str, message: String, details: Value) {
+        if required && status == "fail" {
+            self.required_failures += 1;
+        }
+        self.checks.push(json!({
+            "name": name,
+            "required": required,
+            "status": status,
+            "message": message,
+            "details": details,
+        }));
+    }
+
+    fn ok(&mut self, name: &str, required: bool, message: impl Into<String>, details: Value) {
+        self.push(name, required, "ok", message.into(), details);
+    }
+
+    fn fail(
+        &mut self,
+        name: &str,
+        required: bool,
+        message: impl Into<String>,
+        error: &anyhow::Error,
+    ) {
+        self.push(
+            name,
+            required,
+            "fail",
+            message.into(),
+            json!({ "error": format!("{error:#}") }),
+        );
+    }
+
+    fn skipped(&mut self, name: &str, required: bool, message: impl Into<String>, details: Value) {
+        self.push(name, required, "skipped", message.into(), details);
+    }
+
+    fn into_json(self) -> Value {
+        json!({
+            "doctor": {
+                "ok": self.required_failures == 0,
+                "mode": "readiness",
+                "checked_at": now_epoch_seconds().unwrap_or(0),
+                "checks": self.checks,
+            }
+        })
+    }
+}
+
+fn dispatch_doctor_cli(
+    args: DoctorCliArgs,
+    layout: &FsLayout,
+    startup_timeout_seconds: u64,
+) -> Result<Value> {
+    let mut report = DoctorReportBuilder::new();
+
+    let platform_supported = cfg!(target_os = "macos") || cfg!(target_os = "linux");
+    if platform_supported {
+        report.ok(
+            "platform",
+            true,
+            "supported same-user Unix socket platform",
+            json!({
+                "os": env::consts::OS,
+                "family": env::consts::FAMILY,
+            }),
+        );
+    } else {
+        report.push(
+            "platform",
+            true,
+            "fail",
+            "unsupported platform for CLI dogfood v1".to_owned(),
+            json!({
+                "os": env::consts::OS,
+                "family": env::consts::FAMILY,
+                "supported": ["macos", "linux"],
+            }),
+        );
+    }
+
+    match doctor_prepare_fs_and_store(layout) {
+        Ok(details) => report.ok(
+            "fs-store",
+            true,
+            "cbth state directories and SQLite store are ready",
+            details,
+        ),
+        Err(error) => report.fail(
+            "fs-store",
+            true,
+            "cbth state directory or SQLite store check failed",
+            &error,
+        ),
+    }
+
+    let codex_binary = match doctor_check_codex_binary(&args.codex_bin, layout) {
+        Ok((binary, details)) => {
+            report.ok(
+                "codex-binary",
+                true,
+                "Codex CLI executable is available",
+                details,
+            );
+            Some(binary)
+        }
+        Err(error) => {
+            report.fail(
+                "codex-binary",
+                true,
+                "Codex CLI executable check failed",
+                &error,
+            );
+            None
+        }
+    };
+
+    let mut daemon_ready = false;
+    if platform_supported {
+        match doctor_check_daemon(layout, startup_timeout_seconds) {
+            Ok(details) => {
+                report.ok("daemon-ipc", true, "same-user daemon IPC is ready", details);
+                daemon_ready = true;
+            }
+            Err(error) => report.fail(
+                "daemon-ipc",
+                true,
+                "same-user daemon IPC check failed",
+                &error,
+            ),
+        }
+    } else {
+        report.skipped(
+            "daemon-ipc",
+            true,
+            "daemon IPC check skipped because the platform is unsupported",
+            json!({}),
+        );
+    }
+
+    let mut daemon_capabilities_ready = false;
+    if daemon_ready {
+        match doctor_check_daemon_capabilities(layout) {
+            Ok(details) => {
+                report.ok(
+                    "daemon-capabilities",
+                    true,
+                    "daemon protocol and capabilities are compatible",
+                    details,
+                );
+                daemon_capabilities_ready = true;
+            }
+            Err(error) => report.fail(
+                "daemon-capabilities",
+                true,
+                "daemon protocol or capability check failed",
+                &error,
+            ),
+        }
+    } else {
+        report.skipped(
+            "daemon-capabilities",
+            true,
+            "daemon capability check skipped because daemon IPC is unavailable",
+            json!({}),
+        );
+    }
+
+    if let (true, Some(codex_binary)) = (daemon_capabilities_ready, codex_binary.as_ref()) {
+        match doctor_check_app_server_probe(layout, codex_binary) {
+            Ok(details) => report.ok(
+                "codex-app-server-listener",
+                true,
+                "codex app-server listener probe succeeded",
+                details,
+            ),
+            Err(error) => report.fail(
+                "codex-app-server-listener",
+                true,
+                "codex app-server listener probe failed",
+                &error,
+            ),
+        }
+    } else {
+        report.skipped(
+            "codex-app-server-listener",
+            true,
+            "codex app-server listener probe skipped because daemon or codex binary is unavailable",
+            json!({}),
+        );
+    }
+
+    report.ok(
+        "live-e2e-prerequisites",
+        false,
+        "live e2e remains opt-in and was not executed",
+        json!({
+            "env": {
+                "CBTH_RUN_LIVE_CODEX_E2E": env::var("CBTH_RUN_LIVE_CODEX_E2E").ok(),
+                "CBTH_RUN_LIVE_TRUSTED_ALL_E2E": env::var("CBTH_RUN_LIVE_TRUSTED_ALL_E2E").ok(),
+                "CBTH_RUN_LIVE_NEW_THREAD_E2E": env::var("CBTH_RUN_LIVE_NEW_THREAD_E2E").ok(),
+                "CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E": env::var("CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E").ok(),
+            }
+        }),
+    );
+
+    Ok(report.into_json())
+}
+
+fn doctor_prepare_fs_and_store(layout: &FsLayout) -> Result<Value> {
+    layout.ensure_run_dir()?;
+    Store::open_for_daemon_lifecycle(layout)?;
+    let directories = json!({
+        "home": doctor_private_dir_details(layout.home_dir(), "cbth home")?,
+        "run": doctor_private_dir_details(&layout.run_dir(), "cbth run directory")?,
+        "artifacts": doctor_private_dir_details(&layout.artifacts_dir(), "cbth artifacts directory")?,
+        "tasks": doctor_private_dir_details(&layout.tasks_dir(), "cbth tasks directory")?,
+    });
+    Ok(json!({
+        "home": layout.home_dir().display().to_string(),
+        "database": layout.db_path().display().to_string(),
+        "directories": directories,
+    }))
+}
+
+fn doctor_private_dir_details(path: &Path, name: &str) -> Result<Value> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !metadata.is_dir() {
+        bail!("{name} is not a directory: {}", path.display());
+    }
+    let current_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != current_uid {
+        bail!("{name} is not owned by current user: {}", path.display());
+    }
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!("{name} permissions are wider than 0700: {}", path.display());
+    }
+    Ok(json!({
+        "path": path.display().to_string(),
+        "mode": format!("{mode:03o}"),
+        "uid": metadata.uid(),
+    }))
+}
+
+fn doctor_check_codex_binary(binary: &OsStr, layout: &FsLayout) -> Result<(OsString, Value)> {
+    let resolved = resolve_executable(binary)?;
+    let resolved_path = Path::new(&resolved);
+    if !executable_file_exists(resolved_path) {
+        bail!(
+            "Codex binary is not an executable file: {}",
+            resolved_path.display()
+        );
+    }
+    let mut command = Command::new(&resolved);
+    command.arg("--version").stdin(Stdio::null());
+    let output = command_output_timeout(
+        command,
+        Duration::from_secs(DOCTOR_CODEX_VERSION_TIMEOUT_SECONDS),
+        &layout.run_dir(),
+    )
+    .with_context(|| format!("run {:?} --version", resolved))?;
+    if !output.status.success() {
+        bail!(
+            "Codex binary --version failed with status {}; stdout: {}; stderr: {}",
+            output.status,
+            doctor_output_preview(&output.stdout).unwrap_or_default(),
+            doctor_output_preview(&output.stderr).unwrap_or_default()
+        );
+    }
+    Ok((
+        resolved.clone(),
+        json!({
+            "path": resolved_path.display().to_string(),
+            "version": doctor_output_preview(&output.stdout)
+                .or_else(|| doctor_output_preview(&output.stderr)),
+        }),
+    ))
+}
+
+fn doctor_check_daemon(layout: &FsLayout, startup_timeout_seconds: u64) -> Result<Value> {
+    validate_daemon_autostart_endpoint(layout)?;
+    let ensure = daemon_ensure(
+        layout,
+        DaemonEnsureOptions {
+            idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
+            startup_timeout_seconds,
+            startup_sweep_now: Some(now_epoch_seconds()?),
+        },
+    )?;
+    let status = daemon_request(layout, "status")?;
+    Ok(json!({
+        "ensure": ensure,
+        "status": status,
+    }))
+}
+
+fn doctor_check_daemon_capabilities(layout: &FsLayout) -> Result<Value> {
+    let status = daemon_request(layout, "status")?;
+    let protocol_version = status["protocol_version"]
+        .as_u64()
+        .context("daemon status missing protocol_version")?;
+    if protocol_version != 1 {
+        bail!("daemon protocol_version {protocol_version} is not supported");
+    }
+    let reported = status["capabilities"]
+        .as_array()
+        .context("daemon status missing capabilities")?;
+    let missing = DOCTOR_REQUIRED_DAEMON_CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|required| {
+            !reported
+                .iter()
+                .any(|capability| capability.as_str() == Some(*required))
+        })
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "daemon is missing required capabilities: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(json!({
+        "protocol_version": protocol_version,
+        "required_capabilities": DOCTOR_REQUIRED_DAEMON_CAPABILITIES,
+        "reported_capabilities": reported,
+    }))
+}
+
+fn doctor_check_app_server_probe(layout: &FsLayout, codex_binary: &OsStr) -> Result<Value> {
+    let probe = daemon_request_payload_timeout(
+        layout,
+        "cli_app_server_probe",
+        json!({
+            "codex_binary": codex_binary.as_bytes(),
+        }),
+        Duration::from_secs(DOCTOR_APP_SERVER_PROBE_TIMEOUT_SECONDS),
+    )?;
+    Ok(probe)
+}
+
+struct DoctorCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+struct DoctorCaptureFiles {
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+impl DoctorCaptureFiles {
+    fn new(capture_dir: &Path) -> Self {
+        let capture_id = new_id();
+        Self {
+            stdout_path: capture_dir.join(format!("doctor-version-{capture_id}.stdout")),
+            stderr_path: capture_dir.join(format!("doctor-version-{capture_id}.stderr")),
+        }
+    }
+}
+
+impl Drop for DoctorCaptureFiles {
+    fn drop(&mut self) {
+        cleanup_doctor_capture_files(&self.stdout_path, &self.stderr_path);
+    }
+}
+
+fn command_output_timeout(
+    mut command: Command,
+    timeout: Duration,
+    capture_dir: &Path,
+) -> Result<DoctorCommandOutput> {
+    let capture = DoctorCaptureFiles::new(capture_dir);
+    let stdout_file = create_private_file(&capture.stdout_path)?;
+    let stderr_file = create_private_file(&capture.stderr_path)?;
+    command
+        .process_group(0)
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    let mut child = command.spawn().context("spawn command")?;
+    let child_pid = child.id();
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().context("poll command")? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                terminate_process_group_best_effort(child_pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                let stdout = fs::read(&capture.stdout_path).unwrap_or_default();
+                let stderr = fs::read(&capture.stderr_path).unwrap_or_default();
+                bail!(
+                    "command timed out after {} seconds; stdout: {}; stderr: {}",
+                    timeout.as_secs(),
+                    doctor_output_preview(&stdout).unwrap_or_default(),
+                    doctor_output_preview(&stderr).unwrap_or_default()
+                );
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    terminate_process_group_best_effort(child_pid);
+    let stdout_result = fs::read(&capture.stdout_path)
+        .with_context(|| format!("read {}", capture.stdout_path.display()));
+    let stderr_result = fs::read(&capture.stderr_path)
+        .with_context(|| format!("read {}", capture.stderr_path.display()));
+    let stdout = stdout_result?;
+    let stderr = stderr_result?;
+    Ok(DoctorCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn terminate_process_group_best_effort(pid: u32) {
+    signal_process_group_best_effort(pid, libc::SIGTERM);
+    thread::sleep(Duration::from_millis(50));
+    signal_process_group_best_effort(pid, libc::SIGKILL);
+}
+
+fn signal_process_group_best_effort(pid: u32, signal: libc::c_int) {
+    let Ok(pgid) = i32::try_from(pid) else {
+        return;
+    };
+    let _ = unsafe { libc::kill(-pgid, signal) };
+}
+
+fn cleanup_doctor_capture_files(stdout_path: &Path, stderr_path: &Path) {
+    let _ = fs::remove_file(stdout_path);
+    let _ = fs::remove_file(stderr_path);
+}
+
+fn doctor_output_preview(bytes: &[u8]) -> Option<String> {
+    let value = String::from_utf8_lossy(bytes)
+        .trim()
+        .chars()
+        .take(4096)
+        .collect::<String>();
+    (!value.is_empty()).then_some(value)
 }
 
 fn dispatch_task(command: TaskCommand, layout: &FsLayout) -> Result<Value> {

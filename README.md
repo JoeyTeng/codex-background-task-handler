@@ -20,6 +20,7 @@ Design docs:
 - [docs/SHARED_CORE_ARCHITECTURE.md](docs/SHARED_CORE_ARCHITECTURE.md)
 - [docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md)
 - [docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md](docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md)
+- [docs/CLI_OPERATOR_RECOVERY.md](docs/CLI_OPERATOR_RECOVERY.md)
 
 ## Repository Layout
 
@@ -43,6 +44,30 @@ bash scripts/install-git-hooks.sh
 ```
 
 详细设计、工作树安全策略和后续跟踪见 [docs/GIT_HOOKS.md](docs/GIT_HOOKS.md)。
+
+## Local Binary Install
+
+CLI dogfood v1 is intended for macOS/Linux dedicated single-user workstations.
+Install the local binary from a checkout:
+
+```bash
+cargo install --path .
+command -v cbth
+cbth --help
+cbth doctor cli
+```
+
+`cbth doctor cli` is a readiness check, not a read-only inspection command. It may create or repair private `~/.cbth` state directories, open the SQLite store, start the same-user daemon, and briefly start a loopback `codex app-server` to verify listener parsing. It does not send a model request, create a Codex turn, or change the foreground Codex interaction model. Use `--codex-bin <path>` when testing a non-default Codex CLI binary:
+
+```bash
+cbth doctor cli --codex-bin /path/to/codex
+```
+
+For isolated testing, set `CBTH_HOME` or pass `--home <path>`:
+
+```bash
+CBTH_HOME=/tmp/cbth-dogfood cbth doctor cli
+```
 
 ## Testing
 
@@ -78,6 +103,12 @@ CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --
 
 The Rust CLI currently provides read-only store inspection commands, daemon-routed mutating job/batch/task/maintenance commands, `cbth cli run`, adapter-internal attempt and CLI-session commands, an audit log, and a daemon control surface backed by a same-user Unix socket.
 
+Run the deployment readiness check before dogfooding a fresh install:
+
+```bash
+cargo run --bin cbth -- doctor cli
+```
+
 `cbth cli run --bind-thread-id <thread-id>` attach-or-creates a durable fixed-thread managed session, asks the daemon to launch a loopback-only `codex app-server --listen ws://127.0.0.1:0`, refreshes a short app-server lease while foreground Codex runs, launches native `codex --remote <url> --cd <cwd> ...`, and starts a sidecar websocket client that performs initialize / `thread/resume` / `thread/read` and maps `turn/started`, `turn/completed`, and `thread/status/changed` into durable activity updates. `cbth cli run --new-thread` asks the daemon to start a pending app-server, calls `thread/start` on that same process, prints `cbth: bound thread id: <thread-id>` to stderr, then promotes the pending process into the fixed-thread managed session before foreground Codex starts. This avoids losing Codex's fresh unmaterialized thread state while still not sending a foreground prompt, injecting user input, or changing the native `codex --remote` interaction model. Successful `thread.status.type` snapshots for the bound thread dominate earlier request-window notifications, and capability/activity write failures invalidate proof before retry. On foreground exit it stops and joins the sidecar, clears activity/capability proof with the latest sidecar epoch, and stops the daemon-owned app-server.
 
 Default `cbth cli run` remains passive and records only current-state proof. Existing-thread sessions use `thread_resume` / `current_state_sync`; fresh unmaterialized `--new-thread` sessions can use the same-process `thread_start` + `thread/read(includeTurns=false)` proof until the first turn materializes rollout storage. With explicit `--auto-delivery-policy trusted-all`, the sidecar records full automatic-delivery capability for the current epoch, polls durable idle state every 2 seconds, writes an `accept_pending` barrier, sends a unique-marker `turn/start`, waits up to 60 seconds for acceptance, calls `accept-cli` with the returned `turn.id`, and observes the accepted turn. Matching completed notifications close the batch as `delivered`; missed notifications can be reconciled with same-epoch `thread/read(includeTurns=true)` after the accepted turn materializes the rollout; failed/interrupted/replaced turns move the batch to `manual_resolution_only`. Clear pre-accept rejection uses hidden `attempt reject-cli-before-accept` and keeps the batch automatic without incrementing `delivery_attempt_count`. Timeout, websocket close, or protocol ambiguity is not retried; stale sweep later marks the attempt `unknown` and fail-closes the batch.
@@ -92,6 +123,9 @@ Use `--auto-daemon-startup-timeout-seconds <seconds>` on routed mutating command
 `cbth task run` is daemon-owned background supervision for local commands. It creates a durable task plus associated job, spawns the command in its own process group using the caller's environment, returns immediately with `task_id` / `job_id`, and lets the daemon complete or fail the job when the command exits. stdout and stderr are spooled to task log files under `~/.cbth/tasks/<task-id>/`, with bounded in-memory tails, 64 MiB per-stream spool caps, a 16 active-task daemon cap, and cleanup only after linked delivery batches have closed and their retention window has elapsed. The delivery prompt includes command metadata, exit status, byte/truncation flags, small tail previews, and managed artifact refs; large logs stay in the managed files/artifacts. `task cancel` records the cancel request and asks the daemon to terminate the task process group with SIGTERM, then SIGKILL after a grace window; daemon startup recovery validates a persisted process identity before killing a lost task process group.
 
 ```bash
+cargo run --bin cbth -- \
+  doctor cli
+
 cargo run --bin cbth -- \
   job submit \
   --source-thread-id <thread-id> \
@@ -183,6 +217,8 @@ cargo run --bin cbth -- daemon stop
 ```
 
 `daemon ensure` starts `cbth daemon serve` on demand when no active daemon is reachable. The daemon listens on `~/.cbth/run/cbth.sock`, requires private `~/.cbth` / `run` directories, validates peer uid before serving requests, runs a startup maintenance sweep, and exits after an idle timeout. Mutating CLI commands use this IPC path by default and fail closed if the same-user socket proof cannot be established.
+
+Operator recovery procedures for `manual_resolution_only`, head batch inspection, task logs, audit records, and manual close are documented in [docs/CLI_OPERATOR_RECOVERY.md](docs/CLI_OPERATOR_RECOVERY.md).
 
 ## Python Usage
 

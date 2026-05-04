@@ -20,7 +20,7 @@
 - [x] 增加 ignored / opt-in live CLI trusted-all full e2e，验证真实 `cbth cli run --auto-delivery-policy trusted-all` 能在 existing thread idle 后自动投递 head batch 并关闭为 `delivered`。
 - [x] 单独沉淀 CLI Dogfood V1 完成计划，见 [CLI_DOGFOOD_V1_COMPLETION_PLAN.md](CLI_DOGFOOD_V1_COMPLETION_PLAN.md)。
 - [x] 合入 Phase 12 `cbth cli run --new-thread` PR 后，从最新 `master` 开始 CLI Dogfood V1 后续 PR。
-- [ ] 合入 daemon-owned CLI task supervisor PR：
+- [x] 合入 daemon-owned CLI task supervisor PR：
   - [x] `cbth task run --source-thread-id ... --summary ... -- <cmd> [args...]`
   - [x] `cbth task inspect --task-id ...`
   - [x] `cbth task list [--source-thread-id ...]`
@@ -30,9 +30,9 @@
   - [x] active supervised tasks 阻止 daemon idle exit；完成后恢复正常 idle exit
   - [x] 增加 deterministic fake e2e 覆盖 trusted-all task auto delivery
   - [x] 增加 ignored / opt-in live task-supervisor e2e 入口；真实本机复测命令已记录在 [LIVE_E2E.md](LIVE_E2E.md)
-- [ ] 增加 `cbth doctor cli`，检查 codex binary、app-server listener parsing、same-user daemon IPC、store permissions、SQLite open、platform support 和 optional live smoke prerequisites。
-- [ ] 补齐 CLI operator recovery 文档：batch inspect/manual close、audit、task logs、`manual_resolution_only` 处理。
-- [ ] 补齐 local binary dogfood 部署文档：`cargo install --path .`、PATH 检查、`cbth doctor cli`、最小端到端 walkthrough。
+- [x] 增加 `cbth doctor cli`，检查 codex binary、app-server listener parsing、same-user daemon IPC、store permissions、SQLite open、platform support 和 optional live smoke prerequisites。
+- [x] 补齐 CLI operator recovery 文档：batch inspect/manual close、audit、task logs、`manual_resolution_only` 处理。
+- [x] 补齐 local binary dogfood 部署文档：`cargo install --path .`、PATH 检查、`cbth doctor cli`、最小端到端 walkthrough。
 - [x] 增加 opt-in live task-supervisor e2e：`CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture`。
 - [ ] 文档化 active-turn `turn/steer` 后续进入自动路径前需要的 risk/capability proof；当前自动投递继续只允许 idle `turn/start`。
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
@@ -388,6 +388,7 @@
   - [x] daemon capability 增加 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-auto-delivery-dispatch`，避免新 CLI 把 auto-delivery audit / reject-before-accept / trusted-all auth-mode 路由给旧 daemon
   - [x] daemon capability 增加 `cli-app-server-lifecycle`，避免新 CLI 把 app-server lifecycle request 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-app-server-probe`，避免新 CLI 把 `doctor cli` app-server listener probe 路由给旧 daemon
   - [x] shared `app-server` 归 daemon 持有
   - [x] 前台 wrapper 持有短 lease；foreground 退出显式 stop，wrapper crash 时 daemon lease expiry 会清理 app-server
   - [x] daemon-owned app-server 在 explicit stop、dead-child refresh、lease expiry 与 daemon shutdown 时会清理 registered session proof，且 cleanup 即使 proof 已 clear 也会推进 epoch fence，避免 wrapper crash 或 daemon cleanup 后旧 `idle` / capability proof 继续打开自动投递

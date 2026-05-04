@@ -10,8 +10,8 @@ Desktop bridge、Socket/API 插件协议、Homebrew/Tap 发布、规则/allowlis
 
 - **Phase 12 landing**：先合入 `cbth cli run --new-thread`，保留 `--bind-thread-id` / `--new-thread` 二选一，成功后只向 stderr 打印 `cbth: bound thread id: <thread-id>`，不注入 foreground 输入。
 - **Task supervisor**：新增 daemon-owned `cbth task run`，让用户可以提交 shell command 作为 background task；daemon 创建 job、监督 child/process group，并在退出后自动 `job complete` 或 `job fail`。
-- **Diagnostics and recovery**：新增 `cbth doctor cli`，并补齐 operator recovery 文档，覆盖 audit、batch inspect/manual close、task logs 和 `manual_resolution_only`。
-- **Local binary deploy**：支持 `cargo install --path .` 或 release binary 的本机安装说明、PATH 检查和 live smoke 复测；不做包管理器。
+- **Diagnostics and recovery**：`cbth doctor cli` 是本机 readiness check；它覆盖 codex binary、app-server listener parsing、same-user daemon IPC、store permissions、SQLite open、platform support 和 live smoke prerequisites，并配套 operator recovery 文档。
+- **Local binary deploy**：支持 `cargo install --path .` 或 release binary 的本机安装说明、PATH 检查、`cbth doctor cli` 和最小 dogfood walkthrough；不做包管理器。
 - **Active steer design only**：文档化 `turn/steer` 未来需要的 risk/capability proof，但当前自动投递仍只允许 durable idle proof 后的 `turn/start`。
 
 ## Task Supervisor Contract
@@ -61,8 +61,8 @@ Resource defaults:
 
 1. **Phase 12 PR**: push `codex/phase-12-cli-new-thread`, create PR, wait for Rust CI / fake e2e / `codex/review-gate`, fix review comments if any, squash merge with the required Codex co-author footer.
 2. **Supervisor PR**: implement daemon-owned `cbth task run/list/inspect/cancel`, task state, bounded log spool/tails, child cleanup, daemon idle integration, fake e2e, and opt-in live task-supervisor e2e.
-3. **Diagnostics PR**: implement `cbth doctor cli` and recovery docs for inspecting tasks, batches, audit records, and manual-resolution states.
-4. **Deploy docs PR**: document local binary install, PATH verification, dogfood walkthrough, and live retest commands.
+3. **Diagnostics/deploy PR**: implement `cbth doctor cli`, recovery docs for tasks/batches/audit/manual-resolution states, local binary install, PATH verification, dogfood walkthrough, and live retest commands.
+4. **Optional packaging PR**: only after dogfood stability, decide whether release binaries or package-manager docs are worth adding.
 5. **Steer design PR**: record the future active-turn `turn/steer` risk/capability contract without enabling automatic steer.
 
 ## Test Plan
