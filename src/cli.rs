@@ -36,6 +36,7 @@ use crate::models::{
     DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, NewAuditDecision,
     NewCliAcceptPendingAttempt, NewJob, PartialDeliveryPolicy, SubmitMetadata,
 };
+use crate::self_update::{SelfUpdateOptions, run_self_update};
 use crate::store::{Store, new_id};
 
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
@@ -81,6 +82,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
 #[derive(Debug, Parser)]
 #[command(name = "cbth")]
 #[command(about = "Codex background task handler")]
+#[command(version)]
 pub struct Cli {
     #[arg(long, global = true)]
     home: Option<PathBuf>,
@@ -122,6 +124,11 @@ enum Commands {
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
+    },
+    #[command(name = "self")]
+    Self_ {
+        #[command(subcommand)]
+        command: SelfCommand,
     },
     Cli {
         #[command(subcommand)]
@@ -335,6 +342,27 @@ enum AuditCommand {
     List(AuditListArgs),
     #[command(hide = true)]
     Record(Box<AuditRecordArgs>),
+}
+
+#[derive(Debug, Subcommand)]
+enum SelfCommand {
+    #[command(about = "Update the cbth binary from GitHub Releases")]
+    Update(SelfUpdateArgs),
+}
+
+#[derive(Debug, Args)]
+struct SelfUpdateArgs {
+    #[arg(long, value_name = "vX.Y.Z", help = "Install a specific release tag")]
+    version: Option<String>,
+
+    #[arg(
+        long,
+        help = "Check whether an update is available without installing it"
+    )]
+    check: bool,
+
+    #[arg(long, help = "Confirm non-interactive update; accepted for scripts")]
+    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -910,6 +938,13 @@ pub fn run() -> Result<()> {
                 run_cli_session(args, &layout, cli.auto_daemon_startup_timeout_seconds)?;
             std::process::exit(exit_code);
         }
+        Commands::Self_ {
+            command: SelfCommand::Update(args),
+        } => run_self_update(SelfUpdateOptions {
+            version: args.version,
+            check: args.check,
+            yes: args.yes,
+        })?,
         command => dispatch(
             command,
             &layout,
@@ -1059,6 +1094,7 @@ pub(crate) fn dispatch_daemon_argv(layout: &FsLayout, argv: Vec<Vec<u8>>) -> Res
     }
     match cli.command {
         Commands::Daemon { .. } => bail!("daemon dispatch cannot execute daemon commands"),
+        Commands::Self_ { .. } => bail!("daemon dispatch cannot execute self update commands"),
         command => dispatch(command, layout, DispatchMode::Direct),
     }
 }
@@ -1073,6 +1109,13 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
         Commands::Batch { command } => dispatch_batch(command, layout),
         Commands::Attempt { command } => dispatch_attempt(command, layout),
         Commands::Audit { command } => dispatch_audit(command, layout),
+        Commands::Self_ {
+            command: SelfCommand::Update(args),
+        } => run_self_update(SelfUpdateOptions {
+            version: args.version,
+            check: args.check,
+            yes: args.yes,
+        }),
         Commands::Cli { command } => dispatch_cli(command, layout),
         Commands::Maintenance { command } => dispatch_maintenance(command, layout),
         Commands::Daemon { command } => dispatch_daemon(command, layout),
@@ -3422,6 +3465,7 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
         | Commands::Audit {
             command: AuditCommand::List(_),
         }
+        | Commands::Self_ { .. }
         | Commands::Cli {
             command: CliCommand::Run(_),
         }

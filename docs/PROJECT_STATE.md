@@ -10,6 +10,11 @@
 - 当前 runner 已改成 reaction-driven serialized marker design，并通过本地 composite action wrapper 调用；ruleset 已要求 `codex/review-gate`、Rust CI 和 resolved conversations。
 - 2026-05-04 已补做 resolved/remapped inline thread live validation：PR #14 的 Codex comment `3148673469` 在 REST 中 `commit_id` 被映射到 head `6a2d9e57...`，但 GraphQL thread `PRRT_kwDOSJZ-as594_hR` 为 `isResolved=true`；当前默认分支 workflow dispatch run `25316273973` 成功通过，证明该旧 inline thread 不再被误判为 current-head blocker。
 - 本地确定性 Rust gate 现在有 repo-tracked githooks 入口：[docs/GIT_HOOKS.md](GIT_HOOKS.md)。安装后 pre-commit 会在 Rust/Cargo staged changes 上运行 `cargo fmt --all`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked`。
+- GitHub Release packaging 正在补齐首发 `v0.1.0` 路径：
+  - `Cargo.toml` 版本保持 `0.1.0`，首个 release tag 计划为 `v0.1.0`
+  - release workflow 会为 Linux x86_64 与 macOS arm64 构建 raw `cbth` binary 和 `.sha256`
+  - `scripts/install.sh` 提供 GitHub Release 安装入口，`cbth self update` 提供显式自升级入口
+  - 当前不支持 GHCR/OCI package、Homebrew/Tap、macOS Intel、Linux arm64 或 Windows release assets
 - Phase 11a 把 deterministic fake e2e 收进 Rust integration tests，因此现有 `ubuntu-latest` / `macos-latest` matrix 的 `cargo test --locked` 会直接 gate：
   - `job submit` / `job fail` 产生 open batch 后，经 managed CLI session proof、`attempt begin-cli-accept`、`accept-cli`、`observe-cli-turn` 收敛为 `close_reason=delivered`
   - `cbth cli run` 配合 fake codex 与 fake app-server 验证默认路径仍只是 passive sync：只发送 initialize / `thread/resume` / `thread/read`，不会发送 `turn/start` 或 `turn/steer`

@@ -33,6 +33,11 @@
 - [x] 增加 `cbth doctor cli`，检查 codex binary、app-server listener parsing、same-user daemon IPC、store permissions、SQLite open、platform support 和 optional live smoke prerequisites。
 - [x] 补齐 CLI operator recovery 文档：batch inspect/manual close、audit、task logs、`manual_resolution_only` 处理。
 - [x] 补齐 local binary dogfood 部署文档：`cargo install --path .`、PATH 检查、`cbth doctor cli`、最小端到端 walkthrough。
+- [ ] 合入 GitHub Release 安装/升级 PR 后，在最新 `master` 上打首发 `v0.1.0` signed annotated tag：
+  - [ ] release workflow 发布 Linux x86_64 与 macOS arm64 raw binary + `.sha256`
+  - [ ] `scripts/install.sh` 可安装指定 `CBTH_VERSION=v0.1.0`
+  - [ ] `cbth self update --check` 可识别当前版本与 latest release
+  - [ ] macOS arm64 安装后 `cbth doctor cli` 通过
 - [x] 增加 opt-in live task-supervisor e2e：`CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture`。
 - [x] 文档化 active-turn `turn/steer` 后续进入自动路径前需要的 risk/capability proof；当前自动投递继续只允许 idle `turn/start`。见 [CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md)。
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
