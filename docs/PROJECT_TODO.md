@@ -34,7 +34,7 @@
 - [x] 补齐 CLI operator recovery 文档：batch inspect/manual close、audit、task logs、`manual_resolution_only` 处理。
 - [x] 补齐 local binary dogfood 部署文档：`cargo install --path .`、PATH 检查、`cbth doctor cli`、最小端到端 walkthrough。
 - [x] 增加 opt-in live task-supervisor e2e：`CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture`。
-- [ ] 文档化 active-turn `turn/steer` 后续进入自动路径前需要的 risk/capability proof；当前自动投递继续只允许 idle `turn/start`。
+- [x] 文档化 active-turn `turn/steer` 后续进入自动路径前需要的 risk/capability proof；当前自动投递继续只允许 idle `turn/start`。见 [CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md)。
 - [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
 - [x] 确认桌面端私有 `app-server` 当前正持有该 rollout 文件。
 - [x] 实现最小 PoC 脚本，通过外部独立 `codex app-server` 对该 thread 执行 `read` / `resume` / `inject_items`。
@@ -452,7 +452,7 @@
   - [x] clear pre-accept `turn/start` rejection 会写入 `rejected_before_accept`，不消耗 attempt count，并等待 fresh idle proof 后再 retry
 - [x] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为，且不会导致当前 turn 提前结束。
 - [x] 为 CLI adapter 明确定义实验 RPC 的最小能力集、capability probe 和 fail-closed 策略。
-- [ ] 把 `turn/steer` 维持为默认关闭的 gated optimization，并明确不满足条件时的 idle-only fallback。
+- [x] 把 `turn/steer` 维持为默认关闭的 gated optimization，并明确不满足条件时的 idle-only fallback。见 [CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md)。
 - [x] 为 CLI adapter 落实 `turn/start` delivery completion contract：
   - [x] accepted `turn/start` 只记录 `delivery_turn_id`
   - accepted `turn/steer` 仍待 active-turn risk proof 落地后开放；当前 `begin-cli-accept --rpc-kind turn-steer` 仍 fail-closed
