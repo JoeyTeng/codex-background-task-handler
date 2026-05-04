@@ -16,6 +16,8 @@ Desktop bridge、Socket/API 插件协议、Homebrew/Tap 发布、规则/allowlis
 
 ## Task Supervisor Contract
 
+The detailed supervisor design is tracked in [CLI_TASK_SUPERVISOR_DESIGN.md](CLI_TASK_SUPERVISOR_DESIGN.md). This section records the stable Dogfood V1 contract for the PR sequence.
+
 用户入口：
 
 ```text

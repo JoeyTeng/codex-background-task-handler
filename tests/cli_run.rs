@@ -1885,6 +1885,66 @@ fn wait_for_batch_close_reason(home: &TempDir, batch_id: &str, close_reason: &st
 }
 
 #[cfg(unix)]
+fn wait_for_task_status(home: &TempDir, task_id: &str, status: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let inspected = cbth_direct_json(home, &["task", "inspect", "--task-id", task_id]);
+        if inspected["task"]["status"] == status {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task did not reach {status}: {inspected}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_job_batch_close_reason(home: &TempDir, job_id: &str, close_reason: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let db_path = home.path().join("cbth.sqlite3");
+    loop {
+        let conn = Connection::open(&db_path).expect("open db");
+        let reason = conn
+            .query_row(
+                "SELECT batches.close_reason
+                 FROM batches
+                 JOIN batch_jobs ON batch_jobs.batch_id = batches.batch_id
+                 WHERE batch_jobs.job_id = ?",
+                [job_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        if reason.as_deref() == Some(close_reason) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "job batch did not close as {close_reason}: {:?}",
+            reason
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(unix)]
+fn job_batch_summary(home: &TempDir, job_id: &str) -> String {
+    let db_path = home.path().join("cbth.sqlite3");
+    let conn = Connection::open(&db_path).expect("open db");
+    conn.query_row(
+        "SELECT batches.summary
+         FROM batches
+         JOIN batch_jobs ON batch_jobs.batch_id = batches.batch_id
+         WHERE batch_jobs.job_id = ?",
+        [job_id],
+        |row| row.get(0),
+    )
+    .expect("job batch summary")
+}
+
+#[cfg(unix)]
 fn stop_daemon(home: &TempDir) {
     let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("--home")
@@ -2294,7 +2354,7 @@ fn cli_run_passive_adapter_records_app_server_activity() {
         .arg(&fake_codex)
         .env("FAKE_CODEX_LOG", &log_path)
         .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
-        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "7")
         .output()
         .expect("run cbth cli run");
 
@@ -2509,6 +2569,98 @@ fn cli_run_trusted_all_auto_delivery_notification_closes_delivered() {
             .iter()
             .any(|decision| decision["decision"] == "observed")
     );
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_task_run_auto_delivery_closes_delivered() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-task";
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let (app_server_url, fake_server_done) = spawn_fake_app_server_auto_delivery(
+        thread_id,
+        FakeAutoDeliveryOutcome::CompletedNotification,
+    );
+
+    let cli_run = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg(thread_id)
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--auto-delivery-policy")
+        .arg("trusted-all")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "15")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cbth cli run");
+    wait_for_log_contains(&log_path, "foreground");
+
+    let task = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("task")
+        .arg("run")
+        .arg("--source-thread-id")
+        .arg(thread_id)
+        .arg("--summary")
+        .arg("task e2e")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("printf '%s' \"$CBTH_TEST_TASK_OUTPUT\"")
+        .env("CBTH_TEST_TASK_OUTPUT", "task-output")
+        .output()
+        .expect("run supervised task");
+    assert!(
+        task.status.success(),
+        "task run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&task.stdout),
+        String::from_utf8_lossy(&task.stderr)
+    );
+    let task_json: serde_json::Value = serde_json::from_slice(&task.stdout).expect("task json");
+    let task_id = task_json["task"]["task_id"].as_str().expect("task id");
+    let job_id = task_json["task"]["job_id"].as_str().expect("job id");
+    wait_for_task_status(&home, task_id, "succeeded");
+    wait_for_job_batch_close_reason(&home, job_id, "delivered");
+    let summary = job_batch_summary(&home, job_id);
+    assert!(summary.contains("Background task succeeded."));
+    assert!(
+        summary
+            .contains("Command: \"/bin/sh\" \"-c\" \"printf '%s' \\\"$CBTH_TEST_TASK_OUTPUT\\\"\"")
+    );
+    assert!(
+        summary.contains("stdout/stderr tails are omitted from this automatic-delivery prompt")
+    );
+    assert!(
+        !summary.contains("task-output"),
+        "task stdout must not be embedded into auto-delivery prompt text"
+    );
+
+    let output = cli_run.wait_with_output().expect("wait cli run");
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(methods.iter().any(|method| method == "turn/start"));
     stop_daemon(&home);
 }
 

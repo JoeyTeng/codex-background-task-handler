@@ -13,7 +13,7 @@ The shared architecture is converging on one Rust binary with thin integration e
 
 - a CLI entrypoint that launches the shared `app-server` path
 - a Desktop-facing helper/bridge entrypoint
-- a shared local daemon, store, artifact manager, and job-control CLI surface underneath
+- a shared local daemon, store, artifact manager, and job/task-control CLI surface underneath
 
 Design docs:
 
@@ -66,11 +66,17 @@ CBTH_RUN_LIVE_TRUSTED_ALL_E2E=1 cargo test --test live_trusted_all -- --ignored
 CBTH_RUN_LIVE_NEW_THREAD_E2E=1 cargo test --test live_new_thread -- --ignored
 ```
 
+完整 live task-supervisor e2e 也是 opt-in；它用真实 `cbth cli run --new-thread --auto-delivery-policy trusted-all` 和真实 daemon-owned `cbth task run` 验证后台命令完成后自动投递为 `delivered`：
+
+```bash
+CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture
+```
+
 复测步骤、环境变量和失败排查见 [docs/LIVE_E2E.md](docs/LIVE_E2E.md)。
 
 ## Rust CLI Usage
 
-The Rust CLI currently provides read-only store inspection commands, daemon-routed mutating job/batch/maintenance commands, `cbth cli run`, adapter-internal attempt and CLI-session commands, an audit log, and a daemon control surface backed by a same-user Unix socket.
+The Rust CLI currently provides read-only store inspection commands, daemon-routed mutating job/batch/task/maintenance commands, `cbth cli run`, adapter-internal attempt and CLI-session commands, an audit log, and a daemon control surface backed by a same-user Unix socket.
 
 `cbth cli run --bind-thread-id <thread-id>` attach-or-creates a durable fixed-thread managed session, asks the daemon to launch a loopback-only `codex app-server --listen ws://127.0.0.1:0`, refreshes a short app-server lease while foreground Codex runs, launches native `codex --remote <url> --cd <cwd> ...`, and starts a sidecar websocket client that performs initialize / `thread/resume` / `thread/read` and maps `turn/started`, `turn/completed`, and `thread/status/changed` into durable activity updates. `cbth cli run --new-thread` asks the daemon to start a pending app-server, calls `thread/start` on that same process, prints `cbth: bound thread id: <thread-id>` to stderr, then promotes the pending process into the fixed-thread managed session before foreground Codex starts. This avoids losing Codex's fresh unmaterialized thread state while still not sending a foreground prompt, injecting user input, or changing the native `codex --remote` interaction model. Successful `thread.status.type` snapshots for the bound thread dominate earlier request-window notifications, and capability/activity write failures invalidate proof before retry. On foreground exit it stops and joins the sidecar, clears activity/capability proof with the latest sidecar epoch, and stops the daemon-owned app-server.
 
@@ -82,6 +88,8 @@ State lives under `~/.cbth` by default. Use `--home <path>` or `CBTH_HOME` for t
 The local-store and daemon IPC semantics are supported on macOS and Linux; pure Windows support is out of scope until the IPC, atomic-replace, and directory-sync contracts are designed separately.
 By default, `job submit`, `job complete`, `job fail`, `batch close-head`, and `maintenance sweep` first ensure the local daemon is running, then execute through its same-user Unix socket. Read-only commands such as `job inspect`, `job list`, `batch inspect-head`, and `batch inspect` read the local store directly.
 Use `--auto-daemon-startup-timeout-seconds <seconds>` on routed mutating commands when a large startup sweep or slow disk needs more than the default 5 seconds.
+
+`cbth task run` is daemon-owned background supervision for local commands. It creates a durable task plus associated job, spawns the command in its own process group using the caller's environment, returns immediately with `task_id` / `job_id`, and lets the daemon complete or fail the job when the command exits. stdout and stderr are spooled to task log files under `~/.cbth/tasks/<task-id>/`, with bounded in-memory tails, 64 MiB per-stream spool caps, a 16 active-task daemon cap, and cleanup only after linked delivery batches have closed and their retention window has elapsed. The delivery prompt includes command metadata, exit status, byte/truncation flags, small tail previews, and managed artifact refs; large logs stay in the managed files/artifacts. `task cancel` records the cancel request and asks the daemon to terminate the task process group with SIGTERM, then SIGKILL after a grace window; daemon startup recovery validates a persisted process identity before killing a lost task process group.
 
 ```bash
 cargo run --bin cbth -- \
@@ -137,6 +145,30 @@ cargo run --bin cbth -- \
 cargo run --bin cbth -- \
   audit list \
   --source-thread-id <thread-id>
+
+cargo run --bin cbth -- \
+  task run \
+  --source-thread-id <thread-id> \
+  --summary "run slow test suite" \
+  --delivery-read-only true \
+  --delivery-requires-approval false \
+  --delivery-requires-network false \
+  --delivery-requires-write-access false \
+  --cwd "$PWD" \
+  --timeout-seconds 3600 \
+  -- cargo test
+
+cargo run --bin cbth -- \
+  task inspect \
+  --task-id <task-id>
+
+cargo run --bin cbth -- \
+  task list \
+  --source-thread-id <thread-id>
+
+cargo run --bin cbth -- \
+  task cancel \
+  --task-id <task-id>
 ```
 
 If delivery policy is omitted, the core records a fail-closed policy: not read-only, requires approval, requires network, and requires write access. Completed result files are streamed into the managed artifact store; the original `--result-file` path is only an input. The current core does not persist inline handoff payloads yet, so completed job batches conservatively keep `requires_artifact_read=true` even for small artifacts.
