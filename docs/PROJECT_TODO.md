@@ -385,6 +385,7 @@
   - [x] daemon capability 增加 `cli-session-dispatch`，避免新 CLI 把 session mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-session-capability-dispatch`，避免新 CLI 把 session capability mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-session-proof-invalidation-dispatch`，避免新 CLI 把 continuity-loss proof invalidation 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-session-recovery-dispatch`，避免新 CLI 把 retire/replacement 语义路由给旧 daemon
   - [x] daemon capability 增加 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-auto-delivery-dispatch`，避免新 CLI 把 auto-delivery audit / reject-before-accept / trusted-all auth-mode 路由给旧 daemon
   - [x] daemon capability 增加 `cli-app-server-lifecycle`，避免新 CLI 把 app-server lifecycle request 路由给旧 daemon

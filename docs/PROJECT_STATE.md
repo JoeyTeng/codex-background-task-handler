@@ -47,6 +47,7 @@
   - accepted 或 pre-accept fail-closed 到 `manual_resolution_only` 时，关联 managed session 会进入 `parked`
   - operator retirement 拒绝 `live` session、active delivery attempt、以及仍有 open `manual_resolution_only` head batch 的 bound thread
   - `cli run --bind-thread-id` 可在旧 `detached` / `parked` / `stale` / profile-drift session 已满足 retirement 条件后自动 retire 并创建 replacement；否则 fail closed，仍维持每个 `bound_thread_id` 最多一个 non-retired session
+  - daemon capability / doctor gate 新增 `cli-session-recovery-dispatch`，避免新 CLI 把 retire/replacement 语义路由给旧 daemon
 - Live opt-in 复测已覆盖 CLI trusted-all 自动投递：
   - `codex-cli 0.125.0` 在非 TTY 下会把 `codex app-server` listener banner 输出到 `stderr`；`cbth` daemon 和 live smoke 现在都会同时扫描 `stdout` / `stderr`
   - `CBTH_RUN_LIVE_CODEX_E2E=1 cargo test --test live_smoke -- --ignored` 已在本机通过，验证真实 shared app-server sidecar turn 仍可完成并被 `thread/read` 看到 marker

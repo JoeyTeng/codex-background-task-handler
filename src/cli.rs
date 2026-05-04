@@ -71,6 +71,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "cli-session-dispatch",
     "cli-session-capability-dispatch",
     "cli-session-proof-invalidation-dispatch",
+    "cli-session-recovery-dispatch",
     "cli-turn-observation-dispatch",
     "cli-auto-delivery-dispatch",
     "task-supervisor",
