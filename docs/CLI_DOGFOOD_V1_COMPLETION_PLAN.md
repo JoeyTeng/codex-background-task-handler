@@ -12,7 +12,7 @@ Desktop bridge、Socket/API 插件协议、Homebrew/Tap 发布、规则/allowlis
 - **Task supervisor**：新增 daemon-owned `cbth task run`，让用户可以提交 shell command 作为 background task；daemon 创建 job、监督 child/process group，并在退出后自动 `job complete` 或 `job fail`。
 - **Diagnostics and recovery**：`cbth doctor cli` 是本机 readiness check；它覆盖 codex binary、app-server listener parsing、same-user daemon IPC、store permissions、SQLite open、platform support 和 live smoke prerequisites，并配套 operator recovery 文档。
 - **Local binary deploy**：支持 `cargo install --path .` 或 release binary 的本机安装说明、PATH 检查、`cbth doctor cli` 和最小 dogfood walkthrough；不做包管理器。
-- **Active steer design only**：文档化 `turn/steer` 未来需要的 risk/capability proof，但当前自动投递仍只允许 durable idle proof 后的 `turn/start`。
+- **Active steer design only**：`CLI_ACTIVE_TURN_STEER_DESIGN.md` 文档化 `turn/steer` 未来需要的 risk/capability proof；当前自动投递仍只允许 durable idle proof 后的 `turn/start`。
 
 ## Task Supervisor Contract
 
@@ -63,7 +63,7 @@ Resource defaults:
 2. **Supervisor PR**: implement daemon-owned `cbth task run/list/inspect/cancel`, task state, bounded log spool/tails, child cleanup, daemon idle integration, fake e2e, and opt-in live task-supervisor e2e.
 3. **Diagnostics/deploy PR**: implement `cbth doctor cli`, recovery docs for tasks/batches/audit/manual-resolution states, local binary install, PATH verification, dogfood walkthrough, and live retest commands.
 4. **Optional packaging PR**: only after dogfood stability, decide whether release binaries or package-manager docs are worth adding.
-5. **Steer design PR**: record the future active-turn `turn/steer` risk/capability contract without enabling automatic steer.
+5. **Steer design PR**: record the future active-turn `turn/steer` risk/capability contract in [CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md) without enabling automatic steer.
 
 ## Test Plan
 

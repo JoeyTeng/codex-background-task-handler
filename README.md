@@ -20,6 +20,7 @@ Design docs:
 - [docs/SHARED_CORE_ARCHITECTURE.md](docs/SHARED_CORE_ARCHITECTURE.md)
 - [docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md)
 - [docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md](docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md)
+- [docs/CLI_ACTIVE_TURN_STEER_DESIGN.md](docs/CLI_ACTIVE_TURN_STEER_DESIGN.md)
 - [docs/CLI_OPERATOR_RECOVERY.md](docs/CLI_OPERATOR_RECOVERY.md)
 
 ## Repository Layout
@@ -113,7 +114,7 @@ cargo run --bin cbth -- doctor cli
 
 Default `cbth cli run` remains passive and records only current-state proof. Existing-thread sessions use `thread_resume` / `current_state_sync`; fresh unmaterialized `--new-thread` sessions can use the same-process `thread_start` + `thread/read(includeTurns=false)` proof until the first turn materializes rollout storage. With explicit `--auto-delivery-policy trusted-all`, the sidecar records full automatic-delivery capability for the current epoch, polls durable idle state every 2 seconds, writes an `accept_pending` barrier, sends a unique-marker `turn/start`, waits up to 60 seconds for acceptance, calls `accept-cli` with the returned `turn.id`, and observes the accepted turn. Matching completed notifications close the batch as `delivered`; missed notifications can be reconciled with same-epoch `thread/read(includeTurns=true)` after the accepted turn materializes the rollout; failed/interrupted/replaced turns move the batch to `manual_resolution_only`. Clear pre-accept rejection uses hidden `attempt reject-cli-before-accept` and keeps the batch automatic without incrementing `delivery_attempt_count`. Timeout, websocket close, or protocol ambiguity is not retried; stale sweep later marks the attempt `unknown` and fail-closes the batch.
 
-`trusted-all` is deliberately broad: it bypasses batch policy, artifact-read, and managed-session risk-profile gates, but it still requires an open head batch, remaining budget, matching `source_thread_id`, bound `managed_session_id`, matching `session_epoch`, and fresh idle proof. `cbth audit list` exposes the append-only decision trail for allow/deny/attempt-start/accepted/rejected/reconciled/observed/manualized records. `turn/steer`, active-turn injection, rollout-only delivery proof, and foreground thread retargeting are still outside the implemented automatic delivery path.
+`trusted-all` is deliberately broad: it bypasses batch policy, artifact-read, and managed-session risk-profile gates, but it still requires an open head batch, remaining budget, matching `source_thread_id`, bound `managed_session_id`, matching `session_epoch`, and fresh idle proof. `cbth audit list` exposes the append-only decision trail for allow/deny/attempt-start/accepted/rejected/reconciled/observed/manualized records. `turn/steer`, active-turn injection, rollout-only delivery proof, and foreground thread retargeting are still outside the implemented automatic delivery path; the future steer contract is documented in [docs/CLI_ACTIVE_TURN_STEER_DESIGN.md](docs/CLI_ACTIVE_TURN_STEER_DESIGN.md).
 
 State lives under `~/.cbth` by default. Use `--home <path>` or `CBTH_HOME` for tests and isolated runs.
 The local-store and daemon IPC semantics are supported on macOS and Linux; pure Windows support is out of scope until the IPC, atomic-replace, and directory-sync contracts are designed separately.
@@ -236,7 +237,7 @@ The current CLI shared-server PoC is [scripts/cli_shared_app_server_poc.mjs](scr
 
 In addition to the protocol-level PoC, the shared-server CLI route has also been validated against a real foreground TUI session running through `codex --remote`, confirming that the user-facing TUI output reflects the sidecar-triggered turn while the foreground stays on the same caller thread used in the PTY validation. That PTY validation matches the current loopback-only upstream surface available in `codex-cli 0.123.0`.
 
-The current CLI active-turn steering PoC is [scripts/cli_turn_steer_poc.mjs](scripts/cli_turn_steer_poc.mjs). It starts a long-running turn, submits `turn/steer` from a second client while that turn is still active, and validates that the same turn completes normally instead of ending early.
+The current CLI active-turn steering PoC is [scripts/cli_turn_steer_poc.mjs](scripts/cli_turn_steer_poc.mjs). It starts a long-running turn, submits `turn/steer` from a second client while that turn is still active, and validates that the same turn completes normally instead of ending early. The PoC is narrow evidence for the future gated contract in [docs/CLI_ACTIVE_TURN_STEER_DESIGN.md](docs/CLI_ACTIVE_TURN_STEER_DESIGN.md); automatic steer remains disabled.
 
 ## Planned Implementation Direction
 

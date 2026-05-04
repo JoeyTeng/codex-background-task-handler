@@ -772,7 +772,7 @@ cooldown -> superseded
 - `turn/steer` 不是共享核心的默认投递手段。
 - 它只是 CLI adapter 的受限优化。
 - 默认行为仍然应当是“等 caller idle 后再投递 batch”。
-- 第一版默认 shipping 配置中，`turn/steer` 应视为关闭；只有在 capability probe 与 active-turn 分类能力都成熟后，才作为 feature flag 打开。
+- 第一版默认 shipping 配置中，`turn/steer` 应视为关闭；只有在 capability probe 与 active-turn 分类能力都成熟后，才作为 feature flag 打开。CLI 侧未来合同见 [CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md)。
 - 这里的 active-turn 分类不能只看 batch 自己的 delivery policy，还必须同时有一份可机判的当前 turn 风险视图，至少包括：
   - `active_turn_kind`
   - `active_turn_requires_approval`

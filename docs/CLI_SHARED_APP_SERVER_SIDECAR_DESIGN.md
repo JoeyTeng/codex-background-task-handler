@@ -258,7 +258,7 @@ capabilities.experimentalApi = true
 - 但如果要支持 `cbth cli run --new-thread` 这种 fresh-thread bootstrap，capability probe 还必须额外证明 `thread/start` 可用。
 - 如果缺少 `turn/steer`，CLI adapter 仍可工作，但只能在 caller idle 时投递。
 - 不能把 PoC 中碰巧可用的实验 RPC 直接当成长期稳定契约。
-- 第一版 shipping 配置默认关闭 `turn/steer`，直到 active-turn 分类与安全门槛被实证支持。
+- 第一版 shipping 配置默认关闭 `turn/steer`，直到 active-turn 分类与安全门槛被实证支持；未来合同收敛在 [CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md)。
 
 ## 已实证支持的关键能力
 
