@@ -54,7 +54,7 @@ The supported release assets are currently Linux x86_64 glibc and macOS arm64, i
 Install the latest GitHub Release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JoeyTeng/codex-background-task-handler/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/JoeyTeng/codex-background-task-handler/HEAD/scripts/install.sh | sh
 command -v cbth
 cbth doctor cli
 ```
