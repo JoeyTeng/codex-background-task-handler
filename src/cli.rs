@@ -2232,6 +2232,7 @@ fn reject_cli_auto_delivery_permanent_before_accept(
         },
         true,
     )?;
+    stop_passive_adapter_after_session_parked(state, running);
     record_cli_auto_delivery_audit(
         config,
         CliAutoDeliveryAuditEvent {
@@ -2244,7 +2245,6 @@ fn reject_cli_auto_delivery_permanent_before_accept(
             details: json!({ "error": error.message() }),
         },
     )?;
-    stop_passive_adapter_after_session_parked(state, running);
     Ok(())
 }
 
