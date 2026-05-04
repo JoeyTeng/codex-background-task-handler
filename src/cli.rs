@@ -336,7 +336,7 @@ enum AuditCommand {
 #[derive(Debug, Subcommand)]
 enum CliCommand {
     Run(CliRunArgs),
-    #[command(hide = true)]
+    #[command(about = "Inspect and recover managed CLI sessions")]
     Session {
         #[command(subcommand)]
         command: CliSessionCommand,
@@ -345,11 +345,20 @@ enum CliCommand {
 
 #[derive(Debug, Subcommand)]
 enum CliSessionCommand {
+    #[command(hide = true)]
     Bind(CliSessionBindArgs),
+    #[command(hide = true)]
     NoteActivity(CliSessionNoteActivityArgs),
+    #[command(hide = true)]
     NoteCapabilities(CliSessionNoteCapabilitiesArgs),
+    #[command(hide = true)]
     InvalidateProof(CliSessionInvalidateProofArgs),
+    #[command(about = "Inspect one managed CLI session")]
     Inspect(CliSessionInspectArgs),
+    #[command(about = "List managed CLI sessions")]
+    List(CliSessionListArgs),
+    #[command(about = "Retire a detached, parked, or stale managed CLI session")]
+    Retire(CliSessionRetireArgs),
 }
 
 #[derive(Debug, Args)]
@@ -764,6 +773,51 @@ struct CliSessionInvalidateProofArgs {
 struct CliSessionInspectArgs {
     #[arg(long)]
     managed_session_id: String,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum CliSessionStateFilter {
+    Live,
+    Detached,
+    Parked,
+    Stale,
+    Retired,
+}
+
+impl CliSessionStateFilter {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Detached => "detached",
+            Self::Parked => "parked",
+            Self::Stale => "stale",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct CliSessionListArgs {
+    #[arg(long)]
+    bound_thread_id: Option<String>,
+
+    #[arg(long, value_enum)]
+    state: Option<CliSessionStateFilter>,
+
+    #[arg(long, default_value_t = 50)]
+    limit: i64,
+}
+
+#[derive(Debug, Args)]
+struct CliSessionRetireArgs {
+    #[arg(long)]
+    managed_session_id: String,
+
+    #[arg(long)]
+    reason: String,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -3274,6 +3328,24 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             }
             argv
         }
+        Commands::Cli {
+            command:
+                CliCommand::Session {
+                    command: CliSessionCommand::Retire(args),
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("cli"),
+                OsString::from("session"),
+                OsString::from("retire"),
+            ];
+            push_string_arg(&mut argv, "--managed-session-id", &args.managed_session_id);
+            push_string_arg(&mut argv, "--reason", &args.reason);
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
         Commands::Maintenance {
             command: MaintenanceCommand::Sweep(args),
         } => {
@@ -3308,7 +3380,7 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
         | Commands::Cli {
             command:
                 CliCommand::Session {
-                    command: CliSessionCommand::Inspect(_),
+                    command: CliSessionCommand::Inspect(_) | CliSessionCommand::List(_),
                 },
         }
         | Commands::Doctor { .. }
@@ -4261,6 +4333,31 @@ fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
                 let session = store.inspect_cli_managed_session(&args.managed_session_id)?;
                 Ok(json!({ "cli_session": session }))
             }
+            CliSessionCommand::List(args) => {
+                validate_limit(args.limit)?;
+                if let Some(bound_thread_id) = &args.bound_thread_id {
+                    validate_nonempty("bound_thread_id", bound_thread_id)?;
+                }
+                let sessions = store.list_cli_managed_sessions(
+                    args.bound_thread_id.as_deref(),
+                    args.state.as_ref().map(CliSessionStateFilter::as_str),
+                    args.limit,
+                )?;
+                Ok(json!({ "cli_sessions": sessions }))
+            }
+            CliSessionCommand::Retire(args) => {
+                validate_nonempty("reason", &args.reason)?;
+                let now = match args.now {
+                    Some(value) => value,
+                    None => now_epoch_seconds()?,
+                };
+                let retirement = store.retire_cli_managed_session(
+                    &args.managed_session_id,
+                    &args.reason,
+                    now,
+                )?;
+                Ok(json!({ "cli_session": retirement }))
+            }
         },
     }
 }
@@ -4271,7 +4368,8 @@ fn cli_command_uses_lifecycle_store_timeout(command: &CliCommand) -> bool {
         CliCommand::Session {
             command: CliSessionCommand::NoteActivity(_)
                 | CliSessionCommand::NoteCapabilities(_)
-                | CliSessionCommand::InvalidateProof(_),
+                | CliSessionCommand::InvalidateProof(_)
+                | CliSessionCommand::Retire(_),
         }
     )
 }
@@ -4389,6 +4487,10 @@ fn validate_positive_max(name: &str, value: i64, max: i64) -> Result<()> {
     } else {
         bail!("{name} must be <= {max}")
     }
+}
+
+fn validate_limit(limit: i64) -> Result<()> {
+    validate_positive_max("limit", limit, 1000)
 }
 
 fn validate_nonzero_u64(name: &str, value: u64) -> Result<()> {

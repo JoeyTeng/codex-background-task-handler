@@ -184,6 +184,17 @@ fn bind_idle_cli_session(home: &TempDir, bound_thread_id: &str) -> String {
     managed_session_id
 }
 
+fn set_cli_session_state(home: &TempDir, managed_session_id: &str, state: &str) {
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE cli_managed_sessions
+         SET session_state = ?, updated_at = updated_at + 1
+         WHERE managed_session_id = ?",
+        params![state, managed_session_id],
+    )
+    .expect("set CLI session state");
+}
+
 fn create_accepted_cli_attempt(
     home: &TempDir,
     source_thread_id: &str,
@@ -567,7 +578,298 @@ fn cli_session_bind_rejects_profile_drift() {
             "false",
         ],
     );
-    assert!(stderr.contains("profile does not match requested profile"));
+    assert!(stderr.contains("is live"));
+}
+
+#[test]
+fn cli_session_list_and_retire_detached_session() {
+    let home = tempfile::tempdir().expect("temp home");
+    let managed_session_id = bind_cli_session(&home, "thread-cli-retire-detached");
+    set_cli_session_state(&home, &managed_session_id, "detached");
+
+    let listed = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "list",
+            "--bound-thread-id",
+            "thread-cli-retire-detached",
+            "--state",
+            "detached",
+        ],
+    );
+    assert_eq!(
+        listed["cli_sessions"].as_array().expect("sessions").len(),
+        1
+    );
+    assert_eq!(
+        listed["cli_sessions"][0]["managed_session_id"],
+        managed_session_id
+    );
+
+    let retired = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "retire",
+            "--managed-session-id",
+            &managed_session_id,
+            "--reason",
+            "operator cleanup after foreground exit",
+            "--now",
+            "500",
+        ],
+    );
+    assert_eq!(
+        retired["cli_session"]["session"]["session_state"],
+        "retired"
+    );
+    assert_eq!(retired["cli_session"]["session"]["retired_at"], 500);
+
+    let audit = cbth(
+        &home,
+        &[
+            "audit",
+            "list",
+            "--source-thread-id",
+            "thread-cli-retire-detached",
+        ],
+    );
+    assert_eq!(audit["audit"][0]["decision"], "operator_retire");
+    assert_eq!(
+        audit["audit"][0]["reason"],
+        "operator cleanup after foreground exit"
+    );
+}
+
+#[test]
+fn cli_session_retire_rejects_unsafe_states_and_blockers() {
+    let home = tempfile::tempdir().expect("temp home");
+    let live_session = bind_cli_session(&home, "thread-cli-retire-live");
+    let live_stderr = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "retire",
+            "--managed-session-id",
+            &live_session,
+            "--reason",
+            "unsafe",
+        ],
+    );
+    assert!(live_stderr.contains("is live"));
+
+    let (_batch_id, _attempt_id, active_session) =
+        create_accepted_cli_attempt(&home, "thread-cli-retire-active", "turn-active");
+    set_cli_session_state(&home, &active_session, "detached");
+    let active_stderr = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "retire",
+            "--managed-session-id",
+            &active_session,
+            "--reason",
+            "active attempt",
+        ],
+    );
+    assert!(active_stderr.contains("active delivery attempt"));
+
+    let (_manual_batch_id, manual_attempt_id, manual_session) =
+        create_accepted_cli_attempt(&home, "thread-cli-retire-manual", "turn-manual");
+    cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &manual_attempt_id,
+            "--delivery-turn-id",
+            "turn-manual",
+            "--turn-event",
+            "turn-failed",
+            "--now",
+            "1200",
+        ],
+    );
+    let parked = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &manual_session,
+        ],
+    );
+    assert_eq!(parked["cli_session"]["session_state"], "parked");
+
+    let manual_stderr = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "retire",
+            "--managed-session-id",
+            &manual_session,
+            "--reason",
+            "manual pending",
+        ],
+    );
+    assert!(manual_stderr.contains("manual_resolution_only head batch"));
+}
+
+#[test]
+fn cli_session_bind_replaces_retire_eligible_detached_profile_drift() {
+    let home = tempfile::tempdir().expect("temp home");
+    let old_session = bind_cli_session(&home, "thread-cli-replace-detached");
+    set_cli_session_state(&home, &old_session, "detached");
+
+    let replaced = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-replace-detached",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "true",
+            "--session-allows-write-access",
+            "false",
+            "--now",
+            "700",
+        ],
+    );
+    assert_eq!(replaced["cli_session"]["outcome"], "replaced");
+    let new_session = replaced["cli_session"]["session"]["managed_session_id"]
+        .as_str()
+        .expect("new managed session id");
+    assert_ne!(new_session, old_session);
+    assert_eq!(
+        replaced["cli_session"]["session"]["session_allows_network"],
+        true
+    );
+
+    let old = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &old_session,
+        ],
+    );
+    assert_eq!(old["cli_session"]["session_state"], "retired");
+}
+
+#[test]
+fn cli_session_bind_replaces_parked_after_manual_batch_closes() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (_batch_id, attempt_id, old_session) =
+        create_accepted_cli_attempt(&home, "thread-cli-replace-parked", "turn-parked");
+    cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-parked",
+            "--turn-event",
+            "turn-interrupted",
+            "--now",
+            "1300",
+        ],
+    );
+
+    let blocked = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-replace-parked",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+        ],
+    );
+    assert!(blocked.contains("manual_resolution_only head batch"));
+
+    cbth(
+        &home,
+        &[
+            "batch",
+            "close-head",
+            "--source-thread-id",
+            "thread-cli-replace-parked",
+            "--reason",
+            "operator-closed-unconfirmed",
+            "--note",
+            "operator resolved manual batch",
+        ],
+    );
+
+    let replaced = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-replace-parked",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+        ],
+    );
+    assert_eq!(replaced["cli_session"]["outcome"], "replaced");
+    assert_ne!(
+        replaced["cli_session"]["session"]["managed_session_id"],
+        old_session
+    );
+}
+
+#[test]
+fn cli_session_bind_rejects_replacement_with_active_attempt() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (_batch_id, _attempt_id, managed_session_id) =
+        create_accepted_cli_attempt(&home, "thread-cli-active-attach", "turn-active-attach");
+    set_cli_session_state(&home, &managed_session_id, "detached");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-active-attach",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "true",
+            "--session-allows-write-access",
+            "false",
+        ],
+    );
+    assert!(stderr.contains("active delivery attempt"));
 }
 
 #[test]
@@ -1620,6 +1922,7 @@ fn cli_turn_observation_completed_closes_batch() {
         ],
     );
     assert_eq!(session["cli_session"]["session_epoch"], 2);
+    assert_eq!(session["cli_session"]["session_state"], "live");
     assert_eq!(session["cli_session"]["activity_state"], "unknown");
 
     let retried = cbth(
@@ -2819,6 +3122,28 @@ fn maintenance_sweep_abandons_stale_cli_accept_pending_attempt() {
             "operator-closed-unconfirmed",
         ],
     );
+    let replacement = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-stale-accept",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+        ],
+    );
+    assert_eq!(replacement["cli_session"]["outcome"], "replaced");
+    let replacement_session_id = replacement["cli_session"]["session"]["managed_session_id"]
+        .as_str()
+        .expect("replacement managed session id")
+        .to_owned();
+    assert_ne!(replacement_session_id, managed_session_id);
     let missing_capabilities = cbth_failure(
         &home,
         &[
@@ -2827,9 +3152,9 @@ fn maintenance_sweep_abandons_stale_cli_accept_pending_attempt() {
             "--batch-id",
             second_batch_id,
             "--managed-session-id",
-            &managed_session_id,
+            &replacement_session_id,
             "--session-epoch",
-            "2",
+            "1",
             "--rpc-kind",
             "turn-start",
             "--rpc-request-id",
@@ -2837,7 +3162,7 @@ fn maintenance_sweep_abandons_stale_cli_accept_pending_attempt() {
         ],
     );
     assert!(missing_capabilities.contains("minimum turn_start capability probe"));
-    note_cli_session_minimum_capabilities(&home, &managed_session_id);
+    note_cli_session_minimum_capabilities(&home, &replacement_session_id);
     let not_idle = cbth_failure(
         &home,
         &[
@@ -2846,9 +3171,9 @@ fn maintenance_sweep_abandons_stale_cli_accept_pending_attempt() {
             "--batch-id",
             second_batch_id,
             "--managed-session-id",
-            &managed_session_id,
+            &replacement_session_id,
             "--session-epoch",
-            "2",
+            "1",
             "--rpc-kind",
             "turn-start",
             "--rpc-request-id",
@@ -2856,7 +3181,7 @@ fn maintenance_sweep_abandons_stale_cli_accept_pending_attempt() {
         ],
     );
     assert!(not_idle.contains("not idle"));
-    note_cli_session_idle(&home, &managed_session_id);
+    note_cli_session_idle(&home, &replacement_session_id);
     let second_attempt = cbth(
         &home,
         &[
@@ -2865,9 +3190,9 @@ fn maintenance_sweep_abandons_stale_cli_accept_pending_attempt() {
             "--batch-id",
             second_batch_id,
             "--managed-session-id",
-            &managed_session_id,
+            &replacement_session_id,
             "--session-epoch",
-            "2",
+            "1",
             "--rpc-kind",
             "turn-start",
             "--rpc-request-id",

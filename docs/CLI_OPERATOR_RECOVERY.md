@@ -18,6 +18,13 @@ cbth batch inspect-head --source-thread-id <thread-id>
 cbth audit list --source-thread-id <thread-id> --limit 50
 ```
 
+Inspect the managed CLI session bound to the caller thread:
+
+```bash
+cbth cli session list --bound-thread-id <thread-id>
+cbth cli session inspect --managed-session-id <managed-session-id>
+```
+
 If the head batch has already closed and `inspect-head` no longer finds it, use the `batch_id` from audit or task/job output:
 
 ```bash
@@ -72,6 +79,22 @@ cbth batch close-head \
 ```
 
 Do not manually edit the SQLite database or task log files. Use the CLI so audit records, artifact retention, and daemon lifecycle state stay consistent.
+
+## Session Retirement
+
+Managed CLI sessions can outlive a foreground `codex --remote` process. After foreground teardown, `cbth` marks the session `detached` and clears proof so stale idle/capability evidence cannot open a new automatic delivery. If delivery fails closed into `manual_resolution_only`, the session becomes `parked` until the manual head batch is closed or swept.
+
+After manual recovery is complete, retire an old non-live session before reusing the thread with a different risk profile or replacing a stale record:
+
+```bash
+cbth cli session retire \
+  --managed-session-id <managed-session-id> \
+  --reason "operator cleanup after manual recovery"
+```
+
+Retirement is fail-closed. It refuses `live` sessions, sessions that still own active delivery attempts, and sessions whose bound thread still has an open `manual_resolution_only` head batch. In those cases, inspect the head batch or attempt first, close the manual head batch when you have made a decision, then retry `cli session retire` or `cli run`.
+
+`cbth cli run --bind-thread-id ...` can automatically retire and replace `detached`, `parked`, or `stale` records only after the same safety checks pass. It never creates a second non-retired session for the same bound thread.
 
 ## Maintenance And Cleanup
 

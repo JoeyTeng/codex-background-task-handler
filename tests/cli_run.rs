@@ -2028,7 +2028,7 @@ fn cli_run_binds_session_starts_foreground_codex_and_stops_app_server() {
         )
         .expect("query managed session");
     assert!(!managed_session_id.is_empty());
-    assert_eq!(session_state, "live");
+    assert_eq!(session_state, "detached");
     assert_eq!(session_epoch, 2);
     assert_eq!(activity_state, "unknown");
     assert_eq!(activity_revision, 0);
@@ -2145,7 +2145,7 @@ fn cli_run_new_thread_bootstraps_thread_then_preserves_foreground_model() {
         )
         .expect("query managed session");
     assert_eq!(session_count, 1);
-    assert_eq!(session_state, "live");
+    assert_eq!(session_state, "detached");
     stop_daemon(&home);
 }
 

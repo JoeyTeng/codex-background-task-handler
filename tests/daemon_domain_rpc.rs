@@ -707,7 +707,7 @@ fn daemon_routed_on_time_cli_turn_completion_survives_startup_sweep() {
 }
 
 #[test]
-fn daemon_routed_bind_after_startup_sweep_blocks_delayed_completion() {
+fn daemon_routed_blocked_bind_after_startup_sweep_preserves_delayed_completion_reconcile() {
     let home = temp_home();
     let (batch_id, attempt_id) = create_accepted_cli_attempt_direct(
         &home,
@@ -716,7 +716,7 @@ fn daemon_routed_bind_after_startup_sweep_blocks_delayed_completion() {
         "rpc-request-bind-after-startup-sweep",
     );
 
-    let attached = cbth(
+    let blocked = cbth_failure(
         &home,
         &[
             "cli",
@@ -734,14 +734,11 @@ fn daemon_routed_bind_after_startup_sweep_blocks_delayed_completion() {
             "1062",
         ],
     );
-    assert_eq!(attached["cli_session"]["outcome"], "attached");
+    assert!(blocked.contains("manual_resolution_only head batch"));
 
     let expired = cbth(&home, &["attempt", "inspect", "--attempt-id", &attempt_id]);
     assert_eq!(expired["attempt"]["state"], "abandoned");
-    assert_eq!(
-        expired["attempt"]["delivery_observation_state"],
-        "abandoned"
-    );
+    assert_eq!(expired["attempt"]["delivery_observation_state"], "expired");
 
     let observed = cbth(
         &home,
@@ -758,10 +755,10 @@ fn daemon_routed_bind_after_startup_sweep_blocks_delayed_completion() {
             "1060",
         ],
     );
-    assert_eq!(observed["attempt"]["state"], "abandoned");
+    assert_eq!(observed["attempt"]["state"], "closed");
     assert_eq!(
         observed["attempt"]["delivery_observation_state"],
-        "abandoned"
+        "completed"
     );
     assert_eq!(
         observed["attempt"]["last_observed_turn_event"],
@@ -769,12 +766,8 @@ fn daemon_routed_bind_after_startup_sweep_blocks_delayed_completion() {
     );
 
     let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
-    assert_eq!(batch["batch"]["batch"]["state"], "open");
-    assert_eq!(
-        batch["batch"]["batch"]["replay_policy"],
-        "manual_resolution_only"
-    );
-    assert!(batch["batch"]["batch"]["close_reason"].is_null());
+    assert_eq!(batch["batch"]["batch"]["state"], "closed");
+    assert_eq!(batch["batch"]["batch"]["close_reason"], "delivered");
 
     cbth(&home, &["daemon", "stop"]);
     wait_for_socket_removed(&home);
