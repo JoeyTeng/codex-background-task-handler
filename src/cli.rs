@@ -1889,7 +1889,6 @@ fn maybe_run_cli_auto_delivery(
             reject_cli_auto_delivery_permanent_before_accept(
                 config,
                 state,
-                client,
                 running,
                 CliAutoDeliveryPendingAttempt {
                     source_thread_id: &source_thread_id,
@@ -2206,7 +2205,6 @@ fn cleanup_cli_auto_delivery_before_start_after_error(
 fn reject_cli_auto_delivery_permanent_before_accept(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
-    client: &mut AppServerJsonRpcClient,
     running: &AtomicBool,
     pending: CliAutoDeliveryPendingAttempt<'_>,
     error: &AppServerRequestError,
@@ -2234,7 +2232,8 @@ fn reject_cli_auto_delivery_permanent_before_accept(
             details: json!({ "error": error.message() }),
         },
     )?;
-    resync_passive_adapter_after_durable_invalidation(config, state, client, Some(running))
+    stop_passive_adapter_after_session_parked(state, running);
+    Ok(())
 }
 
 fn remote_error_is_retryable_pre_accept_rejection(error: &AppServerRequestError) -> bool {
@@ -2267,7 +2266,7 @@ fn observe_cli_auto_delivery_turn(
     }
     while running.load(Ordering::Acquire) {
         if accepted_cli_observation_deadline_elapsed(&accepted)? {
-            expire_cli_auto_delivery_observation(config, state, client, running, &accepted)?;
+            expire_cli_auto_delivery_observation(config, state, running, &accepted)?;
             return Ok(());
         }
         match client.recv(accepted_cli_observation_recv_timeout(&accepted)?)? {
@@ -2319,7 +2318,6 @@ fn accepted_cli_observation_recv_timeout(accepted: &CliAcceptedTurn) -> Result<D
 fn expire_cli_auto_delivery_observation(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
-    client: &mut AppServerJsonRpcClient,
     running: &AtomicBool,
     accepted: &CliAcceptedTurn,
 ) -> Result<()> {
@@ -2346,7 +2344,7 @@ fn expire_cli_auto_delivery_observation(
             }),
         },
     );
-    let _ = resync_passive_adapter_after_durable_invalidation(config, state, client, Some(running));
+    stop_passive_adapter_after_session_parked(state, running);
     Ok(())
 }
 
@@ -2357,6 +2355,7 @@ fn abandon_cli_auto_delivery_after_observation_connection_loss(
     accepted: &CliAcceptedTurn,
 ) -> Result<()> {
     invalidate_passive_adapter_proof(config, state, Some(running))?;
+    stop_passive_adapter_after_session_parked(state, running);
     record_cli_auto_delivery_audit_best_effort(
         config,
         CliAutoDeliveryAuditEvent {
@@ -2555,7 +2554,24 @@ fn observe_cli_auto_delivery_terminal(
             }),
         },
     );
+    if !matches!(turn_event, CliTurnEvent::Completed) {
+        stop_passive_adapter_after_session_parked(state, running);
+        return Ok(());
+    }
     resync_passive_adapter_after_durable_invalidation(config, state, client, Some(running))
+}
+
+fn stop_passive_adapter_after_session_parked(
+    state: &mut CliAppServerPassiveAdapterState,
+    running: &AtomicBool,
+) {
+    state.activity_revision = 0;
+    state.capability_revision = 0;
+    state.last_activity_state = None;
+    state.passive_capabilities_recorded = false;
+    state.durable_proof_may_exist = false;
+    state.last_auto_delivery_poll = None;
+    running.store(false, Ordering::Release);
 }
 
 fn resync_passive_adapter_after_durable_invalidation(
