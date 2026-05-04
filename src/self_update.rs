@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use semver::Version;
@@ -21,6 +22,9 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 const MAX_RELEASE_JSON_BYTES: u64 = 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
+const GITHUB_HTTP_GLOBAL_TIMEOUT: Duration = Duration::from_secs(120);
+const GITHUB_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const GITHUB_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub struct SelfUpdateOptions {
@@ -196,6 +200,13 @@ fn http_get_bytes(url: &str, limit: u64) -> Result<Vec<u8>> {
 fn github_get(url: &str) -> Result<ureq::RequestBuilder<ureq::typestate::WithoutBody>> {
     let user_agent = format!("cbth/{}", env!("CARGO_PKG_VERSION"));
     let mut request = ureq::get(url)
+        .config()
+        .timeout_global(Some(GITHUB_HTTP_GLOBAL_TIMEOUT))
+        .timeout_resolve(Some(GITHUB_HTTP_CONNECT_TIMEOUT))
+        .timeout_connect(Some(GITHUB_HTTP_CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(GITHUB_HTTP_READ_TIMEOUT))
+        .timeout_recv_body(Some(GITHUB_HTTP_READ_TIMEOUT))
+        .build()
         .header("User-Agent", user_agent)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28");
