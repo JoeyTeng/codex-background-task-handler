@@ -8354,6 +8354,10 @@ mod tests {
             supervised_task_process_state(&control).expect("process state"),
             SupervisedTaskProcessState::Completing
         );
+        let gone_deadline = Instant::now() + Duration::from_secs(2);
+        while process_group_exists(pid) && Instant::now() < gone_deadline {
+            thread::sleep(TASK_WAIT_POLL_INTERVAL);
+        }
         assert!(
             !process_group_exists(pid),
             "stream spool failure should terminate the running task group"
