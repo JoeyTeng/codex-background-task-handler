@@ -4,7 +4,7 @@
 
 - [x] 用 live PR 验证 repo 内部子项目 [tools/codex-review-gate](../tools/codex-review-gate/README.md) 的 reaction-driven gate，然后配置 required status check 和 conversations-resolved branch protection。
 - [x] 合入 `codex/review-gate-review-body-findings` 后，在 #12 或后续测试 PR 上验证 Codex review-body findings 会让 `codex/review-gate` deterministic failure，而旧 commit 的 review-body findings 不会 block 新 head。
-- [ ] 合入 `codex/review-gate-resolved-threads` 后，在 #12 或后续测试 PR 上验证已 resolved / outdated 的旧 Codex inline review thread 不会被 REST `commit_id` remap 误判为 current-head blocker。
+- [x] 合入 `codex/review-gate-resolved-threads` 后，在 #12 或后续测试 PR 上验证已 resolved / outdated 的旧 Codex inline review thread 不会被 REST `commit_id` remap 误判为 current-head blocker。证据：PR #14 comment `3148673469` 的 REST `commit_id` remap 到 head `6a2d9e57...`，GraphQL thread `isResolved=true`，workflow run `25316273973` 通过。
 - [x] 把 deterministic fake e2e 纳入默认 Rust gate：job/batch/attempt delivered path 与 `cbth cli run` passive no-delivery-RPC guard 都由 `cargo test --locked` 覆盖。
 - [x] 实现 Phase 11b `cbth cli run --auto-delivery-policy trusted-all`：
   - [x] 默认 passive 仍不发送 `turn/start`

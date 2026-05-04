@@ -14,4 +14,12 @@
 - [x] Filter inline Codex findings through GraphQL review-thread state so resolved or outdated threads do not block a later head.
 - [x] Validate on a live PR before adding `codex/review-gate` to required status checks.
 - [x] Configure branch protection to require both `codex/review-gate` and all conversations resolved.
-- [ ] After this branch lands, rerun #12 or a successor PR to confirm a resolved outdated Codex thread no longer blocks marker creation.
+- [x] After this branch lands, rerun #12 or a successor PR to confirm a resolved outdated Codex thread no longer blocks marker creation.
+
+## Live validation evidence
+
+- 2026-05-04: reran `codex-review-gate.yml` via `workflow_dispatch` on PR #14.
+- Evidence target: PR #14 head `6a2d9e57e6dff257f1ea4a81f4a0cca96768a383`, GraphQL thread `PRRT_kwDOSJZ-as594_hR`, Codex comment `3148673469`.
+- REST remap shape: comment `3148673469` reports `commit_id=6a2d9e57e6dff257f1ea4a81f4a0cca96768a383` while `original_commit_id=07172b85d5404b65a9a3400bf63831a4ef8c4fa8`.
+- GraphQL thread state: `isResolved=true`, `isOutdated=false`.
+- Gate result: run `25316273973` passed with status `Codex completion observed and current head has no Codex findings`, proving the resolved remapped inline thread did not block marker creation or final success.
