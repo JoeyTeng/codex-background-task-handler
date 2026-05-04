@@ -17,11 +17,11 @@ use crate::models::{
     ArtifactRecord, AuditDecisionRecord, BatchInspect, BatchJobRecord, BatchRecord,
     CliManagedSessionActivityUpdate, CliManagedSessionAttach, CliManagedSessionCapabilities,
     CliManagedSessionCapabilityUpdate, CliManagedSessionProfile,
-    CliManagedSessionProofInvalidation, CliManagedSessionRecord, DEFAULT_REDELIVERY_WINDOW_SECONDS,
-    DaemonLifecycleStatus, DeliveryAttemptRecord, DeliveryPolicy, JobRecord,
-    LostPendingTaskProcess, NewArtifact, NewAuditDecision, NewBatch, NewCliAcceptPendingAttempt,
-    NewJob, NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
-    TaskRecord,
+    CliManagedSessionProofInvalidation, CliManagedSessionRecord, CliManagedSessionRetirement,
+    DEFAULT_REDELIVERY_WINDOW_SECONDS, DaemonLifecycleStatus, DeliveryAttemptRecord,
+    DeliveryPolicy, JobRecord, LostPendingTaskProcess, NewArtifact, NewAuditDecision, NewBatch,
+    NewCliAcceptPendingAttempt, NewJob, NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS,
+    POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport, TaskRecord,
 };
 
 const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
@@ -919,61 +919,58 @@ impl Store {
         if let Some(existing) =
             query_non_retired_cli_managed_session_by_thread_tx(&tx, bound_thread_id)?
         {
-            ensure_cli_session_profile_matches(&existing, &profile)?;
-            ensure_cli_session_attachable(&existing)?;
-            abandon_cli_observations_for_session_epoch_loss_tx(
+            if ensure_cli_session_profile_matches(&existing, &profile).is_ok()
+                && ensure_cli_session_attachable(&existing).is_ok()
+            {
+                ensure_cli_session_has_no_recovery_blockers_tx(&tx, &existing, "reattaching")?;
+                abandon_cli_observations_for_session_epoch_loss_tx(
+                    &tx,
+                    &existing.managed_session_id,
+                    now,
+                )?;
+                tx.execute(
+                    "UPDATE cli_managed_sessions
+                     SET session_state = 'live',
+                         session_epoch = session_epoch + 1,
+                         activity_state = 'unknown',
+                         activity_revision = 0,
+                         capability_revision = 0,
+                         capability_thread_resume = 0,
+                         capability_turn_start = 0,
+                         capability_current_state_sync = 0,
+                         capability_turn_completed_event = 0,
+                         capability_negative_terminal_events = 0,
+                         capability_thread_start = 0,
+                         capability_turn_steer = 0,
+                         updated_at = ?
+                     WHERE managed_session_id = ?",
+                    params![now, existing.managed_session_id],
+                )?;
+                let session = query_cli_managed_session_tx(&tx, &existing.managed_session_id)?;
+                tx.commit()?;
+                return Ok(CliManagedSessionAttach {
+                    outcome: "attached".to_owned(),
+                    session,
+                });
+            }
+
+            ensure_cli_session_retire_eligible_tx(&tx, &existing)?;
+            retire_cli_managed_session_tx(
                 &tx,
-                &existing.managed_session_id,
+                &existing,
+                "auto_replace",
+                "auto-replaced by cli session bind",
                 now,
             )?;
-            tx.execute(
-                "UPDATE cli_managed_sessions
-                 SET session_state = 'live',
-                     session_epoch = session_epoch + 1,
-                     activity_state = 'unknown',
-                     activity_revision = 0,
-                     capability_revision = 0,
-                     capability_thread_resume = 0,
-                     capability_turn_start = 0,
-                     capability_current_state_sync = 0,
-                     capability_turn_completed_event = 0,
-                     capability_negative_terminal_events = 0,
-                     capability_thread_start = 0,
-                     capability_turn_steer = 0,
-                     updated_at = ?
-                 WHERE managed_session_id = ?",
-                params![now, existing.managed_session_id],
-            )?;
-            let session = query_cli_managed_session_tx(&tx, &existing.managed_session_id)?;
+            let session = create_cli_managed_session_tx(&tx, bound_thread_id, &profile, now)?;
             tx.commit()?;
             return Ok(CliManagedSessionAttach {
-                outcome: "attached".to_owned(),
+                outcome: "replaced".to_owned(),
                 session,
             });
         }
 
-        let managed_session_id = new_id();
-        tx.execute(
-            "INSERT INTO cli_managed_sessions (
-                managed_session_id, bound_thread_id, session_epoch, session_state,
-                activity_state, activity_revision, capability_revision,
-                capability_thread_resume, capability_turn_start,
-                capability_current_state_sync, capability_turn_completed_event,
-                capability_negative_terminal_events, capability_thread_start,
-                capability_turn_steer, session_allows_approval, session_allows_network,
-                session_allows_write_access, created_at, updated_at
-            ) VALUES (?, ?, 1, 'live', 'unknown', 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?)",
-            params![
-                managed_session_id,
-                bound_thread_id,
-                bool_to_i64(profile.session_allows_approval),
-                bool_to_i64(profile.session_allows_network),
-                bool_to_i64(profile.session_allows_write_access),
-                now,
-                now,
-            ],
-        )?;
-        let session = query_cli_managed_session_tx(&tx, &managed_session_id)?;
+        let session = create_cli_managed_session_tx(&tx, bound_thread_id, &profile, now)?;
         tx.commit()?;
         Ok(CliManagedSessionAttach {
             outcome: "created".to_owned(),
@@ -981,11 +978,81 @@ impl Store {
         })
     }
 
+    pub fn list_cli_managed_sessions(
+        &self,
+        bound_thread_id: Option<&str>,
+        state: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<CliManagedSessionRecord>> {
+        ensure_positive_value("limit", limit)?;
+        if limit > 1000 {
+            bail!("limit must be <= 1000");
+        }
+        if let Some(state) = state {
+            ensure_cli_session_state_value(state)?;
+        }
+        let sessions = match (bound_thread_id, state) {
+            (Some(bound_thread_id), Some(state)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM cli_managed_sessions
+                     WHERE bound_thread_id = ? AND session_state = ?
+                     ORDER BY updated_at DESC, created_at DESC, managed_session_id DESC
+                     LIMIT ?",
+                )?;
+                rows_to_cli_managed_sessions(stmt.query(params![bound_thread_id, state, limit])?)?
+            }
+            (Some(bound_thread_id), None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM cli_managed_sessions
+                     WHERE bound_thread_id = ?
+                     ORDER BY updated_at DESC, created_at DESC, managed_session_id DESC
+                     LIMIT ?",
+                )?;
+                rows_to_cli_managed_sessions(stmt.query(params![bound_thread_id, limit])?)?
+            }
+            (None, Some(state)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM cli_managed_sessions
+                     WHERE session_state = ?
+                     ORDER BY updated_at DESC, created_at DESC, managed_session_id DESC
+                     LIMIT ?",
+                )?;
+                rows_to_cli_managed_sessions(stmt.query(params![state, limit])?)?
+            }
+            (None, None) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT * FROM cli_managed_sessions
+                     ORDER BY updated_at DESC, created_at DESC, managed_session_id DESC
+                     LIMIT ?",
+                )?;
+                rows_to_cli_managed_sessions(stmt.query(params![limit])?)?
+            }
+        };
+        Ok(sessions)
+    }
+
     pub fn inspect_cli_managed_session(
         &self,
         managed_session_id: &str,
     ) -> Result<CliManagedSessionRecord> {
         query_cli_managed_session(&self.conn, managed_session_id)
+    }
+
+    pub fn retire_cli_managed_session(
+        &mut self,
+        managed_session_id: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<CliManagedSessionRetirement> {
+        ensure_nonempty_value("reason", reason)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
+        ensure_cli_session_retire_eligible_tx(&tx, &session)?;
+        let session = retire_cli_managed_session_tx(&tx, &session, "operator_retire", reason, now)?;
+        tx.commit()?;
+        Ok(CliManagedSessionRetirement { session })
     }
 
     pub fn note_cli_managed_session_activity(
@@ -1091,7 +1158,10 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
-        ensure_cli_session_attachable(&session)?;
+        if !matches!(session.session_state.as_str(), "live" | "detached") {
+            tx.commit()?;
+            return Ok(CliManagedSessionProofInvalidation { session });
+        }
         if session.session_epoch != session_epoch {
             if session.session_epoch > session_epoch && cli_session_proof_is_clear(&session) {
                 tx.commit()?;
@@ -1121,7 +1191,6 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
-        ensure_cli_session_attachable(&session)?;
         if session.bound_thread_id != bound_thread_id {
             bail!(
                 "CLI managed session {} is bound to {}, not {}",
@@ -1129,6 +1198,10 @@ impl Store {
                 session.bound_thread_id,
                 bound_thread_id
             );
+        }
+        if !matches!(session.session_state.as_str(), "live" | "detached") {
+            tx.commit()?;
+            return Ok(CliManagedSessionProofInvalidation { session });
         }
         let session_epoch = session.session_epoch;
         abandon_cli_observations_for_session_epoch_loss_tx(&tx, managed_session_id, now)?;
@@ -1138,6 +1211,7 @@ impl Store {
             Some(session_epoch),
             now,
         )?;
+        detach_cli_managed_session_tx(&tx, managed_session_id, now)?;
         let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
         tx.commit()?;
         Ok(CliManagedSessionProofInvalidation { session })
@@ -1334,6 +1408,60 @@ impl Store {
             attempt.session_epoch,
             rejected_at,
         )?;
+        let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn expire_cli_observation(
+        &mut self,
+        attempt_id: &str,
+        expired_at: i64,
+    ) -> Result<DeliveryAttemptRecord> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
+        if attempt.state == "abandoned"
+            && matches!(
+                attempt.delivery_observation_state.as_deref(),
+                Some("expired" | "abandoned")
+            )
+        {
+            tx.commit()?;
+            return Ok(attempt);
+        }
+        ensure_attempt_tracking_cli_turn_observation(&attempt)?;
+        if !cli_turn_observation_is_after_deadline(&attempt, expired_at)? {
+            bail!(
+                "delivery attempt {} observation deadline has not elapsed",
+                attempt.attempt_id
+            );
+        }
+        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
+        ensure_batch_open(&batch)?;
+        ensure_batch_is_thread_head_tx(&tx, &batch)?;
+        ensure_attempt_is_current_generation_tx(&tx, &attempt)?;
+        let expired_state =
+            if ensure_cli_attempt_has_current_managed_session_for_batch_tx(&tx, &attempt, &batch)
+                .is_ok()
+            {
+                "expired"
+            } else {
+                "abandoned"
+            };
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'abandoned',
+                 delivery_observation_state = ?,
+                 updated_at = ?,
+                 abandoned_at = ?
+             WHERE attempt_id = ?
+               AND state = 'cooldown'
+               AND delivery_observation_state = 'tracking'",
+            params![expired_state, expired_at, expired_at, attempt_id],
+        )?;
+        manualize_cli_batch_after_observation_loss_tx(&tx, &attempt, expired_at)?;
         let record = query_delivery_attempt_tx(&tx, attempt_id)?;
         tx.commit()?;
         Ok(record)
@@ -2370,6 +2498,86 @@ fn close_batch_tx(
     Ok(())
 }
 
+fn create_cli_managed_session_tx(
+    tx: &Transaction<'_>,
+    bound_thread_id: &str,
+    profile: &CliManagedSessionProfile,
+    now: i64,
+) -> Result<CliManagedSessionRecord> {
+    let managed_session_id = new_id();
+    tx.execute(
+        "INSERT INTO cli_managed_sessions (
+            managed_session_id, bound_thread_id, session_epoch, session_state,
+            activity_state, activity_revision, capability_revision,
+            capability_thread_resume, capability_turn_start,
+            capability_current_state_sync, capability_turn_completed_event,
+            capability_negative_terminal_events, capability_thread_start,
+            capability_turn_steer, session_allows_approval, session_allows_network,
+            session_allows_write_access, created_at, updated_at
+        ) VALUES (?, ?, 1, 'live', 'unknown', 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?)",
+        params![
+            managed_session_id,
+            bound_thread_id,
+            bool_to_i64(profile.session_allows_approval),
+            bool_to_i64(profile.session_allows_network),
+            bool_to_i64(profile.session_allows_write_access),
+            now,
+            now,
+        ],
+    )?;
+    query_cli_managed_session_tx(tx, &managed_session_id)
+}
+
+fn retire_cli_managed_session_tx(
+    tx: &Transaction<'_>,
+    session: &CliManagedSessionRecord,
+    decision: &str,
+    reason: &str,
+    now: i64,
+) -> Result<CliManagedSessionRecord> {
+    tx.execute(
+        "UPDATE cli_managed_sessions
+         SET session_state = 'retired',
+             activity_state = 'unknown',
+             activity_revision = 0,
+             capability_revision = 0,
+             capability_thread_resume = 0,
+             capability_turn_start = 0,
+             capability_current_state_sync = 0,
+             capability_turn_completed_event = 0,
+             capability_negative_terminal_events = 0,
+             capability_thread_start = 0,
+             capability_turn_steer = 0,
+             updated_at = ?,
+             retired_at = ?
+         WHERE managed_session_id = ?
+           AND session_state != 'retired'",
+        params![now, now, session.managed_session_id],
+    )?;
+    tx.execute(
+        "INSERT INTO audit_decisions (
+            audit_id, recorded_at, source_thread_id, batch_id, attempt_id,
+            managed_session_id, session_epoch, policy_kind, decision,
+            reason, adapter_kind, details_json
+        ) VALUES (?, ?, ?, NULL, NULL, ?, ?, 'cli_session_recovery', ?, ?, 'cli', ?)",
+        params![
+            new_id(),
+            now,
+            session.bound_thread_id,
+            session.managed_session_id,
+            session.session_epoch,
+            decision,
+            reason,
+            serde_json::json!({
+                "previous_session_state": session.session_state.as_str(),
+                "retired_by": decision,
+            })
+            .to_string(),
+        ],
+    )?;
+    query_cli_managed_session_tx(tx, &session.managed_session_id)
+}
+
 fn query_active_cli_attempt_session_fences_for_batch_tx(
     tx: &Transaction<'_>,
     batch_id: &str,
@@ -2423,6 +2631,51 @@ fn invalidate_cli_managed_session_activity_tx(
     Ok(())
 }
 
+fn detach_cli_managed_session_tx(
+    tx: &Transaction<'_>,
+    managed_session_id: &str,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE cli_managed_sessions
+         SET session_state = 'detached',
+             updated_at = ?
+         WHERE managed_session_id = ?
+           AND session_state IN ('live', 'detached')",
+        params![now, managed_session_id],
+    )?;
+    Ok(())
+}
+
+fn park_cli_managed_session_tx(
+    tx: &Transaction<'_>,
+    managed_session_id: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let Some(managed_session_id) = managed_session_id else {
+        return Ok(());
+    };
+    tx.execute(
+        "UPDATE cli_managed_sessions
+         SET session_state = 'parked',
+             activity_state = 'unknown',
+             activity_revision = 0,
+             capability_revision = 0,
+             capability_thread_resume = 0,
+             capability_turn_start = 0,
+             capability_current_state_sync = 0,
+             capability_turn_completed_event = 0,
+             capability_negative_terminal_events = 0,
+             capability_thread_start = 0,
+             capability_turn_steer = 0,
+             updated_at = ?
+         WHERE managed_session_id = ?
+           AND session_state IN ('live', 'detached', 'stale')",
+        params![now, managed_session_id],
+    )?;
+    Ok(())
+}
+
 fn manualize_cli_batch_after_observation_loss_tx(
     tx: &Transaction<'_>,
     attempt: &DeliveryAttemptRecord,
@@ -2447,7 +2700,8 @@ fn manualize_cli_batch_after_observation_loss_tx(
         attempt.managed_session_id.as_deref(),
         attempt.session_epoch,
         now,
-    )
+    )?;
+    park_cli_managed_session_tx(tx, attempt.managed_session_id.as_deref(), now)
 }
 
 fn manualize_cli_batch_after_pre_accept_rejection_tx(
@@ -2469,7 +2723,7 @@ fn manualize_cli_batch_after_pre_accept_rejection_tx(
            AND state = 'open'",
         params![manual_resolution_window_ends_at, now, attempt.batch_id],
     )?;
-    Ok(())
+    park_cli_managed_session_tx(tx, attempt.managed_session_id.as_deref(), now)
 }
 
 fn abandon_cli_observations_for_session_epoch_loss_tx(
@@ -2507,6 +2761,7 @@ fn abandon_cli_observations_for_session_epoch_loss_tx(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
 
+    let parked = !attempts.is_empty();
     for (attempt_id, batch_id) in attempts {
         tx.execute(
             "UPDATE delivery_attempts
@@ -2536,6 +2791,9 @@ fn abandon_cli_observations_for_session_epoch_loss_tx(
                AND state = 'open'",
             params![manual_resolution_window_ends_at, now, batch_id],
         )?;
+    }
+    if parked {
+        park_cli_managed_session_tx(tx, Some(managed_session_id), now)?;
     }
     Ok(())
 }
@@ -2833,6 +3091,7 @@ fn expire_stale_cli_acceptances_tx(tx: &Transaction<'_>, now: i64) -> Result<usi
             *session_epoch,
             now,
         )?;
+        park_cli_managed_session_tx(tx, managed_session_id.as_deref(), now)?;
     }
     Ok(attempts.len())
 }
@@ -2906,6 +3165,7 @@ fn expire_due_cli_observations_tx(tx: &Transaction<'_>, now: i64) -> Result<usiz
             *session_epoch,
             now,
         )?;
+        park_cli_managed_session_tx(tx, managed_session_id.as_deref(), now)?;
     }
     Ok(attempts.len())
 }
@@ -3140,6 +3400,57 @@ fn query_non_retired_cli_managed_session_by_thread_tx(
          LIMIT 1",
         params![bound_thread_id],
         cli_managed_session_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn rows_to_cli_managed_sessions(
+    mut rows: rusqlite::Rows<'_>,
+) -> Result<Vec<CliManagedSessionRecord>> {
+    let mut sessions = Vec::new();
+    while let Some(row) = rows.next()? {
+        sessions.push(cli_managed_session_from_row(row)?);
+    }
+    Ok(sessions)
+}
+
+fn query_active_delivery_attempt_for_cli_session_tx(
+    tx: &Transaction<'_>,
+    managed_session_id: &str,
+) -> Result<Option<(String, String)>> {
+    tx.query_row(
+        "SELECT attempt_id, state FROM delivery_attempts
+         WHERE adapter_kind = 'cli'
+           AND managed_session_id = ?
+           AND state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown')
+         ORDER BY updated_at DESC, attempt_id DESC
+         LIMIT 1",
+        params![managed_session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn query_open_manual_head_batch_for_thread_tx(
+    tx: &Transaction<'_>,
+    source_thread_id: &str,
+) -> Result<Option<String>> {
+    tx.query_row(
+        "SELECT batch_id FROM batches
+         WHERE source_thread_id = ?
+           AND state = 'open'
+           AND replay_policy = 'manual_resolution_only'
+           AND batch_id = (
+             SELECT batch_id FROM batches
+             WHERE source_thread_id = ?
+               AND state = 'open'
+             ORDER BY created_at ASC, batch_id ASC
+             LIMIT 1
+           )",
+        params![source_thread_id, source_thread_id],
+        |row| row.get(0),
     )
     .optional()
     .map_err(Into::into)
@@ -3677,6 +3988,55 @@ fn ensure_cli_session_profile_matches(
     }
 }
 
+fn ensure_cli_session_retire_eligible_tx(
+    tx: &Transaction<'_>,
+    session: &CliManagedSessionRecord,
+) -> Result<()> {
+    match session.session_state.as_str() {
+        "detached" | "parked" | "stale" => {}
+        "live" => bail!(
+            "CLI managed session {} is live; stop the foreground session before retiring it",
+            session.managed_session_id
+        ),
+        "retired" => bail!(
+            "CLI managed session {} is already retired",
+            session.managed_session_id
+        ),
+        other => bail!(
+            "CLI managed session {} has unsupported state {other}",
+            session.managed_session_id
+        ),
+    }
+    ensure_cli_session_has_no_recovery_blockers_tx(tx, session, "retiring")
+}
+
+fn ensure_cli_session_has_no_recovery_blockers_tx(
+    tx: &Transaction<'_>,
+    session: &CliManagedSessionRecord,
+    action: &str,
+) -> Result<()> {
+    if let Some((attempt_id, state)) =
+        query_active_delivery_attempt_for_cli_session_tx(tx, &session.managed_session_id)?
+    {
+        bail!(
+            "CLI managed session {} has active delivery attempt {} in state {}; resolve it before {action}",
+            session.managed_session_id,
+            attempt_id,
+            state
+        );
+    }
+    if let Some(batch_id) =
+        query_open_manual_head_batch_for_thread_tx(tx, &session.bound_thread_id)?
+    {
+        bail!(
+            "CLI managed session {} is blocked by manual_resolution_only head batch {}; close the head batch before {action}",
+            session.managed_session_id,
+            batch_id
+        );
+    }
+    Ok(())
+}
+
 fn ensure_cli_session_attachable(session: &CliManagedSessionRecord) -> Result<()> {
     match session.session_state.as_str() {
         "live" | "detached" => Ok(()),
@@ -3696,6 +4056,13 @@ fn ensure_cli_session_attachable(session: &CliManagedSessionRecord) -> Result<()
             "CLI managed session {} has unsupported state {other}",
             session.managed_session_id
         ),
+    }
+}
+
+fn ensure_cli_session_state_value(session_state: &str) -> Result<()> {
+    match session_state {
+        "live" | "detached" | "parked" | "stale" | "retired" => Ok(()),
+        other => bail!("unsupported CLI managed session state {other}"),
     }
 }
 

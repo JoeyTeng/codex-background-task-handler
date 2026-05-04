@@ -1065,7 +1065,12 @@ fn accept_fake_app_server_auto_delivery(
         ));
     }
     if terminal_count > 0 {
-        thread::sleep(Duration::from_millis(1500));
+        drain_fake_auto_delivery_post_terminal(
+            &mut stream,
+            &mut methods,
+            thread_id,
+            Duration::from_millis(1500),
+        )?;
     }
     Ok(methods)
 }
@@ -1081,6 +1086,31 @@ fn fake_auto_delivery_done(outcome: FakeAutoDeliveryOutcome, terminal_count: usi
         FakeAutoDeliveryOutcome::TwoCompletedNotifications => terminal_count >= 2,
         _ => terminal_count >= 1,
     }
+}
+
+#[cfg(unix)]
+fn drain_fake_auto_delivery_post_terminal(
+    stream: &mut TcpStream,
+    methods: &mut Vec<String>,
+    thread_id: &'static str,
+    duration: Duration,
+) -> Result<(), String> {
+    let observe_until = Instant::now() + duration;
+    while Instant::now() < observe_until {
+        let Some(message) = try_read_fake_client_text_frame(stream)? else {
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        let method = record_fake_app_server_method(methods, &message)?;
+        match method {
+            "thread/read" | "thread/resume" => {
+                write_fake_thread_response(stream, &message, thread_id, true)?;
+            }
+            "initialized" => {}
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1885,6 +1915,20 @@ fn wait_for_batch_close_reason(home: &TempDir, batch_id: &str, close_reason: &st
 }
 
 #[cfg(unix)]
+fn assert_method_not_after(methods: &[String], anchor: &str, unexpected: &str) {
+    let anchor_index = methods
+        .iter()
+        .position(|method| method == anchor)
+        .unwrap_or_else(|| panic!("methods did not include {anchor}: {methods:?}"));
+    assert!(
+        !methods[anchor_index + 1..]
+            .iter()
+            .any(|method| method == unexpected),
+        "unexpected {unexpected} after {anchor}: {methods:?}"
+    );
+}
+
+#[cfg(unix)]
 fn wait_for_task_status(home: &TempDir, task_id: &str, status: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -2028,7 +2072,7 @@ fn cli_run_binds_session_starts_foreground_codex_and_stops_app_server() {
         )
         .expect("query managed session");
     assert!(!managed_session_id.is_empty());
-    assert_eq!(session_state, "live");
+    assert_eq!(session_state, "detached");
     assert_eq!(session_epoch, 2);
     assert_eq!(activity_state, "unknown");
     assert_eq!(activity_revision, 0);
@@ -2145,7 +2189,7 @@ fn cli_run_new_thread_bootstraps_thread_then_preserves_foreground_model() {
         )
         .expect("query managed session");
     assert_eq!(session_count, 1);
-    assert_eq!(session_state, "live");
+    assert_eq!(session_state, "detached");
     stop_daemon(&home);
 }
 
@@ -2905,6 +2949,7 @@ fn cli_run_trusted_all_auto_delivery_failed_turn_manualizes_batch() {
     run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
     let methods = wait_for_fake_app_server_methods(fake_server_done);
     assert!(methods.iter().any(|method| method == "turn/start"));
+    assert_method_not_after(&methods, "turn/start", "thread/read");
 
     let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
     assert_eq!(inspected["batch"]["batch"]["state"], "open");
@@ -2912,6 +2957,19 @@ fn cli_run_trusted_all_auto_delivery_failed_turn_manualizes_batch() {
         inspected["batch"]["batch"]["replay_policy"],
         "manual_resolution_only"
     );
+    let sessions = cbth_direct_json(
+        &home,
+        &[
+            "cli",
+            "session",
+            "list",
+            "--bound-thread-id",
+            thread_id,
+            "--limit",
+            "5",
+        ],
+    );
+    assert_eq!(sessions["cli_sessions"][0]["session_state"], "parked");
     let audit = cbth_direct_json(
         &home,
         &[
@@ -2989,6 +3047,7 @@ fn cli_run_trusted_all_auto_delivery_permanent_remote_error_manualizes_batch() {
             .count(),
         1
     );
+    assert_method_not_after(&methods, "turn/start", "thread/read");
 
     let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
     assert_eq!(inspected["batch"]["batch"]["state"], "open");
@@ -2997,6 +3056,19 @@ fn cli_run_trusted_all_auto_delivery_permanent_remote_error_manualizes_batch() {
         "manual_resolution_only"
     );
     assert_eq!(inspected["batch"]["batch"]["delivery_attempt_count"], 0);
+    let sessions = cbth_direct_json(
+        &home,
+        &[
+            "cli",
+            "session",
+            "list",
+            "--bound-thread-id",
+            thread_id,
+            "--limit",
+            "5",
+        ],
+    );
+    assert_eq!(sessions["cli_sessions"][0]["session_state"], "parked");
 
     let audit = cbth_direct_json(
         &home,

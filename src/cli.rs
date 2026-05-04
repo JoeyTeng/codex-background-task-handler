@@ -71,7 +71,9 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "cli-session-dispatch",
     "cli-session-capability-dispatch",
     "cli-session-proof-invalidation-dispatch",
+    "cli-session-recovery-dispatch",
     "cli-turn-observation-dispatch",
+    "cli-turn-observation-expiry-dispatch",
     "cli-auto-delivery-dispatch",
     "task-supervisor",
 ];
@@ -323,6 +325,8 @@ enum AttemptCommand {
     ObserveCliTurn(AttemptObserveCliTurnArgs),
     #[command(hide = true)]
     RejectCliBeforeAccept(AttemptRejectCliBeforeAcceptArgs),
+    #[command(hide = true)]
+    ExpireCliObservation(AttemptExpireCliObservationArgs),
     Inspect(AttemptInspectArgs),
 }
 
@@ -336,7 +340,7 @@ enum AuditCommand {
 #[derive(Debug, Subcommand)]
 enum CliCommand {
     Run(CliRunArgs),
-    #[command(hide = true)]
+    #[command(about = "Inspect and recover managed CLI sessions")]
     Session {
         #[command(subcommand)]
         command: CliSessionCommand,
@@ -345,11 +349,20 @@ enum CliCommand {
 
 #[derive(Debug, Subcommand)]
 enum CliSessionCommand {
+    #[command(hide = true)]
     Bind(CliSessionBindArgs),
+    #[command(hide = true)]
     NoteActivity(CliSessionNoteActivityArgs),
+    #[command(hide = true)]
     NoteCapabilities(CliSessionNoteCapabilitiesArgs),
+    #[command(hide = true)]
     InvalidateProof(CliSessionInvalidateProofArgs),
+    #[command(about = "Inspect one managed CLI session")]
     Inspect(CliSessionInspectArgs),
+    #[command(about = "List managed CLI sessions")]
+    List(CliSessionListArgs),
+    #[command(about = "Retire a detached, parked, or stale managed CLI session")]
+    Retire(CliSessionRetireArgs),
 }
 
 #[derive(Debug, Args)]
@@ -578,6 +591,15 @@ struct AttemptRejectCliBeforeAcceptArgs {
 }
 
 #[derive(Debug, Args)]
+struct AttemptExpireCliObservationArgs {
+    #[arg(long)]
+    attempt_id: String,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
 struct AttemptInspectArgs {
     #[arg(long)]
     attempt_id: String,
@@ -764,6 +786,51 @@ struct CliSessionInvalidateProofArgs {
 struct CliSessionInspectArgs {
     #[arg(long)]
     managed_session_id: String,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum CliSessionStateFilter {
+    Live,
+    Detached,
+    Parked,
+    Stale,
+    Retired,
+}
+
+impl CliSessionStateFilter {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Detached => "detached",
+            Self::Parked => "parked",
+            Self::Stale => "stale",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct CliSessionListArgs {
+    #[arg(long)]
+    bound_thread_id: Option<String>,
+
+    #[arg(long, value_enum)]
+    state: Option<CliSessionStateFilter>,
+
+    #[arg(long, default_value_t = 50)]
+    limit: i64,
+}
+
+#[derive(Debug, Args)]
+struct CliSessionRetireArgs {
+    #[arg(long)]
+    managed_session_id: String,
+
+    #[arg(long)]
+    reason: String,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1834,7 +1901,6 @@ fn maybe_run_cli_auto_delivery(
             reject_cli_auto_delivery_permanent_before_accept(
                 config,
                 state,
-                client,
                 running,
                 CliAutoDeliveryPendingAttempt {
                     source_thread_id: &source_thread_id,
@@ -2151,7 +2217,6 @@ fn cleanup_cli_auto_delivery_before_start_after_error(
 fn reject_cli_auto_delivery_permanent_before_accept(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
-    client: &mut AppServerJsonRpcClient,
     running: &AtomicBool,
     pending: CliAutoDeliveryPendingAttempt<'_>,
     error: &AppServerRequestError,
@@ -2167,6 +2232,7 @@ fn reject_cli_auto_delivery_permanent_before_accept(
         },
         true,
     )?;
+    stop_passive_adapter_after_session_parked(state, running);
     record_cli_auto_delivery_audit(
         config,
         CliAutoDeliveryAuditEvent {
@@ -2179,7 +2245,7 @@ fn reject_cli_auto_delivery_permanent_before_accept(
             details: json!({ "error": error.message() }),
         },
     )?;
-    resync_passive_adapter_after_durable_invalidation(config, state, client, Some(running))
+    Ok(())
 }
 
 fn remote_error_is_retryable_pre_accept_rejection(error: &AppServerRequestError) -> bool {
@@ -2212,7 +2278,7 @@ fn observe_cli_auto_delivery_turn(
     }
     while running.load(Ordering::Acquire) {
         if accepted_cli_observation_deadline_elapsed(&accepted)? {
-            expire_cli_auto_delivery_observation(config, state, client, running, &accepted)?;
+            expire_cli_auto_delivery_observation(config, state, running, &accepted)?;
             return Ok(());
         }
         match client.recv(accepted_cli_observation_recv_timeout(&accepted)?)? {
@@ -2264,18 +2330,23 @@ fn accepted_cli_observation_recv_timeout(accepted: &CliAcceptedTurn) -> Result<D
 fn expire_cli_auto_delivery_observation(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
-    client: &mut AppServerJsonRpcClient,
     running: &AtomicBool,
     accepted: &CliAcceptedTurn,
 ) -> Result<()> {
     let now = now_epoch_seconds()?;
-    let _ = dispatch_cli_adapter_command(
+    dispatch_cli_adapter_command_with_retry_timeout(
         config,
-        Commands::Maintenance {
-            command: MaintenanceCommand::Sweep(MaintenanceSweepArgs { now: Some(now) }),
+        || Commands::Attempt {
+            command: AttemptCommand::ExpireCliObservation(AttemptExpireCliObservationArgs {
+                attempt_id: accepted.attempt_id.clone(),
+                now: Some(now),
+            }),
         },
         false,
-    );
+        Duration::from_secs(CLI_APP_SERVER_DURABLE_WRITE_RETRY_TIMEOUT_SECONDS),
+        Some(running),
+        "expire accepted CLI observation",
+    )?;
     record_cli_auto_delivery_audit_best_effort(
         config,
         CliAutoDeliveryAuditEvent {
@@ -2291,7 +2362,7 @@ fn expire_cli_auto_delivery_observation(
             }),
         },
     );
-    let _ = resync_passive_adapter_after_durable_invalidation(config, state, client, Some(running));
+    stop_passive_adapter_after_session_parked(state, running);
     Ok(())
 }
 
@@ -2302,6 +2373,7 @@ fn abandon_cli_auto_delivery_after_observation_connection_loss(
     accepted: &CliAcceptedTurn,
 ) -> Result<()> {
     invalidate_passive_adapter_proof(config, state, Some(running))?;
+    stop_passive_adapter_after_session_parked(state, running);
     record_cli_auto_delivery_audit_best_effort(
         config,
         CliAutoDeliveryAuditEvent {
@@ -2500,7 +2572,24 @@ fn observe_cli_auto_delivery_terminal(
             }),
         },
     );
+    if !matches!(turn_event, CliTurnEvent::Completed) {
+        stop_passive_adapter_after_session_parked(state, running);
+        return Ok(());
+    }
     resync_passive_adapter_after_durable_invalidation(config, state, client, Some(running))
+}
+
+fn stop_passive_adapter_after_session_parked(
+    state: &mut CliAppServerPassiveAdapterState,
+    running: &AtomicBool,
+) {
+    state.activity_revision = 0;
+    state.capability_revision = 0;
+    state.last_activity_state = None;
+    state.passive_capabilities_recorded = false;
+    state.durable_proof_may_exist = false;
+    state.last_auto_delivery_poll = None;
+    running.store(false, Ordering::Release);
 }
 
 fn resync_passive_adapter_after_durable_invalidation(
@@ -3137,6 +3226,19 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             }
             argv
         }
+        Commands::Attempt {
+            command: AttemptCommand::ExpireCliObservation(args),
+        } => {
+            let mut argv = vec![
+                OsString::from("attempt"),
+                OsString::from("expire-cli-observation"),
+            ];
+            push_string_arg(&mut argv, "--attempt-id", &args.attempt_id);
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
         Commands::Audit {
             command: AuditCommand::Record(args),
         } => {
@@ -3274,6 +3376,24 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             }
             argv
         }
+        Commands::Cli {
+            command:
+                CliCommand::Session {
+                    command: CliSessionCommand::Retire(args),
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("cli"),
+                OsString::from("session"),
+                OsString::from("retire"),
+            ];
+            push_string_arg(&mut argv, "--managed-session-id", &args.managed_session_id);
+            push_string_arg(&mut argv, "--reason", &args.reason);
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
         Commands::Maintenance {
             command: MaintenanceCommand::Sweep(args),
         } => {
@@ -3308,7 +3428,7 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
         | Commands::Cli {
             command:
                 CliCommand::Session {
-                    command: CliSessionCommand::Inspect(_),
+                    command: CliSessionCommand::Inspect(_) | CliSessionCommand::List(_),
                 },
         }
         | Commands::Doctor { .. }
@@ -4128,6 +4248,14 @@ fn dispatch_attempt(command: AttemptCommand, layout: &FsLayout) -> Result<Value>
             )?;
             Ok(json!({ "attempt": attempt }))
         }
+        AttemptCommand::ExpireCliObservation(args) => {
+            let now = match args.now {
+                Some(value) => value,
+                None => now_epoch_seconds()?,
+            };
+            let attempt = store.expire_cli_observation(&args.attempt_id, now)?;
+            Ok(json!({ "attempt": attempt }))
+        }
         AttemptCommand::Inspect(args) => {
             let attempt = store.inspect_attempt(&args.attempt_id)?;
             Ok(json!({ "attempt": attempt }))
@@ -4261,6 +4389,31 @@ fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
                 let session = store.inspect_cli_managed_session(&args.managed_session_id)?;
                 Ok(json!({ "cli_session": session }))
             }
+            CliSessionCommand::List(args) => {
+                validate_limit(args.limit)?;
+                if let Some(bound_thread_id) = &args.bound_thread_id {
+                    validate_nonempty("bound_thread_id", bound_thread_id)?;
+                }
+                let sessions = store.list_cli_managed_sessions(
+                    args.bound_thread_id.as_deref(),
+                    args.state.as_ref().map(CliSessionStateFilter::as_str),
+                    args.limit,
+                )?;
+                Ok(json!({ "cli_sessions": sessions }))
+            }
+            CliSessionCommand::Retire(args) => {
+                validate_nonempty("reason", &args.reason)?;
+                let now = match args.now {
+                    Some(value) => value,
+                    None => now_epoch_seconds()?,
+                };
+                let retirement = store.retire_cli_managed_session(
+                    &args.managed_session_id,
+                    &args.reason,
+                    now,
+                )?;
+                Ok(json!({ "cli_session": retirement }))
+            }
         },
     }
 }
@@ -4271,7 +4424,8 @@ fn cli_command_uses_lifecycle_store_timeout(command: &CliCommand) -> bool {
         CliCommand::Session {
             command: CliSessionCommand::NoteActivity(_)
                 | CliSessionCommand::NoteCapabilities(_)
-                | CliSessionCommand::InvalidateProof(_),
+                | CliSessionCommand::InvalidateProof(_)
+                | CliSessionCommand::Retire(_),
         }
     )
 }
@@ -4389,6 +4543,10 @@ fn validate_positive_max(name: &str, value: i64, max: i64) -> Result<()> {
     } else {
         bail!("{name} must be <= {max}")
     }
+}
+
+fn validate_limit(limit: i64) -> Result<()> {
+    validate_positive_max("limit", limit, 1000)
 }
 
 fn validate_nonzero_u64(name: &str, value: u64) -> Result<()> {

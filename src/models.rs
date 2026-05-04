@@ -272,6 +272,11 @@ pub struct CliManagedSessionAttach {
     pub session: CliManagedSessionRecord,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct CliManagedSessionRetirement {
+    pub session: CliManagedSessionRecord,
+}
+
 #[derive(Clone, Debug)]
 pub struct CliManagedSessionProfile {
     pub session_allows_approval: bool,

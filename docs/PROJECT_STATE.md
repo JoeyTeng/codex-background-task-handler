@@ -41,6 +41,13 @@
   - bootstrap 的 remote error / timeout / closed / protocol / malformed response 都在 foreground 启动前 fail closed，不创建 managed session，也不进入自动投递
   - fresh unmaterialized thread 的初始 idle proof 使用同一 app-server 上的 `thread_start + thread/read(includeTurns=false)`；accepted turn materialize rollout 后再使用正常 observation / reconcile 路径
   - fake e2e 覆盖 `--new-thread` passive session、fresh-unmaterialized trusted-all 自动投递、互斥参数、bootstrap 失败不启动 foreground / 不绑定 session
+- CLI session recovery hardening 已进入实现：
+  - `cbth cli session list/inspect/retire` 是 supported operator diagnostic surface；adapter writer subcommands 仍保持 hidden
+  - foreground/app-server teardown 后 managed session 会从 `live` 转为 `detached` 并清空 proof，避免旧 idle/capability 证明误导后续自动投递
+  - accepted 或 pre-accept fail-closed 到 `manual_resolution_only` 时，关联 managed session 会进入 `parked`
+  - operator retirement 拒绝 `live` session、active delivery attempt、以及仍有 open `manual_resolution_only` head batch 的 bound thread
+  - `cli run --bind-thread-id` 可在旧 `detached` / `parked` / `stale` / profile-drift session 已满足 retirement 条件后自动 retire 并创建 replacement；same-profile attach 也会先拒绝 active attempt / open manual head blockers；否则 fail closed，仍维持每个 `bound_thread_id` 最多一个 non-retired session
+  - daemon capability / doctor gate 新增 `cli-session-recovery-dispatch`，避免新 CLI 把 retire/replacement 语义路由给旧 daemon
 - Live opt-in 复测已覆盖 CLI trusted-all 自动投递：
   - `codex-cli 0.125.0` 在非 TTY 下会把 `codex app-server` listener banner 输出到 `stderr`；`cbth` daemon 和 live smoke 现在都会同时扫描 `stdout` / `stderr`
   - `CBTH_RUN_LIVE_CODEX_E2E=1 cargo test --test live_smoke -- --ignored` 已在本机通过，验证真实 shared app-server sidecar turn 仍可完成并被 `thread/read` 看到 marker
@@ -554,13 +561,14 @@ scripts/desktop_thread_inject_poc.py
 - Phase 6 当前分支为 `codex/phase-6-cli-managed-sessions`，范围限定在 CLI managed-session durable bookkeeping 与 accepted-attempt 前置校验：
   - 新增 `cli_managed_sessions` schema，durable 记录 `managed_session_id`、`bound_thread_id`、`session_epoch`、`session_state`、`activity_state`、`activity_revision`、session-scoped risk profile 和 timestamps
   - 同一个 `bound_thread_id` 当前最多只允许一个 non-retired managed session；unique partial index 直接约束这一点
-  - 新增 hidden adapter-internal `cbth cli session bind` / `note-activity` / `inspect`：
+  - 新增 adapter-internal `cbth cli session bind` / `note-activity` 与 operator-facing `inspect`：
     - `bind` 是现阶段的 attach-or-create building block，不是稳定最终用户入口
     - `bind` 必须显式传入三项 session risk profile；缺失 profile 不会默认成低风险
     - 对 `live` / `detached` session 复用同一个 `managed_session_id`
     - attach 时递增 `session_epoch`、把 `activity_state` 重置为 `unknown`、把 epoch-local `activity_revision` 重置为 0，后续仍必须通过更新的 current-state sync 才能判定 idle
     - `note-activity` 是 current-state sync 的临时 durable 写入面；当前只允许把同 epoch 的 `live` / `detached` session 通过严格顺序递增的 `activity_revision` 标成 `active` 或 `idle`，同 revision 只允许完全相同状态的幂等重放
-    - requested profile drift、`stale`、`parked` 或 `retired` session 都 fail closed
+    - requested profile drift、`stale` 或 `parked` session 现在会先走 retirement safety check；旧 session 仍 `live`、仍有 active attempt、或仍有 open `manual_resolution_only` head batch 时 fail closed，否则先 retire 再创建新的 `managed_session_id`
+    - `retired` session 不会被 attach 复用
   - `begin-cli-accept` 不再接受任意字符串形式的 `managed_session_id`：
     - session 必须存在
     - `bound_thread_id` 必须等于 batch 的 `source_thread_id`
@@ -581,7 +589,7 @@ scripts/desktop_thread_inject_poc.py
   - `turn_failed` / `turn_interrupted` / `turn_replaced` 会把 attempt 标为 `abandoned`，并把当前 head batch fail-closed 到 `manual_resolution_only`
   - `observed_at >= delivery_observation_deadline` 的事件不会关闭 batch；即使是 `turn_completed` 也只作为 late evidence 记录，并 fail-closed 到 manual resolution
   - observed turn id 必须匹配 stored `delivery_turn_id`，否则拒绝写入
-  - daemon capability 列表新增 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给 Phase 6 旧 daemon
+  - daemon capability 列表新增 `cli-turn-observation-dispatch` / `cli-turn-observation-expiry-dispatch`，避免新 CLI 把 turn-observation / observation-expiry mutation 路由给 Phase 6 旧 daemon
   - 本地验证已覆盖 full Rust/JS gate、shared `app-server` e2e、以及 fresh `gpt-5.5` reviewer pass；最终 review 结果为 no findings
 - Phase 8 当前分支为 `codex/phase-8-cli-capability-probe`，范围限定在 CLI managed session 的最小 capability proof：
   - `cli_managed_sessions` 新增 epoch-local capability fields 与 `capability_revision`
@@ -621,7 +629,7 @@ scripts/desktop_thread_inject_poc.py
   - 本 phase 不发送 `turn/start` / `turn/steer`，也不调用 `attempt observe-cli-turn`；完整 `turn_start` capability proof、主动 delivery loop 与 accepted-turn observation loop 留给后续 phase
   - 测试新增 fake app-server websocket，验证 passive adapter 能完成 initialize / resume / read，并从 lifecycle notifications 推进 durable activity state
 - 当前 daemon / CLI adapter 已接入 explicit opt-in delivery lifecycle：
-  - CLI attempt / session mutation / session capability / session proof invalidation / app-server lifecycle / app-server doctor probe / turn observation / auto-delivery audit-reject-auth 通过 daemon dispatch 或 daemon control RPC 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-session-proof-invalidation-dispatch` / `cli-app-server-lifecycle` / `cli-app-server-probe` / `cli-turn-observation-dispatch` / `cli-auto-delivery-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
+  - CLI attempt / session mutation / session capability / session proof invalidation / app-server lifecycle / app-server doctor probe / turn observation / observation expiry / auto-delivery audit-reject-auth 通过 daemon dispatch 或 daemon control RPC 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-session-proof-invalidation-dispatch` / `cli-app-server-lifecycle` / `cli-app-server-probe` / `cli-turn-observation-dispatch` / `cli-turn-observation-expiry-dispatch` / `cli-auto-delivery-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
   - CLI accepted attempt durable schema、daemon 保活、managed-session durable record / fixed-thread gate、daemon-owned shared app-server process model、passive current-state / lifecycle event sync、accepted turn observation store surface、`trusted-all` delivery loop、notification observation、`thread/read` reconcile、pre-accept reject、unknown+sweep fail-closed 均已落地
   - Desktop arm / pause / boundary deadlines 尚未有 schema / adapter，因此尚未接入 daemon 保活
   - CLI fresh-thread bootstrap 已落地；`turn/steer` automatic path 与 Desktop bridge adapters 尚未实现

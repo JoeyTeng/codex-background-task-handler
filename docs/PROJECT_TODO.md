@@ -381,11 +381,13 @@
   - [x] 如上游未来支持 loopback auth，再单独补更强本地 auth 设计
 - [ ] 为 CLI 的 daemon-owned managed session 设计并实现：
   - [x] 落地 durable `cli_managed_sessions` 记录，用于固定 `managed_session_id` / `bound_thread_id` / `session_epoch` / `session_state` / `activity_state` / `activity_revision` / risk profile
-  - [x] 增加 hidden adapter-internal `cbth cli session bind` / `note-activity` / `inspect`，作为未来 `cbth cli run` 的 attach-or-create / monotonic current-state-sync building block
+  - [x] 增加 adapter-internal `cbth cli session bind` / `note-activity` 与 operator-facing `inspect`，作为未来 `cbth cli run` 的 attach-or-create / monotonic current-state-sync building block
   - [x] daemon capability 增加 `cli-session-dispatch`，避免新 CLI 把 session mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-session-capability-dispatch`，避免新 CLI 把 session capability mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-session-proof-invalidation-dispatch`，避免新 CLI 把 continuity-loss proof invalidation 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-session-recovery-dispatch`，避免新 CLI 把 retire/replacement 语义路由给旧 daemon
   - [x] daemon capability 增加 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-turn-observation-expiry-dispatch`，避免新 CLI 把 accepted observation expiry mutation 路由给旧 daemon
   - [x] daemon capability 增加 `cli-auto-delivery-dispatch`，避免新 CLI 把 auto-delivery audit / reject-before-accept / trusted-all auth-mode 路由给旧 daemon
   - [x] daemon capability 增加 `cli-app-server-lifecycle`，避免新 CLI 把 app-server lifecycle request 路由给旧 daemon
   - [x] daemon capability 增加 `cli-app-server-probe`，避免新 CLI 把 `doctor cli` app-server listener probe 路由给旧 daemon
@@ -410,9 +412,9 @@
   - [x] 同一个 `bound_thread_id` 最多只允许一个 non-retired managed session
   - [x] existing-thread bootstrap 的 durable building block 是 attach-or-create；当前实现表现为 hidden `cbth cli session bind`
   - [x] `cbth cli session bind` 必须显式传入完整 risk profile，缺失 profile 不会默认成低风险
-  - [x] `parked` session attach 当前 fail-closed；后续还需接入 unresolved manual batch 终态判断后再允许 retirement / replace
-  - [x] attach 遇到 requested session profile drift 时，不得原地改写；当前实现 fail-closed
-  - [x] stale session 当前 fail-closed；后续还需接入 retirement 条件判断后再允许替换
+  - [x] `parked` session attach 当前会先检查 unresolved manual head batch 和 active attempt；无阻塞工作后可 retire + replace
+  - [x] attach 遇到 requested session profile drift 时不得原地改写；旧 session retire-eligible 时先 retire 再创建 replacement，否则 fail-closed
+  - [x] stale session 当前只有在满足同一 retirement 条件后才允许替换
   - 第一版不做前台 thread-switch 的自动观测或自动 retarget
   - 如需把自动续跑目标换到别的 thread，必须显式开新 session 或等待未来 rebind contract
   - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
@@ -432,7 +434,7 @@
   - [x] passive adapter continuity loss / missing authoritative current-state snapshot 会推进 `session_epoch` 并清空旧 activity / capability proof，避免断连前 idle 证明继续打开自动投递
   - [x] passive adapter 的 matched-thread `thread.status.type` authoritative snapshot 会支配同一 request response 前消费到的 stale notification，明确不可信 snapshot 会 fail-closed，且 capability / activity 写入失败会先清空 proof 再 retry
   - [x] passive adapter 不再在 `thread/read` timeout 后复用同一 websocket；timeout / 协议 / decode / closed / remote-error 都会关闭本轮连接并 fail-closed retry
-  - [x] `cli run` foreground 退出时会清空 passive sidecar 最后写入的 activity / capability proof，避免 event stream 已关闭后旧 `idle` proof 继续打开自动投递
+  - [x] `cli run` foreground 退出时会清空 passive sidecar 最后写入的 activity / capability proof，并把 session 标成 `detached`，避免 event stream 已关闭后旧 `idle` proof 继续打开自动投递
   - [x] passive adapter 的 proof 写入使用短 SQLite busy timeout 与 lifecycle-aware bounded retry，避免 DB lock 下耗尽 daemon dispatch worker、让短暂 lock 直接失败 foreground `cli run`，或在 foreground 退出后继续阻塞 cleanup
   - [x] passive adapter websocket receive 使用 absolute deadline，且 control-frame pong 写回同样受该 deadline 约束
   - [x] `note-activity` 只能在当前 epoch 内按 `activity_revision + 1` 顺序推进，或做完全相同状态的幂等重放
