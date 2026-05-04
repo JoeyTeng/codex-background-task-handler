@@ -83,6 +83,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "cli-session-proof-invalidation-dispatch",
     "cli-session-recovery-dispatch",
     "cli-turn-observation-dispatch",
+    "cli-turn-observation-expiry-dispatch",
     "cli-auto-delivery-dispatch",
     "task-supervisor",
 ];

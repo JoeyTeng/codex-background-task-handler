@@ -1413,6 +1413,60 @@ impl Store {
         Ok(record)
     }
 
+    pub fn expire_cli_observation(
+        &mut self,
+        attempt_id: &str,
+        expired_at: i64,
+    ) -> Result<DeliveryAttemptRecord> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
+        if attempt.state == "abandoned"
+            && matches!(
+                attempt.delivery_observation_state.as_deref(),
+                Some("expired" | "abandoned")
+            )
+        {
+            tx.commit()?;
+            return Ok(attempt);
+        }
+        ensure_attempt_tracking_cli_turn_observation(&attempt)?;
+        if !cli_turn_observation_is_after_deadline(&attempt, expired_at)? {
+            bail!(
+                "delivery attempt {} observation deadline has not elapsed",
+                attempt.attempt_id
+            );
+        }
+        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
+        ensure_batch_open(&batch)?;
+        ensure_batch_is_thread_head_tx(&tx, &batch)?;
+        ensure_attempt_is_current_generation_tx(&tx, &attempt)?;
+        let expired_state =
+            if ensure_cli_attempt_has_current_managed_session_for_batch_tx(&tx, &attempt, &batch)
+                .is_ok()
+            {
+                "expired"
+            } else {
+                "abandoned"
+            };
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'abandoned',
+                 delivery_observation_state = ?,
+                 updated_at = ?,
+                 abandoned_at = ?
+             WHERE attempt_id = ?
+               AND state = 'cooldown'
+               AND delivery_observation_state = 'tracking'",
+            params![expired_state, expired_at, expired_at, attempt_id],
+        )?;
+        manualize_cli_batch_after_observation_loss_tx(&tx, &attempt, expired_at)?;
+        let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
     pub fn observe_cli_turn_event(
         &mut self,
         layout: &FsLayout,

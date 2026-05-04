@@ -73,6 +73,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "cli-session-proof-invalidation-dispatch",
     "cli-session-recovery-dispatch",
     "cli-turn-observation-dispatch",
+    "cli-turn-observation-expiry-dispatch",
     "cli-auto-delivery-dispatch",
     "task-supervisor",
 ];
@@ -324,6 +325,8 @@ enum AttemptCommand {
     ObserveCliTurn(AttemptObserveCliTurnArgs),
     #[command(hide = true)]
     RejectCliBeforeAccept(AttemptRejectCliBeforeAcceptArgs),
+    #[command(hide = true)]
+    ExpireCliObservation(AttemptExpireCliObservationArgs),
     Inspect(AttemptInspectArgs),
 }
 
@@ -582,6 +585,15 @@ struct AttemptRejectCliBeforeAcceptArgs {
 
     #[arg(long, hide = true)]
     manual_resolution_only: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct AttemptExpireCliObservationArgs {
+    #[arg(long)]
+    attempt_id: String,
 
     #[arg(long, hide = true)]
     now: Option<i64>,
@@ -2322,13 +2334,19 @@ fn expire_cli_auto_delivery_observation(
     accepted: &CliAcceptedTurn,
 ) -> Result<()> {
     let now = now_epoch_seconds()?;
-    let _ = dispatch_cli_adapter_command(
+    dispatch_cli_adapter_command_with_retry_timeout(
         config,
-        Commands::Maintenance {
-            command: MaintenanceCommand::Sweep(MaintenanceSweepArgs { now: Some(now) }),
+        || Commands::Attempt {
+            command: AttemptCommand::ExpireCliObservation(AttemptExpireCliObservationArgs {
+                attempt_id: accepted.attempt_id.clone(),
+                now: Some(now),
+            }),
         },
         false,
-    );
+        Duration::from_secs(CLI_APP_SERVER_DURABLE_WRITE_RETRY_TIMEOUT_SECONDS),
+        Some(running),
+        "expire accepted CLI observation",
+    )?;
     record_cli_auto_delivery_audit_best_effort(
         config,
         CliAutoDeliveryAuditEvent {
@@ -3203,6 +3221,19 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             if args.manual_resolution_only {
                 argv.push(OsString::from("--manual-resolution-only"));
             }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Attempt {
+            command: AttemptCommand::ExpireCliObservation(args),
+        } => {
+            let mut argv = vec![
+                OsString::from("attempt"),
+                OsString::from("expire-cli-observation"),
+            ];
+            push_string_arg(&mut argv, "--attempt-id", &args.attempt_id);
             if let Some(now) = args.now {
                 push_i64_arg(&mut argv, "--now", now);
             }
@@ -4215,6 +4246,14 @@ fn dispatch_attempt(command: AttemptCommand, layout: &FsLayout) -> Result<Value>
                 now,
                 args.manual_resolution_only,
             )?;
+            Ok(json!({ "attempt": attempt }))
+        }
+        AttemptCommand::ExpireCliObservation(args) => {
+            let now = match args.now {
+                Some(value) => value,
+                None => now_epoch_seconds()?,
+            };
+            let attempt = store.expire_cli_observation(&args.attempt_id, now)?;
             Ok(json!({ "attempt": attempt }))
         }
         AttemptCommand::Inspect(args) => {

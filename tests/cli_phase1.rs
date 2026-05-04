@@ -2191,6 +2191,77 @@ fn cli_turn_observation_at_deadline_manualizes_without_delivery() {
 }
 
 #[test]
+fn cli_attempt_expire_observation_manualizes_current_attempt() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (batch_id, attempt_id, managed_session_id) =
+        create_accepted_cli_attempt(&home, "thread-cli-expire-current", "turn-expire-current");
+
+    let early = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "expire-cli-observation",
+            "--attempt-id",
+            &attempt_id,
+            "--now",
+            "1060",
+        ],
+    );
+    assert!(early.contains("observation deadline has not elapsed"));
+
+    let expired = cbth(
+        &home,
+        &[
+            "attempt",
+            "expire-cli-observation",
+            "--attempt-id",
+            &attempt_id,
+            "--now",
+            "1061",
+        ],
+    );
+    assert_eq!(expired["attempt"]["state"], "abandoned");
+    assert_eq!(expired["attempt"]["delivery_observation_state"], "expired");
+    assert_eq!(expired["attempt"]["abandoned_at"], 1061);
+
+    let replayed = cbth(
+        &home,
+        &[
+            "attempt",
+            "expire-cli-observation",
+            "--attempt-id",
+            &attempt_id,
+            "--now",
+            "1062",
+        ],
+    );
+    assert_eq!(replayed["attempt"]["state"], "abandoned");
+    assert_eq!(replayed["attempt"]["delivery_observation_state"], "expired");
+    assert_eq!(replayed["attempt"]["abandoned_at"], 1061);
+
+    let batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(batch["batch"]["batch"]["state"], "open");
+    assert_eq!(
+        batch["batch"]["batch"]["replay_policy"],
+        "manual_resolution_only"
+    );
+    assert!(batch["batch"]["batch"]["close_reason"].is_null());
+
+    let session = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(session["cli_session"]["session_state"], "parked");
+    assert_eq!(session["cli_session"]["activity_state"], "unknown");
+}
+
+#[test]
 fn cli_turn_observation_requires_matching_delivery_turn() {
     let home = tempfile::tempdir().expect("temp home");
     let (_batch_id, attempt_id, _managed_session_id) =

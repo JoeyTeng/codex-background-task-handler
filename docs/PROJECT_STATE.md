@@ -589,7 +589,7 @@ scripts/desktop_thread_inject_poc.py
   - `turn_failed` / `turn_interrupted` / `turn_replaced` 会把 attempt 标为 `abandoned`，并把当前 head batch fail-closed 到 `manual_resolution_only`
   - `observed_at >= delivery_observation_deadline` 的事件不会关闭 batch；即使是 `turn_completed` 也只作为 late evidence 记录，并 fail-closed 到 manual resolution
   - observed turn id 必须匹配 stored `delivery_turn_id`，否则拒绝写入
-  - daemon capability 列表新增 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给 Phase 6 旧 daemon
+  - daemon capability 列表新增 `cli-turn-observation-dispatch` / `cli-turn-observation-expiry-dispatch`，避免新 CLI 把 turn-observation / observation-expiry mutation 路由给 Phase 6 旧 daemon
   - 本地验证已覆盖 full Rust/JS gate、shared `app-server` e2e、以及 fresh `gpt-5.5` reviewer pass；最终 review 结果为 no findings
 - Phase 8 当前分支为 `codex/phase-8-cli-capability-probe`，范围限定在 CLI managed session 的最小 capability proof：
   - `cli_managed_sessions` 新增 epoch-local capability fields 与 `capability_revision`
@@ -629,7 +629,7 @@ scripts/desktop_thread_inject_poc.py
   - 本 phase 不发送 `turn/start` / `turn/steer`，也不调用 `attempt observe-cli-turn`；完整 `turn_start` capability proof、主动 delivery loop 与 accepted-turn observation loop 留给后续 phase
   - 测试新增 fake app-server websocket，验证 passive adapter 能完成 initialize / resume / read，并从 lifecycle notifications 推进 durable activity state
 - 当前 daemon / CLI adapter 已接入 explicit opt-in delivery lifecycle：
-  - CLI attempt / session mutation / session capability / session proof invalidation / app-server lifecycle / app-server doctor probe / turn observation / auto-delivery audit-reject-auth 通过 daemon dispatch 或 daemon control RPC 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-session-proof-invalidation-dispatch` / `cli-app-server-lifecycle` / `cli-app-server-probe` / `cli-turn-observation-dispatch` / `cli-auto-delivery-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
+  - CLI attempt / session mutation / session capability / session proof invalidation / app-server lifecycle / app-server doctor probe / turn observation / observation expiry / auto-delivery audit-reject-auth 通过 daemon dispatch 或 daemon control RPC 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-session-proof-invalidation-dispatch` / `cli-app-server-lifecycle` / `cli-app-server-probe` / `cli-turn-observation-dispatch` / `cli-turn-observation-expiry-dispatch` / `cli-auto-delivery-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
   - CLI accepted attempt durable schema、daemon 保活、managed-session durable record / fixed-thread gate、daemon-owned shared app-server process model、passive current-state / lifecycle event sync、accepted turn observation store surface、`trusted-all` delivery loop、notification observation、`thread/read` reconcile、pre-accept reject、unknown+sweep fail-closed 均已落地
   - Desktop arm / pause / boundary deadlines 尚未有 schema / adapter，因此尚未接入 daemon 保活
   - CLI fresh-thread bootstrap 已落地；`turn/steer` automatic path 与 Desktop bridge adapters 尚未实现
