@@ -36,7 +36,7 @@ use crate::models::{
     DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, NewAuditDecision,
     NewCliAcceptPendingAttempt, NewJob, PartialDeliveryPolicy, SubmitMetadata,
 };
-use crate::self_update::{SelfUpdateOptions, run_self_update};
+use crate::self_update::{SelfUpdateOptions, current_release_target_triple, run_self_update};
 use crate::store::{Store, new_id};
 
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
@@ -3700,6 +3700,16 @@ fn dispatch_doctor_cli(
         );
     }
 
+    match doctor_check_cbth_binary() {
+        Ok(details) => report.ok(
+            "cbth-binary",
+            false,
+            "cbth executable and release target information",
+            details,
+        ),
+        Err(error) => report.fail("cbth-binary", false, "cbth executable check failed", &error),
+    }
+
     match doctor_prepare_fs_and_store(layout) {
         Ok(details) => report.ok(
             "fs-store",
@@ -3862,6 +3872,19 @@ fn doctor_private_dir_details(path: &Path, name: &str) -> Result<Value> {
         "path": path.display().to_string(),
         "mode": format!("{mode:03o}"),
         "uid": metadata.uid(),
+    }))
+}
+
+fn doctor_check_cbth_binary() -> Result<Value> {
+    let current_exe = env::current_exe().context("resolve current cbth executable")?;
+    let release_target_triple = current_release_target_triple();
+    Ok(json!({
+        "path": current_exe.display().to_string(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": env::consts::OS,
+        "arch": env::consts::ARCH,
+        "release_target_supported": release_target_triple.is_some(),
+        "release_target_triple": release_target_triple,
     }))
 }
 

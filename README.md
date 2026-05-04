@@ -59,6 +59,8 @@ command -v cbth
 cbth doctor cli
 ```
 
+The install script downloads the Rust release-profile binary from GitHub Releases, verifies the matching `.sha256`, and installs that binary; it does not build from source.
+
 Install a specific release or custom directory:
 
 ```bash

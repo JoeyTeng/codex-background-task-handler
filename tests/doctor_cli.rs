@@ -156,14 +156,16 @@ fn parse_stdout(output: &Output) -> Value {
 }
 
 fn check_status<'a>(value: &'a Value, name: &str) -> &'a str {
+    check(value, name)["status"].as_str().expect("check status")
+}
+
+fn check<'a>(value: &'a Value, name: &str) -> &'a Value {
     value["doctor"]["checks"]
         .as_array()
         .expect("checks array")
         .iter()
         .find(|check| check["name"] == name)
-        .unwrap_or_else(|| panic!("missing check {name}: {value}"))["status"]
-        .as_str()
-        .expect("check status")
+        .unwrap_or_else(|| panic!("missing check {name}: {value}"))
 }
 
 #[test]
@@ -181,6 +183,27 @@ fn doctor_cli_readiness_succeeds_with_stdout_listener() {
     );
     let value = parse_stdout(&output);
     assert_eq!(value["doctor"]["ok"], true);
+    let cbth_binary = &check(&value, "cbth-binary")["details"];
+    assert_eq!(check_status(&value, "cbth-binary"), "ok");
+    assert_eq!(cbth_binary["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        cbth_binary["path"]
+            .as_str()
+            .is_some_and(|path| !path.is_empty()),
+        "missing cbth binary path: {cbth_binary}"
+    );
+    assert!(
+        cbth_binary["release_target_supported"].is_boolean(),
+        "missing release target support flag: {cbth_binary}"
+    );
+    if cbth_binary["release_target_supported"].as_bool() == Some(true) {
+        assert!(
+            cbth_binary["release_target_triple"]
+                .as_str()
+                .is_some_and(|target| !target.is_empty()),
+            "missing supported release target triple: {cbth_binary}"
+        );
+    }
     assert_eq!(check_status(&value, "codex-app-server-listener"), "ok");
     assert!(
         fs::read_to_string(home.path().join("fake-codex.log"))

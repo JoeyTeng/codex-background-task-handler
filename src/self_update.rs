@@ -73,7 +73,7 @@ struct SelectedReleaseAsset {
 }
 
 pub fn run_self_update(options: SelfUpdateOptions) -> Result<Value> {
-    let target_triple = current_target_triple()
+    let target_triple = current_release_target_triple()
         .ok_or_else(|| anyhow!("self update is not supported on this platform"))?;
     let requested_tag = options
         .version
@@ -99,15 +99,13 @@ pub fn run_self_update(options: SelfUpdateOptions) -> Result<Value> {
     let same_version = target_version == current_version;
 
     if options.check || same_version || (!update_available && requested_tag.is_none()) {
-        let message = if same_version {
-            "cbth is already at the requested version".to_owned()
-        } else if downgrade && requested_tag.is_none() {
-            "latest release is older than the current binary".to_owned()
-        } else if update_available {
-            "update available".to_owned()
-        } else {
-            "requested release is older than the current binary".to_owned()
-        };
+        let message = self_update_status_message(
+            same_version,
+            downgrade,
+            update_available,
+            requested_tag.is_some(),
+        )
+        .to_owned();
         return Ok(json!({
             "self_update": SelfUpdateReport {
                 current_version: current_version.to_string(),
@@ -339,7 +337,7 @@ fn install_binary_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn current_target_triple() -> Option<&'static str> {
+pub(crate) fn current_release_target_triple() -> Option<&'static str> {
     target_triple_for_platform(
         env::consts::OS,
         env::consts::ARCH,
@@ -393,6 +391,25 @@ fn target_triple_for_platform(
     }
 }
 
+fn self_update_status_message(
+    same_version: bool,
+    downgrade: bool,
+    update_available: bool,
+    requested_tag: bool,
+) -> &'static str {
+    if same_version && requested_tag {
+        "cbth is already at the requested version"
+    } else if same_version {
+        "cbth is already at the latest version"
+    } else if downgrade && !requested_tag {
+        "latest release is older than the current binary"
+    } else if update_available {
+        "update available"
+    } else {
+        "requested release is older than the current binary"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +447,18 @@ mod tests {
         assert_eq!(
             target_triple_for_platform("windows", "x86_64", "", false),
             None
+        );
+    }
+
+    #[test]
+    fn status_message_distinguishes_latest_and_requested_same_version() {
+        assert_eq!(
+            self_update_status_message(true, false, false, false),
+            "cbth is already at the latest version"
+        );
+        assert_eq!(
+            self_update_status_message(true, false, false, true),
+            "cbth is already at the requested version"
         );
     }
 
