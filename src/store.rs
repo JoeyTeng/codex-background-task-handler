@@ -922,6 +922,7 @@ impl Store {
             if ensure_cli_session_profile_matches(&existing, &profile).is_ok()
                 && ensure_cli_session_attachable(&existing).is_ok()
             {
+                ensure_cli_session_has_no_recovery_blockers_tx(&tx, &existing, "reattaching")?;
                 abandon_cli_observations_for_session_epoch_loss_tx(
                     &tx,
                     &existing.managed_session_id,
@@ -3952,11 +3953,19 @@ fn ensure_cli_session_retire_eligible_tx(
             session.managed_session_id
         ),
     }
+    ensure_cli_session_has_no_recovery_blockers_tx(tx, session, "retiring")
+}
+
+fn ensure_cli_session_has_no_recovery_blockers_tx(
+    tx: &Transaction<'_>,
+    session: &CliManagedSessionRecord,
+    action: &str,
+) -> Result<()> {
     if let Some((attempt_id, state)) =
         query_active_delivery_attempt_for_cli_session_tx(tx, &session.managed_session_id)?
     {
         bail!(
-            "CLI managed session {} has active delivery attempt {} in state {}; resolve it before retiring",
+            "CLI managed session {} has active delivery attempt {} in state {}; resolve it before {action}",
             session.managed_session_id,
             attempt_id,
             state
@@ -3966,7 +3975,7 @@ fn ensure_cli_session_retire_eligible_tx(
         query_open_manual_head_batch_for_thread_tx(tx, &session.bound_thread_id)?
     {
         bail!(
-            "CLI managed session {} is blocked by manual_resolution_only head batch {}; close the head batch before retiring",
+            "CLI managed session {} is blocked by manual_resolution_only head batch {}; close the head batch before {action}",
             session.managed_session_id,
             batch_id
         );

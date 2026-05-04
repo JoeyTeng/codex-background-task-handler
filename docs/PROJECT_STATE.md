@@ -46,7 +46,7 @@
   - foreground/app-server teardown 后 managed session 会从 `live` 转为 `detached` 并清空 proof，避免旧 idle/capability 证明误导后续自动投递
   - accepted 或 pre-accept fail-closed 到 `manual_resolution_only` 时，关联 managed session 会进入 `parked`
   - operator retirement 拒绝 `live` session、active delivery attempt、以及仍有 open `manual_resolution_only` head batch 的 bound thread
-  - `cli run --bind-thread-id` 可在旧 `detached` / `parked` / `stale` / profile-drift session 已满足 retirement 条件后自动 retire 并创建 replacement；否则 fail closed，仍维持每个 `bound_thread_id` 最多一个 non-retired session
+  - `cli run --bind-thread-id` 可在旧 `detached` / `parked` / `stale` / profile-drift session 已满足 retirement 条件后自动 retire 并创建 replacement；same-profile attach 也会先拒绝 active attempt / open manual head blockers；否则 fail closed，仍维持每个 `bound_thread_id` 最多一个 non-retired session
   - daemon capability / doctor gate 新增 `cli-session-recovery-dispatch`，避免新 CLI 把 retire/replacement 语义路由给旧 daemon
 - Live opt-in 复测已覆盖 CLI trusted-all 自动投递：
   - `codex-cli 0.125.0` 在非 TTY 下会把 `codex app-server` listener banner 输出到 `stderr`；`cbth` daemon 和 live smoke 现在都会同时扫描 `stdout` / `stderr`

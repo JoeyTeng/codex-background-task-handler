@@ -94,7 +94,7 @@ cbth cli session retire \
 
 Retirement is fail-closed. It refuses `live` sessions, sessions that still own active delivery attempts, and sessions whose bound thread still has an open `manual_resolution_only` head batch. In those cases, inspect the head batch or attempt first, close the manual head batch when you have made a decision, then retry `cli session retire` or `cli run`.
 
-`cbth cli run --bind-thread-id ...` can automatically retire and replace `detached`, `parked`, or `stale` records only after the same safety checks pass. It never creates a second non-retired session for the same bound thread.
+`cbth cli run --bind-thread-id ...` can automatically retire and replace `detached`, `parked`, or `stale` records only after the same safety checks pass. Same-profile reattach also refuses active delivery attempts and open manual head batches, because reattaching would otherwise abandon observation ownership. It never creates a second non-retired session for the same bound thread.
 
 ## Maintenance And Cleanup
 

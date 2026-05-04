@@ -195,6 +195,28 @@ fn set_cli_session_state(home: &TempDir, managed_session_id: &str, state: &str) 
     .expect("set CLI session state");
 }
 
+fn bump_cli_session_epoch(home: &TempDir, managed_session_id: &str) {
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE cli_managed_sessions
+         SET session_epoch = session_epoch + 1,
+             activity_state = 'unknown',
+             activity_revision = 0,
+             capability_revision = 0,
+             capability_thread_resume = 0,
+             capability_turn_start = 0,
+             capability_current_state_sync = 0,
+             capability_turn_completed_event = 0,
+             capability_negative_terminal_events = 0,
+             capability_thread_start = 0,
+             capability_turn_steer = 0,
+             updated_at = updated_at + 1
+         WHERE managed_session_id = ?",
+        params![managed_session_id],
+    )
+    .expect("bump CLI session epoch");
+}
+
 fn create_accepted_cli_attempt(
     home: &TempDir,
     source_thread_id: &str,
@@ -870,6 +892,101 @@ fn cli_session_bind_rejects_replacement_with_active_attempt() {
         ],
     );
     assert!(stderr.contains("active delivery attempt"));
+}
+
+#[test]
+fn cli_session_bind_rejects_same_profile_with_active_attempt() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (_batch_id, _attempt_id, managed_session_id) = create_accepted_cli_attempt(
+        &home,
+        "thread-cli-active-same-profile",
+        "turn-active-same-profile",
+    );
+    set_cli_session_state(&home, &managed_session_id, "detached");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-active-same-profile",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+        ],
+    );
+    assert!(stderr.contains("active delivery attempt"));
+    let inspected = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(inspected["cli_session"]["session_state"], "detached");
+}
+
+#[test]
+fn cli_session_bind_rejects_same_profile_with_manual_head() {
+    let home = tempfile::tempdir().expect("temp home");
+    let (_batch_id, attempt_id, managed_session_id) = create_accepted_cli_attempt(
+        &home,
+        "thread-cli-manual-same-profile",
+        "turn-manual-same-profile",
+    );
+    cbth(
+        &home,
+        &[
+            "attempt",
+            "observe-cli-turn",
+            "--attempt-id",
+            &attempt_id,
+            "--delivery-turn-id",
+            "turn-manual-same-profile",
+            "--turn-event",
+            "turn-failed",
+            "--now",
+            "1500",
+        ],
+    );
+    set_cli_session_state(&home, &managed_session_id, "detached");
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-manual-same-profile",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+        ],
+    );
+    assert!(stderr.contains("manual_resolution_only head batch"));
+    let inspected = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(inspected["cli_session"]["session_state"], "detached");
 }
 
 #[test]
@@ -2123,24 +2240,7 @@ fn cli_turn_observation_with_stale_session_epoch_manualizes_batch() {
     let (batch_id, attempt_id, managed_session_id) =
         create_accepted_cli_attempt(&home, "thread-cli-turn-stale-epoch", "turn-stale-epoch");
 
-    cbth(
-        &home,
-        &[
-            "cli",
-            "session",
-            "bind",
-            "--bound-thread-id",
-            "thread-cli-turn-stale-epoch",
-            "--session-allows-approval",
-            "false",
-            "--session-allows-network",
-            "false",
-            "--session-allows-write-access",
-            "false",
-            "--now",
-            "1002",
-        ],
-    );
+    bump_cli_session_epoch(&home, &managed_session_id);
     let observed = cbth(
         &home,
         &[
@@ -2189,7 +2289,7 @@ fn cli_turn_observation_with_stale_session_epoch_manualizes_batch() {
 #[test]
 fn cli_turn_completion_after_continuity_loss_does_not_deliver() {
     let home = tempfile::tempdir().expect("temp home");
-    let (batch_id, attempt_id, _managed_session_id) = create_accepted_cli_attempt(
+    let (batch_id, attempt_id, managed_session_id) = create_accepted_cli_attempt(
         &home,
         "thread-cli-turn-continuity-loss",
         "turn-continuity-loss",
@@ -2200,15 +2300,11 @@ fn cli_turn_completion_after_continuity_loss_does_not_deliver() {
         &[
             "cli",
             "session",
-            "bind",
-            "--bound-thread-id",
-            "thread-cli-turn-continuity-loss",
-            "--session-allows-approval",
-            "false",
-            "--session-allows-network",
-            "false",
-            "--session-allows-write-access",
-            "false",
+            "invalidate-proof",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
             "--now",
             "1002",
         ],
@@ -2258,7 +2354,7 @@ fn cli_turn_completion_after_continuity_loss_does_not_deliver() {
 #[test]
 fn cli_turn_completion_after_continuity_loss_and_sweep_does_not_deliver() {
     let home = tempfile::tempdir().expect("temp home");
-    let (batch_id, attempt_id, _managed_session_id) = create_accepted_cli_attempt(
+    let (batch_id, attempt_id, managed_session_id) = create_accepted_cli_attempt(
         &home,
         "thread-cli-turn-continuity-loss-sweep",
         "turn-continuity-loss-sweep",
@@ -2269,15 +2365,11 @@ fn cli_turn_completion_after_continuity_loss_and_sweep_does_not_deliver() {
         &[
             "cli",
             "session",
-            "bind",
-            "--bound-thread-id",
-            "thread-cli-turn-continuity-loss-sweep",
-            "--session-allows-approval",
-            "false",
-            "--session-allows-network",
-            "false",
-            "--session-allows-write-access",
-            "false",
+            "invalidate-proof",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
             "--now",
             "1002",
         ],
