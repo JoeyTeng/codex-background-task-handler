@@ -48,10 +48,10 @@
   - 复测流程、env 和失败排查记录在 [docs/LIVE_E2E.md](LIVE_E2E.md)
 - CLI Dogfood V1 的收敛计划已单独记录在 [docs/CLI_DOGFOOD_V1_COMPLETION_PLAN.md](CLI_DOGFOOD_V1_COMPLETION_PLAN.md)：
   - 当前边界是本机 macOS/Linux dedicated single-user workstation dogfood，不是多用户服务器产品
-  - Phase 12 `cbth cli run --new-thread` 已合入；当前分支 `codex/cli-task-supervisor` 正在实现后续 daemon-owned `cbth task run/list/inspect/cancel`
+  - Phase 12 `cbth cli run --new-thread` 与 daemon-owned `cbth task run/list/inspect/cancel` 已合入
   - 自动投递仍只走 idle `turn/start`；active-turn `turn/steer` 当前只补设计，不进入自动路径
-  - 本轮 task supervisor slice 已在本地实现 daemon-owned child/process-group supervision、bounded stdout/stderr spool、task inspect/list/cancel、task result artifact、task fake e2e 和 ignored live task-supervisor e2e；可靠性边界覆盖 active-task cap、restart lost-pgid cleanup with persisted process identity、direct-child-exit 后的 process-group 等待、cancel request precedence、late cancel/timeout 裁决和 task log retention cleanup；本机已通过 `CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture`
-  - 后续还需要 `cbth doctor cli`、operator recovery 文档、local binary 安装/复测文档和 active-turn steer 设计文档
+  - 当前分支 `codex/cli-dogfood-hardening` 正在补 `cbth doctor cli`、operator recovery 文档、local binary 安装/复测文档和对应 fake tests
+  - 后续还需要 active-turn steer 设计文档；Desktop bridge 仍是单独后续大块
 - #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
 - 当前修复分支 `codex/review-gate-resolved-threads` 正在补兼容：GitHub REST 可能把已 resolved / outdated 的旧 inline review comment `commit_id` 映射到后续 head；gate 现在会额外读取 GraphQL `reviewThreads`，只把未 resolved、未 outdated 的 current-head Codex inline threads 算作 blocker。Codex review-body findings 仍按 `PullRequestReview.commit_id` 和 current-head blob link 判定，因为它们没有可 resolve 的 thread。
 
@@ -594,7 +594,7 @@ scripts/desktop_thread_inject_poc.py
 - Phase 9 当前分支为 `codex/phase-9-cli-run-process-model`，范围限定在 CLI existing-thread 最小进程模型与 daemon-owned app-server lifecycle：
   - 新增 public `cbth cli run --bind-thread-id <thread_id>`，先通过 hidden `cli session bind` 建立 / attach durable managed session，再启动 foreground Codex
   - `cli run` 要求调用方显式传入 session risk profile，不把缺失 profile 默认成低风险
-  - daemon capability 列表新增 `cli-app-server-lifecycle`，避免新 CLI 把 app-server lifecycle request 路由给 Phase 8 旧 daemon
+  - daemon capability 列表新增 `cli-app-server-lifecycle` / `cli-app-server-probe`，避免新 CLI 把 app-server lifecycle 或 doctor probe request 路由给旧 daemon
   - daemon-side `bound_thread_id` reservation 会在 session bind 前建立，避免重复 foreground start 在失败前推进现有 `session_epoch`
   - daemon 现在按 `managed_session_id` 管理 shared `codex app-server --listen ws://127.0.0.1:0`
   - daemon 只接受 app-server 上报的 `127.0.0.1` / `localhost` websocket listener，并在 `daemon status` 中暴露 active CLI app-server 列表
@@ -620,7 +620,7 @@ scripts/desktop_thread_inject_poc.py
   - 本 phase 不发送 `turn/start` / `turn/steer`，也不调用 `attempt observe-cli-turn`；完整 `turn_start` capability proof、主动 delivery loop 与 accepted-turn observation loop 留给后续 phase
   - 测试新增 fake app-server websocket，验证 passive adapter 能完成 initialize / resume / read，并从 lifecycle notifications 推进 durable activity state
 - 当前 daemon / CLI adapter 已接入 explicit opt-in delivery lifecycle：
-  - CLI attempt / session mutation / session capability / session proof invalidation / app-server lifecycle / turn observation / auto-delivery audit-reject-auth 通过 daemon dispatch 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-session-proof-invalidation-dispatch` / `cli-app-server-lifecycle` / `cli-turn-observation-dispatch` / `cli-auto-delivery-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
+  - CLI attempt / session mutation / session capability / session proof invalidation / app-server lifecycle / app-server doctor probe / turn observation / auto-delivery audit-reject-auth 通过 daemon dispatch 或 daemon control RPC 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-session-proof-invalidation-dispatch` / `cli-app-server-lifecycle` / `cli-app-server-probe` / `cli-turn-observation-dispatch` / `cli-auto-delivery-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
   - CLI accepted attempt durable schema、daemon 保活、managed-session durable record / fixed-thread gate、daemon-owned shared app-server process model、passive current-state / lifecycle event sync、accepted turn observation store surface、`trusted-all` delivery loop、notification observation、`thread/read` reconcile、pre-accept reject、unknown+sweep fail-closed 均已落地
   - Desktop arm / pause / boundary deadlines 尚未有 schema / adapter，因此尚未接入 daemon 保活
   - CLI fresh-thread bootstrap 已落地；`turn/steer` automatic path 与 Desktop bridge adapters 尚未实现

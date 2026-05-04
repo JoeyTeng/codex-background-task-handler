@@ -1,0 +1,91 @@
+# CLI Operator Recovery
+
+This guide covers the manual recovery surface for CLI dogfood v1. It assumes a macOS/Linux single-user workstation and a trusted local `CBTH_HOME` / `~/.cbth`.
+
+## Inspect Current State
+
+Start with the daemon and readiness checks:
+
+```bash
+cbth doctor cli
+cbth daemon status
+```
+
+For a caller thread, inspect the current head batch and audit trail:
+
+```bash
+cbth batch inspect-head --source-thread-id <thread-id>
+cbth audit list --source-thread-id <thread-id> --limit 50
+```
+
+If the head batch has already closed and `inspect-head` no longer finds it, use the `batch_id` from audit or task/job output:
+
+```bash
+cbth batch inspect --batch-id <batch-id>
+```
+
+## Task Logs
+
+Daemon-supervised tasks are inspectable even after their associated job has completed or failed:
+
+```bash
+cbth task list --source-thread-id <thread-id>
+cbth task inspect --task-id <task-id>
+```
+
+`task inspect` returns `stdout_log_path`, `stderr_log_path`, byte counts, and truncation flags. Paths are relative to `CBTH_HOME`; for the default home, inspect logs with:
+
+```bash
+less ~/.cbth/<stdout_log_path>
+less ~/.cbth/<stderr_log_path>
+```
+
+Completed task log directories are retained while linked batches remain open and for the post-close retention window. After maintenance cleanup, the durable task row remains, but log path fields may be cleared.
+
+## Manual Resolution
+
+`manual_resolution_only` means `cbth` could not prove safe automatic delivery. Typical causes are ambiguous `turn/start` acceptance, websocket/app-server continuity loss after acceptance, terminal failure/interruption evidence, or a batch policy outside the current automatic path.
+
+Use the audit trail to decide whether the assistant-visible result already landed:
+
+```bash
+cbth audit list --source-thread-id <thread-id> --limit 100
+cbth batch inspect-head --source-thread-id <thread-id>
+```
+
+If you verified the caller thread already received and used the result, close the head batch as confirmed:
+
+```bash
+cbth batch close-head \
+  --source-thread-id <thread-id> \
+  --reason operator-confirmed-delivery \
+  --note "verified in caller thread"
+```
+
+If you cannot prove delivery, close it unconfirmed before retrying or filing a follow-up:
+
+```bash
+cbth batch close-head \
+  --source-thread-id <thread-id> \
+  --reason operator-closed-unconfirmed \
+  --note "manual recovery: delivery could not be proven"
+```
+
+Do not manually edit the SQLite database or task log files. Use the CLI so audit records, artifact retention, and daemon lifecycle state stay consistent.
+
+## Maintenance And Cleanup
+
+Run a sweep when stale attempts, expired artifacts, or task-log cleanup need to be reconciled immediately:
+
+```bash
+cbth maintenance sweep
+```
+
+Stop the daemon only after active tasks are complete or intentionally cancelled:
+
+```bash
+cbth task list --status running
+cbth daemon stop
+```
+
+On daemon crash/restart, queued or running tasks that can no longer be proven supervised are failed closed during startup recovery. Inspect failed tasks and associated batches before resubmitting work.

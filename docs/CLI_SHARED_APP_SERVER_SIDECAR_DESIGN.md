@@ -691,7 +691,7 @@ v1 范围外：
   - 不能使用“short-lived bootstrap app-server 后关闭”的实现：Codex 0.128 的 fresh thread 在 first user message 前不会 materialize rollout，关闭 bootstrap app-server 后新的 app-server 会对该 thread 返回 `no rollout found` / `includeTurns is unavailable before first user message`。
   - bootstrap app-server 在 promote 前只存在于 pending registry，不触碰 managed session proof；bootstrap 失败、promote 失败、lease 过期或 daemon shutdown 时必须停止子进程并 join drain worker。
   - bootstrap 的 remote error / timeout / closed / malformed response 都在 foreground 启动前 fail closed，不创建 managed session。
-- daemon status 现在会列出 active CLI app-server，并且 daemon capability 列表包含 `cli-app-server-lifecycle`；新 CLI 不会把 lifecycle request 投递给不支持该命令的旧 daemon。
+- daemon status 现在会列出 active CLI app-server，并且 daemon capability 列表包含 `cli-app-server-lifecycle` / `cli-app-server-probe`；新 CLI 不会把 lifecycle 或 doctor probe request 投递给不支持该命令的旧 daemon。
 - durable `cli_managed_sessions` schema 已落地，记录 `managed_session_id`、`bound_thread_id`、`session_epoch`、`session_state`、`activity_state`、`activity_revision`、session-scoped risk profile 和 timestamps。
 - hidden adapter-internal `cbth cli session bind` 已作为 existing-thread attach-or-create building block 落地；它要求调用方显式传入完整 risk profile，会复用同一 `bound_thread_id` 上的 `live` / `detached` session，并在 attach 时递增 `session_epoch`、把 `activity_state` 重置为 `unknown`、把 epoch-local `activity_revision` 重置为 0。
 - hidden adapter-internal `cbth cli session note-activity` 已作为 current-state sync 的临时 durable 写入面落地；当前只允许同 epoch 的 `live` / `detached` session 通过严格顺序递增的 `activity_revision` 被标成 `active` 或 `idle`，同 revision 只允许完全相同状态的幂等重放。
@@ -725,7 +725,7 @@ v1 范围外：
 - accepted-turn observation loop 也受 accepted attempt 的 `delivery_observation_deadline` 约束；本地 deadline 到期会触发一次 best-effort sweep / proof refresh 后退出观察，避免前台进程长期存活时旧 attempt 阻塞后续 head batch。
 - sidecar shutdown 是 `turn/start` 前的硬门禁：passive loop 在每次 auto-delivery poll 前重新检查 stop flag；如果 `begin-cli-accept` 后、真正发送 `turn/start` 前进入 shutdown，会写入 pre-accept rejection 并保留 batch 可重试，而不是在关闭窗口里继续发 side-effectful RPC。
 - 同一 pre-start cleanup 也覆盖 `begin-cli-accept` 后、`turn/start` 前的 prompt 构造 / attempt-start audit / response parsing 失败：这些失败都必须先 best-effort `reject-cli-before-accept`，避免从未发出 RPC 的 attempt 之后被 stale sweep 当作 unknown manualize。
-- daemon capability 列表已包含 `cli-app-server-lifecycle`、`cli-session-capability-dispatch`、`cli-session-proof-invalidation-dispatch`、`cli-turn-observation-dispatch` 与 `cli-auto-delivery-dispatch`，避免新 CLI 把 app-server lifecycle / capability / proof invalidation / terminal-event / auto-delivery audit or rejection 写入路由给不支持对应 subcommand 的旧 daemon。
+- daemon capability 列表已包含 `cli-app-server-lifecycle`、`cli-app-server-probe`、`cli-session-capability-dispatch`、`cli-session-proof-invalidation-dispatch`、`cli-turn-observation-dispatch` 与 `cli-auto-delivery-dispatch`，避免新 CLI 把 app-server lifecycle / doctor probe / capability / proof invalidation / terminal-event / auto-delivery audit or rejection 写入路由给不支持对应 subcommand 的旧 daemon。
 - `turn_steer` 当前仍 fail-closed，直到后续 phase 落地 active-turn risk proof。
 - 这些实现仍不等价于完整 CLI 自动续跑：`trusted-all` idle `turn/start` 路径与 `--new-thread` fresh bootstrap 已落地，但 `turn/steer`、active-turn injection、rollout-only automatic delivered proof、以及更细粒度 policy engine 仍待后续 phase 实现。
 
