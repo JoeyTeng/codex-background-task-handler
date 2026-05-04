@@ -38,10 +38,12 @@ detect_target() {
 
 normalize_tag() {
   case "$1" in
-    v[0-9]*.[0-9]*.[0-9]*) printf '%s\n' "$1" ;;
-    [0-9]*.[0-9]*.[0-9]*) printf 'v%s\n' "$1" ;;
-    *) fail "invalid release version: $1; expected vX.Y.Z" ;;
+    v*) tag="$1" ;;
+    *) tag="v$1" ;;
   esac
+  printf '%s\n' "$tag" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' >/dev/null 2>&1 \
+    || fail "invalid release version: $1; expected vX.Y.Z"
+  printf '%s\n' "$tag"
 }
 
 curl_to_file() {
@@ -83,6 +85,7 @@ sha256_file() {
 
 need_cmd uname
 need_cmd curl
+need_cmd grep
 need_cmd sed
 need_cmd awk
 need_cmd mktemp
