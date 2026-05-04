@@ -46,9 +46,37 @@ bash scripts/install-git-hooks.sh
 
 详细设计、工作树安全策略和后续跟踪见 [docs/GIT_HOOKS.md](docs/GIT_HOOKS.md)。
 
-## Local Binary Install
+## Release Install
 
 CLI dogfood v1 is intended for macOS/Linux dedicated single-user workstations.
+The supported release assets are currently Linux x86_64 glibc and macOS arm64, including Apple Silicon hosts launched from a Rosetta shell.
+
+Install the latest GitHub Release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JoeyTeng/codex-background-task-handler/HEAD/scripts/install.sh | sh
+command -v cbth
+cbth doctor cli
+```
+
+Install a specific release or custom directory:
+
+```bash
+CBTH_VERSION=v0.1.0 CBTH_INSTALL_DIR="$HOME/.local/bin" \
+  sh scripts/install.sh
+```
+
+Upgrade an installed binary:
+
+```bash
+cbth self update --check
+cbth self update --yes
+```
+
+`cbth self update --yes` downloads the matching GitHub Release binary and `.sha256`, verifies the checksum, writes a temporary file next to the current executable, and atomically replaces it. It does not use `sudo`; if the current executable is not writable, reinstall into a user-writable directory.
+
+## Local Development Install
+
 Install the local binary from a checkout:
 
 ```bash
@@ -102,7 +130,7 @@ CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --
 
 ## Rust CLI Usage
 
-The Rust CLI currently provides read-only store inspection commands, daemon-routed mutating job/batch/task/maintenance commands, `cbth cli run`, operator-facing CLI session recovery commands, adapter-internal attempt commands, an audit log, and a daemon control surface backed by a same-user Unix socket.
+The Rust CLI currently provides read-only store inspection commands, daemon-routed mutating job/batch/task/maintenance commands, `cbth cli run`, operator-facing CLI session recovery commands, adapter-internal attempt commands, an audit log, explicit `cbth self update`, and a daemon control surface backed by a same-user Unix socket.
 
 Run the deployment readiness check before dogfooding a fresh install:
 
@@ -128,6 +156,9 @@ Use `--auto-daemon-startup-timeout-seconds <seconds>` on routed mutating command
 ```bash
 cargo run --bin cbth -- \
   doctor cli
+
+cargo run --bin cbth -- \
+  self update --check
 
 cargo run --bin cbth -- \
   job submit \
