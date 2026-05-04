@@ -144,7 +144,7 @@ jobs:
 
           Install with:
 
-              curl -fsSL https://raw.githubusercontent.com/JoeyTeng/codex-background-task-handler/master/scripts/install.sh | sh
+              curl -fsSL https://raw.githubusercontent.com/JoeyTeng/codex-background-task-handler/main/scripts/install.sh | sh
           EOF
           if gh release view "${tag}" >/dev/null 2>&1; then
             gh release upload "${tag}" dist/* --clobber
