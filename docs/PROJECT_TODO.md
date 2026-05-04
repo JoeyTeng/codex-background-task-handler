@@ -34,7 +34,7 @@
 - [x] 补齐 CLI operator recovery 文档：batch inspect/manual close、audit、task logs、`manual_resolution_only` 处理。
 - [x] 补齐 local binary dogfood 部署文档：`cargo install --path .`、PATH 检查、`cbth doctor cli`、最小端到端 walkthrough。
 - [ ] 合入 GitHub Release 安装/升级 PR 后，在最新 `master` 上打首发 `v0.1.0` signed annotated tag：
-  - [ ] release workflow 发布 Linux x86_64 与 macOS arm64 raw binary + `.sha256`
+  - [ ] release workflow 发布 Linux x86_64 glibc 与 macOS arm64 raw binary + `.sha256`
   - [ ] `scripts/install.sh` 可安装指定 `CBTH_VERSION=v0.1.0`
   - [ ] `cbth self update --check` 可识别当前版本与 latest release
   - [ ] macOS arm64 安装后 `cbth doctor cli` 通过

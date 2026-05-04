@@ -327,13 +327,23 @@ fn install_binary_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn current_target_triple() -> Option<&'static str> {
-    target_triple_for_platform(env::consts::OS, env::consts::ARCH)
+    target_triple_for_platform(env::consts::OS, env::consts::ARCH, current_target_env())
 }
 
-fn target_triple_for_platform(os: &str, arch: &str) -> Option<&'static str> {
-    match (os, arch) {
-        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
-        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+fn current_target_env() -> &'static str {
+    if cfg!(target_env = "gnu") {
+        "gnu"
+    } else if cfg!(target_env = "musl") {
+        "musl"
+    } else {
+        ""
+    }
+}
+
+fn target_triple_for_platform(os: &str, arch: &str, target_env: &str) -> Option<&'static str> {
+    match (os, arch, target_env) {
+        ("linux", "x86_64", "gnu") => Some("x86_64-unknown-linux-gnu"),
+        ("macos", "aarch64", _) => Some("aarch64-apple-darwin"),
         _ => None,
     }
 }
@@ -353,15 +363,16 @@ mod tests {
     #[test]
     fn target_triple_detection_is_limited_to_v1_targets() {
         assert_eq!(
-            target_triple_for_platform("linux", "x86_64"),
+            target_triple_for_platform("linux", "x86_64", "gnu"),
             Some("x86_64-unknown-linux-gnu")
         );
         assert_eq!(
-            target_triple_for_platform("macos", "aarch64"),
+            target_triple_for_platform("macos", "aarch64", ""),
             Some("aarch64-apple-darwin")
         );
-        assert_eq!(target_triple_for_platform("macos", "x86_64"), None);
-        assert_eq!(target_triple_for_platform("windows", "x86_64"), None);
+        assert_eq!(target_triple_for_platform("linux", "x86_64", "musl"), None);
+        assert_eq!(target_triple_for_platform("macos", "x86_64", ""), None);
+        assert_eq!(target_triple_for_platform("windows", "x86_64", ""), None);
     }
 
     #[test]

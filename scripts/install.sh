@@ -24,9 +24,15 @@ detect_target() {
   os="$(uname -s)"
   arch="$(uname -m)"
   case "${os}:${arch}" in
-    Linux:x86_64) printf '%s\n' "x86_64-unknown-linux-gnu" ;;
+    Linux:x86_64)
+      if command -v getconf >/dev/null 2>&1 && getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+        printf '%s\n' "x86_64-unknown-linux-gnu"
+      else
+        fail "unsupported Linux libc: only glibc x86_64 release assets are available"
+      fi
+      ;;
     Darwin:arm64) printf '%s\n' "aarch64-apple-darwin" ;;
-    *) fail "unsupported platform: ${os} ${arch}; supported: Linux x86_64, macOS arm64" ;;
+    *) fail "unsupported platform: ${os} ${arch}; supported: Linux x86_64 glibc, macOS arm64" ;;
   esac
 }
 
