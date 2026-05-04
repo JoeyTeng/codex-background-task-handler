@@ -32,6 +32,14 @@ detect_target() {
       fi
       ;;
     Darwin:arm64) printf '%s\n' "aarch64-apple-darwin" ;;
+    Darwin:x86_64)
+      if command -v sysctl >/dev/null 2>&1 \
+        && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || printf '%s' 0)" = "1" ]; then
+        printf '%s\n' "aarch64-apple-darwin"
+      else
+        fail "unsupported macOS host: Intel macOS release assets are not available"
+      fi
+      ;;
     *) fail "unsupported platform: ${os} ${arch}; supported: Linux x86_64 glibc, macOS arm64" ;;
   esac
 }

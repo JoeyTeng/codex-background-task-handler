@@ -49,7 +49,7 @@ bash scripts/install-git-hooks.sh
 ## Release Install
 
 CLI dogfood v1 is intended for macOS/Linux dedicated single-user workstations.
-The supported release assets are currently Linux x86_64 glibc and macOS arm64.
+The supported release assets are currently Linux x86_64 glibc and macOS arm64, including Apple Silicon hosts launched from a Rosetta shell.
 
 Install the latest GitHub Release:
 

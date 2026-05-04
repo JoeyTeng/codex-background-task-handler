@@ -3,6 +3,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use semver::Version;
@@ -327,7 +329,12 @@ fn install_binary_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn current_target_triple() -> Option<&'static str> {
-    target_triple_for_platform(env::consts::OS, env::consts::ARCH, current_target_env())
+    target_triple_for_platform(
+        env::consts::OS,
+        env::consts::ARCH,
+        current_target_env(),
+        macos_host_supports_arm64(),
+    )
 }
 
 fn current_target_env() -> &'static str {
@@ -340,10 +347,37 @@ fn current_target_env() -> &'static str {
     }
 }
 
-fn target_triple_for_platform(os: &str, arch: &str, target_env: &str) -> Option<&'static str> {
-    match (os, arch, target_env) {
-        ("linux", "x86_64", "gnu") => Some("x86_64-unknown-linux-gnu"),
-        ("macos", "aarch64", _) => Some("aarch64-apple-darwin"),
+fn macos_host_supports_arm64() -> bool {
+    macos_host_supports_arm64_impl()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_host_supports_arm64_impl() -> bool {
+    env::consts::ARCH == "aarch64"
+        || Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.optional.arm64"])
+            .output()
+            .map(|output| {
+                output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
+            })
+            .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_host_supports_arm64_impl() -> bool {
+    false
+}
+
+fn target_triple_for_platform(
+    os: &str,
+    arch: &str,
+    target_env: &str,
+    macos_arm64_host: bool,
+) -> Option<&'static str> {
+    match (os, arch, target_env, macos_arm64_host) {
+        ("linux", "x86_64", "gnu", _) => Some("x86_64-unknown-linux-gnu"),
+        ("macos", "aarch64", _, _) => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64", _, true) => Some("aarch64-apple-darwin"),
         _ => None,
     }
 }
@@ -363,16 +397,29 @@ mod tests {
     #[test]
     fn target_triple_detection_is_limited_to_v1_targets() {
         assert_eq!(
-            target_triple_for_platform("linux", "x86_64", "gnu"),
+            target_triple_for_platform("linux", "x86_64", "gnu", false),
             Some("x86_64-unknown-linux-gnu")
         );
         assert_eq!(
-            target_triple_for_platform("macos", "aarch64", ""),
+            target_triple_for_platform("macos", "aarch64", "", true),
             Some("aarch64-apple-darwin")
         );
-        assert_eq!(target_triple_for_platform("linux", "x86_64", "musl"), None);
-        assert_eq!(target_triple_for_platform("macos", "x86_64", ""), None);
-        assert_eq!(target_triple_for_platform("windows", "x86_64", ""), None);
+        assert_eq!(
+            target_triple_for_platform("macos", "x86_64", "", true),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(
+            target_triple_for_platform("linux", "x86_64", "musl", false),
+            None
+        );
+        assert_eq!(
+            target_triple_for_platform("macos", "x86_64", "", false),
+            None
+        );
+        assert_eq!(
+            target_triple_for_platform("windows", "x86_64", "", false),
+            None
+        );
     }
 
     #[test]
