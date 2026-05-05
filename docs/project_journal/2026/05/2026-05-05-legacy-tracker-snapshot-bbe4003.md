@@ -1,0 +1,1198 @@
+---
+id: 20260505-bbe4003-legacy
+title: Legacy Tracker Snapshot
+status: completed
+created: 2026-05-05
+updated: 2026-05-05
+branch: codex/project-journal-migration-main
+pr:
+supersedes: []
+superseded_by:
+---
+
+# Legacy Tracker Snapshot
+
+This entry preserves the complete pre-migration contents of the top-level project trackers before they were reduced to project-journal entrypoints.
+
+## docs/PROJECT_STATE.md
+
+````markdown
+# Project State
+
+## 当前目标
+
+验证一套纯外围方案，分别覆盖 Codex Desktop 与 CLI 两条交互路径，让长时间后台任务可以在不修改上游 `codex` 仓库的前提下恢复或继续 caller thread。
+
+## Repo CI / review gate
+
+- `codex/review-gate` 已抽成 repo 内部子项目：[tools/codex-review-gate](../tools/codex-review-gate/README.md)。顶层 workflow 只保留 `.github/workflows/codex-review-gate.yml` thin wrapper。
+- 当前 runner 已改成 reaction-driven serialized marker design，并通过本地 composite action wrapper 调用；ruleset 已要求 `codex/review-gate`、Rust CI 和 resolved conversations。
+- 2026-05-04 已补做 resolved/remapped inline thread live validation：PR #14 的 Codex comment `3148673469` 在 REST 中 `commit_id` 被映射到 head `6a2d9e57...`，但 GraphQL thread `PRRT_kwDOSJZ-as594_hR` 为 `isResolved=true`；当前默认分支 workflow dispatch run `25316273973` 成功通过，证明该旧 inline thread 不再被误判为 current-head blocker。
+- 本地确定性 Rust gate 现在有 repo-tracked githooks 入口：[docs/GIT_HOOKS.md](GIT_HOOKS.md)。安装后 pre-commit 会在 Rust/Cargo staged changes 上运行 `cargo fmt --all`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked`。
+- `v0.1.0` 已发布：[GitHub Release](https://github.com/JoeyTeng/codex-background-task-handler/releases/tag/v0.1.0)。
+  - Packaging PR #32 squash merge commit：`e6d013adbae633eb43efc5b7f9a3d680a4bb82a5`
+  - signed annotated tag：`v0.1.0`，tag object `84ca65b57ada2dd696c960dd554c55364dec67ea`，tag target commit `e6d013adbae633eb43efc5b7f9a3d680a4bb82a5`
+  - release workflow run：[25336039804](https://github.com/JoeyTeng/codex-background-task-handler/actions/runs/25336039804)
+  - release assets：`cbth-v0.1.0-x86_64-unknown-linux-gnu`、`cbth-v0.1.0-x86_64-unknown-linux-gnu.sha256`、`cbth-v0.1.0-aarch64-apple-darwin`、`cbth-v0.1.0-aarch64-apple-darwin.sha256`
+  - macOS arm64 本机已验证：`CBTH_VERSION=v0.1.0 scripts/install.sh` 安装 release binary，`cbth self update --check` 识别当前版本等于 latest，安装后二进制 `cbth doctor cli` 通过
+  - 当前不支持 GHCR/OCI package、Homebrew/Tap、macOS Intel、Linux musl、Linux arm64 或 Windows release assets
+- Phase 11a 把 deterministic fake e2e 收进 Rust integration tests，因此现有 `ubuntu-latest` / `macos-latest` matrix 的 `cargo test --locked` 会直接 gate：
+  - `job submit` / `job fail` 产生 open batch 后，经 managed CLI session proof、`attempt begin-cli-accept`、`accept-cli`、`observe-cli-turn` 收敛为 `close_reason=delivered`
+  - `cbth cli run` 配合 fake codex 与 fake app-server 验证默认路径仍只是 passive sync：只发送 initialize / `thread/resume` / `thread/read`，不会发送 `turn/start` 或 `turn/steer`
+  - live Codex shared `app-server` smoke 放在 ignored Rust test 中，默认 CI 只编译，不执行真实 `codex` / 模型 / 网络路径
+- Phase 11b 已实现 CLI explicit opt-in 自动投递闭环：
+  - 默认 `cbth cli run` 仍是 passive，不发送 delivery RPC
+  - `--auto-delivery-policy trusted-all` 会在 durable idle proof 后写入 `accept_pending`、发送带唯一 marker 的 `turn/start`、最多等待 60 秒取得 acceptance response、接受返回的 `turn.id`，并通过 matching notification 或 same-epoch `thread/read` reconcile 收口
+  - completed turn 关闭 batch 为 `delivered`
+  - failed/interrupted/replaced terminal evidence fail-close 到 `manual_resolution_only`
+  - clear pre-accept rejection 写入 `rejected_before_accept` 且不消耗 attempt count
+  - timeout / websocket closed / protocol error 不重发，保留 `accept_pending` 交给 stale sweep 标成 `unknown + manual_resolution_only`
+  - `begin-cli-accept` 使用 deterministic attempt/request id，daemon IPC 失败后走幂等 direct-store fallback；最终仍无法证明 begin 是否落库时，会 best-effort reject 该 attempt 并清空 proof
+  - `turn/start` 返回 `turn.id` 后，adapter 会在有界窗口内重试幂等 `accept-cli` 持久化，并允许 daemon IPC 失败后的 direct-store fallback，减少已接受 turn id 丢失风险
+  - `turn/start` accepted 之后，accepted / started / terminal audit 变为 best-effort；matching terminal evidence 先写入 `attempt observe-cli-turn`，再做 passive activity bookkeeping / resync，避免审计或 activity 写入失败覆盖真实完成证据
+  - matching terminal evidence 的 `observe-cli-turn` 持久化也使用有界重试与 direct-store fallback，减少 accepted turn 已完成但 durable observation 丢失的风险
+  - `thread/read(includeTurns=true)` reconcile 同时兼容 nested `thread.turns` 与真实 app-server 可能返回的 top-level `turns`
+  - accepted-turn observation window 内的 proof-only `thread/status/changed` noise 不再废弃已 accepted attempt；fresh first-turn materialization 前的临时 `thread/read(includeTurns=true)` remote error 也按“暂无 reconcile 证据”处理，继续等待 notification 或下一次 reconcile
+  - accepted-turn observation loop 现在按 accepted attempt 的 `delivery_observation_deadline` 本地收敛；deadline 到期会 best-effort sweep / proof refresh 后退出观察，避免长期前台进程阻塞后续 head batch
+  - sidecar shutdown 现在是 `turn/start` 前硬门禁：auto-delivery poll 前会重查 stop flag；`begin-cli-accept` 后若进入 shutdown，会写入 pre-accept rejection 并保留 batch 可重试，不在关闭窗口里继续发送 side-effectful RPC
+  - `begin-cli-accept` 后、`turn/start` 前的 prompt 构造 / attempt-start audit / response parsing 失败也会先 best-effort `reject-cli-before-accept`，避免从未发出 RPC 的 pending attempt 被 stale sweep 误判为 unknown
+  - 新增 append-only audit log 与 `cbth audit list`
+  - daemon capability 列表新增 `cli-auto-delivery-dispatch`，避免新 CLI 把 auto-delivery audit / reject-before-accept / trusted-all auth-mode 写入路由给 Phase 11a 或更早旧 daemon
+  - fake e2e 覆盖 notification delivered、`thread/read` reconcile、terminal failure manualize、pre-accept rejection、unknown+sweep，以及 `strict_safe` vs `trusted_all` 授权差异
+- Phase 12 已实现 CLI fresh-thread bootstrap：
+  - `cbth cli run` 现在要求 `--bind-thread-id <thread_id>` 或 `--new-thread` 二选一
+  - `--new-thread` 通过 daemon-owned pending loopback app-server 调用 `thread/start`，成功后把同一个 app-server 进程提升为 fixed-thread managed session，并把返回的 `thread_id` durable 绑定为 `bound_thread_id`
+  - 这样避开 Codex 0.128 的 fresh-thread 行为：first user message 前 rollout 不会 materialize，关闭 bootstrap app-server 后新的 app-server 不能 `thread/resume` 该 thread
+  - 成功 bootstrap 后只向 stderr 打印 `cbth: bound thread id: <thread_id>`，不注入 foreground 输入，不改变原生 `codex --remote` 交互模型
+  - bootstrap 的 remote error / timeout / closed / protocol / malformed response 都在 foreground 启动前 fail closed，不创建 managed session，也不进入自动投递
+  - fresh unmaterialized thread 的初始 idle proof 使用同一 app-server 上的 `thread_start + thread/read(includeTurns=false)`；accepted turn materialize rollout 后再使用正常 observation / reconcile 路径
+  - fake e2e 覆盖 `--new-thread` passive session、fresh-unmaterialized trusted-all 自动投递、互斥参数、bootstrap 失败不启动 foreground / 不绑定 session
+- CLI session recovery hardening 已进入实现：
+  - `cbth cli session list/inspect/retire` 是 supported operator diagnostic surface；adapter writer subcommands 仍保持 hidden
+  - foreground/app-server teardown 后 managed session 会从 `live` 转为 `detached` 并清空 proof，避免旧 idle/capability 证明误导后续自动投递
+  - accepted 或 pre-accept fail-closed 到 `manual_resolution_only` 时，关联 managed session 会进入 `parked`
+  - operator retirement 拒绝 `live` session、active delivery attempt、以及仍有 open `manual_resolution_only` head batch 的 bound thread
+  - `cli run --bind-thread-id` 可在旧 `detached` / `parked` / `stale` / profile-drift session 已满足 retirement 条件后自动 retire 并创建 replacement；same-profile attach 也会先拒绝 active attempt / open manual head blockers；否则 fail closed，仍维持每个 `bound_thread_id` 最多一个 non-retired session
+  - daemon capability / doctor gate 新增 `cli-session-recovery-dispatch`，避免新 CLI 把 retire/replacement 语义路由给旧 daemon
+- Live opt-in 复测已覆盖 CLI trusted-all 自动投递：
+  - `codex-cli 0.125.0` 在非 TTY 下会把 `codex app-server` listener banner 输出到 `stderr`；`cbth` daemon 和 live smoke 现在都会同时扫描 `stdout` / `stderr`
+  - `CBTH_RUN_LIVE_CODEX_E2E=1 cargo test --test live_smoke -- --ignored` 已在本机通过，验证真实 shared app-server sidecar turn 仍可完成并被 `thread/read` 看到 marker
+  - `CBTH_RUN_LIVE_TRUSTED_ALL_E2E=1 cargo test --test live_trusted_all -- --ignored` 已在本机通过，验证真实 `cbth cli run --auto-delivery-policy trusted-all` 可在 seed 后的 existing thread 上自动投递 head batch 并关闭为 `delivered`
+  - `CBTH_RUN_LIVE_NEW_THREAD_E2E=1 cargo test --test live_new_thread -- --ignored --nocapture` 已在本机通过，验证真实 `thread/start` fresh bootstrap 后 trusted-all 自动投递闭环；本轮复测覆盖了 Codex 0.128 fresh first-turn materialization 下的 proof-noise / reconcile-error 边界
+  - 复测流程、env 和失败排查记录在 [docs/LIVE_E2E.md](LIVE_E2E.md)
+- CLI Dogfood V1 的收敛计划已单独记录在 [docs/CLI_DOGFOOD_V1_COMPLETION_PLAN.md](CLI_DOGFOOD_V1_COMPLETION_PLAN.md)：
+  - 当前边界是本机 macOS/Linux dedicated single-user workstation dogfood，不是多用户服务器产品
+  - Phase 12 `cbth cli run --new-thread`、daemon-owned `cbth task run/list/inspect/cancel`、`cbth doctor cli`、operator recovery 文档和 local binary dogfood 文档都已合入
+  - 自动投递仍只走 idle `turn/start`；active-turn `turn/steer` 当前只补设计，不进入自动路径
+  - active-turn steer 的 future risk/capability contract 已收敛到 [CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md)
+  - Desktop bridge 仍是单独后续大块
+- Desktop bridge foundation 已开始落地，设计与实现边界见 [DESKTOP_BRIDGE_FOUNDATION.md](DESKTOP_BRIDGE_FOUNDATION.md)：
+  - 新增 `cbth desktop installation-state --json` 与 `installation-state repair ... --json`，把 installation-wide read transport / capability / validation fingerprint 收口到 `desktop_installation_state`
+  - 新增 `cbth desktop binding repair ... --json`，把 `source_thread_id -> caller_automation_id` durable 绑定，并镜像当前 installation generation / fingerprint；同一个 active caller automation 不能被多个 source thread 复用
+  - 新增 daemon-routed `cbth desktop bridge-preflight ... --json`，执行 sweep 后原子发布稳定 `current-snapshot.json` manifest，并让 manifest 指向 `snapshots/<snapshot_revision>/ready-threads.json`、`arm-pending-bindings.json`、`pause-due-bindings.json` skeleton
+  - `bridge-preflight` 也会刷新 preferred direct-file-read export：`~/.cbth/inbox/desktop-installation-state.json`，供 Desktop heartbeat 读取 installation generation / fingerprint / capability state
+  - Desktop live preflight validation harness 已记录在 [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](DESKTOP_LIVE_PREFLIGHT_VALIDATION.md)，但真实 heartbeat 无审批证据仍待执行；当前 `ready_threads` / `arm_pending_bindings` / `pause_due_bindings` entries 仍为空，caller heartbeat wake、automation mutation、ready attempt materialization、`note-arm*` / `note-boundary-crossed` 仍未实现
+- #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
+- GitHub REST 可能把已 resolved / outdated 的旧 inline review comment `commit_id` 映射到后续 head；gate 现在会额外读取 GraphQL `reviewThreads`，只把未 resolved、未 outdated 的 current-head Codex inline threads 算作 blocker。Codex review-body findings 仍按 `PullRequestReview.commit_id` 和 current-head blob link 判定，因为它们没有可 resolve 的 thread。
+
+## 当前架构方向
+
+- 双端方案现在共享一套更清晰的核心抽象：
+  - 一个共享的本地 daemon
+  - 一个共享的 job store / 状态机
+  - 一个共享的 CLI 控制面
+  - 两个薄的 Codex integration adapters：CLI 与 Desktop
+- 第一版不做系统级常驻服务；改为按需启动的本地 daemon。
+- 该 daemon 生命周期独立于单个 Codex 前台实例，但第一版不要求它为长窗口持续常驻：
+  - 近端 delivery work / timers 可以阻止当前实例退出
+  - 更长的 deadline 则改为 durable 落盘，并在下次启动时先做 overdue sweep / auto-close / reconcile
+  - 唯一例外是 CLI accepted attempt 的 `delivery_observation_deadline`：在 deadline 到期前它仍属于必须常驻观察的 live-observation window
+- 第一版稳定外部接口只做 CLI，不承诺公开 socket / Web / plugin 协议。
+- 因此，之前设计里提到的 `background-taskctl` helper，应收敛成主 binary 的 `cbth job ...` 子命令，而不是第二个长期维护的独立工具。
+- 经过 reviewer 复核后，Desktop 关键路径又做了一个更保守的收口：
+  - 不再把“heartbeat turn 稳定执行通用 `cbth job ...` CLI”当作既定前提
+  - 改为定义统一 delivery envelope schema，并给出两条候选读取传输：
+    - `direct_file_read`
+    - `helper_cli_read`
+  - 其中 `direct_file_read` 仍是候选优先路径，`helper_cli_read` 只是条件性 fallback
+  - 但 `direct_file_read` 不是 daemon liveness 机制：每轮 bridge wake 仍必须先执行窄 helper `cbth desktop bridge-preflight ...`，按需拉起 daemon、补做 overdue sweep / GC / auto-close / reconcile，并原子发布同一 `snapshot_revision` 的 ready/reconcile manifest
+  - 同时又补了一层 explicit desktop binding：bridge 运行期只更新已知 caller automation，不做 blind create/discovery
+  - Desktop 的 `read_transport` 也已收口为 installation-wide 选择：
+    - binding 里只 durable 镜像当前安装选定 transport 与其 generation
+    - 权威来源是 daemon-managed `desktop_installation_state`
+    - v1 不支持 mixed Desktop `read_transport` bindings
+    - `~/.cbth` 文件权限与稳定 helper CLI 只是在降低意外暴露面；Desktop helper / snapshot 路线同样只支持 dedicated single-user deployment assumption
+    - installation-wide capability 结论也已收回到 `desktop_installation_state`：
+      - transport generation 变化时，旧 generation 的 capability 不能继续被 bridge 使用；未显式提供 capability 参数时 repair 默认写入 `unknown`
+      - capability 还必须绑定 installation-wide `validation_fingerprint`
+      - binding repair 不得单独覆盖 installation-wide capability
+  - Desktop 顶部文案也已改成更保守的口径：`bridge-preflight` / `note-arm-pending` / `note-arm` / `note-boundary-crossed` 是 v1 规划中的窄 helper 依赖；`note-delivered` 已降级为未来 post-output ack 扩展点，但后台 heartbeat 能否无审批执行前者仍待实证
+  - 而且 Desktop 自动续跑现在被明确成双门槛：
+    - batch 本身必须是只读 / 低风险
+    - 目标安装上的读路径也必须已验证可无审批执行
+    - 目标安装上的 `note-*` 写 helper 也必须已验证可无审批执行
+  - 同时又进一步收紧成：
+    - v1 automatic caller path 只支持 `note-boundary-crossed` fresh success 后的一次性 inline text handoff
+    - 大 artifact continuation 与 post-boundary 普通工具步骤不再纳入 v1 automatic path
+    - 这两类场景直接留给 operator/manual follow-up
+- 同时，CLI 关键路径也收口为：
+  - 明确依赖实验 RPC
+  - 启动时 capability probe
+  - 基于本机 `codex-cli 0.123.0` 的当前上游能力，第一版实际合同收口为 loopback-only shared `app-server`
+  - `--ws-auth` 目前仍只适用于 non-loopback listeners，因此不再把 per-session bearer-token auth 当成 v1 既有能力
+  - 因而 v1 只能在“专用单用户工作站 / 等价隔离环境”这个部署前提下成立；更强本地 auth 边界留待上游支持 loopback auth 后再补
+  - shared `app-server` 由 daemon 持有，而不是前台 wrapper 临时持有
+  - 一个 managed CLI session 在 v1 里只绑定一个 `bound_thread_id`
+  - 这个 `bound_thread_id` 在 v1 现在有两个显式 bootstrap：
+    - 已知 thread 的 `cbth cli run --bind-thread-id <thread_id>`
+    - 以及 `thread/start` 可用时的 `cbth cli run --new-thread`
+  - v1 不再承诺 late-bind，也不把 `managed_session_id` 暴露成外部回填 thread id 的 stable bootstrap surface
+  - 同一个 `bound_thread_id` 在 v1 最多只允许一个 non-retired managed session；`cbth cli run --bind-thread-id` 必须是 attach-or-create，而不是 blind create
+  - 前台 thread-switch 的自动观测/自动 retarget 不属于 v1 合同
+  - 默认仅在 idle 时 `turn/start`
+  - `strict_safe` detached 自动投递还要求 managed session 自身是 no-approval / no-network / no-write profile
+  - `trusted_all` 是显式 broad escape hatch，会绕过 batch policy / artifact-read / session risk-profile gates，但仍要求 head batch、budget、bound thread/session/epoch 和 fresh idle proof
+  - `turn/steer` 仍不进入当前自动投递路径
+- 共享核心也补上了 reviewer 指出的 thread 级缺口：
+  - 引入 thread-scoped FIFO 队列
+  - 引入 `delivery batch`
+  - 引入最小连续发送间隔
+  - 同一 thread 同时最多一个 in-flight delivery attempt
+  - 并进一步补上了 durable `attempt_id + generation` 合约，以及 optional `automation_id` 协调字段
+  - 其中 `generation` 现在明确只作用在 batch 内 attempt 级 redelivery：
+    - 新 generation 只会 supersede 旧 attempt
+    - 不会自动把整个 batch 关闭为 `close_reason=superseded`
+- Desktop 第一版的送达语义也已收口：
+  - 目标是 `at-least-once wakeup scheduling`
+  - `closed` 只表示 `cbth` 停止自动重投，不表示 caller 一定已消费
+- 为了让 redelivery 语义真正可实现，batch schema 也进一步要求 durable 记录：
+  - `redelivery_window_ends_at`
+  - `max_delivery_attempts`
+  - `delivery_attempt_count`
+- Desktop 运行期还新增了两条窄控制面：
+  - `cbth desktop note-arm-pending ...`
+  - 用于在 bridge 真正调用 `automation_update` 前，把当前 head attempt durable 推到 `arm_pending`
+  - `cbth desktop note-arm ...`
+  - 用于在 bridge 成功 `automation_update` 后，把 attempt durable 推进到 `cooldown`
+- Desktop helper/control 链路也进一步按职责分层：
+  - mandatory preflight：`cbth desktop bridge-preflight ...`
+  - optional bridge-side read fallback：`list-arm-pending` / `list-pause-due` / `claim-next-ready`
+  - writeback / gated continuation：`note-arm-pending` / `note-arm` / `note-boundary-crossed`
+  - operator/manual recovery 或 future-expansion：`read-artifact`
+- 但除了 mandatory `bridge-preflight` 外，额外 helper read fallback 仍被重新降级成“条件性 fallback”：
+  - 它仍要求 heartbeat turn 无审批执行窄 `cbth desktop ...` 命令
+  - 在这个前提被实证前，不能把额外 helper read fallback 当作已验证主路径
+  - 当前真正优先候选仍是 `bridge-preflight + direct_file_read`
+- Desktop 的 delivery state machine 也继续收紧：
+  - attempt 不再保留单独的 durable `armed`
+  - bridge 在真正调用 `automation_update` 前，先把 attempt durable 推到 `arm_pending`
+  - 只有 bridge arm 成功并 `note-arm` durable 记录后，attempt 才进入 `cooldown`
+  - `cooldown` 期满后若仍可重投，也必须重新进入 eligible ready / fresh-arm gate；Desktop 同一 binding 必须等上一代 `armed_generation` quiesced 后才允许新 attempt
+  - 若 `delivery_attempt_count >= max_delivery_attempts`，batch 必须自动关闭到 `close_reason=max_attempts_exhausted`
+- Desktop 的送达语义也进一步收紧：
+  - `claim-next-ready` 虽然名字里带 `claim`，但第一版必须是纯 read/peek helper，不能 reservation 或隐藏 head batch
+  - `arm_pending` attempt 不再是新的 ready head；bridge 必须先 reconcile 它，不能重复 arm 同一 generation
+  - `note-boundary-crossed` 现在不只是断点写回，而是 gated continuation helper：
+    - caller 必须先拿到它的 fresh success 返回，才允许看到 inline continuation payload / summary
+    - helper mutation 前必须校验完整 caller prompt token：`source_thread_id + batch_id + attempt_id + generation + expected_snapshot_revision`
+    - 这一步在 v1 是单次 crossing，不再提供自动 replay-safe continuation；response 丢失后改走 operator recovery
+    - redelivery 只能发生在 durable reconciliation 正向证明 crossing mutation 没有提交时；helper 已提交但 response 丢失仍按 `handoff_recorded` 处理
+  - 如果 `note-boundary-crossed` 尚未 success，caller 不得真正跨过 continuation boundary
+  - `note-boundary-crossed` 需要 compare-and-swap / stale-no-op 语义，避免重复 wake 或 supersede 后重复记账
+  - 一旦 `note-boundary-crossed` 成功，当前 batch 就必须进入 `closed + close_reason=handoff_recorded + replay_policy=manual_resolution_only`
+  - post-boundary 只允许进入一次性 inline text handoff phase，不把普通 Codex 工具纳入 supported automatic path
+  - 第一版不再尝试把纯文本回复或后续工具动作自动收口成 “已送达”；`handoff_recorded` 只表示 inline handoff payload / recovery envelope 已 durable 记录，释放 FIFO，但不证明 caller assistant 文本可见
+  - post-boundary lost response 只能通过 `cbth batch inspect --batch-id ...` 读取 `boundary_recovery_envelope` 做 operator recovery
+  - `note-arm` 也新增了 CAS/幂等合同，避免 bridge 重试导致重复计数
+  - `note-boundary-crossed` 的非 success outcome 已拆成 transient / stale / already-crossed / capability-invalid / unknown，避免把已 `handoff_recorded` 的 batch 误重投
+  - pre-boundary 歧义 batch 的 durable 表达应落成 `replay_policy=manual_resolution_only`
+  - 默认只允许 operator close；若长期无人处理，则在 `redelivery_window_ends_at` 到期时自动 close 释放 FIFO/GC
+- 第一版自动续跑总门槛也已统一：
+  - 只处理 `delivery_read_only=true`
+  - 且不需要 approval/network/write access 的 batch
+  - Desktop 还必须满足安装级 `read_transport_capability=validated`
+  - Desktop 还必须满足 `writeback_capability=validated`
+  - `requires_artifact_read=true` 的 batch 不再进入 Desktop automatic caller path
+  - 非只读 batch 一律不自动续跑，留给 operator/manual follow-up
+  - 这些字段的输入合同也已收口为：
+    - submitter 显式提供 delivery policy
+    - 若缺失则 core fail-closed 写入保守默认值
+    - `inline_payload_bytes` / `requires_artifact_read` 由 core 统一派生，不由 submitter 直填
+    - CLI adapter 再在共享核心字段之上本地判定是否 steer-eligible
+- caller heartbeat lifecycle 也已收口：
+  - `caller_automation_id` 是预绑定、长期复用的 heartbeat automation
+  - `armed_generation` 作为这个长期复用 heartbeat 的 generation 栅栏
+  - `armed_generation_quiesced_at` 记录上一代 one-shot wake 已经被 bridge 证明 `PAUSED` / deleted / otherwise quiesced
+  - 同一 binding 在 `armed_generation_quiesced_at` 为空时不得 fresh-arm 下一批；`handoff_recorded` 释放 FIFO 不等于 heartbeat 已 quiesced
+  - `arm_pending_deadline` 是当前 head attempt 的 reconcile 截止点，不属于 binding 自身的 durable 字段
+  - `pause_not_before` / `pause_deadline` 才是 binding / armed generation 级的一次性 wake cleanup 窗口
+  - 其中 `pause_not_before` 明确保证 bridge 至少给 caller 一次完整 heartbeat 触发机会，再允许回收这次 wake
+  - bridge 的 ready entry 也已收口：
+    - 只要求返回 prompt token
+    - caller prompt token 必须包含 `source_thread_id + batch_id + attempt_id + generation + snapshot_revision`
+    - `snapshot_path` 只保留在 bridge-side locator，不进入 caller prompt
+    - `caller_automation_id` 一律由 bridge 通过 `source_thread_id -> binding` lookup 解析
+  - daemon 自动退出条件也必须覆盖这两个 deadline
+  - `read_transport_capability=validated` 现在明确包括 mandatory `bridge-preflight` 的无审批执行、daemon sweep/refresh 成功，以及刷新后 snapshot 的无审批读取
+  - bridge 还需要一个专门的 overdue-binding 输入面：
+    - `~/.cbth/inbox/snapshots/<snapshot_revision>/arm-pending-bindings.json`
+    - 或 `cbth desktop list-arm-pending ...`
+    - `~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json`
+    - 或 `cbth desktop list-pause-due ...`
+  - 正常路径只由 bridge / operator `pause` / `update` / `reuse`
+  - caller prompt 自己不直接 pause 这个长期复用 automation
+  - stale wake、snapshot 不可读、boundary 已记录后的后续 wake、degraded 都先 no-op / helper writeback，再由 bridge 后续切回 `PAUSED`
+  - 正常投递路径不做 `delete`
+  - 只有明确 operator `binding unbind` 才允许删除
+- CLI 侧 reviewer 指出的 idle/race 缺口也已收口：
+  - idle 必须来自 app-server live event stream
+  - attach/recovery / continuity-loss 之后必须先回到 `activity_state=unknown`
+  - 只有重新拿到 current-state sync 或新的本地 turn lifecycle 证据后，才允许重新判定 `idle`
+  - `turn/start` 失败要被当成 benign race，回到等待下一个 idle，而不是视为成功送达
+- CLI managed session contract 也已补硬：
+  - shared `app-server` 由 daemon 持有
+  - 一个 managed session 在 v1 里只承诺一个固定的 `bound_thread_id`
+  - `bound_thread_id` 通过两种显式 bootstrap 建立：
+    - `cbth cli run --bind-thread-id <thread_id>`
+    - 或 `thread/start` 可用时的 `cbth cli run --new-thread`
+  - 当前上游 surface 仍不提供可依赖的前台来源归因
+  - daemon 必须 durable 跟踪 `managed_session_id + bound_thread_id`
+  - daemon 还必须 durable 跟踪 session-scoped risk profile：
+    - `session_allows_approval`
+    - `session_allows_network`
+    - `session_allows_write_access`
+  - session state 现在必须允许 `parked`：
+    - live app-server 已结束
+    - 但 unresolved manual batch 仍在 durable 等待 operator 收口
+    - 这个 manual batch 可以来自 accepted attempt fail-closed，也可以来自 pre-accept manual/operator path
+  - 这组 profile 对 non-retired session 是 immutable 的；attach-or-create 必须先比较 requested profile 与 durable profile，drift 时只能 fail-closed 或 retire-and-recreate
+  - 同一个 `bound_thread_id` 最多只允许一个 non-retired managed session；不可安全复用时必须 fail-closed，而不是并发创建第二个 session
+  - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点
+  - v1 不提供 late-bind / external discovery surface；如需换目标 thread，必须新开 session
+  - 如果用户想把自动续跑目标换到另一个 thread，必须显式开新 session 或等待未来的 rebind contract
+- CLI 的 delivery completion contract 也继续收口：
+  - 在真正调用 `turn/start` / `turn/steer` 前，必须先 durable 写入 `accept_pending` barrier：
+    - `delivery_rpc_request_id`
+    - `delivery_rpc_kind`
+    - `delivery_rpc_started_at`
+    - `delivery_rpc_state=pending_acceptance`
+    - `delivery_rpc_correlation_marker`
+  - response 丢失时，只有同一 `managed_session_id + session_epoch` 的连续 event/current-state 面能正向证明 marker 已接入 exactly one caller turn，才允许补写 `delivery_turn_id`
+  - 如果既不能证明 accepted，也不能证明未 accepted，当前 head batch 必须 fail-closed 到 `manual_resolution_only`，不得重新发送同一 batch
+  - 如果能在同一连续会话里正向证明 RPC rejected before accept，才允许 `accept_pending -> prepared`，写入 `delivery_rpc_state=rejected_before_accept`，且不递增 `delivery_attempt_count`
+  - `turn/start` / `turn/steer` 被接受，只表示 batch 已接入某个 caller turn 的 pending input
+  - 每次 accepted attempt 都必须 durable 记录 `delivery_turn_id`
+  - accepted attempt 还必须 durable 绑定 `managed_session_id + session_epoch`
+  - `managed_session_id` 是逻辑会话 id；`session_epoch` 是该会话当前可证明连续的 app-server 事件流代号
+  - accepted attempt 还必须 durable 记录：
+    - `delivery_accepted_at`
+    - `last_observed_turn_event`
+    - `last_observed_turn_event_at`
+  - `last_observed_turn_event` 的 v1 canonical enum 已固定为：
+    - `turn_started`
+    - `turn_completed`
+    - `turn_failed`
+    - `turn_interrupted`
+    - `turn_replaced`
+  - accepted attempt 还必须带 `delivery_observation_deadline`
+  - 只有在这个 deadline 之内，未收口 `delivery_turn_id` 才阻止 daemon 退出
+  - deadline 到期仍未观察到可信 `turn/completed` 时：
+    - 当前 attempt 收敛到 `abandoned`
+    - `delivery_observation_state=expired`
+    - 当前 head batch 必须 fail-closed 到 `manual_resolution_only`
+  - 这之后任何实际发生在 deadline 上或 deadline 之后的 `turn/completed` 都只能保留为 operator/debug 证据，不得再自动 close 为 `delivered`
+  - 只有当同一个 `delivery_turn_id` 的 `turn/completed` 被观察到，且以下条件同时满足时，batch 才允许关闭：
+    - 该 attempt 仍是当前 head delivery
+    - 事件自身的 `observed_at < delivery_observation_deadline`
+    - 正常路径要求 `delivery_observation_state=tracking` 且 `replay_policy=automatic`
+    - 如果 daemon startup sweep 已先在 session continuity 仍有效时把同一 attempt 过期到 `abandoned/expired`，但随后收到的 `turn_completed` 事件自带的 `observed_at` 仍早于原 deadline，允许按 delayed on-time evidence 修正为 `delivered`
+  - 如果某次 accepted attempt 已经带有 `delivery_turn_id`，即使前台 UI 临时切到别的 thread，它也仍可等待匹配的 `turn/completed` 正常收口
+  - 因此 daemon 退出条件只需要在 `delivery_observation_deadline` 窗口内覆盖这些未收口的 `delivery_turn_id` 观察
+  - 但只要 `managed_session_id + session_epoch` 的观察连续性丢失，就不得自动 replay；当前 head batch 必须进入 `manual_resolution_only`
+  - 同样地，只要 accepted 的 `delivery_turn_id` 后续出现失败/中断/替换等不可信终局，也必须 fail-closed 到 `manual_resolution_only`
+  - CLI 的最小 capability set 现在不只包括 `thread/resume` / `turn/start` / current-state sync；还必须能观察 accepted turn 的负终态事件，否则 detached auto-continuation 必须 fail-closed
+  - accepted attempt fail-closed 到 `manual_resolution_only` 后，managed session 的 live 部分可以结束，但 durable session 要先转成 `parked`；同样的 `parked` 语义也覆盖 pre-accept manual/operator path，等 manual batch 终态后再允许 replace
+  - continuity-loss 后的最小人工收口路径也已收口为：`batch inspect-head` 看 durable 证据，再用 `batch close-head` 带明确 reason 收口
+- 同时又补了一个和 TUI 当前实现一致的判断：
+  - active-turn steer 语义更接近现有 TUI 的 `pending_steers` / queued-follow-up 行为
+  - non-steerable turn 必须回落到排队，而不是被算作成功送达
+  - steer 的 gating 不能只看 batch 自己；还必须证明当前 active turn 本身也是 `read_only_low_risk`
+- 结果保留责任也已收敛：
+  - `cbth job complete --result-file <path>` 的语义改为 ingest/copy 到 `cbth` 自己管理的 artifact store
+  - 原始外部文件不再承担长期保留责任
+  - artifact GC 也被绑定到 batch 终态与最小保留窗口，而不是外部临时文件生命周期
+- 但 reviewer 第二轮指出，设计还没有完全闭环；当前剩余的是 contract 细化和实证，不再是路线选择问题。
+- 进一步用本机 `codex-cli 0.123.0` 复核后，`codex app-server --help` 仍把 `--ws-auth` 标成仅适用于 non-loopback listeners。
+- 因此 CLI 第一版现在改成更现实的安全边界：
+  - loopback-only listener
+  - daemon-owned ephemeral port
+  - unauthenticated local control plane
+  - 仅在 dedicated single-user deployment assumption 下支持
+- 这里的 unauthenticated loopback 只指上游 Codex shared `app-server` 的当前可用 surface；`cbth` 自己的 daemon IPC v1 已收紧为 same-user-only Unix domain socket：
+  - socket 位于 `~/.cbth/run` 这类 `0700` 用户私有目录
+  - socket / parent ownership 与权限必须校验
+  - daemon 接入后必须校验 peer uid
+  - 无法提供 same-user proof 时，mutating / recovery CLI 命令 fail closed，不退回 unauthenticated TCP
+- `--remote-auth-token-env` 仍是上游已存在的 surface，但在当前 loopback 合同下不再被当成第一版既有依赖。
+- `~/.cbth` 的 Desktop 侧文件路径也新增了权限合同：
+  - directory `0700`
+  - file `0600`
+  - automatic Desktop path 在 pre-boundary 阶段只暴露 ready/reconcile metadata
+  - `by-thread/<thread_id>.json` 与 artifact 文件保留为 operator/debug export，默认不属于 automatic caller path
+- phase 1 Rust local-store 实现边界已明确为 macOS / Linux：
+  - 当前依赖 Unix 风格的私有权限、atomic replace 与 directory sync 语义
+  - 纯 Windows 支持需要单独设计 IPC、ACL、replace/sync 合同后再纳入
+- phase 1 CLI 的人工关闭 reason 已收口到 operator 专用 canonical reason：
+  - `operator_closed_unconfirmed`
+  - `operator_confirmed_delivery`
+  - `manual_resolution_expired` / `max_attempts_exhausted` / `redelivery_window_exhausted` 继续作为系统状态机 reason，而不是 `batch close-head` 的用户输入 reason
+- phase 1 orphan ingest cleanup 已修正一个 future-clock 风险：
+  - `maintenance sweep --now <future>` 可以用合成时间做 overdue 判定
+  - 但 pending ingest stale selection、`.ingest-active` marker observation 与 retry refresh 都必须按真实 wall clock 处理
+  - 否则一次未来 sweep 可能抢删刚创建但 marker 尚未落下的 ingest ownership，或把已崩溃 ingest 的 `updated_at` 固定到未来
+- Desktop bootstrap 合约也已收紧：
+  - 不能只相信一次 `PAUSED` 创建请求
+  - 必须 create/update 后读回验证 paused 状态
+  - 否则 binding 不能进入 `bound`
+- 这套共通核心设计已单独沉淀在：
+  - `docs/SHARED_CORE_ARCHITECTURE.md`
+
+## 已确认事实
+
+- 普通 `codex` / `codex resume` 使用嵌入式 `app-server`，默认没有对外 attach surface。
+- `codex --remote` 可以连接共享 `app-server`，适合 wrapper + sidecar 方案。
+- Codex Desktop 会启动自己的私有 `codex app-server` 子进程。
+- 测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 的 rollout 文件当前被桌面端私有 `app-server` 打开，说明它处于已加载状态。
+
+## 当前实验
+
+在本仓库实现一个最小 PoC 脚本：
+
+```text
+external process
+  -> spawn standalone `codex app-server --listen stdio://`
+  -> initialize
+  -> thread/read
+  -> thread/resume
+  -> thread/inject_items
+  -> verify rollout persistence
+```
+
+当前脚本位于：
+
+```text
+scripts/desktop_thread_inject_poc.py
+```
+
+## 当前结果
+
+- PoC 已在测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 上跑通两次。
+- 两次运行都能成功 `thread/read` + `thread/resume` + `thread/inject_items`。
+- rollout 行数从 `13 -> 14 -> 15`，每次只新增一条外部注入的 `response_item`。
+- 注入时，桌面端私有 `app-server` 仍然持有该 rollout 文件的打开句柄。
+- `thread/read(includeTurns=true)` 不会把这种“未附着到某个 turn 的原始 injected item”直接回显出来，因此它不能作为注入成功与否的判断标准；落盘结果才是关键证据。
+- 用户随后在 Codex Desktop 的该 thread 窗口内直接询问历史，可见 assistant 消息仍只有最初那一条“你好，有什么需要我处理的？”，并明确回答看不到两条外部插入 marker。
+- 第二个 PoC 已通过外部独立 `app-server` 对同一 thread 发起一次完整 `turn/start`。
+- 该 turn 在 `2026-04-22T10:05:45Z` 完成，assistant 最终消息为 `EXTERNAL_TURN_START_MARKER_20260422`。
+- 这次不只是 rollout 落盘；`thread/read(includeTurns=true)` 也能在返回 JSON 中看到该 marker，说明完整新 turn 被 thread 结构化吸收了。
+- 随后用户在同一 desktop thread 中再次发起本地 turn，请求“逐字列出当前可见的最近 2 条 assistant 消息”。
+- 该本地 turn 的 assistant 回复仍然只列出早先的两条本地 assistant 文本，完全没有把 `EXTERNAL_TURN_START_MARKER_20260422` 作为可见历史的一部分。
+- 这说明问题不只是“UI 不热刷新”，而是 desktop 当前 loaded thread 的后续推理上下文也没有并入外部完整 turn。
+- 之后又测试了 `codex exec resume 019db49a-de4e-7d61-93ab-5d70a8905cc3 ...`。
+- `exec resume` 明确复用了同一个 thread id，并成功在 `2026-04-22T10:12:10Z` 追加了一次正常 turn，assistant 最终消息为 `EXEC_RESUME_MARKER_20260422`。
+- rollout 行数从 `46 -> 56`，说明 `exec resume` 对 desktop-originated thread 的效果，本质上仍是“从另一个进程往同一 persisted thread 追加 turn”。
+- 又跑了一次独立 `codex exec --ephemeral --json` 的 agent 通信 PoC。该会话成功调用 `spawn_agent`，新建了 worker agent `019db4ae-49df-75e2-b41f-51f23b562858`。
+- 但当前实际暴露给该 `exec` 会话的工具面中，没有模型可调用的 `followup_task` / `send_message` 投递工具，因此无法在运行时直接复现你记忆中的 mailbox 风格跨 agent 发消息。
+- 代码层面仍能看到 `send_message` / `followup_task` 与 `InterAgentCommunication` 的实现，但它们通过当前进程内的 `agent_control.send_inter_agent_communication(...)` 路由，目标 thread 必须是同一个 live thread manager 能处理的 agent。
+
+## 关键判断标准
+
+- 如果外部进程可以 `resume` 并 `inject_items`，说明 desktop-originated thread 的持久化历史可被外围流程改写。
+- 如果消息能稳定落盘，但桌面端不即时反映，则说明“改历史”与“推送进当前交互 session”仍是两回事。
+
+## 当前判断
+
+- “外部独立进程改写 desktop-originated thread 的持久化历史”已经被实证支持。
+- “外部独立进程直接向 desktop 当前 live in-process session 推送一条会被 UI/交互环立即消费的消息”目前有了反证迹象。
+- 目前更像是：外部流程可以追加 thread history，但没有证据表明 desktop 私有 `app-server` 暴露了一个可被外部直接 attach 的公共 transport。
+- 更具体地说，当前最符合证据的模型是：desktop 已加载 thread 的内存态不会热合并外部对 rollout 的追加写入，至少不会把这类 `thread/inject_items` 写入即时映射到当前窗口可见历史。
+- 但完整 `turn/start` 与裸 `thread/inject_items` 并不等价。前者已经被 thread/read 吸收为正常 turn，因此下一步需要用户直接观察 desktop 窗口，判断 UI 是否会对“外部完整新 turn”做热更新或至少在下一次刷新时显示。
+- 现在这一步已经有结论：即使是外部完整 `turn/start`，desktop 当前已加载 session 也不会在后续本地 turn 中把它并入自己的活动上下文。
+- 因此，对于 desktop，外围进程最多只能改写同一个持久化 thread 文件；它不能可靠地“给当前 live session 发消息”。
+- `codex exec resume` 不是例外路径。它能成功向同一个 thread 追加 turn，但没有证据表明它绕过了 desktop 当前 loaded session 的内存隔离。
+- 你记忆中的 agent mailbox 能力在代码里确实存在，但更像“同一 live process 内父子/协作 agent 线程间通信”，不是一个稳定的跨进程、跨现有 desktop session 的公开注入面。
+
+## Heartbeat / Automation 补充判断
+
+- Desktop 的 heartbeat / automation 与“当前 thread 里的 agent 正在长时间等待”不是一回事。
+- 本地状态里存在独立的 `automations` / `automation_runs` / `inbox_items` 持久化表，并且 `automations` 直接记录 `next_run_at` 与 `last_run_at`。
+- 这说明 heartbeat 至少在建模上是独立调度的后台任务，而不是依赖当前 thread 在一个活跃 turn 内持续轮询。
+- 官方公开材料也把 Automations 描述为“按计划在后台运行”并在完成后把结果投递到 review queue。
+- 因此，如果目标只是避免“agent 在当前 turn 里短间隔轮询、轮几次后自己放弃”，heartbeat 路线比把等待留在当前 turn 内更稳。
+- 但目前还没有直接实证证明：当 Desktop app 被完全退出后，heartbeat 仍会准时触发；现有证据只能支持“它不依赖当前主 thread 持续活着轮询”，不能支持“它等价于一个系统级常驻 daemon”。
+- 进一步检查发现：`~/.codex/sqlite/codex-dev.db` 中的 `automations` 表由 Desktop 主进程持有打开句柄，而私有 `codex app-server` 并未直接打开该 DB。
+- 同时，App bundle 字符串中存在 heartbeat 线程选择、目标 thread、next run、pause/resume、以及 `run now` 等 UI 文案，说明 Desktop 内部确实存在面向 thread heartbeat 的调度与立即运行语义。
+- 这使得一个新的外围思路变得可疑似可行：预先为 caller thread 建一个 heartbeat automation，并在外部 sidecar 完成时通过外部写入 automation 持久化状态，把该 heartbeat 重新武装到“马上运行”，从而尽量避免固定频率 wake 痕迹。
+- 但这条路径目前仍是推断，不是已实证能力；尚未验证 Desktop 是否会对运行中 app 外部改写的 automation 调度状态做及时热感知。
+- 进一步从 App bundle 的前端代码字符串里看到了更强的信号：heartbeat automation 在内部对象上直接带有 `targetThreadId`，并且 UI 逻辑会按 `targetThreadId === conversationId` 关联 heartbeat 与具体 thread。
+- 同一处还可以看到 heartbeat automation 的目标 chat 选择、`run now`、以及“直接向所选 chat 发送消息而不是在项目/worktree 中运行”的文案，说明“thread-targeted heartbeat automation”是 Desktop 的一等概念，而不是文档层面的抽象。
+- 基于这些证据，一个更干净的 Desktop 外围架构浮现出来：不让外部 sidecar 直接改 Codex 的 automation DB；改由一个固定的 bridge automation thread 周期性检查外部长任务状态，再用 `automation_update` 管理 caller thread 的 heartbeat。
+- 这条 bridge 架构的关键优点是：caller thread 不需要固定频率 wake，只在 bridge 判定任务 ready 后才被重新武装；周期性检查痕迹被集中在 bridge thread，而不是污染所有 caller thread。
+- 仍需注意：即使不外改 Codex DB，bridge thread 与外部 sidecar 之间依然需要一个共享状态面，例如本地文件、socket、CLI helper，或 sidecar 自己的 store；这里只是避免去碰 Codex 自己的 automation 持久化层。
+
+## Bridge-thread PoC 结论
+
+- 通过 `automation_update` 可以直接在一个 thread 中创建 heartbeat automation，并把 `target_thread_id` 指向另一个现有 thread。
+- 实测创建 `poc-foreign-heartbeat` 时，即使请求 `status = "PAUSED"`，实际落盘仍为 `ACTIVE`；这说明 tool / app 在 heartbeat 创建时可能会强制激活，后续设计需要把这一点当成实现细节风险。
+- 用户提供的 thread `019db5e6-ba6a-7b80-95d2-a6867163281a` 确认使用 `gpt-5.3-codex-spark-preview` + `low`，并成功作为 bridge heartbeat thread 运行。
+- 第一轮 bridge PoC `poc-bridge-armer` 证明：heartbeat turn 内部确实可以调用 `automation_update` 和 `automation_delete`。该 turn 把当前 automation 自身重写成指向 caller thread 的 heartbeat，再把自己删除，最终回复 `BRIDGE_ARMED`。
+- 第二轮 bridge PoC `poc-bridge-retarget` 证明了完整闭环：
+  - bridge thread 在 heartbeat turn 中调用 `automation_update`
+  - 将当前 automation 的 `target_thread_id` 从 bridge thread 改写为 caller thread `019db49a-de4e-7d61-93ab-5d70a8905cc3`
+  - 同时更新名称和 prompt
+  - 下一分钟 caller thread 的 rollout 中出现新的 heartbeat turn，assistant 最终回复 `HEARTBEAT_POC_RETARGETED`
+- 这说明“固定 bridge automation thread 监控状态，再用内建 `automation_update` 去 schedule caller thread heartbeat”在 Desktop 上是可行架构，不需要外部直接改 Codex automation DB。
+- 但这些 PoC 主要证明的是 Desktop 内置 automation 能力与 thread-targeted heartbeat 可行；当前第一版运行期合同已经进一步收窄为“预绑定 caller heartbeat + bridge 只更新已知 automation”，不再把 runtime retarget/create 当成默认路径。
+
+## 当前方案收敛
+
+- Desktop 方向的技术方案已经收敛为：
+  - 外部 `sidecar supervisor` 跑长任务
+  - 共享 `job state` 作为 bridge / caller 读取面
+  - 固定 `bridge heartbeat thread` 负责轮询可投递 thread / batch
+  - bootstrap 预绑定 `caller_automation_id`
+  - bridge 运行期只更新这个已知 heartbeat，不做 blind create / retarget
+  - bridge 侧优先读取只读 inbox snapshot；caller thread 被唤醒后必须先通过 `note-boundary-crossed` 成功跨过 gated continuation boundary，拿到 inline continuation payload / summary 后才能进入一次性 handoff phase
+- 该方案不依赖：
+  - 外部 live push 当前 Desktop thread
+  - 外部直接改 Codex automation DB
+  - 后台 heartbeat 稳定执行通用本地 CLI
+  - notification thread
+- 独立设计文档已记录在：
+  - `docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md`
+
+## CLI 补充结论
+
+- 当前 CLI TUI 不能直接复用 Desktop 的 `automation_update` / heartbeat bridge 方案。
+- 这不是推断，而是 TUI 自身对 `ServerRequest::DynamicToolCall` 直接返回 unsupported；对应单测名字就是 `rejects_dynamic_tool_calls_as_unsupported`，文案为 `Dynamic tool calls are not available in TUI yet.`。
+- 因此，CLI 方向仍应以 `wrapper + shared app-server + sidecar` 作为主方案。
+- 但 reviewer 指出了一个重要约束：这条路线实际建立在实验 RPC 上，因此文档已进一步收口为“必须 capability probe + fail-closed”，不能把当前 PoC 可用的所有 RPC 都当成长期稳定契约。
+- 目前文档已经进一步规定：第一版 shipping 配置默认关闭 `turn/steer`，只有在 feature flag 打开且满足只读/低风险门槛时，才允许作为可选优化启用。
+- 已新增一个最小 CLI 正向 PoC：
+  - `scripts/cli_shared_app_server_poc.mjs`
+  - 使用本机安装的 `codex app-server --listen ws://127.0.0.1:4311`
+  - 由脚本同时模拟 frontend client 与 sidecar client
+  - frontend 先创建 thread 并完成一个 seed turn
+  - sidecar 随后对同一 thread 执行 `thread/resume + turn/start`
+  - frontend 成功收到 sidecar turn 的 `turn/started` 与 `turn/completed` 通知
+  - `thread/read` 中也能看到 sidecar marker
+- 本次实测结果：
+  - `thread_id = 019db60d-97d8-7e73-b992-afe8073d7fe6`
+  - `frontend_seed_turn_id = 019db60d-97f2-7742-90ec-dfdf2c6e9436`
+  - `sidecar_turn_id = 019db60d-a9bd-7ad1-a372-931865554a89`
+  - `frontend_saw_turn_started = true`
+  - `frontend_saw_turn_completed = true`
+  - `sidecar_turn_status = completed`
+  - `marker_visible_in_thread_read = true`
+- 这说明 CLI wrapper 路线的关键前提已经被正向验证：在共享 `app-server` 模式下，第二个 sidecar client 可以续跑同一个 live thread，而且前台 client 会感知到对应 thread 事件。
+- 又补做了一次真实 PTY 级别的前台 TUI 实测，而不只是协议层脚本模拟。
+- 实测方式：
+  - 启动共享 `codex app-server --listen ws://127.0.0.1:4312`
+  - 前台启动真实 `codex --remote ws://127.0.0.1:4312 --no-alt-screen -C /Users/hoteng/Program/GitHub/codex-background-task-handler`
+  - 先在前台 TUI 中完成 seed turn，marker 为 `TUI_SEED_MARKER_20260422`
+  - 再由外部 sidecar client 对同一 thread 发起第二轮 turn，marker 为 `TUI_SIDECAR_MARKER_20260422`
+- 对应 thread 为 `019db614-1fb7-70a3-956f-7a96c48f0226`。
+- PTY 输出中确实出现了 sidecar 触发的第二轮用户输入与 assistant 最终结果 `TUI_SIDECAR_MARKER_20260422`。
+- 因此，CLI 方向的结论已经不只是“协议层上的前台 client 会收到通知”，而是“当用户手动把前台停留在同一个 `bound_thread_id` 时，真实前台 TUI 也会把 sidecar 触发的新 turn 展示给用户”。
+- 独立设计文档已记录在：
+  - `docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md`
+- 又补做了 active-turn `turn/steer` 的定点 PoC，用来验证“caller thread 还在 running 时，sidecar 能否把同一个 turn steer 下去，而且不会让 turn 提前结束”。
+- 新脚本位于：
+  - `scripts/cli_turn_steer_poc.mjs`
+- PoC 通过共享 `codex app-server` 启动一个 regular turn，并明确让模型使用 shell 执行 `sleep 10`。
+- 在该 turn 仍处于 active 状态时，第二个 sidecar client 对同一 thread 调用 `turn/steer`。
+- 第二轮实测结果：
+  - `thread_id = 019db65d-2df2-7941-8871-b8ed1fe0b73b`
+  - `turn_id = 019db65d-2e9c-7ff2-9690-f84b725a9a12`
+  - `same_turn_id_after_steer = true`
+  - `turn_completed_same_turn = true`
+  - `turn_status = completed`
+  - `turn_started_notification_count = 1`
+  - `no_additional_turn_started = true`
+  - `notifications_have_command_execution = true`
+  - `final_agent_message_from_notifications = CLI_TURN_STEER_APPLIED_MARKER_20260422`
+  - `final_message_matches_steer_via_notifications = true`
+  - `no_premature_completion_signal = true`
+- 这说明：
+  - sidecar 对 active caller turn 使用 `turn/steer` 时，server 接受的是同一个 `turn_id`
+  - steer 不会额外开启一个新 turn
+  - steer 之后原 turn 继续运行并正常 `turn/completed`
+  - steer 内容会被最终 assistant 结果吸收
+- 但 reviewer 也指出：当前 steer PoC 只覆盖了无审批、无网络、固定 `sleep 10` 的窄场景，因此设计已进一步收口为“`turn/steer` 只作为只读、低风险投递场景下的可选优化”，而不是一般性的默认主路径。
+- 第一轮同类实测还从 rollout 侧拿到了更底层的补充证据：
+  - 模型实际发起了 `exec_command: sleep 10`
+  - steer 文本作为新的 user message 被写入同一个 rollout
+  - 最终 `agent_message` 与 `task_complete.last_agent_message` 都是 `CLI_TURN_STEER_APPLIED_MARKER_20260422`
+
+## 当前实现进展
+
+- Phase 1 已经通过 PR #2 squash merge 到 `master`，merge commit 为 `6678f25a591208d09d53546dc78a1e9f22b83767`。
+- Phase 2 已经通过 PR #5 squash merge 到 `master`，merge commit 为 `1d66ad95ca25599e178fab34791d400a8ace6225`。
+- Phase 2 第一批实现范围限定在共享 daemon / IPC 基础，不接入 CLI `app-server` 或 Desktop heartbeat：
+  - `cbth daemon serve`
+  - `cbth daemon ensure`
+  - `cbth daemon ping`
+  - `cbth daemon status`
+  - `cbth daemon stop`
+- 当前 daemon 基础合同：
+  - 使用 `~/.cbth/run/cbth.sock` Unix domain socket
+  - `~/.cbth` 与 `run` 目录必须是当前 uid owned 且不宽于 `0700`
+  - socket 必须是当前 uid owned 且不宽于 `0600`
+  - server accept 后校验 peer uid，不支持 same-user proof 的平台 fail closed
+  - `daemon ensure` 会按需拉起 foreground `daemon serve`
+  - daemon 启动时先跑一次 maintenance sweep
+  - daemon 在简单 idle timeout 后退出并清理 socket
+- Phase 3 已经通过 PR #12 squash merge 到 `master`，merge commit 为 `8a692920f0e79ce1692b86f3a23d6ce0c0ae062e`。
+- Phase 3 范围限定在把既有核心 CLI mutating/recovery 命令接入 daemon domain RPC，不接入 CLI `app-server` 或 Desktop heartbeat：
+  - 默认 `job submit` / `job complete` / `job fail` 会先 `daemon ensure`，再通过 daemon 的 `dispatch` RPC 执行
+  - 默认 `batch close-head` 与 `maintenance sweep` 同样走 daemon `dispatch` RPC
+  - 自动 daemon routing 的启动等待默认 5 秒，但用户可通过全局 `--auto-daemon-startup-timeout-seconds <seconds>` 为慢磁盘或大 startup sweep 场景显式放宽
+  - `job inspect` / `job list` / `batch inspect-head` / `batch inspect` 仍然直接只读打开 store，避免把普通检查绑定到 daemon lifecycle
+  - client 在提交 RPC 前把 `--metadata-file` / `--result-file` 转成绝对路径，避免 daemon 当前工作目录与调用者不同导致读取错位
+  - daemon-side `dispatch` 拒绝 `--home` 与 `daemon ...` 子命令，避免通过 domain RPC 改写目标 home 或递归控制 daemon
+  - `maintenance sweep` 触发 autostart 时会跳过 daemon startup sweep，避免 startup sweep 抢先消耗待返回的 sweep report；普通 daemon ensure / serve 仍保留 startup sweep
+  - daemon accept loop 使用有上限的 per-client worker，避免长 artifact ingest 阻塞 `status` / `stop`；active client 未结束前 idle shutdown 不会触发，worker slot 上限防止无限制线程增长
+  - 测试内部保留隐藏 `--direct-store` 路径，用于固定旧的本地 store 语义与 daemon lifecycle 单元测试；该路径需要显式 `CBTH_ALLOW_DIRECT_STORE=1` 环境门控，不作为普通用户入口
+  - mutating CLI 复用 daemon socket endpoint 校验；当 private run dir / socket ownership / peer uid proof 不能成立时 fail closed，不回退到 direct store 或 unauthenticated TCP
+  - 私有目录创建在 Unix 下使用 `0700` creation mode，并对 chmod 路径使用 no-follow fd 操作，避免 autostart 并发窗口和 symlink race 扩大权限边界
+- Phase 4 已经通过 PR #15 squash merge 到 `master`，merge commit 为 `dca6424b7a740bf5da44bd90e4f528f988942bd6`。范围限定在 daemon lifecycle guard 的第一层实现：
+  - 当前 store 已存在的 `pending` jobs 会阻止 daemon idle exit
+  - 最近 activity 后的当前 idle timeout window 内会到期的 open batches 会阻止 daemon 直接退出，并由 daemon 在到期后先执行 sweep；该 horizon 不随后续 lifecycle refresh 滑动
+  - 超出当前 idle timeout window 的 open batches 仍不阻止退出，继续依赖 next-start / explicit sweep 收口
+  - lifecycle refresh 使用短 SQLite timeout；刷新失败时保守阻止 idle exit，但不会让 listener accept loop 长时间阻塞 control RPC
+  - idle timeout 判定在 idle deadline 之后至少强制刷新一次 lifecycle 状态，避免 deadline 前缓存导致误退出；client 完成也会刷新 activity generation，避免长 dispatch 结束后使用 accept-time horizon
+  - due maintenance sweep 不在 listener accept loop 同步执行；daemon 只启动单个后台 maintenance worker，并在 worker 运行期间阻止 idle exit
+  - 当 daemon 因显式 `maintenance sweep` autostart 而 skip startup sweep 时，后台 lifecycle maintenance 会抑制到第一个 `dispatch` 请求进入后，避免抢先消费显式 sweep report；抑制期间 due batches 不单独阻止 idle exit
+  - shutdown 会等待已启动的 lifecycle maintenance worker 到达一致点后再返回
+- Phase 5 已经通过 PR #16 squash merge 到 `master`，merge commit 为 `3e452caa6f874b1ec54464d152838900ba4dce7d`。范围限定在 CLI accepted-attempt durable state 与 daemon observation deadline 集成：
+  - 新增 `delivery_attempts` schema，覆盖 CLI `accept_pending -> cooldown -> abandoned` 的最小 accepted-observation slice
+  - adapter-internal 隐藏命令 `cbth attempt begin-cli-accept` / `accept-cli` / `inspect` 只用于后续 CLI adapter 与测试，不作为稳定外部用户接口
+  - `begin-cli-accept` 要求 adapter 先提供稳定 `--rpc-request-id`，并 durable 记录 `delivery_rpc_request_id`、`delivery_rpc_kind`、`delivery_rpc_state=pending_acceptance`、`delivery_rpc_correlation_marker`、`managed_session_id` 与 `session_epoch`
+  - `begin-cli-accept` 按 adapter-provided `delivery_rpc_request_id` 幂等：如果 DB 写入已提交但 JSON response 丢失，adapter 重试同一个 request id 会拿回原 attempt，而不是创建第二个 attempt 或卡到 manual timeout
+  - `accept-cli` 记录 `delivery_turn_id`、`delivery_accepted_at`、`delivery_observation_state=tracking` 与 `delivery_observation_deadline`，并只在 accepted 后递增 `delivery_attempt_count`
+  - Store 层拒绝对 fail-closed、需要 approval/network/write、或 `requires_artifact_read=true` 的 batch 进入 detached CLI delivery
+  - `accept_pending` 现在有 bounded sweep 收敛：若 pending acceptance 超过当前 5 分钟内部窗口仍无法证明 accepted/rejected，attempt 会进入 `abandoned`，RPC state 记为 `unknown`，head batch 进入 `manual_resolution_only`
+  - daemon lifecycle 会在 `accept_pending` timeout 前保持 active acceptance live window，并在 stale 后触发 maintenance sweep；显式 `maintenance sweep` autostart 的 suppressed lifecycle 例外仍保留，避免抢先消费显式 sweep report
+  - `maintenance sweep` 会把过期 accepted CLI observation 收敛到 `attempt.state=abandoned`、`delivery_observation_state=expired`，并把 head batch fail-closed 到 `replay_policy=manual_resolution_only`
+  - CLI fail-closed 到 manual 时会重新打开默认 manual resolution window，避免同一轮 sweep 把刚 manualized 的 batch 立即 `manual_resolution_expired`
+  - daemon lifecycle 的 due-batch 计数会排除仍有 active attempt 的 batch，避免在 attempt deadline 前反复触发无进展 sweep
+  - `batch close-head` 会同步把当前 batch 上仍未终态的 delivery attempt 标为 `closed`，避免 operator close 后的旧 attempt 阻塞同 thread 后续 head batch
+  - daemon lifecycle 会在 active `delivery_observation_deadline` 前阻止 idle exit；deadline 到期后由后台 sweep 收口，再允许退出
+  - CLI accepted observation window 第一版固定上限为 6 小时，避免错误 adapter 输入把 daemon idle-exit blocker 持久化到天级或无限远
+  - 显式 `maintenance sweep` autostart 的 skip-startup-sweep suppression 仍会保留：due CLI observation 与 due batch 一样不会抢先消费显式 sweep report；active 未到期 observation 仍保活到 deadline
+- Phase 6 当前分支为 `codex/phase-6-cli-managed-sessions`，范围限定在 CLI managed-session durable bookkeeping 与 accepted-attempt 前置校验：
+  - 新增 `cli_managed_sessions` schema，durable 记录 `managed_session_id`、`bound_thread_id`、`session_epoch`、`session_state`、`activity_state`、`activity_revision`、session-scoped risk profile 和 timestamps
+  - 同一个 `bound_thread_id` 当前最多只允许一个 non-retired managed session；unique partial index 直接约束这一点
+  - 新增 adapter-internal `cbth cli session bind` / `note-activity` 与 operator-facing `inspect`：
+    - `bind` 是现阶段的 attach-or-create building block，不是稳定最终用户入口
+    - `bind` 必须显式传入三项 session risk profile；缺失 profile 不会默认成低风险
+    - 对 `live` / `detached` session 复用同一个 `managed_session_id`
+    - attach 时递增 `session_epoch`、把 `activity_state` 重置为 `unknown`、把 epoch-local `activity_revision` 重置为 0，后续仍必须通过更新的 current-state sync 才能判定 idle
+    - `note-activity` 是 current-state sync 的临时 durable 写入面；当前只允许把同 epoch 的 `live` / `detached` session 通过严格顺序递增的 `activity_revision` 标成 `active` 或 `idle`，同 revision 只允许完全相同状态的幂等重放
+    - requested profile drift、`stale` 或 `parked` session 现在会先走 retirement safety check；旧 session 仍 `live`、仍有 active attempt、或仍有 open `manual_resolution_only` head batch 时 fail closed，否则先 retire 再创建新的 `managed_session_id`
+    - `retired` session 不会被 attach 复用
+  - `begin-cli-accept` 不再接受任意字符串形式的 `managed_session_id`：
+    - session 必须存在
+    - `bound_thread_id` 必须等于 batch 的 `source_thread_id`
+    - `session_epoch` 必须匹配
+    - session 必须处于 `live` 或 `detached`
+    - 默认 `strict_safe` authorization mode 下，session risk profile 必须是 no-approval / no-network / no-write；显式 `trusted_all` 会绕过这组 risk-profile gate
+    - `turn_start` 目前还要求 `activity_state=idle`
+    - `turn_steer` 仍 fail-closed，直到后续 phase 落地 active-turn risk proof
+    - 同一 `delivery_rpc_request_id` 的幂等重试会先恢复已有 attempt，但仍要求 stored attempt 绑定当前有效 managed session；它不再受后续 activity 状态漂移影响，但 session epoch 失效、缺失 session、profile drift 或 thread mismatch 都会 fail-closed
+    - stale `accept_pending`、expired `cooldown` observation、以及 `batch close-head` 关闭仍未终态 CLI attempt 时，当前实现都会推进对应 managed session 的 `session_epoch` 并清空 activity proof，避免旧 idle 证明继续打开下一次自动投递
+  - daemon capability 列表新增 `cli-session-dispatch`，避免新 CLI 把 session mutation 路由给旧 daemon
+- Phase 7 当前分支为 `codex/phase-7-cli-turn-observation`，范围限定在 accepted CLI turn 的 adapter-internal terminal-event 写入面：
+  - 新增 hidden `cbth attempt observe-cli-turn`
+  - 同一 `delivery_turn_id` 的 `turn_started` 只 durable 更新 `last_observed_turn_event + last_observed_turn_event_at`，attempt 保持 `tracking`
+  - `observed_at < delivery_observation_deadline` 的匹配 `turn_completed` 才会把 `delivery_observation_state` 标为 `completed` 并关闭当前 head batch 为 `close_reason=delivered`
+  - 如果 daemon startup sweep 先按 wall clock 把 attempt 过期，且 sweep 当时仍能证明 session continuity，但随后 dispatcher 带来的 `turn_completed` 事件证明实际完成时间仍早于原 deadline，当前实现会把这个 delayed on-time observation 修正为 `delivered`
+  - 但任何后续 `cli session bind` / re-attach 都会把同一 managed session 仍 open 的 tracking/expired attempts 收敛到 `abandoned`，撤销 delayed-deliver 资格并保持 manual resolution
+  - `turn_failed` / `turn_interrupted` / `turn_replaced` 会把 attempt 标为 `abandoned`，并把当前 head batch fail-closed 到 `manual_resolution_only`
+  - `observed_at >= delivery_observation_deadline` 的事件不会关闭 batch；即使是 `turn_completed` 也只作为 late evidence 记录，并 fail-closed 到 manual resolution
+  - observed turn id 必须匹配 stored `delivery_turn_id`，否则拒绝写入
+  - daemon capability 列表新增 `cli-turn-observation-dispatch` / `cli-turn-observation-expiry-dispatch`，避免新 CLI 把 turn-observation / observation-expiry mutation 路由给 Phase 6 旧 daemon
+  - 本地验证已覆盖 full Rust/JS gate、shared `app-server` e2e、以及 fresh `gpt-5.5` reviewer pass；最终 review 结果为 no findings
+- Phase 8 当前分支为 `codex/phase-8-cli-capability-probe`，范围限定在 CLI managed session 的最小 capability proof：
+  - `cli_managed_sessions` 新增 epoch-local capability fields 与 `capability_revision`
+  - 新增 hidden `cbth cli session note-capabilities`
+  - `bind` / re-attach / continuity-loss fence 会清空旧 capability proof，避免复用旧 app-server epoch 的能力结论
+  - `begin-cli-accept --rpc-kind turn-start` 现在要求同 epoch 已证明 `turn_start`、`current_state_sync`、`turn_completed_event`、负终态 observation surface，以及 `thread_resume` 或 fresh `thread_start` attachment proof，否则 fail-closed
+  - 新建 CLI attempt 会记录 `session_activity_revision` / `session_capability_revision` proof snapshot；同 RPC retry 和 accept path 要求 snapshot 非零，避免迁移旧 attempt 绕过 Phase 8 gate，同时不因 accepted turn 后的 activity drift 破坏幂等恢复
+  - daemon capability 列表新增 `cli-session-capability-dispatch`，避免新 CLI 把 `note-capabilities` mutation 路由给 Phase 7 旧 daemon
+  - `turn_steer` 仍保持 fail-closed，直到后续 phase 落地 active-turn risk proof
+  - 本地验证已覆盖 full Rust/JS gate 与 shared `app-server` e2e；e2e 使用本机 `codex-cli 0.125.0`，确认 frontend client 仍能看到 sidecar turn started/completed，且 `thread/read` 能看到 marker
+- Phase 9 当前分支为 `codex/phase-9-cli-run-process-model`，范围限定在 CLI existing-thread 最小进程模型与 daemon-owned app-server lifecycle：
+  - 新增 public `cbth cli run --bind-thread-id <thread_id>`，先通过 hidden `cli session bind` 建立 / attach durable managed session，再启动 foreground Codex
+  - `cli run` 要求调用方显式传入 session risk profile，不把缺失 profile 默认成低风险
+  - daemon capability 列表新增 `cli-app-server-lifecycle` / `cli-app-server-probe`，避免新 CLI 把 app-server lifecycle 或 doctor probe request 路由给旧 daemon
+  - daemon-side `bound_thread_id` reservation 会在 session bind 前建立，避免重复 foreground start 在失败前推进现有 `session_epoch`
+  - daemon 现在按 `managed_session_id` 管理 shared `codex app-server --listen ws://127.0.0.1:0`
+  - daemon 只接受 app-server 上报的 `127.0.0.1` / `localhost` websocket listener，并在 `daemon status` 中暴露 active CLI app-server 列表
+  - foreground wrapper 使用 `codex --remote <url> --cd <current_dir> ...` 暴露原生 Codex CLI/TUI 体验，并支持 passthrough Codex 参数
+  - foreground wrapper 持有短 lease 并周期性 refresh；foreground 退出时显式 stop 当前 lease
+  - daemon 会在 lease 过期、daemon shutdown、或 app-server 启动失败时 kill/wait app-server，并 join stdout/stderr drain worker，避免孤儿子进程与 pipe worker 泄漏
+  - 该 phase 不包含真实 capability collection、current-state sync、websocket event loop、sidecar delivery loop 或 accepted-turn observation loop
+- Phase 10 当前分支为 `codex/phase-10-cli-passive-adapter`，范围限定在 `cbth cli run` 的只读 passive app-server adapter：
+  - `cli run` 在 daemon-owned app-server URL 可用后启动一个 wrapper-owned sidecar 线程，并在 foreground Codex 退出时设置 stop flag 后 join，避免 wrapper 退出后遗留线程或连接
+  - foreground Codex 退出后，wrapper 会用 passive sidecar 的最新 epoch/revision 执行 final `invalidate-proof`，再停止 daemon-owned app-server，避免 app-server / event stream 已结束后仍保留 `idle` / capability proof
+  - sidecar 使用最小 blocking WebSocket / JSON-RPC client 连接同一个 loopback app-server，不引入 Tokio / websocket runtime 依赖，idle 路径只做有界 connect retry 与 500ms receive timeout
+  - sidecar 初始化时声明 `experimentalApi=true`，并 opt out 高频 delta notification，只保留 thread / turn lifecycle 所需事件，降低长时间运行时的无用 CPU / IO 压力
+  - sidecar 只做无副作用 `thread/resume` 与 `thread/read(includeTurns=true)`，把当前 epoch 的初始 current-state proof 写入 `note-activity`；成功返回且 `thread.id` 匹配 `bound_thread_id` 的 `thread.status.type` authoritative snapshot 是对应 request 窗口的顺序边界，不会被该 response 前已消费的 stale notification 覆盖；缺少 status 时才 fallback 到 turns tail
+  - sidecar 会把 `turn/started`、`turn/completed` 与 `thread/status/changed` 映射为 monotonic `active` / `idle` activity revision；`completed` / `failed` / `interrupted` / `replaced` 都视为 terminal turn status；activity 写入失败会先 invalidate 当前 proof 再返回错误，避免把 durable state 留在旧 `idle`
+  - 新增 hidden adapter-internal `cbth cli session invalidate-proof`，用于 websocket continuity loss 或 authoritative current-state snapshot 缺失时推进 `session_epoch` 并清空旧 activity / capability proof
+  - daemon-owned app-server cleanup 也会清理 registered session proof：explicit stop、dead-child refresh、lease-expiry reaper 都先按注册的 `managed_session_id + bound_thread_id` 推进一个 current-proof epoch fence，再移除/停止 app-server；即使 proof 已经 clear，也要推进 epoch，避免 cleanup 与 sidecar 重新写 proof 之间的竞态；启动时 `session_epoch`、lease id 和 child pid 只用于确认 registry entry 身份，不能作为 invalidation 目标 epoch，否则 sidecar 断连后推进 epoch 并重新写入 proof 时会让 reaper 卡在旧 epoch；未注册的 candidate app-server 只停止进程，不触碰 proof；daemon shutdown 则 best-effort invalidate 后仍强制停止子进程以避免泄漏
+  - sidecar 不把缺失 / foreign `threadId` 的 notification 当成当前 bound thread 证据；snapshot path 也要求 returned `thread.id` 匹配当前 bound thread；unknown turn status、`notLoaded` 或 `systemError` 都不会被折叠成 `idle`
+  - sidecar 在 JSON-RPC request 等待窗口内不会让 stale lifecycle notification 覆盖后续 authoritative snapshot；如果 `thread/read` 缺少 authoritative snapshot 但 `thread/resume` 已给出可信 current-state snapshot，则会按顺序 replay `thread/resume` / `thread/read` 两个 request window 的 notification，避免丢失 resume 响应前到达的 active 信号；如果 `thread/read` 超时、protocol / decode / closed / remote-error 等失败，则关闭本轮连接并 fail-closed retry，避免复用可能存在 outstanding response 或已失同步的 websocket；如果 snapshot 缺失导致 epoch invalidation，则不会把旧 epoch 的 buffered notification 写回新 epoch
+  - proof invalidation 是 fail-closed 写入：daemon 短超时失败后会对该 invalidation 命令做 direct-store fallback，且 store 对“daemon 已经推进 epoch 并清空 proof”的旧 epoch 重放返回幂等成功，避免 continuity loss、activity write failure 或 snapshot 缺失时旧 idle / capability proof 只是 best-effort 清理
+  - passive proof 写入路径现在使用 daemon lifecycle 级短 SQLite busy timeout，并在 sidecar 侧做 lifecycle-aware bounded retry，避免 DB lock 下 sidecar 1s request timeout 之后仍把 daemon dispatch worker 卡在普通 30s store open / transaction wait，同时降低短暂 lock 造成 foreground `cli run` 失败的概率；foreground 退出后 retry 会观察 shutdown flag，避免 stop / cleanup 被 proof retry 拖住
+  - passive websocket receive 现在用 absolute deadline 贯穿 frame parse、control-frame loop 和 pong 写回，并拒绝超过 125 bytes 的 control frame，避免连续 control frame 或 trickled payload 无限延长一次 `recv` 并阻塞 foreground exit 后的 sidecar join / app-server cleanup
+  - sidecar 只记录 partial passive capability proof：existing-thread path 为 `thread_resume=true`、`current_state_sync=true`，fresh unmaterialized path 为 `thread_start=true`、`current_state_sync=true`，但 `turn_start=false`、terminal-event proof 仍为 false，因此不会打开 `begin-cli-accept` 的最小自动投递 gate
+  - 本 phase 不发送 `turn/start` / `turn/steer`，也不调用 `attempt observe-cli-turn`；完整 `turn_start` capability proof、主动 delivery loop 与 accepted-turn observation loop 留给后续 phase
+  - 测试新增 fake app-server websocket，验证 passive adapter 能完成 initialize / resume / read，并从 lifecycle notifications 推进 durable activity state
+- 当前 daemon / CLI adapter 已接入 explicit opt-in delivery lifecycle：
+  - CLI attempt / session mutation / session capability / session proof invalidation / app-server lifecycle / app-server doctor probe / turn observation / observation expiry / auto-delivery audit-reject-auth 通过 daemon dispatch 或 daemon control RPC 时分别要求 daemon 暴露 `attempt-dispatch` / `cli-session-dispatch` / `cli-session-capability-dispatch` / `cli-session-proof-invalidation-dispatch` / `cli-app-server-lifecycle` / `cli-app-server-probe` / `cli-turn-observation-dispatch` / `cli-turn-observation-expiry-dispatch` / `cli-auto-delivery-dispatch` capability；旧 daemon 不满足 capability 会被 ensure path 判定为 incompatible 并替换
+  - CLI accepted attempt durable schema、daemon 保活、managed-session durable record / fixed-thread gate、daemon-owned shared app-server process model、passive current-state / lifecycle event sync、accepted turn observation store surface、`trusted-all` delivery loop、notification observation、`thread/read` reconcile、pre-accept reject、unknown+sweep fail-closed 均已落地
+  - Desktop arm / pause / boundary deadlines 尚未有 schema / adapter，因此尚未接入 daemon 保活
+  - CLI fresh-thread bootstrap 已落地；`turn/steer` automatic path 与 Desktop bridge adapters 尚未实现
+
+## Phase 1 Implementation Priority
+
+- 第一个实现 PR 先做共享核心最小闭环，而不是直接实现 Desktop heartbeat 或 CLI shared app-server adapter。
+- 工程优先级固定为：
+  - correctness first：状态机、artifact ingest、FIFO、operator close 等语义必须可恢复、可审计、fail-closed
+  - long-running reliability second：所有后台或未来 daemon-facing 组件都必须避免无界内存增长、泄漏文件句柄/子进程、孤儿任务和不可停止轮询
+  - resource efficiency third：默认 idle 路径应保持低内存、低 CPU，轮询和 sweep 必须有明确 budget / batch limit
+- Phase 1 因此优先落地本地 store、artifact ownership、batch lifecycle、operator CLI 和测试，再把 daemon auto-start、Desktop bridge、CLI live continuation 放到后续 PR。
+
+## Phase 1 Implementation Checkpoint
+
+- 当前 `codex/phase-1-core-cli` 分支已经落地第一版 Rust `cbth` binary。
+- 已实现的共享核心范围：
+  - 本地 `~/.cbth` / `CBTH_HOME` 状态目录与 `0700` / `0600` 权限约束；新建目录和 DB 文件后同步父目录，避免 fresh home 成功返回后丢失 directory entry
+  - SQLite store 与 schema 初始化，WAL 模式下使用 `synchronous=FULL`，避免命令成功返回后 DB ownership commit 比 artifact fsync 更弱；SQLite busy timeout 设为 30 秒，并且 store open / schema 初始化阶段对 `BUSY` / `LOCKED` 做有界 retry，用于承受短时多进程 CLI 启动风暴
+  - `job submit` / `job complete` / `job fail` / `job inspect` / `job list`
+  - `job complete --result-file` 的 streaming artifact ingest、SHA-256、manifest 与 retention metadata
+  - DB-backed pending artifact ingest 记录与 result artifact ingest marker，用于避免 cleanup 删除仍在复制中的大 artifact，并让 crash orphan cleanup 有有界 DB 输入面；异常 ingest id 不参与文件系统删除
+  - thread-scoped open batch、head batch 查询、operator `batch close-head`
+  - fail-closed delivery policy 默认值、metadata / CLI override、metadata policy 短字段 alias 与 unknown-field 拒绝
+  - `redelivery_window_seconds` 等 timestamp 派生使用 checked arithmetic，避免 CLI 超大输入造成 panic / wrap
+  - Phase 1 尚未持久化 inline handoff payload，因此 completed job batch 统一保持 `requires_artifact_read=true`
+  - `maintenance sweep` 的基础 manual-expiry、automatic redelivery-window expiry、artifact-GC、manifest reconcile、orphan artifact cleanup 入口
+  - sweep lane 现在都有有界 work budget：expired batch close、artifact delete、manifest sync、orphan scan/delete 都不会一次性无界展开
+  - artifact manifest reconcile 通过 DB 中的 `manifest_synced_retention_until` / `manifest_sync_attempted_at` 记录 durable progress，per-artifact 失败不会阻塞后续 GC / cleanup lane，也不会让长期失败集合饿死后续 artifact
+  - artifact GC 通过 `gc_attempted_at` 记录 durable attempt progress，per-artifact 删除失败不会让后续可删 artifact 长期饥饿
+  - artifact ingest 创建 per-artifact directory 后会同步父 `artifacts/` 目录，避免 DB commit 指向未 durable 的目录 entry
+  - artifact maintenance 写入/删除路径按 `artifact_id` 计算 canonical store path，并校验 DB 中的 `relative_path` 未漂移
+  - artifact 目录删除必须在 remove 后同步父目录，只有删除成功或确认 NotFound 后才丢弃 DB ownership
+  - pending ingest cleanup 同样校验 `artifact_id` 与 `relative_path`，且 stale selection / active ingest marker 新鲜度均按真实 wall clock 判断，不受 `maintenance sweep --now` 影响
+  - failed result ingest 会保留 `artifact_ingests` cleanup 输入面，避免 partial artifact cleanup 未确认时形成不可重试泄漏
+  - metadata file 读取要求 regular file，并使用 bounded read 重新确认 `MAX_METADATA_BYTES` 上限
+  - artifact / marker manifest 写入使用唯一临时文件再 rename，避免并发 sweep / close 之间抢同一个 `.tmp`
+- Phase 1 PR 当时刻意不包含：
+  - daemon auto-start / idle lifecycle
+  - Unix socket same-user IPC
+  - Desktop heartbeat / bridge helpers
+  - CLI shared app-server managed session
+  - `turn/start` / `turn/steer` delivery adapter
+- 已覆盖的自动化检查：
+  - `cargo fmt --check`
+  - `cargo clippy --all-targets -- -D warnings`
+  - `cargo test`
+````
+
+## docs/PROJECT_TODO.md
+
+````markdown
+# Project TODO
+
+当前仍有几条关键 capability / contract 没实证完成；在这些项完成前，不应把 v1 描述成端到端已验证。
+
+- [x] 用 live PR 验证 repo 内部子项目 [tools/codex-review-gate](../tools/codex-review-gate/README.md) 的 reaction-driven gate，然后配置 required status check 和 conversations-resolved branch protection。
+- [x] 合入 `codex/review-gate-review-body-findings` 后，在 #12 或后续测试 PR 上验证 Codex review-body findings 会让 `codex/review-gate` deterministic failure，而旧 commit 的 review-body findings 不会 block 新 head。
+- [x] 合入 `codex/review-gate-resolved-threads` 后，在 #12 或后续测试 PR 上验证已 resolved / outdated 的旧 Codex inline review thread 不会被 REST `commit_id` remap 误判为 current-head blocker。证据：PR #14 comment `3148673469` 的 REST `commit_id` remap 到 head `6a2d9e57...`，GraphQL thread `isResolved=true`，workflow run `25316273973` 通过。
+- [x] 把 deterministic fake e2e 纳入默认 Rust gate：job/batch/attempt delivered path 与 `cbth cli run` passive no-delivery-RPC guard 都由 `cargo test --locked` 覆盖。
+- [x] 实现 Phase 11b `cbth cli run --auto-delivery-policy trusted-all`：
+  - [x] 默认 passive 仍不发送 `turn/start`
+  - [x] explicit `trusted-all` 会在 durable idle proof 后发送带 unique marker 的 `turn/start`
+  - [x] completed notification 可关闭 batch 为 `delivered`
+  - [x] missed notification 可通过 same-epoch `thread/read(includeTurns=true)` reconcile 关闭为 `delivered`
+  - [x] failed/interrupted/replaced terminal evidence 会 fail-close 到 `manual_resolution_only`
+  - [x] clear pre-accept rejection 写入 `rejected_before_accept` 且不消耗 attempt count
+  - [x] timeout / closed / protocol-error ambiguity 不重发，交给 stale sweep 标成 `unknown + manual_resolution_only`
+  - [x] `strict_safe` 与 `trusted_all` 授权差异已覆盖，`trusted_all` 绕过 policy/artifact/session-risk gates 但仍要求 head/budget/session/epoch/idle proof
+  - [x] `cbth audit list` 可读取 allow/deny/attempt-start/accepted/rejected/reconciled/observed/manualized audit records
+- [x] 增加 ignored / opt-in live Codex shared `app-server` smoke，保持编译与 lint-clean，但不进入默认 CI 执行。
+- [x] 增加 ignored / opt-in live CLI trusted-all full e2e，验证真实 `cbth cli run --auto-delivery-policy trusted-all` 能在 existing thread idle 后自动投递 head batch 并关闭为 `delivered`。
+- [x] 单独沉淀 CLI Dogfood V1 完成计划，见 [CLI_DOGFOOD_V1_COMPLETION_PLAN.md](CLI_DOGFOOD_V1_COMPLETION_PLAN.md)。
+- [x] 合入 Phase 12 `cbth cli run --new-thread` PR 后，从最新 `master` 开始 CLI Dogfood V1 后续 PR。
+- [x] 合入 daemon-owned CLI task supervisor PR：
+  - [x] `cbth task run --source-thread-id ... --summary ... -- <cmd> [args...]`
+  - [x] `cbth task inspect --task-id ...`
+  - [x] `cbth task list [--source-thread-id ...]`
+  - [x] `cbth task cancel --task-id ...`
+  - [x] daemon 创建 job、监督 child/process group，并在任务结束后自动 complete/fail job
+  - [x] stdout/stderr 写 managed task log files/result artifact，prompt 只放退出状态、tail preview、truncation flags 和 artifact refs
+  - [x] active supervised tasks 阻止 daemon idle exit；完成后恢复正常 idle exit
+  - [x] 增加 deterministic fake e2e 覆盖 trusted-all task auto delivery
+  - [x] 增加 ignored / opt-in live task-supervisor e2e 入口；真实本机复测命令已记录在 [LIVE_E2E.md](LIVE_E2E.md)
+- [x] 增加 `cbth doctor cli`，检查 codex binary、app-server listener parsing、same-user daemon IPC、store permissions、SQLite open、platform support 和 optional live smoke prerequisites。
+- [x] 补齐 CLI operator recovery 文档：batch inspect/manual close、audit、task logs、`manual_resolution_only` 处理。
+- [x] 补齐 local binary dogfood 部署文档：`cargo install --path .`、PATH 检查、`cbth doctor cli`、最小端到端 walkthrough。
+- [x] 合入 GitHub Release 安装/升级 PR 后，在最新 `master` 上打首发 `v0.1.0` signed annotated tag：
+  - [x] release workflow 发布 Linux x86_64 glibc 与 macOS arm64 raw binary + `.sha256`
+  - [x] `scripts/install.sh` 可安装指定 `CBTH_VERSION=v0.1.0`
+  - [x] `cbth self update --check` 可识别当前版本与 latest release
+  - [x] macOS arm64 安装后 `cbth doctor cli` 通过
+- [ ] 设计并实现外部 code review delegation，并把 review 结果通知回原 caller thread。
+- [ ] 设计并实现 app-server output bridge：转发到 Webex / GitHub Issue，并把 channel 用户回复转回 app-server。
+- [ ] 设计并实现 PR / GitHub Actions 状态轮询器，提醒对应 thread 处理 remote review comments 或 merge blockers。
+- [x] 增加 opt-in live task-supervisor e2e：`CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture`。
+- [x] 文档化 active-turn `turn/steer` 后续进入自动路径前需要的 risk/capability proof；当前自动投递继续只允许 idle `turn/start`。见 [CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md)。
+- [x] 确认测试 thread `019db49a-de4e-7d61-93ab-5d70a8905cc3` 已落盘并可定位到 rollout 文件。
+- [x] 确认桌面端私有 `app-server` 当前正持有该 rollout 文件。
+- [x] 实现最小 PoC 脚本，通过外部独立 `codex app-server` 对该 thread 执行 `read` / `resume` / `inject_items`。
+- [x] 运行 PoC，验证 marker 是否写入 rollout。
+- [x] 扩展 PoC，验证外部独立 `turn/start` 能否在 desktop-originated thread 上生成完整新 turn。
+- [x] 让用户在 desktop UI 中确认：完整外部 turn 在当前 loaded session 中仍不可见，且后续本地 turn 也未将其纳入上下文。
+- [x] 验证 `codex exec resume` 能否作为不同于裸 app-server 的“特殊入口”向同一 desktop thread 追加 turn。
+- [x] 验证独立 `codex exec` 会话是否实际暴露 agent mailbox 投递工具。
+- [x] 基于结果收敛结论：哪些能力可以靠 wrapper/sidecar 实现，哪些 desktop 行为仍缺少公开 attach 面。
+- [ ] 如果需要，把 Desktop heartbeat 做一个定时实测，区分“app 保持打开”与“app 完全退出”两种情况下是否按时触发。
+- [ ] 建一个真实 heartbeat automation 样本，确认 thread 目标等字段在 `automation.toml` / `codex-dev.db` 中的持久化形状。
+- [ ] 验证外部进程在 Desktop 运行时改写 automation 调度状态（尤其是 `next_run_at` / 状态切换）后，caller thread heartbeat 是否会被及时触发。
+- [x] 验证 bridge automation thread 是否能通过 `automation_update` 稳定为别的 caller thread 创建/更新 heartbeat automation，而无需外部直接改 Codex automation DB。
+- [x] 单独沉淀 Desktop background-task bridge 技术方案文档。
+- [x] 单独沉淀 Desktop bridge foundation 实现文档，见 [DESKTOP_BRIDGE_FOUNDATION.md](DESKTOP_BRIDGE_FOUNDATION.md)。
+- [x] 单独沉淀共享核心架构文档，明确单 binary、多入口、按需启动 daemon 的生命周期方案。
+- [x] 用 Rust 实现主 binary 的共享 `job` CLI 子命令，替代单独的 `background-taskctl` helper。
+- [x] 实现 Phase 2 第一批按需启动 daemon / IPC 基础：
+  - `cbth daemon serve`
+  - `cbth daemon ensure`
+  - `cbth daemon ping`
+  - `cbth daemon status`
+  - `cbth daemon stop`
+  - daemon 启动时先执行 maintenance sweep
+  - daemon 简单 idle timeout 后退出并清理 socket
+- [ ] 把 daemon 退出条件从简单 idle timeout 收紧为：
+  - [x] 当前 store 已存在的 `pending` jobs 阻止 daemon idle exit
+  - [x] 最近 activity 后的当前 idle timeout window 内会到期的 open batches 阻止 daemon 直接退出，并在到期后由 daemon sweep 收口；该 horizon 不随后续 lifecycle refresh 滑动
+  - [x] active clients 已由 daemon worker guard 覆盖
+  - [x] lifecycle refresh 使用短 SQLite timeout；刷新失败时不阻塞 control RPC，且保守阻止 idle exit
+  - [x] idle timeout 判定在 idle deadline 之后至少强制刷新一次 lifecycle 状态，避免用 deadline 前缓存退出；client 完成也会刷新 activity generation，避免长 dispatch 结束后使用 accept-time horizon
+  - [x] due maintenance sweep 由单个后台 worker 执行，listener accept loop 只做短状态刷新
+  - [x] 显式 `maintenance sweep` autostart 的 skip-startup-sweep 路径会抑制后台 lifecycle maintenance，直到第一个 `dispatch` 请求进入，避免抢先消费显式 sweep report；抑制期间 due batches 不单独阻止 idle exit
+  - [x] shutdown 会等待已启动的 lifecycle maintenance worker 到达一致点后再返回
+  - [x] open 但长窗口的 batch / attempt 不单独阻止退出；由下次启动时的 overdue sweep 收口
+  - [x] CLI accepted attempt schema 已落地，并已把 `delivery_observation_deadline` 接入 daemon 保活 / expiry sweep
+  - [ ] 后续 Desktop binding / attempt schema 落地后，把 `arm_pending_deadline` / `pause_deadline` 接入 daemon 保活
+  - [ ] 如果未来有 daemon-owned supervised child processes，把 active supervised jobs 与普通 externally-reported pending jobs 进一步拆开
+- [x] 实现 `cbth` daemon IPC 的 same-user-only 基础合同：
+  - macOS / Linux 使用 `~/.cbth/run/cbth.sock` 或等价用户私有 Unix domain socket
+  - parent directories 必须当前 uid owned 且不宽于 `0700`
+  - socket 必须当前 uid owned 且不宽于 `0600`
+  - daemon accept 后必须校验 peer uid
+  - v1 不退回 unauthenticated TCP daemon IPC；纯 Windows IPC 暂不支持
+- [x] 将 mutating / recovery CLI 命令接入 daemon IPC，并在无法提供 same-user proof 时 fail closed。
+- [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 bridge-side 所需的只读 inbox snapshot，且不会卡审批：
+  - [x] `bridge-preflight` foundation 已原子发布同一 `snapshot_revision` 的 manifest skeleton
+  - [x] `current-snapshot.json`
+  - [x] `snapshots/<snapshot_revision>/ready-threads.json` skeleton，entries 当前为空
+  - [x] `snapshots/<snapshot_revision>/arm-pending-bindings.json` skeleton，entries 当前为空
+  - [x] `snapshots/<snapshot_revision>/pause-due-bindings.json` skeleton，entries 当前为空
+  - [x] `desktop-installation-state.json` preferred direct-file-read export
+  - [x] 记录真实 Desktop heartbeat preflight/read 复测流程，见 [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](DESKTOP_LIVE_PREFLIGHT_VALIDATION.md)
+  - [ ] 在真实 Desktop heartbeat 中验证无审批读取这些 snapshot
+  - [x] bridge helper prompt 必须校验 manifest revision 与每个 snapshot 文件内嵌 revision 一致
+  - 大 artifact 的正式自动路径不再依赖直接读 `artifacts/<artifact_id>/payload`
+- [ ] 如果未来要把大 artifact 纳入 automatic caller path，再单独验证 `cbth desktop read-artifact ...` 在 heartbeat / caller 路径中的无审批能力，并把结果写回 `artifact_read_capability`。
+- [ ] 单独验证 Desktop heartbeat 在后台运行时，是否能无审批执行窄 `cbth desktop ...` helper：
+  - `bridge-preflight`
+  - `note-arm-pending`
+  - `list-arm-pending`
+  - `list-pause-due`
+  - `claim-next-ready`
+  - `note-arm`
+  - `note-boundary-crossed`
+- [ ] 为 Desktop bootstrap 设计并实现完整 `desktop binding` 流程，至少 durable 记录：
+  - [x] `source_thread_id`
+  - [x] `caller_automation_id`
+  - [x] active `caller_automation_id` 唯一占用约束
+  - [x] `binding_state`
+  - [ ] `armed_generation`
+  - [ ] `armed_generation_quiesced_at`
+  - [ ] `pause_not_before`
+  - [ ] `pause_deadline`
+  - [x] `read_transport` mirrors the installation-wide chosen transport
+  - [x] `read_transport_generation`
+  - [ ] `read_transport_capability` as read-only output mirror
+  - [ ] `artifact_read_capability` as read-only output mirror
+  - [ ] `writeback_capability` as read-only output mirror
+  - [x] `validation_fingerprint`
+  - [ ] paused 状态读回校验
+  - [x] v1 明确不支持 mixed Desktop `read_transport` bindings
+- [ ] 按已定稿合同实现 Desktop installation-wide `read_transport` 权威来源：
+  - [x] daemon-managed `desktop_installation_state`
+  - [x] preferred `~/.cbth/inbox/desktop-installation-state.json`
+  - [x] fallback `cbth desktop installation-state --json`
+  - [x] `installation-state repair` 是当前唯一写入路径
+  - [x] capability 结论绑定 `validation_fingerprint`
+  - [x] transport generation / fingerprint drift 会让不匹配 binding 进入 `degraded`
+  - [ ] live 验证后才允许把 `read_transport_capability=validated` 当作覆盖 mandatory `bridge-preflight` 无审批执行、daemon sweep/refresh 成功、以及刷新后 snapshot 无审批读取的结论
+- [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
+  - [x] `current-snapshot.json` foundation manifest
+  - [x] `snapshots/<snapshot_revision>/ready-threads.json` skeleton
+  - [x] `snapshots/<snapshot_revision>/arm-pending-bindings.json` skeleton
+  - [x] `snapshots/<snapshot_revision>/pause-due-bindings.json` skeleton
+  - `by-thread/<thread_id>.json` (optional diagnostic export, disabled by default)
+  - `artifacts/<artifact_id>/manifest.json` (diagnostic / operator path)
+  - `artifacts/<artifact_id>/payload` (diagnostic / operator path; not the automatic continuation path)
+- [ ] 为 Desktop bridge 实现 bounded fairness / work budget contract：
+  - 每轮 wake 有独立 reconcile lane 与 fresh-arm lane
+  - `max_reconcile_items_per_wake`
+  - `max_reconcile_wall_time_ms`
+  - `max_new_arms_per_wake=1`
+  - 单个 degraded / overdue binding 不得让 unrelated ready thread 永久饿死
+- [x] 落实 `~/.cbth` 的权限合同：
+  - directories `0700`
+  - regular files `0600`
+- [ ] 设计并实现 Desktop bridge preflight 与 bridge-side `helper_cli_read` fallback：
+  - [x] `cbth desktop bridge-preflight --bridge-thread-id ... --json` foundation skeleton
+  - [ ] `cbth desktop list-arm-pending --bridge-thread-id ... --json`
+  - [ ] `cbth desktop list-pause-due --bridge-thread-id ... --json`
+  - [ ] `cbth desktop claim-next-ready --bridge-thread-id ... --json`
+  - [x] `bridge-preflight` 是每轮 bridge wake 的 mandatory helper；`direct_file_read` 也必须先通过它发布 snapshot manifest
+  - `cbth desktop read-artifact --artifact-id ... --artifact-read-lease-id ... --offset ... --max-bytes ... --json` 只属于 operator/manual recovery 或 future-expansion；v1 里传入的 lease 必须来自 operator recovery 签发的 `artifact_recovery_lease_id`
+  - chunked payload return contract 只用于 recovery / future-expansion，不属于 v1 automatic caller path
+- [ ] 按已定稿合同实现 `claim-next-ready` 的纯 read/peek 语义：
+  - 不 reservation
+  - 不隐藏 head batch
+  - 不推进 attempt / batch durable 状态
+- [ ] 把 Desktop `bridge_arm_lease` 合同收口成 `note-arm-pending` 的可执行 acquire/carry-forward 语义：
+  - key 为 `(source_thread_id, attempt_id, generation)`
+  - `note-arm-pending` 必须带 `bridge_request_id`
+  - 只有同一 `bridge_request_id` 才允许 carry-forward 同一 lease
+  - 不同 `bridge_request_id` 在 lease 仍有效时必须收到 `lease-held` / `busy`
+  - `note-arm-pending` 返回稳定的 `bridge_arm_lease_id`
+  - `note-arm` 必须显式回传 `bridge_request_id + bridge_arm_lease_id`
+  - 不改变 head batch 的外部可见性
+  - `note-arm` unknown 时先 reconcile，再决定是否 degraded/manual
+- [ ] 设计并实现 Desktop bridge 的窄写回 helper：
+  - `cbth desktop note-arm-pending --source-thread-id ... --attempt-id ... --generation ... --bridge-request-id ... --json`
+  - compare-and-swap 只允许唯一一次 `prepared -> arm_pending`
+  - `cbth desktop note-arm --source-thread-id ... --attempt-id ... --generation ... --bridge-request-id ... --bridge-arm-lease-id ... --json`
+  - compare-and-swap 只允许唯一一次 `arm_pending -> cooldown`
+  - idempotent retry 不得重复递增 `delivery_attempt_count`
+- [ ] 按已定稿合同实现 Desktop continuation-boundary 断点 helper：
+  - `cbth desktop note-boundary-crossed --source-thread-id ... --batch-id ... --attempt-id ... --generation ... --expected-snapshot-revision ... --json`
+  - 必须先于真正的 continuation boundary durable 成功
+  - mutation 前必须先校验完整 caller prompt token：`source_thread_id + batch_id + attempt_id + generation + expected_snapshot_revision`
+  - success 前置条件必须包括：attempt 已 durable `cooldown`，且 `armed_generation` 仍匹配
+  - 还必须包括 binding / installation-state 仍有效：
+    - `binding_state=bound`
+    - `read_transport_generation` 未漂移
+    - `validation_fingerprint` 未漂移
+    - `read_transport_capability=validated`
+    - `writeback_capability=validated`
+  - 成功后当前 head batch 转为 `continuation_boundary_state=crossed_unacknowledged`
+  - 同时切到 `replay_policy=manual_resolution_only`
+  - 同时关闭为 `close_reason=handoff_recorded`
+  - 同时 durable 保存 `boundary_recovery_envelope`
+  - success 返回同时提供 gated inline continuation payload / summary
+- [ ] 按已定稿 continuation-boundary contract 实现并验证：
+  - bridge 读到 ready entry，或 caller 仅拿到 gated inline continuation payload / summary，都不能关闭 batch
+  - 如果 `note-boundary-crossed` 尚未成功，caller 不得真正跨过 continuation boundary
+  - 一旦 `note-boundary-crossed` 成功，当前 batch 必须进入 `closed + close_reason=handoff_recorded + replay_policy=manual_resolution_only`
+  - post-boundary 只允许进入一次性 inline text handoff phase；普通 Codex 工具不属于 supported automatic path
+  - 自动 caller path 不提供 replay-safe continuation；response 丢失后改走 operator recovery
+  - 第一版不提供 post-boundary `delivered` 自动 close；`handoff_recorded` 只是 durable handoff 记录
+  - 如果未来需要支持 post-output ack，再单独设计 observation / response-digest contract
+- [ ] 明确第一版自动续跑的总安全门槛：
+  - 仅限 `delivery_read_only=true`
+  - 且 `delivery_requires_approval/network/write_access=false`
+  - Desktop 还必须额外满足 `read_transport_capability=validated`
+  - Desktop 还必须额外满足 `writeback_capability=validated`
+  - `requires_artifact_read=true` 的 batch 不进入 v1 automatic caller path
+  - 非只读 batch 只走 manual/operator follow-up
+- [ ] 为 post-continuation-boundary 的 operator-resolution contract 定死收口规则：
+  - `binding repair` 不得自动 replay 当前 head batch
+  - `note-boundary-crossed` fresh success 后 batch 已经 `closed + close_reason=handoff_recorded`
+  - lost response recovery 必须通过 `cbth batch inspect --batch-id ...`，不能依赖 `inspect-head`
+  - pre-boundary `replay_policy=manual_resolution_only` batch 仍只能人工 `batch close-head` 或等待 `manual_resolution_expired`
+  - 如需 post-output ack / replay，后续单独设计 operator override
+- [ ] 按已定稿合同实现 Desktop ghost-wake reconciliation：
+  - 先 reconcile，而不是立刻视为歧义失败
+  - 如果能证明 attempt 已进入 `cooldown` 且 `armed_generation` 匹配，则按成功 arm 处理
+  - 如果能证明同一 attempt 已成功 `note-boundary-crossed`，则 batch 必须保持 `closed + close_reason=handoff_recorded`
+  - 如果能证明当前 generation 对应的 heartbeat 已重新 `PAUSED`，则当前 attempt 收敛到 `abandoned`，head batch 保持 `replay_policy=automatic`
+  - 只有在既无法证明 arm 成功、也无法证明 pause 成功时，head batch 才进入 `manual_resolution_only`，binding 才进入 `degraded`
+- [ ] 为 Desktop arm flow 增补 durable `arm_pending` barrier：
+  - `note-arm-pending` 先把 attempt 从 `prepared` 推到 `arm_pending`
+  - `note-arm` 只允许从 `arm_pending -> cooldown`
+  - 只要 attempt 仍是 `arm_pending`，bridge 就不得对同一 generation 重复 arm
+- [ ] 为 `arm_pending` 增补专门的 reconcile 输入面：
+  - `~/.cbth/inbox/snapshots/<snapshot_revision>/arm-pending-bindings.json`
+  - `cbth desktop list-arm-pending --bridge-thread-id ... --json`
+  - bridge 每轮必须先 reconcile 这些 attempt，再处理 pause-due / ready
+- [ ] 为 bridge overdue-binding cleanup 定义 durable 只读输入面：
+  - `~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json`
+  - `cbth desktop list-pause-due --bridge-thread-id ... --json`
+  - bridge 每轮必须先 reconcile 这些 binding，再读取新的 ready batch
+- [x] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
+- [ ] 设计 caller heartbeat 的清理策略，避免残留重复 heartbeat automation。
+- [ ] 把 caller heartbeat 的 one-shot cleanup 合同落进实现：
+  - daemon exit 条件必须覆盖 `arm_pending_deadline`
+  - arm 后写入 `pause_not_before` 与 `pause_deadline`
+  - `note-arm` 写入新 `armed_generation` 时必须清空 `armed_generation_quiesced_at`
+  - 在 `pause_not_before` 之前不得因为普通 cleanup 提前 pause 当前 generation
+  - daemon exit 条件也必须覆盖 `pause_deadline`
+  - bridge 每轮先 pause/reconcile 已到期 generation
+  - 同一 binding 只有在上一代 `armed_generation` 已被证明 quiesced 并设置 `armed_generation_quiesced_at` 后，才允许 fresh-arm 下一批
+  - pause 连续失败时 binding 进入 `degraded`
+- [ ] 按已定稿合同实现 `note-boundary-crossed` 的 compare-and-swap / 幂等语义：
+  - `note-boundary-crossed` 只允许唯一一次 `not_crossed -> crossed_unacknowledged`
+  - 自动 caller path 的重复调用必须返回 `already-crossed` / stale-no-op
+  - `batch inspect --batch-id ...` 必须提供 operator-only `boundary_recovery_envelope`
+  - stale / mismatch / closed batch 才返回 stale-no-op
+- [ ] 为 Desktop operator/manual 大 artifact recovery 定死 lease 生命周期：
+  - automatic caller path 不再依赖 `artifact_read_lease`
+  - operator recovery 需要单独的 `artifact_recovery_lease_id + artifact_recovery_lease_deadline`
+  - `read-artifact` 只能在持有当前有效 lease 时读取
+  - `note-boundary-crossed` fresh success 关闭 batch 后，`boundary_recovery_envelope` 仍必须按 retention contract 保留
+  - 短寿命 recovery lease 在 deadline 到期 / lease rotation / artifact GC / operator revoke 后必须失效
+  - `batch inspect --batch-id ...` 还必须能返回 operator-only `artifact_recovery_lease_id + artifact_recovery_lease_deadline`（或等价 re-lease surface）
+- [ ] 如果未来需要 post-output ack，再单独设计 `note-delivered` 合同：
+  - 不进入 v1 自动续跑主路径
+  - 必须建立 post-output / post-side-effect observation contract
+  - 不能靠“continuation preparation 已完成”来自动关闭 batch
+- [ ] 把 Desktop operator recovery / cleanup 命令面定死并实现：
+  - [x] `cbth batch inspect-head ...`
+  - [x] `cbth batch inspect --batch-id ...`
+  - [x] `cbth batch close-head ...`
+  - [x] `cbth desktop binding repair ...`
+  - [x] `cbth desktop installation-state repair --read-transport ... [--read-transport-capability ...] [--artifact-read-capability ...] [--writeback-capability ...] ...`
+  - [ ] `cbth desktop binding unbind ...`
+- [ ] 把 installation-wide capability authority 收口到 `desktop_installation_state`：
+  - [x] transport / fingerprint drift 可以通过 repair 把 omitted capability 原子写回 `unknown`
+  - [x] 只有 installation-state repair 才允许再次写入 validated 结论
+  - [x] binding repair 只能消费 installation state，不能单独覆盖 capability 结论
+  - [ ] live Desktop heartbeat validation 后再把对应 capability 写为 `validated`
+- [ ] 把 Desktop rebind / binding repair 的硬失效合同落进实现：
+  - 如果更换 `caller_automation_id`，必须优先证明旧 automation 已 quiesced / deleted
+  - 如果旧 automation 无法被证明 quiesced，则不得复用当前 attempt / generation
+  - 必须先强制切到新的 fresh attempt / generation，再允许恢复自动 delivery
+- [x] 为 CLI accepted delivery 的核心 durable slice 落地实现：
+  - `delivery_attempts` schema
+  - `accept_pending -> cooldown` accepted barrier
+  - `begin-cli-accept` idempotency by adapter-provided `delivery_rpc_request_id`; `--rpc-request-id` is required so lost JSON responses can be recovered by retrying the same key
+  - daemon compatibility requires `attempt-dispatch` capability before routing hidden attempt mutations through domain RPC
+  - accepted attempt 的 `delivery_turn_id`
+  - `managed_session_id + session_epoch`
+  - `delivery_accepted_at + delivery_observation_deadline`
+  - `delivery_observation_state=tracking`
+  - stale `accept_pending` bounded expiry to `abandoned + unknown`
+  - 过期后 `abandoned + expired`
+  - head batch fail-closed 到 `manual_resolution_only`
+  - fail-closed 时重新打开默认 manual resolution window，避免同轮 sweep 立即关闭刚 manualized 的 batch
+  - daemon lifecycle 跟踪 active/stale `accept_pending`，并在 stale 后触发 maintenance sweep
+  - daemon lifecycle 的 due-batch 计数排除 active-attempt-blocked batch，避免 deadline 前反复无进展 sweep
+  - daemon 在 deadline 前保持 active observation live window
+  - hidden adapter-internal `cbth attempt ...` 命令仅用于后续 CLI adapter / tests，不是稳定外部用户接口
+- [ ] 把 CLI attach/recovery 的 `activity_state=unknown -> current-state sync -> active/idle` 合同落进实现：
+  - 未完成 current-state sync 前不得自动把 thread 判成 idle
+  - continuity-loss 后只能 fail-closed，直到恢复到权威 current-state 或新的本地 regular turn lifecycle
+- [x] 把 CLI current-state sync 升成最小 capability probe 的正式要求：
+  - [x] 缺少 `thread/read` 或等价 current-state 面时，v1 不支持 detached managed-session auto-continuation
+  - 这个 sync 至少必须对 `bound_thread_id` 返回 `has_active_regular_turn` 与可选 `active_turn_id`
+- [x] 把 CLI fresh-thread bootstrap 收口成正式合同：
+  - [x] `cbth cli run --new-thread` 通过 daemon-owned pending app-server 成功执行 `thread/start` 后才进入 fixed-thread managed session
+  - [x] daemon 先创建 brand-new thread，再把同一个 app-server 进程提升为 managed app-server，并把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
+  - [x] fresh unmaterialized thread 的初始 idle proof 使用 `thread_start + thread/read(includeTurns=false)`，避免依赖 first user message 前不可用的 `thread/resume`
+  - [x] bootstrap 失败时在 foreground 启动前 fail closed，不创建 managed session，不进入 auto-delivery
+  - [x] `--new-thread` 只向 stderr 打印 `cbth: bound thread id: <thread_id>`，不改变 foreground Codex 交互模型
+  - [x] opt-in live `CBTH_RUN_LIVE_NEW_THREAD_E2E=1 cargo test --test live_new_thread -- --ignored --nocapture` 已验证 fresh bootstrap + trusted-all delivered path
+  - [x] fake e2e 覆盖 accepted observation 中的 proof-only status noise 与 fresh first-turn `thread/read(includeTurns=true)` materialization error
+- [x] 把 accepted-turn 负终态观察面升成最小 capability probe 的正式要求：
+  - [x] 最小 capability set 不只包括 `turn/completed`
+  - [x] 还必须能对当前 `delivery_turn_id` 观察并 durable 区分：
+    - [x] `turn_started`
+    - [x] `turn_completed`
+    - [x] `turn_failed`
+    - [x] `turn_interrupted`
+    - [x] `turn_replaced`
+  - [x] 缺少这组观察面时，CLI detached auto-continuation 必须 fail-closed
+- [ ] 为 daemon 的 overdue sweep / next-start reconcile 落地稳定合同：
+  - daemon 不需要为大多数长窗口 `manual_resolution_only` / deadline 持续常驻
+  - 但 `delivery_observation_deadline` 是必须常驻观察的唯一例外
+  - 但下次任何入口启动前都必须先补做 overdue close / reconcile / artifact GC
+- [ ] 定死 caller heartbeat 的长期生命周期合同：
+  - 预绑定 `caller_automation_id`
+  - 正常路径只 `pause` / `update` / `reuse`
+  - 不在正常投递路径里 `delete`
+  - 只有 operator unbind / destroy 才允许删除
+- [x] 为 Desktop bridge 设计基于 delivery envelope 的共享状态面，不把后台 heartbeat 对通用 `cbth job ...` CLI 的执行能力当成前提。
+- [x] 为共享核心设计 thread-scoped FIFO 队列、batch 合并规则和最小连续发送间隔。
+- [x] 为共享核心落地可机判的 delivery policy 字段，至少包括：
+  - `delivery_read_only`
+  - `delivery_requires_approval`
+  - `delivery_requires_network`
+  - `delivery_requires_write_access`
+  - `inline_payload_bytes`
+  - `requires_artifact_read`
+  - `job submit` 的输入合同要同步落地：
+    - submit flags / metadata-file.delivery_policy
+    - 缺失时 fail-closed 默认值
+    - `inline_payload_bytes` / `requires_artifact_read` 由 core 派生
+    - CLI adapter 再在共享核心字段之上本地判定是否 steer-eligible
+- [ ] 为 CLI active-turn steer 落地可机判的 turn-risk 字段，至少包括：
+  - `active_turn_kind`
+  - `active_turn_requires_approval`
+  - `active_turn_requires_network`
+  - `active_turn_requires_write_access`
+  - `active_turn_risk_class`
+- [ ] 实现 durable delivery-attempt 合约：
+  - `batch_id`
+  - `attempt_id`
+  - `generation`
+  - `delivery_rpc_request_id` (CLI)
+  - `delivery_rpc_kind` (CLI)
+  - `delivery_rpc_started_at` (CLI)
+  - `delivery_rpc_state` (CLI)
+  - `delivery_rpc_correlation_marker` (CLI)
+  - `delivery_turn_id` (CLI)
+  - optional `automation_id`
+  - stale wake no-op 规则
+- [ ] 按已定稿合同实现 Desktop 第一版的 `close_reason` / redelivery window contract，保证 `closed` 只表示停止自动重投，而不是隐含“caller 已消费”。
+- [ ] 把 `max_attempts_exhausted` 的自动关闭条件落进 durable schema 和实现：
+  - `delivery_attempt_count >= max_delivery_attempts`
+  - 自动转为 `close_reason=max_attempts_exhausted`
+  - 不再继续 redelivery
+- [ ] 明确 `binding_state=degraded` 的收敛与恢复规则：
+  - degraded 后 bridge 不再自动 arm
+  - 当前 attempt 收敛到 `abandoned`
+  - operator 验证后才允许恢复 `bound`
+- [ ] 为 batch durable schema 增补：
+  - `redelivery_window_ends_at`
+  - `max_delivery_attempts`
+  - `delivery_attempt_count`
+  - `replay_policy`
+  - `boundary_snapshot_revision`
+  - `boundary_recovery_envelope_ref`
+  - `boundary_recovery_envelope_bytes`
+  - `boundary_recovery_retention_until`
+  - `boundary_recovery_operator_pin_until`
+- [ ] 实现 `boundary_recovery_envelope` retention / GC contract：
+  - 小 inline handoff 受 `max_boundary_recovery_inline_bytes` 限制
+  - 超限 payload 进入 managed artifact / recovery object
+  - `boundary_recovery_retention_until` 至少覆盖 `closed_at + post_close_ttl`、关联 artifact retention、operator pin
+  - `cbth batch inspect --batch-id ...` 是 `handoff_recorded` 历史 batch 的稳定恢复入口
+- [x] 用 Rust 实现 managed artifact store，并把 `cbth job complete --result-file <path>` 定义成 ingest/copy 语义。
+- [x] 实现 artifact retention / GC contract：
+  - `min_artifact_ttl = 24h`
+  - `post_close_ttl = 72h`
+  - GC 仅在 batch 终态后触发
+- [ ] 用 Rust 实现 sidecar supervisor 的最小骨架，负责长任务状态写入与结果交接。
+- [x] 验证 CLI 在 shared `app-server` 模式下，第二个 sidecar client 能否对同一个 thread 执行 `thread/resume + turn/start`，并让前台 client 收到 live 通知。
+- [x] 验证真实前台 `codex --remote` TUI 在 PTY 中是否会把 sidecar 触发的新 turn 展示给用户。
+- [x] 单独沉淀 CLI shared `app-server` + sidecar 技术方案文档。
+- [x] 为 CLI 设计并实现最小 `cbth cli run` 进程模型：shared `app-server`、前台 `codex --remote`、lease 清理策略；后续 Phase 11b 已补上 explicit `trusted-all` sidecar delivery loop。
+- [x] 把 CLI 第一版的 shared `app-server` 安全边界定死为：
+  - [x] loopback-only listener
+  - [x] daemon-owned random local port
+  - [x] 单机 / 单用户 trust-domain 假设
+  - [x] 如上游未来支持 loopback auth，再单独补更强本地 auth 设计
+- [ ] 为 CLI 的 daemon-owned managed session 设计并实现：
+  - [x] 落地 durable `cli_managed_sessions` 记录，用于固定 `managed_session_id` / `bound_thread_id` / `session_epoch` / `session_state` / `activity_state` / `activity_revision` / risk profile
+  - [x] 增加 adapter-internal `cbth cli session bind` / `note-activity` 与 operator-facing `inspect`，作为未来 `cbth cli run` 的 attach-or-create / monotonic current-state-sync building block
+  - [x] daemon capability 增加 `cli-session-dispatch`，避免新 CLI 把 session mutation 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-session-capability-dispatch`，避免新 CLI 把 session capability mutation 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-session-proof-invalidation-dispatch`，避免新 CLI 把 continuity-loss proof invalidation 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-session-recovery-dispatch`，避免新 CLI 把 retire/replacement 语义路由给旧 daemon
+  - [x] daemon capability 增加 `cli-turn-observation-dispatch`，避免新 CLI 把 turn-observation mutation 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-turn-observation-expiry-dispatch`，避免新 CLI 把 accepted observation expiry mutation 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-auto-delivery-dispatch`，避免新 CLI 把 auto-delivery audit / reject-before-accept / trusted-all auth-mode 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-app-server-lifecycle`，避免新 CLI 把 app-server lifecycle request 路由给旧 daemon
+  - [x] daemon capability 增加 `cli-app-server-probe`，避免新 CLI 把 `doctor cli` app-server listener probe 路由给旧 daemon
+  - [x] shared `app-server` 归 daemon 持有
+  - [x] 前台 wrapper 持有短 lease；foreground 退出显式 stop，wrapper crash 时 daemon lease expiry 会清理 app-server
+  - [x] daemon-owned app-server 在 explicit stop、dead-child refresh、lease expiry 与 daemon shutdown 时会清理 registered session proof，且 cleanup 即使 proof 已 clear 也会推进 epoch fence，避免 wrapper crash 或 daemon cleanup 后旧 `idle` / capability proof 继续打开自动投递
+  - [x] `cbth cli run` 启动 passive sidecar client，完成 app-server initialize / `thread/resume` / `thread/read`，并把 lifecycle notifications 同步为 durable activity state
+  - 前台退出但 active jobs 未结束时继续保活
+  - 后续重连 / resume contract
+  - 如果上游未来支持 loopback auth，再补对应 auth contract validation
+- [ ] 按已定稿合同实现 CLI managed session 的 fixed-thread contract：
+  - [x] durable `managed_session_id + bound_thread_id`
+  - [x] durable `session_allows_approval + session_allows_network + session_allows_write_access`
+  - [x] durable `session_state`
+    - [x] include `parked` for live-part torn down while manual batch still waits operator resolution
+  - 一个 managed session 的自动续跑只针对这个 `bound_thread_id`
+  - 通过显式 bootstrap 建立 `bound_thread_id`，而不是靠前台事件流自动归因：
+    - [x] `cbth cli run --bind-thread-id <thread_id>`
+    - 或 `thread/start` 可用时的 `cbth cli run --new-thread`
+  - v1 不提供 late-bind 或 `managed_session_id` 外部发现/回填的 stable surface
+  - 启动时显式 bootstrap 只决定 delivery target，不证明前台焦点
+  - [x] 同一个 `bound_thread_id` 最多只允许一个 non-retired managed session
+  - [x] existing-thread bootstrap 的 durable building block 是 attach-or-create；当前实现表现为 hidden `cbth cli session bind`
+  - [x] `cbth cli session bind` 必须显式传入完整 risk profile，缺失 profile 不会默认成低风险
+  - [x] `parked` session attach 当前会先检查 unresolved manual head batch 和 active attempt；无阻塞工作后可 retire + replace
+  - [x] attach 遇到 requested session profile drift 时不得原地改写；旧 session retire-eligible 时先 retire 再创建 replacement，否则 fail-closed
+  - [x] stale session 当前只有在满足同一 retirement 条件后才允许替换
+  - 第一版不做前台 thread-switch 的自动观测或自动 retarget
+  - 如需把自动续跑目标换到别的 thread，必须显式开新 session 或等待未来 rebind contract
+  - daemon 需持续观察所有带未收口 `delivery_turn_id` 的 accepted attempt 完成事件
+  - [x] `turn/start` / `turn/steer` 前必须先进入 `accept_pending`
+  - [x] `accept_pending` 必须 durable 记录 `delivery_rpc_request_id + delivery_rpc_correlation_marker`
+  - [x] `accept_pending` 现在要求 `managed_session_id` 存在、绑定当前 batch `source_thread_id`、`session_epoch` 匹配、session 处于 `live` / `detached`、`turn_start` 时 `activity_state=idle`；默认 `strict_safe` 还要求 risk profile 为 no-approval / no-network / no-write，显式 `trusted_all` 绕过 risk-profile gate
+  - response 丢失后只能通过同一连续 event/current-state 面正向证明 marker 已接入 exactly one caller turn；否则 fail-closed，不得自动重发
+  - proven-before-accept benign reject 才允许 `accept_pending -> prepared`
+  - `accept_pending -> prepared` 必须写入 `delivery_rpc_state=rejected_before_accept`，且不得递增 `delivery_attempt_count`
+  - [x] accepted attempt 必须 durable 记录 `managed_session_id + session_epoch`
+  - [x] accepted attempt 必须 durable 记录 `delivery_accepted_at`
+  - [x] accepted attempt 必须 durable 记录 `last_observed_turn_event + last_observed_turn_event_at`
+  - [x] accepted attempt 必须 durable 记录 `delivery_observation_deadline`
+  - [x] `delivery_observation_deadline` 的计算基准必须统一为 `delivery_accepted_at`
+  - [x] `strict_safe` detached auto-delivery 只允许在 session-scoped risk profile 三项都为 `false` 时开启；`trusted_all` 作为显式 broad escape hatch 已单独实现
+  - [x] session attach / stale accept / expired observation / operator-close active attempt 会推进 `session_epoch` 并清空 activity proof，避免旧 idle 证明继续打开自动投递
+  - [x] passive adapter continuity loss / missing authoritative current-state snapshot 会推进 `session_epoch` 并清空旧 activity / capability proof，避免断连前 idle 证明继续打开自动投递
+  - [x] passive adapter 的 matched-thread `thread.status.type` authoritative snapshot 会支配同一 request response 前消费到的 stale notification，明确不可信 snapshot 会 fail-closed，且 capability / activity 写入失败会先清空 proof 再 retry
+  - [x] passive adapter 不再在 `thread/read` timeout 后复用同一 websocket；timeout / 协议 / decode / closed / remote-error 都会关闭本轮连接并 fail-closed retry
+  - [x] `cli run` foreground 退出时会清空 passive sidecar 最后写入的 activity / capability proof，并把 session 标成 `detached`，避免 event stream 已关闭后旧 `idle` proof 继续打开自动投递
+  - [x] passive adapter 的 proof 写入使用短 SQLite busy timeout 与 lifecycle-aware bounded retry，避免 DB lock 下耗尽 daemon dispatch worker、让短暂 lock 直接失败 foreground `cli run`，或在 foreground 退出后继续阻塞 cleanup
+  - [x] passive adapter websocket receive 使用 absolute deadline，且 control-frame pong 写回同样受该 deadline 约束
+  - [x] `note-activity` 只能在当前 epoch 内按 `activity_revision + 1` 顺序推进，或做完全相同状态的幂等重放
+  - [x] 同一 `delivery_rpc_request_id` 的 begin/accept 幂等路径仍必须引用当前有效 managed session，legacy / missing / stale session 不能绕过 Phase 6 gate
+  - [x] `delivery_observation_deadline` 到期仍未看到可信 `turn/completed` 时：
+    - [x] 当前 attempt -> `abandoned`
+    - [x] `delivery_observation_state=expired`
+    - [x] 当前 head batch -> `replay_policy=manual_resolution_only`
+  - 如果 `delivery_turn_id` 的观察连续性丢失，则当前 head batch 进入 `manual_resolution_only`
+  - [x] 落地 store-level `session_epoch` 的生成、递增与 fail-closed 判定规则
+  - [x] `cli run` sidecar 已能读取 app-server lifecycle event stream 并同步 `active` / `idle` current-state；`trusted-all` delivery loop 已接入 accepted-turn notification observation 与 same-epoch `thread/read` reconciliation
+  - 落地 `turn_steer` 所需的 active-turn risk proof 后，再允许 `begin-cli-accept --rpc-kind turn-steer` 从 fail-closed 变成受控可用
+  - 按当前合同实现 continuity-loss 场景的 `inspect-head -> close-head(reason=...)` operator-resolution flow
+- [x] 为 CLI adapter 实现 idle 判定与 benign-race retry contract：
+  - [x] `cli run` passive adapter 已基于 `turn/started` / `turn/completed` / `thread/status/changed` 推进 durable `active` / `idle`
+  - [x] `begin-cli-accept` / delivery loop 会消费该 idle proof
+  - [x] clear pre-accept `turn/start` rejection 会写入 `rejected_before_accept`，不消耗 attempt count，并等待 fresh idle proof 后再 retry
+- [x] 验证 CLI wrapper 场景下，sidecar 使用 `turn/steer` 处理“caller thread 正在活跃 turn 中”的边界行为，且不会导致当前 turn 提前结束。
+- [x] 为 CLI adapter 明确定义实验 RPC 的最小能力集、capability probe 和 fail-closed 策略。
+- [x] 把 `turn/steer` 维持为默认关闭的 gated optimization，并明确不满足条件时的 idle-only fallback。见 [CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md)。
+- [x] 为 CLI adapter 落实 `turn/start` delivery completion contract：
+  - [x] accepted `turn/start` 只记录 `delivery_turn_id`
+  - accepted `turn/steer` 仍待 active-turn risk proof 落地后开放；当前 `begin-cli-accept --rpc-kind turn-steer` 仍 fail-closed
+  - [x] 只有匹配的 `turn/completed` 才允许 close batch
+  - [x] pre-accept 的 benign race / non-steerable reject 可以回退到 retry-on-idle
+  - [x] 但 accepted 之后的 interrupted / replaced / failed turn 必须 fail-closed 到 `manual_resolution_only`
+  - [x] `observed_at >= delivery_observation_deadline` 的 `turn/completed` 不得关闭 batch，只能作为 late evidence 记录并 fail-closed 到 manual resolution；startup sweep 先过期但事件实际 `observed_at` 仍早于 deadline 的 completion 可以修正为 delivered
+  - [x] `cli run` websocket event loop 已实现 current-state / lifecycle sync；accepted `delivery_turn_id` 已接到 `attempt observe-cli-turn` 的 delivery observation loop，并支持 same-epoch `thread/read` reconcile
+````
