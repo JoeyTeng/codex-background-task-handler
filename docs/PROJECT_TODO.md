@@ -96,6 +96,8 @@
   - [x] `snapshots/<snapshot_revision>/pause-due-bindings.json` skeleton，entries 当前为空
   - [x] `desktop-installation-state.json` preferred direct-file-read export
   - [x] 记录真实 Desktop heartbeat preflight/read 复测流程，见 [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](DESKTOP_LIVE_PREFLIGHT_VALIDATION.md)
+  - [x] 执行第一次真实 Desktop heartbeat preflight/read 复测，结果见 [DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md](DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md)
+  - [ ] 修复/验证 `cbth` 对已满足私有权限的目录或文件不做重复 chmod，避免 Desktop heartbeat 环境在 `chmod 0700 ~/.cbth` 处失败
   - [ ] 在真实 Desktop heartbeat 中验证无审批读取这些 snapshot
   - [x] bridge helper prompt 必须校验 manifest revision 与每个 snapshot 文件内嵌 revision 一致
   - 大 artifact 的正式自动路径不再依赖直接读 `artifacts/<artifact_id>/payload`
@@ -132,7 +134,7 @@
   - [x] `installation-state repair` 是当前唯一写入路径
   - [x] capability 结论绑定 `validation_fingerprint`
   - [x] transport generation / fingerprint drift 会让不匹配 binding 进入 `degraded`
-  - [ ] live 验证后才允许把 `read_transport_capability=validated` 当作覆盖 mandatory `bridge-preflight` 无审批执行、daemon sweep/refresh 成功、以及刷新后 snapshot 无审批读取的结论
+  - [ ] live 验证成功后才允许把 `read_transport_capability=validated` 当作覆盖 mandatory `bridge-preflight` 无审批执行、daemon sweep/refresh 成功、以及刷新后 snapshot 无审批读取的结论；2026-05-05 实测失败，仍保持 `unknown`
 - [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
   - [x] `current-snapshot.json` foundation manifest
   - [x] `snapshots/<snapshot_revision>/ready-threads.json` skeleton
