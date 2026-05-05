@@ -75,6 +75,10 @@ impl FsLayout {
         self.inbox_dir().join("current-snapshot.json")
     }
 
+    pub fn desktop_installation_state_path(&self) -> PathBuf {
+        self.inbox_dir().join("desktop-installation-state.json")
+    }
+
     pub fn desktop_snapshots_dir(&self) -> PathBuf {
         self.inbox_dir().join("snapshots")
     }

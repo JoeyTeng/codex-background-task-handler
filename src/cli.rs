@@ -4833,6 +4833,7 @@ fn publish_desktop_bridge_preflight(
     let arm_pending_path = layout.desktop_arm_pending_bindings_path(&snapshot_revision);
     let pause_due_path = layout.desktop_pause_due_bindings_path(&snapshot_revision);
     let manifest_path = layout.desktop_current_snapshot_path();
+    let installation_state_path = layout.desktop_installation_state_path();
 
     let base = json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
@@ -4848,6 +4849,13 @@ fn publish_desktop_bridge_preflight(
             "validation_fingerprint": &installation_state.validation_fingerprint,
         }
     });
+    let installation_state_export = json!({
+        "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "published_at": now,
+        "bridge_thread_id": bridge_thread_id,
+        "desktop_installation_state": installation_state,
+    });
+    write_desktop_snapshot(&installation_state_path, installation_state_export)?;
     write_desktop_snapshot(
         &ready_threads_path,
         json!({
@@ -4896,6 +4904,7 @@ fn publish_desktop_bridge_preflight(
         "created_at": now,
         "bridge_thread_id": bridge_thread_id,
         "snapshot_manifest_path": manifest_path.display().to_string(),
+        "installation_state_path": installation_state_path.display().to_string(),
         "snapshots": {
             "ready_threads": {
                 "path": ready_threads_path.display().to_string(),

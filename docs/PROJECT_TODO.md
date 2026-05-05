@@ -94,8 +94,10 @@
   - [x] `snapshots/<snapshot_revision>/ready-threads.json` skeleton，entries 当前为空
   - [x] `snapshots/<snapshot_revision>/arm-pending-bindings.json` skeleton，entries 当前为空
   - [x] `snapshots/<snapshot_revision>/pause-due-bindings.json` skeleton，entries 当前为空
+  - [x] `desktop-installation-state.json` preferred direct-file-read export
+  - [x] 记录真实 Desktop heartbeat preflight/read 复测流程，见 [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](DESKTOP_LIVE_PREFLIGHT_VALIDATION.md)
   - [ ] 在真实 Desktop heartbeat 中验证无审批读取这些 snapshot
-  - [ ] bridge helper prompt 必须校验 manifest revision 与每个 snapshot 文件内嵌 revision 一致
+  - [x] bridge helper prompt 必须校验 manifest revision 与每个 snapshot 文件内嵌 revision 一致
   - 大 artifact 的正式自动路径不再依赖直接读 `artifacts/<artifact_id>/payload`
 - [ ] 如果未来要把大 artifact 纳入 automatic caller path，再单独验证 `cbth desktop read-artifact ...` 在 heartbeat / caller 路径中的无审批能力，并把结果写回 `artifact_read_capability`。
 - [ ] 单独验证 Desktop heartbeat 在后台运行时，是否能无审批执行窄 `cbth desktop ...` helper：
@@ -125,7 +127,7 @@
   - [x] v1 明确不支持 mixed Desktop `read_transport` bindings
 - [ ] 按已定稿合同实现 Desktop installation-wide `read_transport` 权威来源：
   - [x] daemon-managed `desktop_installation_state`
-  - [ ] preferred `~/.cbth/inbox/desktop-installation-state.json`
+  - [x] preferred `~/.cbth/inbox/desktop-installation-state.json`
   - [x] fallback `cbth desktop installation-state --json`
   - [x] `installation-state repair` 是当前唯一写入路径
   - [x] capability 结论绑定 `validation_fingerprint`

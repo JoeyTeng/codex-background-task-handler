@@ -78,16 +78,19 @@ cbth desktop bridge-preflight --bridge-thread-id <thread-id> --json
 - 原子发布同一 `snapshot_revision` 的 inbox snapshot set。
 - 避免 bridge 读取旧 snapshot 后继续推进 delivery。
 
-当前 preflight 发布一个稳定 manifest 和三份 revision-specific data snapshot：
+当前 preflight 发布一个稳定 manifest、一个稳定 installation-state export，和三份 revision-specific data snapshot：
 
 - `~/.cbth/inbox/current-snapshot.json`
+- `~/.cbth/inbox/desktop-installation-state.json`
 - `~/.cbth/inbox/snapshots/<snapshot_revision>/ready-threads.json`
 - `~/.cbth/inbox/snapshots/<snapshot_revision>/arm-pending-bindings.json`
 - `~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json`
 
 `current-snapshot.json` 必须最后写入，并且只引用 immutable revision-specific data files。这样即使新的 preflight 正在发布或中途失败，旧 manifest 引用的旧 data files 仍保持一致，不会因为固定文件名被覆盖而变成 revision mismatch。
 
-每个文件都包含：
+`desktop-installation-state.json` 是 preferred direct-file-read 路径，用于让 Desktop heartbeat 读取 installation generation、fingerprint、read transport、capability states 和 timestamps。它由 `bridge-preflight` 原子刷新；它不是 capability 写入口，capability 仍只能通过 `installation-state repair` 写入。
+
+每个 snapshot 文件都包含：
 
 - `schema_version = 1`
 - 相同的 `snapshot_revision`
@@ -100,7 +103,7 @@ cbth desktop bridge-preflight --bridge-thread-id <thread-id> --json
 
 - `~/.cbth/inbox` directory: `0700`
 - `~/.cbth/inbox/snapshots/<snapshot_revision>` directory: `0700`
-- snapshot regular files: `0600`
+- snapshot / installation-state regular files: `0600`
 
 ## Fail-Closed Boundaries
 
@@ -120,7 +123,7 @@ cbth desktop bridge-preflight --bridge-thread-id <thread-id> --json
 - ready attempt materialization。
 - `note-arm-pending`、`note-arm`、`note-boundary-crossed`。
 - `list-arm-pending`、`list-pause-due`、`claim-next-ready` fallback helpers。
-- Desktop live heartbeat no-approval validation。
+- Desktop automatic delivery live validation；preflight/read validation workflow is documented separately in [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](DESKTOP_LIVE_PREFLIGHT_VALIDATION.md).
 - 大 artifact automatic continuation。
 - 外部 Webex / GitHub / PR polling integrations。
 
