@@ -318,6 +318,18 @@ fn desktop_bridge_preflight_publishes_revision_consistent_private_snapshots() {
     assert_eq!(preflight["snapshots"]["ready_threads"]["count"], 0);
     assert_eq!(preflight["snapshots"]["arm_pending_bindings"]["count"], 0);
     assert_eq!(preflight["snapshots"]["pause_due_bindings"]["count"], 0);
+    let installation_state_path = preflight["installation_state_path"]
+        .as_str()
+        .expect("installation state path")
+        .to_owned();
+    assert_eq!(
+        installation_state_path,
+        home.path()
+            .join("inbox")
+            .join("desktop-installation-state.json")
+            .display()
+            .to_string()
+    );
     let ready_path = preflight["snapshots"]["ready_threads"]["path"]
         .as_str()
         .expect("ready path")
@@ -403,6 +415,28 @@ fn desktop_bridge_preflight_publishes_revision_consistent_private_snapshots() {
     )
     .unwrap_or_else(|error| panic!("parse {ready_path}: {error}"));
     assert_eq!(old_ready["snapshot_revision"], revision);
+    let installation_state: Value = serde_json::from_slice(
+        &fs::read(&installation_state_path)
+            .unwrap_or_else(|error| panic!("read {installation_state_path}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("parse {installation_state_path}: {error}"));
+    assert_eq!(installation_state["schema_version"], 1);
+    assert_eq!(installation_state["published_at"], 2001);
+    assert_eq!(installation_state["bridge_thread_id"], "bridge-thread");
+    assert_eq!(
+        installation_state["desktop_installation_state"]["read_transport_generation"],
+        0
+    );
+    assert_eq!(
+        installation_state["desktop_installation_state"]["read_transport_capability"],
+        "unknown"
+    );
+    let durable_state = cbth(&home, &["desktop", "installation-state", "--json"]);
+    assert_eq!(
+        durable_state["desktop_installation_state"]["read_transport_generation"],
+        0
+    );
+    assert_eq!(durable_state["desktop_installation_state"]["updated_at"], 0);
 }
 
 #[test]
@@ -427,5 +461,94 @@ fn desktop_bridge_preflight_routes_through_daemon() {
     assert_eq!(
         preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["count"],
         0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn desktop_bridge_preflight_exports_repaired_installation_state_for_direct_read() {
+    let home = temp_home();
+
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "installation-state",
+            "repair",
+            "--read-transport",
+            "direct-file-read",
+            "--read-transport-capability",
+            "validated",
+            "--validation-fingerprint",
+            "desktop-live-preflight",
+            "--json",
+            "--now",
+            "2100",
+        ],
+    );
+
+    let preflight = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-live",
+            "--json",
+            "--now",
+            "2101",
+        ],
+    );
+    let preflight = &preflight["desktop_bridge_preflight"];
+    let installation_state_path = preflight["installation_state_path"]
+        .as_str()
+        .expect("installation state path");
+    let metadata = fs::metadata(installation_state_path)
+        .unwrap_or_else(|error| panic!("stat {installation_state_path}: {error}"));
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+    let installation_state: Value = serde_json::from_slice(
+        &fs::read(installation_state_path)
+            .unwrap_or_else(|error| panic!("read {installation_state_path}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("parse {installation_state_path}: {error}"));
+    assert_eq!(installation_state["schema_version"], 1);
+    assert_eq!(installation_state["published_at"], 2101);
+    assert_eq!(installation_state["bridge_thread_id"], "bridge-thread-live");
+    assert_eq!(
+        installation_state["desktop_installation_state"]["read_transport"],
+        "direct_file_read"
+    );
+    assert_eq!(
+        installation_state["desktop_installation_state"]["read_transport_generation"],
+        1
+    );
+    assert_eq!(
+        installation_state["desktop_installation_state"]["read_transport_capability"],
+        "validated"
+    );
+    assert_eq!(
+        installation_state["desktop_installation_state"]["artifact_read_capability"],
+        "unknown"
+    );
+    assert_eq!(
+        installation_state["desktop_installation_state"]["writeback_capability"],
+        "unknown"
+    );
+    assert_eq!(
+        installation_state["desktop_installation_state"]["validation_fingerprint"],
+        "desktop-live-preflight"
+    );
+    assert_eq!(
+        installation_state["desktop_installation_state"]["validated_at"],
+        2100
+    );
+    assert_eq!(
+        installation_state["desktop_installation_state"]["created_at"],
+        2100
+    );
+    assert_eq!(
+        installation_state["desktop_installation_state"]["updated_at"],
+        2100
     );
 }

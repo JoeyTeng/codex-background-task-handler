@@ -71,7 +71,8 @@
   - 新增 `cbth desktop installation-state --json` 与 `installation-state repair ... --json`，把 installation-wide read transport / capability / validation fingerprint 收口到 `desktop_installation_state`
   - 新增 `cbth desktop binding repair ... --json`，把 `source_thread_id -> caller_automation_id` durable 绑定，并镜像当前 installation generation / fingerprint；同一个 active caller automation 不能被多个 source thread 复用
   - 新增 daemon-routed `cbth desktop bridge-preflight ... --json`，执行 sweep 后原子发布稳定 `current-snapshot.json` manifest，并让 manifest 指向 `snapshots/<snapshot_revision>/ready-threads.json`、`arm-pending-bindings.json`、`pause-due-bindings.json` skeleton
-  - 当前 `ready_threads` / `arm_pending_bindings` / `pause_due_bindings` entries 仍为空；caller heartbeat wake、automation mutation、ready attempt materialization、`note-arm*` / `note-boundary-crossed`、以及 live Desktop heartbeat 无审批验证仍未实现
+  - `bridge-preflight` 也会刷新 preferred direct-file-read export：`~/.cbth/inbox/desktop-installation-state.json`，供 Desktop heartbeat 读取 installation generation / fingerprint / capability state
+  - Desktop live preflight validation harness 已记录在 [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](DESKTOP_LIVE_PREFLIGHT_VALIDATION.md)，但真实 heartbeat 无审批证据仍待执行；当前 `ready_threads` / `arm_pending_bindings` / `pause_due_bindings` entries 仍为空，caller heartbeat wake、automation mutation、ready attempt materialization、`note-arm*` / `note-boundary-crossed` 仍未实现
 - #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
 - GitHub REST 可能把已 resolved / outdated 的旧 inline review comment `commit_id` 映射到后续 head；gate 现在会额外读取 GraphQL `reviewThreads`，只把未 resolved、未 outdated 的 current-head Codex inline threads 算作 blocker。Codex review-body findings 仍按 `PullRequestReview.commit_id` 和 current-head blob link 判定，因为它们没有可 resolve 的 thread。
 
