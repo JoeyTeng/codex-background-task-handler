@@ -161,12 +161,12 @@
 
 ```text
 ~/.cbth/inbox/current-snapshot.json
-~/.cbth/inbox/ready-threads.json
-~/.cbth/inbox/arm-pending-bindings.json
-~/.cbth/inbox/pause-due-bindings.json
+~/.cbth/inbox/snapshots/<snapshot_revision>/ready-threads.json
+~/.cbth/inbox/snapshots/<snapshot_revision>/arm-pending-bindings.json
+~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json
 ```
 
-`current-snapshot.json` 是 `bridge-preflight` 原子发布的 generation manifest；固定文件名可以作为兼容视图存在，但 bridge 必须按 manifest revision 校验所有读取文件。
+`current-snapshot.json` 是 `bridge-preflight` 原子发布的 stable manifest；它必须指向 immutable revision-specific data files。bridge 必须按 manifest revision 校验所有读取文件。
 
 附加的 `by-thread/<thread_id>.json` / artifact 文件只允许作为 operator/debug export：
 
@@ -222,9 +222,9 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 
 ```text
 ~/.cbth/inbox/current-snapshot.json
-~/.cbth/inbox/ready-threads.json
-~/.cbth/inbox/arm-pending-bindings.json
-~/.cbth/inbox/pause-due-bindings.json
+~/.cbth/inbox/snapshots/<snapshot_revision>/ready-threads.json
+~/.cbth/inbox/snapshots/<snapshot_revision>/arm-pending-bindings.json
+~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json
 ```
 
 `by-thread/<thread_id>.json` 与 artifact 文件只允许作为 operator/debug export，默认不属于自动 caller path，也不应用来绕过 continuation boundary。
@@ -236,7 +236,7 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
 
 更新方式：
 
-- daemon 先写入 generationed snapshot files，再发布一个包含 `snapshot_revision` 与各文件 locator 的 `current-snapshot.json` manifest。
+- daemon 先写入 revision-specific snapshot files，再发布一个包含 `snapshot_revision` 与各文件 locator 的 `current-snapshot.json` manifest。
 - manifest 用 `write temp + rename` 原子替换；单个数据文件也必须用 temp + rename，但多文件一致性只由 manifest revision 合同保证。
 - bridge 必须先读取 manifest，再读取 manifest 指向的文件，并确认每个文件内嵌 `snapshot_revision` 都等于 manifest revision；任何 mismatch 都必须 fail closed。
 - 外部语义固定为“读同一 generation 的快照 manifest + 文件”。
@@ -377,12 +377,10 @@ caller 侧 automatic continuation 则必须通过 `note-boundary-crossed` succes
     - installation-wide capability 结论就必须被视为失效
     - bridge 不得继续把该安装当成 `validated`
   - 这些 capability 结论始终绑定在当前 `read_transport_generation` 上：
-    - 只要 `read_transport_generation` 递增
-    - daemon 就必须原子地把 `read_transport_capability`
-    - `artifact_read_capability`
-    - `writeback_capability`
-    - 全部重置为 `unknown`
-    - 并清空 `validated_at`
+    - 只要 `read_transport_generation` 递增，旧 generation 上的 `validated` 结论就不能继续被 bridge 使用
+    - `installation-state repair` 可以在同一次 operator-validated repair 中写入新的 capability 结论
+    - 未显式提供 capability flags 时，CLI 默认写入 `unknown`
+    - 同一参数重复 repair 必须是 no-op，不递增 generation，也不刷新 `validated_at`
   - 推荐暴露面：
     - preferred: `~/.cbth/inbox/desktop-installation-state.json`
     - fallback: `cbth desktop installation-state --json`
@@ -1311,13 +1309,14 @@ cbth desktop binding unbind
 - `cbth desktop bridge-preflight ...` 是 Desktop bridge 每轮 wake 的必经窄 helper：
   - 它按需拉起 daemon
   - 执行 deterministic overdue sweep / GC / auto-close / binding reconcile
-  - 原子发布本轮 snapshot manifest，并让 `ready-threads.json` / `arm-pending-bindings.json` / `pause-due-bindings.json` 全部绑定同一个 `snapshot_revision`
+  - 原子发布本轮 snapshot manifest，并让 manifest 指向的 revision-specific `ready-threads.json` / `arm-pending-bindings.json` / `pause-due-bindings.json` 全部绑定同一个 `snapshot_revision`
   - 返回本轮 `snapshot_manifest_path + snapshot_revision / generation`
   - 如果它失败，本轮 bridge 不得读取旧 snapshot 继续 arm
 - `cbth desktop installation-state repair ...` 是 installation-wide Desktop transport / capability state 的稳定 operator 面：
   - 它才允许切换 `read_transport`
   - 也是唯一允许写 installation-wide capability 结论的路径
-  - 成功时必须原子更新 installation state，并递增 `read_transport_generation`
+  - 发生实际 state 变化时必须原子更新 installation state，并递增 `read_transport_generation`
+  - 同一参数重复执行必须是 no-op
   - 成功输出还必须至少回显：
     - `validation_fingerprint`
     - `validated_at`
@@ -1489,7 +1488,7 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
   - 当前 v1 automatic caller path 不依赖它
 - 如果未来重新启用它，`cbth desktop read-artifact ...` 仍必须提供 chunked payload 协议，而不是返回一个需要再次 file-read 的路径。
 - 其中 bridge 的 overdue-binding cleanup 也必须有对应只读输入面：
-  - `~/.cbth/inbox/pause-due-bindings.json`
+  - `~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json`
   - 或 `cbth desktop list-pause-due --bridge-thread-id <thread_id> --json`
 - 其中 `cbth desktop claim-next-ready ...` 必须一次性返回 bridge 写 prompt 所需的整组 token：
   - `source_thread_id`
@@ -1501,7 +1500,7 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
   - `requires_artifact_read`
 - bridge 必须再根据 `source_thread_id` 查询 binding，解析当前唯一允许更新的 `caller_automation_id`
 - 当前首选路径是：
-  - bridge heartbeat 只读 `ready-threads.json`
+  - bridge heartbeat 先读取 `current-snapshot.json`，再读取其中 locator 指向的 revision-specific `ready-threads.json`
 - caller heartbeat 先调用 `note-boundary-crossed`，并只在 success 返回后消费 inline continuation payload / summary
 - 如果 `direct_file_read` 不能满足无审批读取约束，则 Desktop 设计要么切回经过单独验证的 `helper_cli_read`，要么继续保留为候选方案；不能直接把未验证的 helper 执行前提当成已经成立。
 - Desktop 自动续跑只对已完成 binding 的 thread 生效；未绑定 thread 不得被 bridge 自动 arm。

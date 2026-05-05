@@ -57,6 +57,7 @@
 - [ ] 验证外部进程在 Desktop 运行时改写 automation 调度状态（尤其是 `next_run_at` / 状态切换）后，caller thread heartbeat 是否会被及时触发。
 - [x] 验证 bridge automation thread 是否能通过 `automation_update` 稳定为别的 caller thread 创建/更新 heartbeat automation，而无需外部直接改 Codex automation DB。
 - [x] 单独沉淀 Desktop background-task bridge 技术方案文档。
+- [x] 单独沉淀 Desktop bridge foundation 实现文档，见 [DESKTOP_BRIDGE_FOUNDATION.md](DESKTOP_BRIDGE_FOUNDATION.md)。
 - [x] 单独沉淀共享核心架构文档，明确单 binary、多入口、按需启动 daemon 的生命周期方案。
 - [x] 用 Rust 实现主 binary 的共享 `job` CLI 子命令，替代单独的 `background-taskctl` helper。
 - [x] 实现 Phase 2 第一批按需启动 daemon / IPC 基础：
@@ -88,12 +89,13 @@
   - v1 不退回 unauthenticated TCP daemon IPC；纯 Windows IPC 暂不支持
 - [x] 将 mutating / recovery CLI 命令接入 daemon IPC，并在无法提供 same-user proof 时 fail closed。
 - [ ] 验证 Desktop heartbeat 在后台运行时，是否能稳定读取 bridge-side 所需的只读 inbox snapshot，且不会卡审批：
-  - `current-snapshot.json`
-  - `ready-threads.json`
-  - `arm-pending-bindings.json`
-  - `pause-due-bindings.json`
-  - `bridge-preflight` 必须原子发布同一 `snapshot_revision` 的 manifest
-  - bridge 必须校验 manifest revision 与每个 snapshot 文件内嵌 revision 一致
+  - [x] `bridge-preflight` foundation 已原子发布同一 `snapshot_revision` 的 manifest skeleton
+  - [x] `current-snapshot.json`
+  - [x] `snapshots/<snapshot_revision>/ready-threads.json` skeleton，entries 当前为空
+  - [x] `snapshots/<snapshot_revision>/arm-pending-bindings.json` skeleton，entries 当前为空
+  - [x] `snapshots/<snapshot_revision>/pause-due-bindings.json` skeleton，entries 当前为空
+  - [ ] 在真实 Desktop heartbeat 中验证无审批读取这些 snapshot
+  - [ ] bridge helper prompt 必须校验 manifest revision 与每个 snapshot 文件内嵌 revision 一致
   - 大 artifact 的正式自动路径不再依赖直接读 `artifacts/<artifact_id>/payload`
 - [ ] 如果未来要把大 artifact 纳入 automatic caller path，再单独验证 `cbth desktop read-artifact ...` 在 heartbeat / caller 路径中的无审批能力，并把结果写回 `artifact_read_capability`。
 - [ ] 单独验证 Desktop heartbeat 在后台运行时，是否能无审批执行窄 `cbth desktop ...` helper：
@@ -104,33 +106,36 @@
   - `claim-next-ready`
   - `note-arm`
   - `note-boundary-crossed`
-- [ ] 为 Desktop bootstrap 设计并实现 `desktop binding` 流程，至少 durable 记录：
-  - `source_thread_id`
-  - `caller_automation_id`
-  - `armed_generation`
-  - `armed_generation_quiesced_at`
-  - `pause_not_before`
-  - `pause_deadline`
-  - `read_transport` (mirrors the installation-wide chosen transport)
-  - `read_transport_generation`
-  - `read_transport_capability`
-  - `artifact_read_capability`
-  - `writeback_capability`
-  - `validation_fingerprint`
-  - paused 状态读回校验
-  - v1 明确不支持 mixed Desktop `read_transport` bindings
+- [ ] 为 Desktop bootstrap 设计并实现完整 `desktop binding` 流程，至少 durable 记录：
+  - [x] `source_thread_id`
+  - [x] `caller_automation_id`
+  - [x] active `caller_automation_id` 唯一占用约束
+  - [x] `binding_state`
+  - [ ] `armed_generation`
+  - [ ] `armed_generation_quiesced_at`
+  - [ ] `pause_not_before`
+  - [ ] `pause_deadline`
+  - [x] `read_transport` mirrors the installation-wide chosen transport
+  - [x] `read_transport_generation`
+  - [ ] `read_transport_capability` as read-only output mirror
+  - [ ] `artifact_read_capability` as read-only output mirror
+  - [ ] `writeback_capability` as read-only output mirror
+  - [x] `validation_fingerprint`
+  - [ ] paused 状态读回校验
+  - [x] v1 明确不支持 mixed Desktop `read_transport` bindings
 - [ ] 按已定稿合同实现 Desktop installation-wide `read_transport` 权威来源：
-  - daemon-managed `desktop_installation_state`
-  - preferred `~/.cbth/inbox/desktop-installation-state.json`
-  - fallback `cbth desktop installation-state --json`
-  - bootstrap / repair 是唯一写入路径
-  - capability 结论必须绑定 `validation_fingerprint`
-  - transport generation 或 fingerprint 变化都必须让旧 validated 结论失效
-  - `read_transport_capability=validated` 必须同时覆盖 mandatory `bridge-preflight` 无审批执行、daemon sweep/refresh 成功、以及刷新后 snapshot 无审批读取
+  - [x] daemon-managed `desktop_installation_state`
+  - [ ] preferred `~/.cbth/inbox/desktop-installation-state.json`
+  - [x] fallback `cbth desktop installation-state --json`
+  - [x] `installation-state repair` 是当前唯一写入路径
+  - [x] capability 结论绑定 `validation_fingerprint`
+  - [x] transport generation / fingerprint drift 会让不匹配 binding 进入 `degraded`
+  - [ ] live 验证后才允许把 `read_transport_capability=validated` 当作覆盖 mandatory `bridge-preflight` 无审批执行、daemon sweep/refresh 成功、以及刷新后 snapshot 无审批读取的结论
 - [ ] 设计并实现 `cbth` 的只读 inbox snapshot 形状：
-  - `ready-threads.json`
-  - `arm-pending-bindings.json`
-  - `pause-due-bindings.json`
+  - [x] `current-snapshot.json` foundation manifest
+  - [x] `snapshots/<snapshot_revision>/ready-threads.json` skeleton
+  - [x] `snapshots/<snapshot_revision>/arm-pending-bindings.json` skeleton
+  - [x] `snapshots/<snapshot_revision>/pause-due-bindings.json` skeleton
   - `by-thread/<thread_id>.json` (optional diagnostic export, disabled by default)
   - `artifacts/<artifact_id>/manifest.json` (diagnostic / operator path)
   - `artifacts/<artifact_id>/payload` (diagnostic / operator path; not the automatic continuation path)
@@ -144,11 +149,11 @@
   - directories `0700`
   - regular files `0600`
 - [ ] 设计并实现 Desktop bridge preflight 与 bridge-side `helper_cli_read` fallback：
-  - `cbth desktop bridge-preflight --bridge-thread-id ... --json`
-  - `cbth desktop list-arm-pending --bridge-thread-id ... --json`
-  - `cbth desktop list-pause-due --bridge-thread-id ... --json`
-  - `cbth desktop claim-next-ready --bridge-thread-id ... --json`
-  - `bridge-preflight` 是每轮 bridge wake 的 mandatory helper；`direct_file_read` 也必须先通过它发布 snapshot manifest
+  - [x] `cbth desktop bridge-preflight --bridge-thread-id ... --json` foundation skeleton
+  - [ ] `cbth desktop list-arm-pending --bridge-thread-id ... --json`
+  - [ ] `cbth desktop list-pause-due --bridge-thread-id ... --json`
+  - [ ] `cbth desktop claim-next-ready --bridge-thread-id ... --json`
+  - [x] `bridge-preflight` 是每轮 bridge wake 的 mandatory helper；`direct_file_read` 也必须先通过它发布 snapshot manifest
   - `cbth desktop read-artifact --artifact-id ... --artifact-read-lease-id ... --offset ... --max-bytes ... --json` 只属于 operator/manual recovery 或 future-expansion；v1 里传入的 lease 必须来自 operator recovery 签发的 `artifact_recovery_lease_id`
   - chunked payload return contract 只用于 recovery / future-expansion，不属于 v1 automatic caller path
 - [ ] 按已定稿合同实现 `claim-next-ready` 的纯 read/peek 语义：
@@ -218,11 +223,11 @@
   - `note-arm` 只允许从 `arm_pending -> cooldown`
   - 只要 attempt 仍是 `arm_pending`，bridge 就不得对同一 generation 重复 arm
 - [ ] 为 `arm_pending` 增补专门的 reconcile 输入面：
-  - `~/.cbth/inbox/arm-pending-bindings.json`
+  - `~/.cbth/inbox/snapshots/<snapshot_revision>/arm-pending-bindings.json`
   - `cbth desktop list-arm-pending --bridge-thread-id ... --json`
   - bridge 每轮必须先 reconcile 这些 attempt，再处理 pause-due / ready
 - [ ] 为 bridge overdue-binding cleanup 定义 durable 只读输入面：
-  - `~/.cbth/inbox/pause-due-bindings.json`
+  - `~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json`
   - `cbth desktop list-pause-due --bridge-thread-id ... --json`
   - bridge 每轮必须先 reconcile 这些 binding，再读取新的 ready batch
 - [x] 定义 bridge heartbeat prompt 与 caller heartbeat prompt 的最小稳定合约。
@@ -253,16 +258,17 @@
   - 必须建立 post-output / post-side-effect observation contract
   - 不能靠“continuation preparation 已完成”来自动关闭 batch
 - [ ] 把 Desktop operator recovery / cleanup 命令面定死并实现：
-  - `cbth batch inspect-head ...`
-  - `cbth batch inspect --batch-id ...`
-  - `cbth batch close-head ...`
-  - `cbth desktop binding repair ...`
-  - `cbth desktop installation-state repair --read-transport ... [--read-transport-capability ...] [--artifact-read-capability ...] [--writeback-capability ...] ...`
-  - `cbth desktop binding unbind ...`
+  - [x] `cbth batch inspect-head ...`
+  - [x] `cbth batch inspect --batch-id ...`
+  - [x] `cbth batch close-head ...`
+  - [x] `cbth desktop binding repair ...`
+  - [x] `cbth desktop installation-state repair --read-transport ... [--read-transport-capability ...] [--artifact-read-capability ...] [--writeback-capability ...] ...`
+  - [ ] `cbth desktop binding unbind ...`
 - [ ] 把 installation-wide capability authority 收口到 `desktop_installation_state`：
-  - transport generation 一旦变化，installation-wide capability 必须原子重置为 `unknown`
-  - 只有 installation-state repair 才允许再次写入 validated 结论
-  - binding repair 只能消费 installation state，不能单独覆盖 capability 结论
+  - [x] transport / fingerprint drift 可以通过 repair 把 omitted capability 原子写回 `unknown`
+  - [x] 只有 installation-state repair 才允许再次写入 validated 结论
+  - [x] binding repair 只能消费 installation state，不能单独覆盖 capability 结论
+  - [ ] live Desktop heartbeat validation 后再把对应 capability 写为 `validated`
 - [ ] 把 Desktop rebind / binding repair 的硬失效合同落进实现：
   - 如果更换 `caller_automation_id`，必须优先证明旧 automation 已 quiesced / deleted
   - 如果旧 automation 无法被证明 quiesced，则不得复用当前 attempt / generation

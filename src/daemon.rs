@@ -86,6 +86,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "cli-turn-observation-expiry-dispatch",
     "cli-auto-delivery-dispatch",
     "task-supervisor",
+    "desktop-bridge-foundation-dispatch",
 ];
 const MAX_DISPATCH_WORKERS: usize = 32;
 const RESERVED_CONTROL_WORKERS: usize = 8;

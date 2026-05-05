@@ -67,6 +67,11 @@
   - 自动投递仍只走 idle `turn/start`；active-turn `turn/steer` 当前只补设计，不进入自动路径
   - active-turn steer 的 future risk/capability contract 已收敛到 [CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md)
   - Desktop bridge 仍是单独后续大块
+- Desktop bridge foundation 已开始落地，设计与实现边界见 [DESKTOP_BRIDGE_FOUNDATION.md](DESKTOP_BRIDGE_FOUNDATION.md)：
+  - 新增 `cbth desktop installation-state --json` 与 `installation-state repair ... --json`，把 installation-wide read transport / capability / validation fingerprint 收口到 `desktop_installation_state`
+  - 新增 `cbth desktop binding repair ... --json`，把 `source_thread_id -> caller_automation_id` durable 绑定，并镜像当前 installation generation / fingerprint；同一个 active caller automation 不能被多个 source thread 复用
+  - 新增 daemon-routed `cbth desktop bridge-preflight ... --json`，执行 sweep 后原子发布稳定 `current-snapshot.json` manifest，并让 manifest 指向 `snapshots/<snapshot_revision>/ready-threads.json`、`arm-pending-bindings.json`、`pause-due-bindings.json` skeleton
+  - 当前 `ready_threads` / `arm_pending_bindings` / `pause_due_bindings` entries 仍为空；caller heartbeat wake、automation mutation、ready attempt materialization、`note-arm*` / `note-boundary-crossed`、以及 live Desktop heartbeat 无审批验证仍未实现
 - #8 live probe 已验证 gate 会先 pending、再基于 controlled marker 之后的新 Codex completion 放行。
 - GitHub REST 可能把已 resolved / outdated 的旧 inline review comment `commit_id` 映射到后续 head；gate 现在会额外读取 GraphQL `reviewThreads`，只把未 resolved、未 outdated 的 current-head Codex inline threads 算作 blocker。Codex review-body findings 仍按 `PullRequestReview.commit_id` 和 current-head blob link 判定，因为它们没有可 resolve 的 thread。
 
@@ -98,7 +103,7 @@
     - v1 不支持 mixed Desktop `read_transport` bindings
     - `~/.cbth` 文件权限与稳定 helper CLI 只是在降低意外暴露面；Desktop helper / snapshot 路线同样只支持 dedicated single-user deployment assumption
     - installation-wide capability 结论也已收回到 `desktop_installation_state`：
-      - transport generation 变化时，capability 必须原子重置为 `unknown`
+      - transport generation 变化时，旧 generation 的 capability 不能继续被 bridge 使用；未显式提供 capability 参数时 repair 默认写入 `unknown`
       - capability 还必须绑定 installation-wide `validation_fingerprint`
       - binding repair 不得单独覆盖 installation-wide capability
   - Desktop 顶部文案也已改成更保守的口径：`bridge-preflight` / `note-arm-pending` / `note-arm` / `note-boundary-crossed` 是 v1 规划中的窄 helper 依赖；`note-delivered` 已降级为未来 post-output ack 扩展点，但后台 heartbeat 能否无审批执行前者仍待实证
@@ -210,9 +215,9 @@
   - daemon 自动退出条件也必须覆盖这两个 deadline
   - `read_transport_capability=validated` 现在明确包括 mandatory `bridge-preflight` 的无审批执行、daemon sweep/refresh 成功，以及刷新后 snapshot 的无审批读取
   - bridge 还需要一个专门的 overdue-binding 输入面：
-    - `~/.cbth/inbox/arm-pending-bindings.json`
+    - `~/.cbth/inbox/snapshots/<snapshot_revision>/arm-pending-bindings.json`
     - 或 `cbth desktop list-arm-pending ...`
-    - `~/.cbth/inbox/pause-due-bindings.json`
+    - `~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json`
     - 或 `cbth desktop list-pause-due ...`
   - 正常路径只由 bridge / operator `pause` / `update` / `reuse`
   - caller prompt 自己不直接 pause 这个长期复用 automation

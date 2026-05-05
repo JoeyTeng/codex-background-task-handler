@@ -67,6 +67,37 @@ impl FsLayout {
         self.tasks_dir().join(task_id)
     }
 
+    pub fn inbox_dir(&self) -> PathBuf {
+        self.home.join("inbox")
+    }
+
+    pub fn desktop_current_snapshot_path(&self) -> PathBuf {
+        self.inbox_dir().join("current-snapshot.json")
+    }
+
+    pub fn desktop_snapshots_dir(&self) -> PathBuf {
+        self.inbox_dir().join("snapshots")
+    }
+
+    pub fn desktop_snapshot_revision_dir(&self, snapshot_revision: &str) -> PathBuf {
+        self.desktop_snapshots_dir().join(snapshot_revision)
+    }
+
+    pub fn desktop_ready_threads_path(&self, snapshot_revision: &str) -> PathBuf {
+        self.desktop_snapshot_revision_dir(snapshot_revision)
+            .join("ready-threads.json")
+    }
+
+    pub fn desktop_arm_pending_bindings_path(&self, snapshot_revision: &str) -> PathBuf {
+        self.desktop_snapshot_revision_dir(snapshot_revision)
+            .join("arm-pending-bindings.json")
+    }
+
+    pub fn desktop_pause_due_bindings_path(&self, snapshot_revision: &str) -> PathBuf {
+        self.desktop_snapshot_revision_dir(snapshot_revision)
+            .join("pause-due-bindings.json")
+    }
+
     pub fn ensure(&self) -> Result<()> {
         ensure_private_dir(&self.home)?;
         ensure_private_dir(&self.artifacts_dir())?;

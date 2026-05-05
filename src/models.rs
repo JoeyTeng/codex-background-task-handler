@@ -339,6 +339,55 @@ pub struct NewAuditDecision {
     pub details: Value,
 }
 
+#[derive(Clone, Debug)]
+pub struct NewDesktopInstallationRepair {
+    pub read_transport: String,
+    pub read_transport_capability: String,
+    pub artifact_read_capability: String,
+    pub writeback_capability: String,
+    pub validation_fingerprint: String,
+    pub now: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopInstallationStateRecord {
+    pub read_transport: String,
+    pub read_transport_generation: i64,
+    pub read_transport_capability: String,
+    pub artifact_read_capability: String,
+    pub writeback_capability: String,
+    pub validation_fingerprint: String,
+    pub validated_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopInstallationRepairRecord {
+    pub state: DesktopInstallationStateRecord,
+    pub changed: bool,
+    pub degraded_bindings: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopBindingRecord {
+    pub source_thread_id: String,
+    pub caller_automation_id: String,
+    pub binding_state: String,
+    pub read_transport: String,
+    pub read_transport_generation: i64,
+    pub validation_fingerprint: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub degraded_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopBindingRepairRecord {
+    pub binding: DesktopBindingRecord,
+    pub installation_state: DesktopInstallationStateRecord,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct AuditDecisionRecord {
     pub audit_id: String,
