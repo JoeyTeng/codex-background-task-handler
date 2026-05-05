@@ -148,6 +148,32 @@ Default `cbth cli run` remains passive and records only current-state proof. Exi
 
 Use `cbth cli session list`, `cbth cli session inspect`, and `cbth cli session retire` for managed-session recovery. Operator retirement refuses `live` sessions, sessions that still own active delivery attempts, and sessions whose bound thread still has an open `manual_resolution_only` head batch. `detached`, `parked`, or `stale` sessions with no blockers can be retired manually; `cli run` can also auto-retire and replace retire-eligible `parked` / `stale` / profile-drift records. Same-profile reattach refuses the same active-attempt/manual-head blockers. A fail-closed accepted or pre-accept delivery path parks the session until the manual head batch is closed or swept.
 
+Desktop bridge foundation commands are implemented as operator/helper surfaces, not as an enabled Desktop automatic delivery path. `cbth desktop installation-state` owns installation-wide Desktop read/write capability state, `cbth desktop binding repair` durably binds a Desktop source thread to a caller heartbeat automation id, and `cbth desktop bridge-preflight` publishes a stable `~/.cbth/inbox/current-snapshot.json` manifest that points at revision-specific inbox snapshot skeleton files under `~/.cbth/inbox/snapshots/<revision>/`. Current snapshot entries are intentionally empty until later Desktop delivery PRs add ready selection, arm writeback, and continuation-boundary helpers. See [docs/DESKTOP_BRIDGE_FOUNDATION.md](docs/DESKTOP_BRIDGE_FOUNDATION.md).
+
+```bash
+cargo run --bin cbth -- \
+  desktop installation-state --json
+
+cargo run --bin cbth -- \
+  desktop installation-state repair \
+  --read-transport direct-file-read \
+  --read-transport-capability unknown \
+  --artifact-read-capability unknown \
+  --writeback-capability unknown \
+  --json
+
+cargo run --bin cbth -- \
+  desktop binding repair \
+  --source-thread-id <thread-id> \
+  --caller-automation-id <automation-id> \
+  --json
+
+cargo run --bin cbth -- \
+  desktop bridge-preflight \
+  --bridge-thread-id <thread-id> \
+  --json
+```
+
 State lives under `~/.cbth` by default. Use `--home <path>` or `CBTH_HOME` for tests and isolated runs.
 The local-store and daemon IPC semantics are supported on macOS and Linux; pure Windows support is out of scope until the IPC, atomic-replace, and directory-sync contracts are designed separately.
 By default, `job submit`, `job complete`, `job fail`, `batch close-head`, and `maintenance sweep` first ensure the local daemon is running, then execute through its same-user Unix socket. Read-only commands such as `job inspect`, `job list`, `batch inspect-head`, and `batch inspect` read the local store directly.

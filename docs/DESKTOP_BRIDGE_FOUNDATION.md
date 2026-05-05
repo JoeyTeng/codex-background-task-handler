@@ -1,0 +1,127 @@
+# Desktop Bridge Foundation
+
+本文记录 Desktop bridge foundation 的第一版实现边界。它只落地安装级状态、thread binding、revision-consistent inbox snapshot skeleton 和 `bridge-preflight`；它不表示 Desktop automatic delivery 已可用。
+
+## Current Scope
+
+本阶段新增的稳定 helper / operator 面如下：
+
+```bash
+cbth desktop installation-state --json
+cbth desktop installation-state repair \
+  --read-transport direct-file-read \
+  [--read-transport-capability unknown|validated] \
+  [--artifact-read-capability unknown|validated] \
+  [--writeback-capability unknown|validated] \
+  [--validation-fingerprint <fingerprint>] \
+  --json
+cbth desktop binding repair \
+  --source-thread-id <thread-id> \
+  --caller-automation-id <automation-id> \
+  --json
+cbth desktop bridge-preflight --bridge-thread-id <thread-id> --json
+```
+
+所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch` capability 时会按现有 capability gate fail closed 或重启。
+
+## Installation State
+
+`desktop_installation_state` 是 Desktop 安装级 capability authority。它负责回答“当前这台机器上的 Desktop bridge 可以用哪一种读取路径，以及这些 capability 结论是否还可信”。
+
+它不是 per-thread 状态，也不是 per-batch 授权。所有 Desktop binding 只能镜像并消费它，不能单独覆盖 capability 结论。
+
+当前 singleton 字段：
+
+- `read_transport`: 当前唯一实现值是 canonical `direct_file_read`；CLI flag 形式是 `direct-file-read`。
+- `read_transport_generation`: transport、fingerprint 或 capability 发生实际变化时单调递增；no-op repair 不递增。
+- `read_transport_capability`: `unknown` 或 `validated`。
+- `artifact_read_capability`: `unknown` 或 `validated`。
+- `writeback_capability`: `unknown` 或 `validated`。
+- `validation_fingerprint`: 绑定本地 helper 环境的 deterministic fingerprint，默认覆盖 `cbth` version、platform、current executable path、inbox schema version 和 read transport。
+- `validated_at`: 任一 capability 被写成 `validated` 且 repair 实际改变 state 时写入；no-op repair 保留原值。
+- `created_at` / `updated_at`: durable 操作时间。
+
+默认 `installation-state --json` 不写库；没有记录时返回 generation `0`、capability 全部 `unknown`、fingerprint 为当前 deterministic fingerprint 的 synthetic default。
+
+`installation-state repair` 是当前唯一写入口。它的规则是：
+
+- 未提供 `--validation-fingerprint` 时使用 deterministic local fingerprint。
+- transport / fingerprint / capability 有实际变化时写入新记录并递增 generation。
+- 同一参数重复执行是 no-op，不递增 generation，也不刷新 `validated_at`。
+- repair 后所有镜像 generation / fingerprint / transport 不再匹配的 bound bindings 会被标为 `degraded`。
+
+## Desktop Binding
+
+`desktop_bindings` 负责把一个 Desktop source thread 绑定到一个 caller heartbeat automation：
+
+- `source_thread_id`
+- `caller_automation_id`
+- `binding_state`: 当前 foundation 只创建 / 修复为 `bound`，并在 installation drift 时标成 `degraded`。
+- `read_transport`
+- `read_transport_generation`
+- `validation_fingerprint`
+- `created_at` / `updated_at`
+- `degraded_at`
+
+`cbth desktop binding repair ...` 会读取当前 installation state，把 transport generation 与 fingerprint 镜像到 binding。后续 bridge 运行时必须确认 binding 仍是 `bound`，且镜像字段仍与 installation state 一致；不一致时不得自动 delivery。
+
+同一个 active caller automation 只能被一个 source thread 占用。`binding repair` 会拒绝把已经属于其他 `bound` / `degraded` binding 的 `caller_automation_id` 绑定给新的 `source_thread_id`。
+
+本阶段没有实现 `binding unbind`、caller automation cleanup、arm generation、pause deadlines 或 ready attempt materialization。
+
+## Bridge Preflight Snapshots
+
+`cbth desktop bridge-preflight --bridge-thread-id ... --json` 是每轮 Desktop bridge wake 的 mandatory helper。即使 bridge 最终使用 `direct_file_read`，也必须先调用 preflight，以便：
+
+- 按需启动 same-user daemon。
+- 执行现有 maintenance sweep / GC。
+- 原子发布同一 `snapshot_revision` 的 inbox snapshot set。
+- 避免 bridge 读取旧 snapshot 后继续推进 delivery。
+
+当前 preflight 发布一个稳定 manifest 和三份 revision-specific data snapshot：
+
+- `~/.cbth/inbox/current-snapshot.json`
+- `~/.cbth/inbox/snapshots/<snapshot_revision>/ready-threads.json`
+- `~/.cbth/inbox/snapshots/<snapshot_revision>/arm-pending-bindings.json`
+- `~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json`
+
+`current-snapshot.json` 必须最后写入，并且只引用 immutable revision-specific data files。这样即使新的 preflight 正在发布或中途失败，旧 manifest 引用的旧 data files 仍保持一致，不会因为固定文件名被覆盖而变成 revision mismatch。
+
+每个文件都包含：
+
+- `schema_version = 1`
+- 相同的 `snapshot_revision`
+- 相同的 `created_at`
+- 相同的 `bridge_thread_id`
+
+本阶段三个 data snapshot 的 `entries` 都为空，`count = 0`。真实 ready selection、arm-pending reconciliation、pause-due cleanup、attempt creation 和 writeback helpers 留给后续 PR。
+
+权限合同沿用私有文件约束：
+
+- `~/.cbth/inbox` directory: `0700`
+- `~/.cbth/inbox/snapshots/<snapshot_revision>` directory: `0700`
+- snapshot regular files: `0600`
+
+## Fail-Closed Boundaries
+
+当前 Desktop path 仍 fail closed：
+
+- 未 validated 的 installation state 不允许 automatic Desktop delivery。
+- `degraded` binding 不允许 automatic Desktop delivery。
+- 缺少 daemon capability `desktop-bridge-foundation-dispatch` 时不执行 preflight / repair。
+- preflight 失败时 bridge 不得读取旧 snapshot 继续 arm。
+- `ready_threads.entries` 为空不是“没有任何未来工作”的最终语义；它只是本阶段尚未实现 ready materialization。
+
+## Out Of Scope
+
+本阶段不实现：
+
+- caller heartbeat wake / `automation_update` 调用。
+- ready attempt materialization。
+- `note-arm-pending`、`note-arm`、`note-boundary-crossed`。
+- `list-arm-pending`、`list-pause-due`、`claim-next-ready` fallback helpers。
+- Desktop live heartbeat no-approval validation。
+- 大 artifact automatic continuation。
+- 外部 Webex / GitHub / PR polling integrations。
+
+这些能力仍由 [DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md) 和 [SHARED_CORE_ARCHITECTURE.md](SHARED_CORE_ARCHITECTURE.md) 定义未来合同。

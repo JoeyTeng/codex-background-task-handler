@@ -19,8 +19,10 @@ use crate::models::{
     CliManagedSessionCapabilityUpdate, CliManagedSessionProfile,
     CliManagedSessionProofInvalidation, CliManagedSessionRecord, CliManagedSessionRetirement,
     DEFAULT_REDELIVERY_WINDOW_SECONDS, DaemonLifecycleStatus, DeliveryAttemptRecord,
-    DeliveryPolicy, JobRecord, LostPendingTaskProcess, NewArtifact, NewAuditDecision, NewBatch,
-    NewCliAcceptPendingAttempt, NewJob, NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS,
+    DeliveryPolicy, DesktopBindingRecord, DesktopBindingRepairRecord,
+    DesktopInstallationRepairRecord, DesktopInstallationStateRecord, JobRecord,
+    LostPendingTaskProcess, NewArtifact, NewAuditDecision, NewBatch, NewCliAcceptPendingAttempt,
+    NewDesktopInstallationRepair, NewJob, NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS,
     POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport, TaskRecord,
 };
 
@@ -1655,6 +1657,166 @@ impl Store {
         }
     }
 
+    pub fn desktop_installation_state(
+        &self,
+        default_validation_fingerprint: &str,
+    ) -> Result<DesktopInstallationStateRecord> {
+        query_desktop_installation_state(&self.conn)?
+            .map(Ok)
+            .unwrap_or_else(|| {
+                Ok(default_desktop_installation_state(
+                    default_validation_fingerprint,
+                ))
+            })
+    }
+
+    pub fn repair_desktop_installation_state(
+        &mut self,
+        repair: NewDesktopInstallationRepair,
+    ) -> Result<DesktopInstallationRepairRecord> {
+        let tx = self.conn.transaction()?;
+        let previous = query_desktop_installation_state_tx(&tx)?;
+        let validated_at = desktop_validated_at(&repair);
+        let changed = previous.as_ref().is_none_or(|previous| {
+            previous.read_transport != repair.read_transport
+                || previous.read_transport_capability != repair.read_transport_capability
+                || previous.artifact_read_capability != repair.artifact_read_capability
+                || previous.writeback_capability != repair.writeback_capability
+                || previous.validation_fingerprint != repair.validation_fingerprint
+        });
+
+        if !changed {
+            let state = previous.expect("previous state must exist for unchanged repair");
+            tx.commit()?;
+            return Ok(DesktopInstallationRepairRecord {
+                state,
+                changed: false,
+                degraded_bindings: 0,
+            });
+        }
+
+        let generation = previous
+            .as_ref()
+            .map(|state| state.read_transport_generation + 1)
+            .unwrap_or(1);
+        let created_at = previous
+            .as_ref()
+            .map(|state| state.created_at)
+            .unwrap_or(repair.now);
+        tx.execute(
+            "INSERT INTO desktop_installation_state (
+                id, read_transport, read_transport_generation,
+                read_transport_capability, artifact_read_capability,
+                writeback_capability, validation_fingerprint,
+                validated_at, created_at, updated_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                read_transport = excluded.read_transport,
+                read_transport_generation = excluded.read_transport_generation,
+                read_transport_capability = excluded.read_transport_capability,
+                artifact_read_capability = excluded.artifact_read_capability,
+                writeback_capability = excluded.writeback_capability,
+                validation_fingerprint = excluded.validation_fingerprint,
+                validated_at = excluded.validated_at,
+                updated_at = excluded.updated_at",
+            params![
+                repair.read_transport,
+                generation,
+                repair.read_transport_capability,
+                repair.artifact_read_capability,
+                repair.writeback_capability,
+                repair.validation_fingerprint,
+                validated_at,
+                created_at,
+                repair.now,
+            ],
+        )?;
+        let degraded_bindings = tx.execute(
+            "UPDATE desktop_bindings
+             SET binding_state = 'degraded',
+                 updated_at = ?,
+                 degraded_at = COALESCE(degraded_at, ?)
+             WHERE binding_state = 'bound'
+               AND (
+                 read_transport != (SELECT read_transport FROM desktop_installation_state WHERE id = 1)
+                 OR read_transport_generation != (SELECT read_transport_generation FROM desktop_installation_state WHERE id = 1)
+                 OR validation_fingerprint != (SELECT validation_fingerprint FROM desktop_installation_state WHERE id = 1)
+               )",
+            params![repair.now, repair.now],
+        )?;
+        let state = query_desktop_installation_state_tx(&tx)?
+            .expect("desktop installation state after repair");
+        tx.commit()?;
+        Ok(DesktopInstallationRepairRecord {
+            state,
+            changed: true,
+            degraded_bindings,
+        })
+    }
+
+    pub fn repair_desktop_binding(
+        &mut self,
+        source_thread_id: &str,
+        caller_automation_id: &str,
+        default_validation_fingerprint: &str,
+        now: i64,
+    ) -> Result<DesktopBindingRepairRecord> {
+        let tx = self.conn.transaction()?;
+        let installation_state = query_desktop_installation_state_tx(&tx)?
+            .unwrap_or_else(|| default_desktop_installation_state(default_validation_fingerprint));
+        let existing_owner = tx
+            .query_row(
+                "SELECT source_thread_id FROM desktop_bindings
+                 WHERE caller_automation_id = ?
+                   AND source_thread_id != ?
+                   AND binding_state IN ('bound', 'degraded')",
+                params![caller_automation_id, source_thread_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing_owner) = existing_owner {
+            bail!("caller_automation_id is already bound to source_thread_id {existing_owner}");
+        }
+        let created_at = tx
+            .query_row(
+                "SELECT created_at FROM desktop_bindings WHERE source_thread_id = ?",
+                params![source_thread_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(now);
+        tx.execute(
+            "INSERT INTO desktop_bindings (
+                source_thread_id, caller_automation_id, binding_state,
+                read_transport, read_transport_generation, validation_fingerprint,
+                created_at, updated_at, degraded_at
+            ) VALUES (?, ?, 'bound', ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(source_thread_id) DO UPDATE SET
+                caller_automation_id = excluded.caller_automation_id,
+                binding_state = 'bound',
+                read_transport = excluded.read_transport,
+                read_transport_generation = excluded.read_transport_generation,
+                validation_fingerprint = excluded.validation_fingerprint,
+                updated_at = excluded.updated_at,
+                degraded_at = NULL",
+            params![
+                source_thread_id,
+                caller_automation_id,
+                installation_state.read_transport,
+                installation_state.read_transport_generation,
+                installation_state.validation_fingerprint,
+                created_at,
+                now,
+            ],
+        )?;
+        let binding = query_desktop_binding_tx(&tx, source_thread_id)?;
+        tx.commit()?;
+        Ok(DesktopBindingRepairRecord {
+            binding,
+            installation_state,
+        })
+    }
+
     pub fn daemon_lifecycle_status(
         &self,
         now: i64,
@@ -2274,6 +2436,37 @@ fn migrate(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_audit_decisions_thread_time
             ON audit_decisions(source_thread_id, recorded_at DESC, audit_id DESC);
+
+        CREATE TABLE IF NOT EXISTS desktop_installation_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            read_transport TEXT NOT NULL CHECK (read_transport IN ('direct_file_read')),
+            read_transport_generation INTEGER NOT NULL,
+            read_transport_capability TEXT NOT NULL CHECK (read_transport_capability IN ('unknown', 'validated')),
+            artifact_read_capability TEXT NOT NULL CHECK (artifact_read_capability IN ('unknown', 'validated')),
+            writeback_capability TEXT NOT NULL CHECK (writeback_capability IN ('unknown', 'validated')),
+            validation_fingerprint TEXT NOT NULL,
+            validated_at INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS desktop_bindings (
+            source_thread_id TEXT PRIMARY KEY,
+            caller_automation_id TEXT NOT NULL,
+            binding_state TEXT NOT NULL CHECK (binding_state IN ('bound', 'degraded', 'unbound')),
+            read_transport TEXT NOT NULL CHECK (read_transport IN ('direct_file_read')),
+            read_transport_generation INTEGER NOT NULL,
+            validation_fingerprint TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            degraded_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_desktop_bindings_state
+            ON desktop_bindings(binding_state, updated_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_desktop_bindings_active_caller_automation
+            ON desktop_bindings(caller_automation_id)
+            WHERE binding_state IN ('bound', 'degraded');
 
         CREATE TABLE IF NOT EXISTS batch_jobs (
             batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
@@ -3904,6 +4097,99 @@ fn audit_decision_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditDec
         reason: row.get("reason")?,
         adapter_kind: row.get("adapter_kind")?,
         details,
+    })
+}
+
+fn default_desktop_installation_state(
+    validation_fingerprint: &str,
+) -> DesktopInstallationStateRecord {
+    DesktopInstallationStateRecord {
+        read_transport: "direct_file_read".to_owned(),
+        read_transport_generation: 0,
+        read_transport_capability: "unknown".to_owned(),
+        artifact_read_capability: "unknown".to_owned(),
+        writeback_capability: "unknown".to_owned(),
+        validation_fingerprint: validation_fingerprint.to_owned(),
+        validated_at: None,
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
+fn desktop_validated_at(repair: &NewDesktopInstallationRepair) -> Option<i64> {
+    [
+        repair.read_transport_capability.as_str(),
+        repair.artifact_read_capability.as_str(),
+        repair.writeback_capability.as_str(),
+    ]
+    .into_iter()
+    .any(|capability| capability == "validated")
+    .then_some(repair.now)
+}
+
+fn query_desktop_installation_state(
+    conn: &Connection,
+) -> Result<Option<DesktopInstallationStateRecord>> {
+    conn.query_row(
+        "SELECT * FROM desktop_installation_state WHERE id = 1",
+        [],
+        desktop_installation_state_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn query_desktop_installation_state_tx(
+    tx: &Transaction<'_>,
+) -> Result<Option<DesktopInstallationStateRecord>> {
+    tx.query_row(
+        "SELECT * FROM desktop_installation_state WHERE id = 1",
+        [],
+        desktop_installation_state_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn desktop_installation_state_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DesktopInstallationStateRecord> {
+    Ok(DesktopInstallationStateRecord {
+        read_transport: row.get("read_transport")?,
+        read_transport_generation: row.get("read_transport_generation")?,
+        read_transport_capability: row.get("read_transport_capability")?,
+        artifact_read_capability: row.get("artifact_read_capability")?,
+        writeback_capability: row.get("writeback_capability")?,
+        validation_fingerprint: row.get("validation_fingerprint")?,
+        validated_at: row.get("validated_at")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+fn query_desktop_binding_tx(
+    tx: &Transaction<'_>,
+    source_thread_id: &str,
+) -> Result<DesktopBindingRecord> {
+    tx.query_row(
+        "SELECT * FROM desktop_bindings WHERE source_thread_id = ?",
+        params![source_thread_id],
+        desktop_binding_from_row,
+    )
+    .map_err(Into::into)
+}
+
+fn desktop_binding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DesktopBindingRecord> {
+    Ok(DesktopBindingRecord {
+        source_thread_id: row.get("source_thread_id")?,
+        caller_automation_id: row.get("caller_automation_id")?,
+        binding_state: row.get("binding_state")?,
+        read_transport: row.get("read_transport")?,
+        read_transport_generation: row.get("read_transport_generation")?,
+        validation_fingerprint: row.get("validation_fingerprint")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        degraded_at: row.get("degraded_at")?,
     })
 }
 

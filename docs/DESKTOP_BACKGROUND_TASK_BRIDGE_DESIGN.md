@@ -54,12 +54,13 @@
 2. `shared job state`
    - 由 sidecar 暴露给 Codex thread 读取的共享状态面。
    - 第一版定义统一的 delivery envelope schema，但允许两种读取传输：
-     - `direct_file_read`
-     - `helper_cli_read`
+   - `direct_file_read`
+   - `helper_cli_read`
    - `direct_file_read` 建议至少包含：
-     - `~/.cbth/inbox/ready-threads.json`
-     - `~/.cbth/inbox/arm-pending-bindings.json`
-     - `~/.cbth/inbox/pause-due-bindings.json`
+     - `~/.cbth/inbox/current-snapshot.json`
+     - `~/.cbth/inbox/snapshots/<snapshot_revision>/ready-threads.json`
+     - `~/.cbth/inbox/snapshots/<snapshot_revision>/arm-pending-bindings.json`
+     - `~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json`
    - `~/.cbth/inbox/by-thread/<thread_id>.json` 与 artifact 路径只允许作为 operator/debug export：
      - 默认禁用
      - 不属于 automatic caller path
@@ -128,12 +129,10 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
      - fallback: `cbth desktop installation-state --json`
    - bootstrap / repair 是唯一允许更新 installation state 的路径；bridge 运行期必须先读 installation state，再核对 binding 镜像
    - installation-wide capability 结论必须永远跟随当前 `read_transport_generation`：
-     - transport generation 一旦变化
-     - `read_transport_capability`
-     - `artifact_read_capability`
-     - `writeback_capability`
-     - 都必须被原子重置为 `unknown`
-     - 直到 installation-state repair 明确再次写入新的 validated 结论
+     - transport generation 一旦变化，旧 generation 上的 capability 结论就不能继续被 bridge 使用
+     - `installation-state repair` 可以在同一次 operator-validated repair 中写入新的 capability 结论
+     - capability 参数未显式提供时，CLI 默认写入 `unknown`
+     - 同一参数重复 repair 必须是 no-op，不递增 generation，也不刷新 `validated_at`
    - installation state 的 capability 结论还必须绑定一个 installation-wide `validation_fingerprint`：
      - 至少覆盖当前 Codex Desktop build / helper binary revision / 与无审批执行相关的本地环境形状
      - 只要 fingerprint 变化，bridge 就必须把这套 capability 视为失效，直到 installation-state repair 重新确认
@@ -278,7 +277,7 @@ cbth desktop bridge-preflight --bridge-thread-id <thread_id> --json
 
    - 这个 helper 必须按需拉起 daemon。
    - 它必须先完成 deterministic overdue sweep / auto-close / artifact GC / binding reconcile。
-   - 它必须原子发布本轮要读取的 snapshot manifest；manifest 内的 `ready-threads.json` / `arm-pending-bindings.json` / `pause-due-bindings.json` 必须全部绑定同一个 `snapshot_revision`。
+   - 它必须原子发布本轮要读取的 stable snapshot manifest；manifest 指向的 revision-specific `ready-threads.json` / `arm-pending-bindings.json` / `pause-due-bindings.json` 必须全部绑定同一个 `snapshot_revision`。
    - 它必须返回本轮 `snapshot_manifest_path + snapshot_revision / generation`。
    - bridge 只允许读取该 manifest 指向的文件；如果任一文件内嵌 revision 与 manifest 不一致，本轮必须 fail closed，不得混读不同 revision。
    - 如果 preflight 失败，bridge 本轮不得继续读取旧 snapshot，也不得 arm caller heartbeat。
@@ -311,7 +310,7 @@ cbth desktop bridge-preflight --bridge-thread-id <thread_id> --json
    - arm-pending 的读取面必须是：
 
 ```text
-preferred: ~/.cbth/inbox/arm-pending-bindings.json
+preferred: ~/.cbth/inbox/snapshots/<snapshot_revision>/arm-pending-bindings.json
 fallback:  cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
 ```
 
@@ -321,14 +320,14 @@ fallback:  cbth desktop list-arm-pending --bridge-thread-id <thread_id> --json
    - overdue binding 的读取面必须是：
 
 ```text
-preferred: ~/.cbth/inbox/pause-due-bindings.json
+preferred: ~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json
 fallback:  cbth desktop list-pause-due --bridge-thread-id <thread_id> --json
 ```
 
 2. 按当前安装选定的 `read_transport` 读取 bridge 侧的 ready 来源：
 
 ```text
-preferred: ~/.cbth/inbox/ready-threads.json
+preferred: ~/.cbth/inbox/snapshots/<snapshot_revision>/ready-threads.json
 fallback:  cbth desktop claim-next-ready --bridge-thread-id <thread_id> --json
 ```
 
@@ -530,10 +529,10 @@ cbth desktop note-boundary-crossed --source-thread-id <thread_id> --batch-id <ba
 
 ```text
 ~/.cbth/inbox/current-snapshot.json
-~/.cbth/inbox/ready-threads.json
+~/.cbth/inbox/snapshots/<snapshot_revision>/ready-threads.json
 ```
 
-`current-snapshot.json` 是 `bridge-preflight` 原子发布的 generation manifest，至少包含本轮 `snapshot_revision` 以及 `ready-threads.json` / `arm-pending-bindings.json` / `pause-due-bindings.json` 的路径或等价 locator。直接暴露传统固定文件名可以保留为兼容视图，但 bridge 必须把 manifest revision 与每个文件内嵌 revision 一起校验；不能只依赖每个文件各自 `rename` 的原子性。
+`current-snapshot.json` 是 `bridge-preflight` 原子发布的 stable manifest，至少包含本轮 `snapshot_revision` 以及 revision-specific `ready-threads.json` / `arm-pending-bindings.json` / `pause-due-bindings.json` 的路径或等价 locator。bridge 必须把 manifest revision 与每个文件内嵌 revision 一起校验；不能只依赖每个文件各自 `rename` 的原子性。
 
 ### Operator / diagnostic exports
 
@@ -833,7 +832,8 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
   - `installation-state repair`：
     - 是唯一允许切换 installation-wide `read_transport` 的 operator 路径
     - 也是唯一允许写 installation-wide capability 结论的路径
-    - 成功时必须原子更新 installation state，并递增 `read_transport_generation`
+    - 发生实际 state 变化时必须原子更新 installation state，并递增 `read_transport_generation`
+    - 同一参数重复执行必须是 no-op
     - capability 结论必须和当前 `validation_fingerprint` 一起写入；fingerprint 变化会让旧 validated 结论失效
     - 如果 `read_transport` 发生变化而 capability 参数未显式提供：
       - 必须把 `read_transport_capability`
@@ -914,9 +914,9 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
 1. 固定一个 bridge heartbeat thread。
 2. 让 sidecar 只负责写 job 状态与完成结果。
 3. 由 `cbth` 自己把结果 ingest 到 managed artifact store。
-4. 由 `cbth` 物化 `ready-threads.json` 与 bridge-side inbox snapshot。
+4. 由 `cbth` 物化 `current-snapshot.json` 与 revision-specific bridge-side inbox snapshot。
    - 这些自动路径 snapshot 只包含 ready/reconcile metadata，不包含 pre-boundary payload / artifact 内容。
-5. 让 bridge thread 每分钟读取 `ready-threads.json`。
+5. 让 bridge thread 每分钟先读取 `current-snapshot.json`，再读取其中 locator 指向的 `ready-threads.json`。
 6. bridge 发现可投递 batch 后，为对应 caller thread arm 一次 heartbeat。
 7. caller thread 醒来后先调用 `note-boundary-crossed`，拿到 gated inline continuation payload / summary 后进入一次性 handoff phase。
 

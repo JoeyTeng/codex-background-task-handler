@@ -30,11 +30,14 @@ use crate::daemon::{
     daemon_request_payload_timeout, daemon_serve, validate_daemon_autostart_endpoint,
     validate_daemon_request_budget,
 };
-use crate::fs_layout::{FsLayout, create_private_file, remove_dir_all_durable};
+use crate::fs_layout::{
+    FsLayout, atomic_write_private, create_private_file, remove_dir_all_durable,
+};
 use crate::models::{
     CliManagedSessionCapabilities, CliManagedSessionProfile, DEFAULT_MAX_DELIVERY_ATTEMPTS,
-    DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, NewAuditDecision,
-    NewCliAcceptPendingAttempt, NewJob, PartialDeliveryPolicy, SubmitMetadata,
+    DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, DesktopInstallationStateRecord,
+    NewAuditDecision, NewCliAcceptPendingAttempt, NewDesktopInstallationRepair, NewJob,
+    PartialDeliveryPolicy, SubmitMetadata, SweepReport,
 };
 use crate::self_update::{SelfUpdateOptions, current_release_target_triple, run_self_update};
 use crate::store::{Store, new_id};
@@ -63,6 +66,8 @@ const CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS: i64 = MAX_CLI_OBSERVAT
 const CLI_APP_SERVER_RECONCILE_INTERVAL_MS: u64 = 2_000;
 const DOCTOR_CODEX_VERSION_TIMEOUT_SECONDS: u64 = 5;
 const DOCTOR_APP_SERVER_PROBE_TIMEOUT_SECONDS: u64 = 15;
+const DESKTOP_INBOX_SCHEMA_VERSION: i64 = 1;
+const DESKTOP_SNAPSHOT_REVISION_RETENTION: usize = 128;
 const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "dispatch",
     "attempt-dispatch",
@@ -77,6 +82,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "cli-turn-observation-expiry-dispatch",
     "cli-auto-delivery-dispatch",
     "task-supervisor",
+    "desktop-bridge-foundation-dispatch",
 ];
 
 #[derive(Debug, Parser)]
@@ -134,6 +140,11 @@ enum Commands {
         #[command(subcommand)]
         command: CliCommand,
     },
+    #[command(about = "Desktop bridge foundation and operator helpers")]
+    Desktop {
+        #[command(subcommand)]
+        command: DesktopCommand,
+    },
     Maintenance {
         #[command(subcommand)]
         command: MaintenanceCommand,
@@ -161,6 +172,151 @@ struct DoctorCliArgs {
         help = "Codex CLI executable to validate and use for the app-server listener probe"
     )]
     codex_bin: OsString,
+}
+
+#[derive(Debug, Subcommand)]
+enum DesktopCommand {
+    #[command(
+        name = "installation-state",
+        about = "Inspect or repair installation-wide Desktop bridge state"
+    )]
+    InstallationState(DesktopInstallationStateArgs),
+    #[command(about = "Inspect or repair Desktop thread bindings")]
+    Binding {
+        #[command(subcommand)]
+        command: DesktopBindingCommand,
+    },
+    #[command(
+        name = "bridge-preflight",
+        about = "Publish revision-consistent Desktop bridge inbox snapshots"
+    )]
+    BridgePreflight(DesktopBridgePreflightArgs),
+}
+
+#[derive(Debug, Args)]
+struct DesktopInstallationStateArgs {
+    #[command(subcommand)]
+    command: Option<DesktopInstallationStateCommand>,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum DesktopInstallationStateCommand {
+    #[command(about = "Create or update installation-wide Desktop bridge state")]
+    Repair(DesktopInstallationStateRepairArgs),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DesktopReadTransport {
+    #[value(name = "direct-file-read")]
+    DirectFileRead,
+}
+
+impl DesktopReadTransport {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::DirectFileRead => "direct_file_read",
+        }
+    }
+
+    fn cli_value(&self) -> &'static str {
+        match self {
+            Self::DirectFileRead => "direct-file-read",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DesktopCapabilityState {
+    Unknown,
+    Validated,
+}
+
+impl DesktopCapabilityState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Validated => "validated",
+        }
+    }
+
+    fn cli_value(&self) -> &'static str {
+        self.as_str()
+    }
+}
+
+#[derive(Debug, Args)]
+struct DesktopInstallationStateRepairArgs {
+    #[arg(long, value_enum, help = "Installation-wide Desktop read transport")]
+    read_transport: DesktopReadTransport,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DesktopCapabilityState::Unknown,
+        help = "Validation state for the selected read transport"
+    )]
+    read_transport_capability: DesktopCapabilityState,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DesktopCapabilityState::Unknown,
+        help = "Validation state for artifact read helpers"
+    )]
+    artifact_read_capability: DesktopCapabilityState,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DesktopCapabilityState::Unknown,
+        help = "Validation state for Desktop bridge writeback helpers"
+    )]
+    writeback_capability: DesktopCapabilityState,
+
+    #[arg(long, help = "Override the deterministic local validation fingerprint")]
+    validation_fingerprint: Option<String>,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Subcommand)]
+enum DesktopBindingCommand {
+    #[command(about = "Create or repair a source-thread to caller-automation binding")]
+    Repair(DesktopBindingRepairArgs),
+}
+
+#[derive(Debug, Args)]
+struct DesktopBindingRepairArgs {
+    #[arg(long, help = "Desktop caller/source thread id")]
+    source_thread_id: String,
+
+    #[arg(long, help = "Caller heartbeat automation id owned by this binding")]
+    caller_automation_id: String,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopBridgePreflightArgs {
+    #[arg(long, help = "Desktop bridge thread id running the preflight")]
+    bridge_thread_id: String,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1117,6 +1273,7 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
             yes: args.yes,
         }),
         Commands::Cli { command } => dispatch_cli(command, layout),
+        Commands::Desktop { command } => dispatch_desktop(command, layout),
         Commands::Maintenance { command } => dispatch_maintenance(command, layout),
         Commands::Daemon { command } => dispatch_daemon(command, layout),
     }
@@ -3437,6 +3594,92 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             }
             argv
         }
+        Commands::Desktop {
+            command:
+                DesktopCommand::InstallationState(DesktopInstallationStateArgs {
+                    command: Some(DesktopInstallationStateCommand::Repair(args)),
+                    ..
+                }),
+        } => {
+            let mut argv = vec![
+                OsString::from("desktop"),
+                OsString::from("installation-state"),
+                OsString::from("repair"),
+            ];
+            push_string_arg(
+                &mut argv,
+                "--read-transport",
+                args.read_transport.cli_value(),
+            );
+            push_string_arg(
+                &mut argv,
+                "--read-transport-capability",
+                args.read_transport_capability.cli_value(),
+            );
+            push_string_arg(
+                &mut argv,
+                "--artifact-read-capability",
+                args.artifact_read_capability.cli_value(),
+            );
+            push_string_arg(
+                &mut argv,
+                "--writeback-capability",
+                args.writeback_capability.cli_value(),
+            );
+            push_optional_string_arg(
+                &mut argv,
+                "--validation-fingerprint",
+                args.validation_fingerprint.as_deref(),
+            );
+            if args.json {
+                argv.push(OsString::from("--json"));
+            }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Desktop {
+            command:
+                DesktopCommand::Binding {
+                    command: DesktopBindingCommand::Repair(args),
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("desktop"),
+                OsString::from("binding"),
+                OsString::from("repair"),
+            ];
+            push_string_arg(&mut argv, "--source-thread-id", &args.source_thread_id);
+            push_string_arg(
+                &mut argv,
+                "--caller-automation-id",
+                &args.caller_automation_id,
+            );
+            if args.json {
+                argv.push(OsString::from("--json"));
+            }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Desktop {
+            command: DesktopCommand::BridgePreflight(args),
+        } => {
+            let mut argv = vec![
+                OsString::from("desktop"),
+                OsString::from("bridge-preflight"),
+            ];
+            push_string_arg(&mut argv, "--bridge-thread-id", &args.bridge_thread_id);
+            if args.json {
+                argv.push(OsString::from("--json"));
+            }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
         Commands::Maintenance {
             command: MaintenanceCommand::Sweep(args),
         } => {
@@ -3475,6 +3718,12 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
                     command: CliSessionCommand::Inspect(_) | CliSessionCommand::List(_),
                 },
         }
+        | Commands::Desktop {
+            command:
+                DesktopCommand::InstallationState(DesktopInstallationStateArgs {
+                    command: None, ..
+                }),
+        }
         | Commands::Doctor { .. }
         | Commands::Daemon { .. } => return Ok(None),
     };
@@ -3485,6 +3734,9 @@ fn daemon_startup_sweep_for_command(command: &Commands) -> Result<Option<i64>> {
     match command {
         Commands::Maintenance {
             command: MaintenanceCommand::Sweep(_),
+        }
+        | Commands::Desktop {
+            command: DesktopCommand::BridgePreflight(_),
         } => Ok(None),
         _ => Ok(Some(now_epoch_seconds()?)),
     }
@@ -4483,6 +4735,232 @@ fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
             }
         },
     }
+}
+
+fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value> {
+    let mut store = Store::open(layout)?;
+    match command {
+        DesktopCommand::InstallationState(args) => match args.command {
+            None => {
+                let fingerprint =
+                    desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
+                let state = store.desktop_installation_state(&fingerprint)?;
+                Ok(json!({ "desktop_installation_state": state }))
+            }
+            Some(DesktopInstallationStateCommand::Repair(args)) => {
+                let now = args.now.unwrap_or(now_epoch_seconds()?);
+                let read_transport = args.read_transport.as_str();
+                let fingerprint = match args.validation_fingerprint {
+                    Some(value) => {
+                        validate_nonempty("validation_fingerprint", &value)?;
+                        value
+                    }
+                    None => desktop_validation_fingerprint(read_transport)?,
+                };
+                let repair =
+                    store.repair_desktop_installation_state(NewDesktopInstallationRepair {
+                        read_transport: read_transport.to_owned(),
+                        read_transport_capability: args
+                            .read_transport_capability
+                            .as_str()
+                            .to_owned(),
+                        artifact_read_capability: args.artifact_read_capability.as_str().to_owned(),
+                        writeback_capability: args.writeback_capability.as_str().to_owned(),
+                        validation_fingerprint: fingerprint,
+                        now,
+                    })?;
+                Ok(json!({ "desktop_installation_state": repair }))
+            }
+        },
+        DesktopCommand::Binding {
+            command: DesktopBindingCommand::Repair(args),
+        } => {
+            validate_nonempty("source_thread_id", &args.source_thread_id)?;
+            validate_nonempty("caller_automation_id", &args.caller_automation_id)?;
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            let fingerprint =
+                desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
+            let repair = store.repair_desktop_binding(
+                &args.source_thread_id,
+                &args.caller_automation_id,
+                &fingerprint,
+                now,
+            )?;
+            Ok(json!({ "desktop_binding": repair }))
+        }
+        DesktopCommand::BridgePreflight(args) => {
+            validate_nonempty("bridge_thread_id", &args.bridge_thread_id)?;
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            let sweep = store.sweep(layout, now)?;
+            let fingerprint =
+                desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
+            let state = store.desktop_installation_state(&fingerprint)?;
+            let preflight = publish_desktop_bridge_preflight(
+                layout,
+                &args.bridge_thread_id,
+                &state,
+                sweep,
+                now,
+            )?;
+            Ok(json!({ "desktop_bridge_preflight": preflight }))
+        }
+    }
+}
+
+fn desktop_validation_fingerprint(read_transport: &str) -> Result<String> {
+    let current_exe = env::current_exe()
+        .context("resolve current cbth executable for Desktop validation fingerprint")?;
+    Ok(format!(
+        "cbth_version={};os={};arch={};exe={};inbox_schema={};read_transport={}",
+        env!("CARGO_PKG_VERSION"),
+        env::consts::OS,
+        env::consts::ARCH,
+        current_exe.display(),
+        DESKTOP_INBOX_SCHEMA_VERSION,
+        read_transport
+    ))
+}
+
+fn publish_desktop_bridge_preflight(
+    layout: &FsLayout,
+    bridge_thread_id: &str,
+    installation_state: &DesktopInstallationStateRecord,
+    sweep: SweepReport,
+    now: i64,
+) -> Result<Value> {
+    let snapshot_revision = new_id();
+    let ready_threads_path = layout.desktop_ready_threads_path(&snapshot_revision);
+    let arm_pending_path = layout.desktop_arm_pending_bindings_path(&snapshot_revision);
+    let pause_due_path = layout.desktop_pause_due_bindings_path(&snapshot_revision);
+    let manifest_path = layout.desktop_current_snapshot_path();
+
+    let base = json!({
+        "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "snapshot_revision": snapshot_revision,
+        "created_at": now,
+        "bridge_thread_id": bridge_thread_id,
+        "installation_state": {
+            "read_transport": &installation_state.read_transport,
+            "read_transport_generation": installation_state.read_transport_generation,
+            "read_transport_capability": &installation_state.read_transport_capability,
+            "artifact_read_capability": &installation_state.artifact_read_capability,
+            "writeback_capability": &installation_state.writeback_capability,
+            "validation_fingerprint": &installation_state.validation_fingerprint,
+        }
+    });
+    write_desktop_snapshot(
+        &ready_threads_path,
+        json!({
+            "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+            "snapshot_revision": snapshot_revision,
+            "created_at": now,
+            "bridge_thread_id": bridge_thread_id,
+            "ready_threads": {
+                "entries": [],
+                "count": 0,
+            },
+            "base": base.clone(),
+        }),
+    )?;
+    write_desktop_snapshot(
+        &arm_pending_path,
+        json!({
+            "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+            "snapshot_revision": snapshot_revision,
+            "created_at": now,
+            "bridge_thread_id": bridge_thread_id,
+            "arm_pending_bindings": {
+                "entries": [],
+                "count": 0,
+            },
+            "base": base.clone(),
+        }),
+    )?;
+    write_desktop_snapshot(
+        &pause_due_path,
+        json!({
+            "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+            "snapshot_revision": snapshot_revision,
+            "created_at": now,
+            "bridge_thread_id": bridge_thread_id,
+            "pause_due_bindings": {
+                "entries": [],
+                "count": 0,
+            },
+            "base": base,
+        }),
+    )?;
+    let manifest = json!({
+        "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "snapshot_revision": snapshot_revision,
+        "created_at": now,
+        "bridge_thread_id": bridge_thread_id,
+        "snapshot_manifest_path": manifest_path.display().to_string(),
+        "snapshots": {
+            "ready_threads": {
+                "path": ready_threads_path.display().to_string(),
+                "count": 0,
+            },
+            "arm_pending_bindings": {
+                "path": arm_pending_path.display().to_string(),
+                "count": 0,
+            },
+            "pause_due_bindings": {
+                "path": pause_due_path.display().to_string(),
+                "count": 0,
+            },
+        },
+        "installation_state": installation_state,
+        "sweep": sweep,
+    });
+    write_desktop_snapshot(&manifest_path, manifest.clone())?;
+    prune_desktop_snapshot_revisions(layout, &snapshot_revision)?;
+    Ok(manifest)
+}
+
+fn write_desktop_snapshot(path: &Path, value: Value) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(&value)?;
+    bytes.push(b'\n');
+    atomic_write_private(path, &bytes)
+}
+
+fn prune_desktop_snapshot_revisions(layout: &FsLayout, keep_revision: &str) -> Result<()> {
+    let snapshots_dir = layout.desktop_snapshots_dir();
+    let entries = match fs::read_dir(&snapshots_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", snapshots_dir.display()));
+        }
+    };
+    let mut revisions = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read {}", snapshots_dir.display()))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .with_context(|| format!("stat {}", path.display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        if entry.file_name() == OsStr::new(keep_revision) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        revisions.push((modified, path));
+    }
+    revisions.sort_by_key(|(modified, _)| *modified);
+    let excess = revisions
+        .len()
+        .saturating_sub(DESKTOP_SNAPSHOT_REVISION_RETENTION.saturating_sub(1));
+    for (_, path) in revisions.into_iter().take(excess) {
+        remove_dir_all_durable(&path)?;
+    }
+    Ok(())
 }
 
 fn cli_command_uses_lifecycle_store_timeout(command: &CliCommand) -> bool {
