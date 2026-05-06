@@ -1,7 +1,13 @@
 use std::fs;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 use std::process::{Command, Output};
+#[cfg(unix)]
+use std::thread;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 #[cfg(unix)]
@@ -40,6 +46,17 @@ fn cbth_daemon(home: &TempDir, args: &[&str]) -> Value {
 
 fn cbth_failure(home: &TempDir, args: &[&str]) -> String {
     let output = cbth_output(home, args, true);
+    assert!(
+        !output.status.success(),
+        "cbth unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn cbth_daemon_failure(home: &TempDir, args: &[&str]) -> String {
+    let output = cbth_output(home, args, false);
     assert!(
         !output.status.success(),
         "cbth unexpectedly succeeded\nstdout: {}\nstderr: {}",
@@ -461,6 +478,261 @@ fn desktop_bridge_preflight_routes_through_daemon() {
     assert_eq!(
         preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["count"],
         0
+    );
+}
+
+#[test]
+fn desktop_bridge_preflight_requires_existing_daemon_when_requested() {
+    let home = temp_home();
+    let preflight = cbth_daemon(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "60",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert_eq!(preflight["started"], true);
+
+    let preflight = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-existing-daemon",
+            "--require-existing-daemon",
+            "--json",
+        ],
+    );
+    stop_daemon(&home);
+
+    assert_eq!(
+        preflight["desktop_bridge_preflight"]["bridge_thread_id"],
+        "bridge-thread-existing-daemon"
+    );
+    assert_eq!(
+        preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["count"],
+        0
+    );
+}
+
+#[test]
+fn desktop_bridge_preflight_require_existing_daemon_does_not_autostart() {
+    let home = temp_home();
+    let stderr = cbth_daemon_failure(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-no-daemon",
+            "--require-existing-daemon",
+            "--json",
+        ],
+    );
+    assert!(
+        stderr.contains("probe existing daemon"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        !home.path().join("run").join("startup.lock").exists(),
+        "require-existing-daemon must not create startup lock"
+    );
+}
+
+#[test]
+fn desktop_bridge_preflight_require_existing_daemon_rejects_direct_store() {
+    let home = temp_home();
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-direct-store",
+            "--require-existing-daemon",
+            "--json",
+        ],
+    );
+    assert!(
+        stderr.contains("--require-existing-daemon cannot be combined with --direct-store"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn desktop_bridge_preflight_require_existing_daemon_rejects_incompatible_daemon() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    let fake_socket_path = socket_path.clone();
+    let handle = thread::spawn(move || {
+        let (mut stream, _addr) = listener.accept().expect("accept fake daemon request");
+        let mut request = String::new();
+        stream
+            .read_to_string(&mut request)
+            .expect("read fake daemon request");
+        assert!(request.contains("\"ping\""));
+        stream
+            .write_all(
+                br#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#,
+            )
+            .expect("write fake daemon response");
+        stream.write_all(b"\n").expect("write fake daemon newline");
+        drop(listener);
+        fs::remove_file(&fake_socket_path).expect("remove fake socket");
+    });
+
+    let stderr = cbth_daemon_failure(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-incompatible",
+            "--require-existing-daemon",
+            "--json",
+        ],
+    );
+    handle.join().expect("fake daemon thread");
+
+    assert!(
+        stderr.contains("existing daemon is missing required capabilities"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        !home.path().join("run").join("startup.lock").exists(),
+        "incompatible existing daemon must not trigger startup lock"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn desktop_bridge_preflight_require_existing_daemon_does_not_forward_client_only_flag() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind fake daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    let fake_socket_path = socket_path.clone();
+    let handle = thread::spawn(move || {
+        let ping_response = json!({
+            "ok": true,
+            "response": {
+                "daemon": { "pid": 4242 },
+                "protocol_version": 1,
+                "capabilities": [
+                    "dispatch",
+                    "attempt-dispatch",
+                    "cli-app-server-lifecycle",
+                    "cli-app-server-probe",
+                    "cli-thread-start-bootstrap",
+                    "cli-session-dispatch",
+                    "cli-session-capability-dispatch",
+                    "cli-session-proof-invalidation-dispatch",
+                    "cli-session-recovery-dispatch",
+                    "cli-turn-observation-dispatch",
+                    "cli-turn-observation-expiry-dispatch",
+                    "cli-auto-delivery-dispatch",
+                    "task-supervisor",
+                    "desktop-bridge-foundation-dispatch"
+                ],
+                "message": "pong"
+            }
+        });
+        let (mut ping_stream, _addr) = listener.accept().expect("accept fake ping");
+        let mut ping_request = String::new();
+        ping_stream
+            .read_to_string(&mut ping_request)
+            .expect("read fake ping");
+        assert!(ping_request.contains("\"ping\""));
+        ping_stream
+            .write_all(serde_json::to_string(&ping_response).unwrap().as_bytes())
+            .expect("write fake ping");
+        ping_stream.write_all(b"\n").expect("write ping newline");
+        drop(ping_stream);
+
+        let (mut dispatch_stream, _addr) = listener.accept().expect("accept fake dispatch");
+        let mut dispatch_request = String::new();
+        dispatch_stream
+            .read_to_string(&mut dispatch_request)
+            .expect("read fake dispatch");
+        let parsed: Value = serde_json::from_str(&dispatch_request).expect("dispatch json");
+        assert_eq!(parsed["command"], "dispatch");
+        let argv = parsed["payload"]["argv"]
+            .as_array()
+            .expect("argv array")
+            .iter()
+            .map(|arg| {
+                let bytes = arg
+                    .as_array()
+                    .expect("arg bytes")
+                    .iter()
+                    .map(|byte| byte.as_u64().expect("byte") as u8)
+                    .collect::<Vec<_>>();
+                String::from_utf8(bytes).expect("utf8 argv")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(argv[0], "desktop");
+        assert_eq!(argv[1], "bridge-preflight");
+        assert!(argv.contains(&"--json".to_owned()));
+        assert!(
+            !argv.contains(&"--require-existing-daemon".to_owned()),
+            "client-only flag must not be forwarded to daemon: {argv:?}"
+        );
+
+        let dispatch_response = json!({
+            "ok": true,
+            "response": {
+                "desktop_bridge_preflight": {
+                    "bridge_thread_id": "bridge-thread-fake-compatible",
+                    "snapshots": {
+                        "ready_threads": { "count": 0 }
+                    }
+                }
+            }
+        });
+        dispatch_stream
+            .write_all(
+                serde_json::to_string(&dispatch_response)
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .expect("write fake dispatch");
+        dispatch_stream
+            .write_all(b"\n")
+            .expect("write dispatch newline");
+        drop(listener);
+        fs::remove_file(&fake_socket_path).expect("remove fake socket");
+    });
+
+    let preflight = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-fake-compatible",
+            "--require-existing-daemon",
+            "--json",
+        ],
+    );
+    handle.join().expect("fake daemon thread");
+
+    assert_eq!(
+        preflight["desktop_bridge_preflight"]["bridge_thread_id"],
+        "bridge-thread-fake-compatible"
     );
 }
 

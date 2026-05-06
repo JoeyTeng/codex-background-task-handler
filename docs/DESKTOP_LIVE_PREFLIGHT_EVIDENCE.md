@@ -88,6 +88,63 @@ read_transport_generation=0
 validated_at=null
 ```
 
+## 2026-05-06 Attempt: Existing-Daemon Socket Blocked
+
+Result: `VALIDATION_FAILED`
+
+Evidence:
+
+- Code branch: `codex/desktop-existing-daemon-preflight`
+- Local binary: `/Users/hoteng/.cache/cargo-target/release/cbth`
+- Local binary version: `cbth 0.1.0`
+- Bridge thread id: `019db5e6-ba6a-7b80-95d2-a6867163281a`
+- Temporary heartbeat automation id: `cbth-desktop-live-preflight-existing-daemon-validation-final`
+- Validation marker: `CBTH_DESKTOP_PREFLIGHT_20260506_EXISTING_DAEMON_V3`
+- Target rollout file: `/Users/hoteng/.codex/sessions/2026/04/22/rollout-2026-04-22T16-54-50-019db5e6-ba6a-7b80-95d2-a6867163281a.jsonl`
+- Heartbeat run timestamp: `2026-05-06T13:11:01.592Z`
+
+The local foreground daemon path succeeded with the same final binary and `--require-existing-daemon`, publishing snapshot revision `019dfd68-7b03-7bc3-b35f-6742386cb40c`.
+
+The Desktop heartbeat executed the corrected helper prompt and failed before publishing a snapshot:
+
+```text
+CBTH_DESKTOP_PREFLIGHT_20260506_EXISTING_DAEMON_V3 VALIDATION_FAILED step1_command_failed:probe existing daemon: connect daemon socket /Users/hoteng/.cbth/run/cbth.sock: connect unix socket: Operation not permitted (os error 1)
+```
+
+Local POSIX permission inspection after the failure showed the cbth home, run directory, daemon socket, and startup lock were already private and owned by the current user (`uid=501`, `hoteng`):
+
+```text
+/Users/hoteng/.cbth type=Directory mode=drwx------ uid=501 gid=20 flags=0
+/Users/hoteng/.cbth/run type=Directory mode=drwx------ uid=501 gid=20 flags=0
+/Users/hoteng/.cbth/run/cbth.sock type=Socket mode=srw------- uid=501 gid=20 flags=0
+/Users/hoteng/.cbth/run/startup.lock type=Regular File mode=-rw------- uid=501 gid=20 flags=0
+```
+
+This means the live blocker is not a `chmod` / ownership misconfiguration. The evidence points to the Codex Desktop heartbeat tool sandbox or macOS app permission boundary denying `connect()` to the Unix domain socket with `EPERM`.
+
+The heartbeat thread reported that the temporary automation was deleted after the failed run.
+
+Therefore this attempt still does not validate `read_transport_capability`. The durable installation state was left unchanged:
+
+```text
+read_transport_capability=unknown
+artifact_read_capability=unknown
+writeback_capability=unknown
+read_transport_generation=0
+validated_at=null
+```
+
 ## Next Retest Condition
 
-Before rerunning the Desktop heartbeat validation again, decide whether mandatory Desktop `bridge-preflight` should avoid daemon autostart / startup-lock writes when an already-running same-user daemon is available, or whether Desktop heartbeat needs a narrower helper path that can publish/read inbox snapshots without opening `~/.cbth/run/startup.lock`. Any change must keep same-user daemon IPC fail-closed for mutating helper paths.
+PR #38 (`08d196e76429836938e5bb6ba560c2f21c22cee7`) fixed the redundant private-permission mutation that caused the first failure. The next validation should keep mandatory Desktop `bridge-preflight` daemon-routed, but use an existing-daemon path so the heartbeat connects the already-running same-user daemon instead of autostarting and opening `~/.cbth/run/startup.lock`.
+
+The existing-daemon path now fails at Desktop heartbeat socket connection, not at chmod, ownership, or startup-lock mutation. Before rerunning the Desktop heartbeat validation again, decide whether to introduce a narrower Desktop helper path that can publish/read inbox snapshots without connecting the daemon socket, or identify an app-side permission model that allows heartbeat code to connect `~/.cbth/run/cbth.sock` without approval.
+
+For local shell sanity checks, the existing-daemon command remains:
+
+```bash
+cbth daemon ensure --idle-timeout-seconds 3600 --startup-timeout-seconds 5
+cbth desktop bridge-preflight --bridge-thread-id 019db5e6-ba6a-7b80-95d2-a6867163281a --require-existing-daemon --json
+```
+
+Do not mark `read_transport_capability=validated` until a real heartbeat completes both helper execution and direct snapshot reads.
