@@ -42,6 +42,52 @@ read_transport_generation=0
 validated_at=null
 ```
 
-## Next Retest Condition
+## Retest Condition From First Attempt
 
 Before rerunning the same Desktop heartbeat validation, `cbth` should avoid a redundant `chmod` when an existing private directory or private file already satisfies the required mode. That change must preserve fail-closed repair behavior for too-permissive or otherwise unsafe paths; it should only skip permission mutation when local metadata proves the existing object is already private enough.
+
+## 2026-05-06 Attempt: Failed At Startup Lock
+
+Result: `VALIDATION_FAILED`
+
+Evidence:
+
+- Code branch: `codex/desktop-noop-private-permissions`
+- Local binary: `/Users/hoteng/.cache/cargo-target/release/cbth`
+- Local binary version: `cbth 0.1.0`
+- Bridge thread id: `019db5e6-ba6a-7b80-95d2-a6867163281a`
+- Temporary heartbeat automation id: `cbth-desktop-live-preflight-validation-retry`
+- Validation marker: `CBTH_DESKTOP_PREFLIGHT_20260506_NOOP_CHMOD`
+- Target rollout file: `/Users/hoteng/.codex/sessions/2026/04/22/rollout-2026-04-22T16-54-50-019db5e6-ba6a-7b80-95d2-a6867163281a.jsonl`
+- Heartbeat run timestamp: `2026-05-06T10:11:29.115Z`
+
+The local shell preflight with the same binary succeeded after the no-op chmod fix and published snapshot revision `019dfcc3-ed26-7b93-84f2-836054bc630f`.
+
+The Desktop heartbeat got past the previous `chmod 0700 /Users/hoteng/.cbth` blocker, but mandatory preflight still failed before snapshot reads:
+
+```text
+CBTH_DESKTOP_PREFLIGHT_20260506_NOOP_CHMOD VALIDATION_FAILED step2_bridge_preflight_failed:open startup lock /Users/hoteng/.cbth/run/startup.lock: Operation not permitted (os error 1)
+```
+
+Local inspection after the failure showed the daemon run directory and startup lock were already private:
+
+```text
+drwx------ 7 hoteng staff 224 May  6 11:09 /Users/hoteng/.cbth
+drwx------ 4 hoteng staff 128 May  6 11:09 /Users/hoteng/.cbth/run
+srw------- 1 hoteng staff   0 May  6 11:09 /Users/hoteng/.cbth/run/cbth.sock
+-rw------- 1 hoteng staff  10 May  6 11:09 /Users/hoteng/.cbth/run/startup.lock
+```
+
+Therefore this attempt still does not validate `read_transport_capability`. The durable installation state was left unchanged:
+
+```text
+read_transport_capability=unknown
+artifact_read_capability=unknown
+writeback_capability=unknown
+read_transport_generation=0
+validated_at=null
+```
+
+## Next Retest Condition
+
+Before rerunning the Desktop heartbeat validation again, decide whether mandatory Desktop `bridge-preflight` should avoid daemon autostart / startup-lock writes when an already-running same-user daemon is available, or whether Desktop heartbeat needs a narrower helper path that can publish/read inbox snapshots without opening `~/.cbth/run/startup.lock`. Any change must keep same-user daemon IPC fail-closed for mutating helper paths.
