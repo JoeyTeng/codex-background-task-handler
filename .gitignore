@@ -13,6 +13,9 @@ Icon?
 # Repo-local scratch space
 .codex-tmp/
 
+# Generated project journal index
+docs/project_journal/INDEX.md
+
 # Python / uv
 .venv/
 .uv-cache/
