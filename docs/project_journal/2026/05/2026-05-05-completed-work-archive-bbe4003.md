@@ -15,7 +15,7 @@ superseded_by:
 ## Summary
 
 - This entry archives the completed tracker themes that were previously mixed into `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md`.
-- The complete verbatim source records remain in [legacy tracker snapshot](2026-05-05-legacy-tracker-snapshot-bbe4003.md).
+- The complete verbatim source records remain in [legacy tracker snapshot](2026-05-05-legacy-tracker-snapshot-bbe4003.md). Links in that snapshot's copied tracker blocks are intentionally historical; this archive provides current navigation links for completed themes.
 
 ## Completed Work
 

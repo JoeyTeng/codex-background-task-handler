@@ -14,6 +14,8 @@ superseded_by:
 
 This entry preserves the complete pre-migration contents of the top-level project trackers before they were reduced to project-journal entrypoints.
 
+The tracker blocks below are intentionally verbatim historical copies. Relative links inside those blocks remain exactly as they appeared in `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md` before migration, so they may not resolve from this nested journal path. Use [current follow-ups](2026-05-05-current-follow-ups-bbe4003.md), [completed work archive](2026-05-05-completed-work-archive-bbe4003.md), and the top-level entrypoints for current navigation.
+
 ## docs/PROJECT_STATE.md
 
 ````markdown

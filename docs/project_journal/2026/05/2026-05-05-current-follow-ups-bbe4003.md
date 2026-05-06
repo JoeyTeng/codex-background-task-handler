@@ -15,7 +15,7 @@ superseded_by:
 ## Summary
 
 - The active backlog is now grouped here instead of living in the top-level trackers.
-- Completed detail and older evidence remain available in [completed work archive](2026-05-05-completed-work-archive-bbe4003.md) and [legacy tracker snapshot](2026-05-05-legacy-tracker-snapshot-bbe4003.md).
+- Completed detail and older evidence remain available in [completed work archive](2026-05-05-completed-work-archive-bbe4003.md) and [legacy tracker snapshot](2026-05-05-legacy-tracker-snapshot-bbe4003.md). The legacy snapshot is an exact historical copy; use this entry for the active backlog and live links.
 
 ## External Integrations
 

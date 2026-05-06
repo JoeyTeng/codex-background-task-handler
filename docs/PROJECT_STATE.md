@@ -3,7 +3,7 @@
 ## Current State
 
 - 本仓用于在不修改上游 `codex` 的前提下验证和实现 `cbth` background task handler；当前主线已经完成 CLI dogfood v1 的主要能力、`v0.1.0` release，以及 Desktop bridge foundation。
-- 顶层历史 tracker 已迁移到 project journal；完整旧记录保存在 [legacy snapshot](project_journal/2026/05/2026-05-05-legacy-tracker-snapshot-bbe4003.md)，完成历史摘要见 [completed work archive](project_journal/2026/05/2026-05-05-completed-work-archive-bbe4003.md)。
+- 顶层历史 tracker 已迁移到 project journal；完整旧记录保存在 [legacy snapshot](project_journal/2026/05/2026-05-05-legacy-tracker-snapshot-bbe4003.md)，完成历史摘要见 [completed work archive](project_journal/2026/05/2026-05-05-completed-work-archive-bbe4003.md)。Legacy snapshot 是逐字归档，内部复制的旧相对链接保留历史原貌；实时导航以本文件、TODO 和 archive summary 为准。
 - 当前活跃工作集中在 Desktop bridge 自动投递闭环、CLI/daemon recovery contract 的剩余收口，以及外部 review / output / PR polling integrations；详见 [current follow-ups](project_journal/2026/05/2026-05-05-current-follow-ups-bbe4003.md)。
 
 ## Active Handoff

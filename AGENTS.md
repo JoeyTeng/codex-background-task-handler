@@ -6,4 +6,5 @@
 - For production Rust components, prioritize correctness first, then long-running reliability, then resource efficiency. Avoid designs that accumulate unbounded memory, tasks, file handles, child processes, or polling work; prefer bounded queues, durable checkpoints, explicit cleanup, and low idle CPU/memory overhead.
 - Do not modify the upstream `codex` repository from this repo. This project is for external integrations, reference PoCs, and companion tooling only.
 - Keep `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md` aligned with meaningful architectural or experimental changes.
+- Keep long-form project history in `docs/project_journal/**`. If a journal entry is marked as a legacy or verbatim snapshot, preserve copied historical content exactly; add navigational summaries beside it instead of rewriting archived relative links.
 - Commits created by Codex in this repo must include the footer `Co-authored-by: Codex (model=GPT-5) <codex@openai.com>`.

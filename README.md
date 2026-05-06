@@ -23,12 +23,24 @@ Design docs:
 - [docs/CLI_ACTIVE_TURN_STEER_DESIGN.md](docs/CLI_ACTIVE_TURN_STEER_DESIGN.md)
 - [docs/CLI_OPERATOR_RECOVERY.md](docs/CLI_OPERATOR_RECOVERY.md)
 
+## Project Journal
+
+Current repo state and cross-task backlog stay in the short entrypoints [docs/PROJECT_STATE.md](docs/PROJECT_STATE.md) and [docs/PROJECT_TODO.md](docs/PROJECT_TODO.md). Durable workstream detail lives under [docs/project_journal/](docs/project_journal/).
+
+The migration journal includes:
+
+- [current follow-ups](docs/project_journal/2026/05/2026-05-05-current-follow-ups-bbe4003.md) for the active implementation backlog
+- [completed work archive](docs/project_journal/2026/05/2026-05-05-completed-work-archive-bbe4003.md) for completed tracker themes and current navigation links
+- [legacy tracker snapshot](docs/project_journal/2026/05/2026-05-05-legacy-tracker-snapshot-bbe4003.md) for the exact pre-migration `PROJECT_STATE` and `PROJECT_TODO` text
+
+The legacy snapshot is intentionally a verbatim archive. Relative links inside its fenced copied tracker text remain in their original historical form and are not expected to resolve from the journal directory; use the entrypoint docs and archive summaries for live navigation.
+
 ## Repository Layout
 
 - `docs/`
   - architecture notes
   - experiment logs
-  - next-step tracking
+  - project journal entrypoints and per-workstream notes
 - `src/`
   - Rust `cbth` binary and shared core modules
 - `tests/`
