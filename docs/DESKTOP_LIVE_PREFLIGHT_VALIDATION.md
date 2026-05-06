@@ -11,18 +11,14 @@
 
 ## Operator Setup
 
-先在普通 shell 中创建 foundation state，启动一个已有 daemon，并创建一个用于验证的 snapshot：
+先在普通 shell 中创建 foundation state，并用 direct-helper 路径创建一个用于验证的 snapshot：
 
 ```bash
 cbth desktop installation-state --json
 
-cbth daemon ensure \
-  --idle-timeout-seconds 3600 \
-  --startup-timeout-seconds 5
-
 cbth desktop bridge-preflight \
   --bridge-thread-id <bridge-thread-id> \
-  --require-existing-daemon \
+  --helper-direct-store \
   --json
 ```
 
@@ -47,7 +43,7 @@ cbth desktop installation-state repair \
 Run this Desktop bridge preflight validation. Do not modify repository files.
 
 1. Run:
-   cbth <cbth-home-arg> desktop bridge-preflight --bridge-thread-id <bridge-thread-id> --require-existing-daemon --json
+   cbth <cbth-home-arg> desktop bridge-preflight --bridge-thread-id <bridge-thread-id> --helper-direct-store --json
 2. Read the JSON field desktop_bridge_preflight.snapshot_manifest_path.
 3. Read that current-snapshot.json file as plain text and parse it.
 4. From the manifest, read:
@@ -67,7 +63,7 @@ Use an empty `<cbth-home-arg>` for the default home. For an isolated home, use `
 A valid run proves only these capabilities for the current Desktop / `cbth` / local environment fingerprint:
 
 - Heartbeat can execute `cbth desktop bridge-preflight ... --json` without approval.
-- Heartbeat can connect the already-running same-user daemon without touching the daemon startup lock.
+- Heartbeat can open the cbth store and publish inbox snapshots without touching daemon autostart, `startup.lock`, or the daemon Unix socket.
 - Heartbeat can direct-read `~/.cbth/inbox/current-snapshot.json` without approval.
 - Heartbeat can direct-read the three revision-specific snapshot files referenced by the manifest.
 - Heartbeat can direct-read `~/.cbth/inbox/desktop-installation-state.json`.
@@ -78,7 +74,7 @@ After recording this evidence, the operator may mark `read_transport_capability=
 ## Failure Handling
 
 - If helper execution asks for approval, leave `read_transport_capability=unknown`.
-- If `--require-existing-daemon` cannot connect the daemon socket, leave `read_transport_capability=unknown`; do not fall back to direct store for this validation.
+- If `--helper-direct-store` cannot open SQLite or write the inbox files, leave `read_transport_capability=unknown`; do not fall back to daemon-routed preflight for this validation.
 - If any file read asks for approval or fails, leave `read_transport_capability=unknown`.
 - If snapshot revisions disagree, treat it as a preflight/export bug and do not repair capability state.
 - If `desktop-installation-state.json` is missing, rerun with a `cbth` build that includes this validation foundation.
@@ -86,8 +82,4 @@ After recording this evidence, the operator may mark `read_transport_capability=
 
 ## Cleanup
 
-This validation only writes cbth-owned state under `~/.cbth/inbox`. Operator setup may start the same-user daemon, but the heartbeat preflight itself must use `--require-existing-daemon` and must not autostart a daemon. There is no Codex thread mutation beyond the heartbeat response itself.
-
-```bash
-cbth daemon stop
-```
+This validation only writes cbth-owned state under `~/.cbth/inbox` and may run normal store sweep / GC as part of preflight. The heartbeat preflight itself must use `--helper-direct-store` and must not autostart a daemon or connect the daemon socket. There is no Codex thread mutation beyond the heartbeat response itself.
