@@ -23,6 +23,16 @@ fn temp_home() -> TempDir {
     home
 }
 
+#[cfg(unix)]
+fn is_peer_disconnect(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
 fn cbth(home: &TempDir, args: &[&str]) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .env("CBTH_ALLOW_DIRECT_STORE", "1")
@@ -814,13 +824,13 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
                     if let Err(error) = stream.write_all(
                         br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch"],"message":"pong"}}"#,
                     ) {
-                        if error.kind() == std::io::ErrorKind::BrokenPipe {
+                        if is_peer_disconnect(&error) {
                             continue;
                         }
                         panic!("write replacement response: {error}");
                     }
                     if let Err(error) = stream.write_all(b"\n") {
-                        if error.kind() == std::io::ErrorKind::BrokenPipe {
+                        if is_peer_disconnect(&error) {
                             continue;
                         }
                         panic!("write response newline: {error}");

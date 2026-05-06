@@ -482,6 +482,132 @@ fn desktop_bridge_preflight_routes_through_daemon() {
 }
 
 #[test]
+fn desktop_bridge_preflight_helper_direct_store_bypasses_daemon() {
+    let home = temp_home();
+    let first = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-helper",
+            "--helper-direct-store",
+            "--json",
+            "--now",
+            "2200",
+        ],
+    );
+    let first = &first["desktop_bridge_preflight"];
+    assert_eq!(first["schema_version"], 1);
+    assert_eq!(first["bridge_thread_id"], "bridge-thread-helper");
+    assert_eq!(first["snapshots"]["ready_threads"]["count"], 0);
+    assert_eq!(first["snapshots"]["arm_pending_bindings"]["count"], 0);
+    assert_eq!(first["snapshots"]["pause_due_bindings"]["count"], 0);
+    assert!(
+        !home.path().join("run").join("startup.lock").exists(),
+        "helper direct-store preflight must not autostart the daemon"
+    );
+
+    let revision = first["snapshot_revision"]
+        .as_str()
+        .expect("snapshot revision")
+        .to_owned();
+    let manifest_path = first["snapshot_manifest_path"]
+        .as_str()
+        .expect("manifest path")
+        .to_owned();
+    let ready_path = first["snapshots"]["ready_threads"]["path"]
+        .as_str()
+        .expect("ready path")
+        .to_owned();
+    assert!(
+        ready_path.contains(&format!("/snapshots/{revision}/")),
+        "ready snapshot path should be revision-specific: {ready_path}"
+    );
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(&manifest_path).unwrap_or_else(|error| panic!("read {manifest_path}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("parse {manifest_path}: {error}"));
+    assert_eq!(manifest["snapshot_revision"], revision);
+    assert_eq!(manifest["bridge_thread_id"], "bridge-thread-helper");
+
+    let second = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-helper",
+            "--helper-direct-store",
+            "--json",
+            "--now",
+            "2201",
+        ],
+    );
+    let second = &second["desktop_bridge_preflight"];
+    assert_ne!(second["snapshot_revision"], revision);
+    assert_eq!(second["created_at"], 2201);
+
+    let durable_state = cbth(&home, &["desktop", "installation-state", "--json"]);
+    assert_eq!(
+        durable_state["desktop_installation_state"]["read_transport_generation"],
+        0
+    );
+    assert_eq!(durable_state["desktop_installation_state"]["updated_at"], 0);
+}
+
+#[test]
+fn desktop_bridge_preflight_helper_direct_store_rejects_existing_daemon_mode() {
+    let home = temp_home();
+    let stderr = cbth_daemon_failure(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-conflict",
+            "--helper-direct-store",
+            "--require-existing-daemon",
+            "--json",
+        ],
+    );
+    assert!(
+        stderr.contains("--helper-direct-store cannot be combined with --require-existing-daemon"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        !home.path().join("run").join("startup.lock").exists(),
+        "conflicting helper modes must not autostart the daemon"
+    );
+}
+
+#[test]
+fn desktop_bridge_preflight_helper_direct_store_fails_without_daemon_fallback() {
+    let home = temp_home();
+    fs::create_dir(home.path().join("cbth.sqlite3")).expect("create directory at db path");
+
+    let stderr = cbth_daemon_failure(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-store-failure",
+            "--helper-direct-store",
+            "--json",
+        ],
+    );
+    assert!(
+        stderr.contains("path exists but is not a regular file"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        !home.path().join("run").join("startup.lock").exists(),
+        "helper direct-store failure must not fall back to daemon autostart"
+    );
+}
+
+#[test]
 fn desktop_bridge_preflight_requires_existing_daemon_when_requested() {
     let home = temp_home();
     let preflight = cbth_daemon(

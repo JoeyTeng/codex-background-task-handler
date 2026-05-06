@@ -318,6 +318,12 @@ struct DesktopBridgePreflightArgs {
     )]
     require_existing_daemon: bool,
 
+    #[arg(
+        long,
+        help = "Run this Desktop preflight helper directly without daemon autostart or socket IPC"
+    )]
+    helper_direct_store: bool,
+
     #[arg(long, help = "Emit JSON output")]
     json: bool,
 
@@ -1129,6 +1135,12 @@ enum DispatchMode {
 }
 
 fn dispatch(command: Commands, layout: &FsLayout, mode: DispatchMode) -> Result<Value> {
+    if desktop_bridge_preflight_has_conflicting_helper_modes(&command) {
+        bail!(
+            "desktop bridge-preflight --helper-direct-store cannot be combined with --require-existing-daemon"
+        );
+    }
+
     if let DispatchMode::Client {
         direct_store: true, ..
     } = mode
@@ -1146,6 +1158,12 @@ fn dispatch(command: Commands, layout: &FsLayout, mode: DispatchMode) -> Result<
         && desktop_bridge_preflight_requires_existing_daemon(&command)
     {
         return dispatch_existing_daemon_command(command, layout);
+    }
+
+    if let DispatchMode::Client { .. } = mode
+        && desktop_bridge_preflight_uses_helper_direct_store(&command)
+    {
+        return dispatch_direct(command, layout);
     }
 
     if let DispatchMode::Client {
@@ -1188,6 +1206,31 @@ fn desktop_bridge_preflight_requires_existing_daemon(command: &Commands) -> bool
         Commands::Desktop {
             command: DesktopCommand::BridgePreflight(DesktopBridgePreflightArgs {
                 require_existing_daemon: true,
+                ..
+            })
+        }
+    )
+}
+
+fn desktop_bridge_preflight_uses_helper_direct_store(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Desktop {
+            command: DesktopCommand::BridgePreflight(DesktopBridgePreflightArgs {
+                helper_direct_store: true,
+                ..
+            })
+        }
+    )
+}
+
+fn desktop_bridge_preflight_has_conflicting_helper_modes(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Desktop {
+            command: DesktopCommand::BridgePreflight(DesktopBridgePreflightArgs {
+                require_existing_daemon: true,
+                helper_direct_store: true,
                 ..
             })
         }

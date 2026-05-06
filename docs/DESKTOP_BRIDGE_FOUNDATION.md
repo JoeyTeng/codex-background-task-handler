@@ -20,6 +20,10 @@ cbth desktop binding repair \
   --caller-automation-id <automation-id> \
   --json
 cbth desktop bridge-preflight --bridge-thread-id <thread-id> --json
+cbth desktop bridge-preflight \
+  --bridge-thread-id <thread-id> \
+  --helper-direct-store \
+  --json
 ```
 
 所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch` capability 时会按现有 capability gate fail closed 或重启。
@@ -78,6 +82,8 @@ cbth desktop bridge-preflight --bridge-thread-id <thread-id> --json
 - 原子发布同一 `snapshot_revision` 的 inbox snapshot set。
 - 避免 bridge 读取旧 snapshot 后继续推进 delivery。
 
+默认 preflight 仍通过 same-user daemon 路由。`--require-existing-daemon` 只连接已经存在且兼容的 daemon，不 autostart，也不触碰 `startup.lock`。`--helper-direct-store` 是 Desktop heartbeat 专用的窄 helper 路径：它不使用 daemon autostart、`startup.lock` 或 Unix socket，而是在当前 `cbth` 进程内打开 store、执行 sweep 并发布同样的 snapshot set。`--helper-direct-store` 与 `--require-existing-daemon` 互斥；direct-helper 失败时必须 fail closed，不 fallback 到 daemon 或旧 snapshot。
+
 当前 preflight 发布一个稳定 manifest、一个稳定 installation-state export，和三份 revision-specific data snapshot：
 
 - `~/.cbth/inbox/current-snapshot.json`
@@ -111,7 +117,7 @@ cbth desktop bridge-preflight --bridge-thread-id <thread-id> --json
 
 - 未 validated 的 installation state 不允许 automatic Desktop delivery。
 - `degraded` binding 不允许 automatic Desktop delivery。
-- 缺少 daemon capability `desktop-bridge-foundation-dispatch` 时不执行 preflight / repair。
+- 默认 daemon-routed preflight 缺少 daemon capability `desktop-bridge-foundation-dispatch` 时不执行 preflight / repair。
 - preflight 失败时 bridge 不得读取旧 snapshot 继续 arm。
 - `ready_threads.entries` 为空不是“没有任何未来工作”的最终语义；它只是本阶段尚未实现 ready materialization。
 

@@ -161,7 +161,7 @@ Default `cbth cli run` remains passive and records only current-state proof. Exi
 
 Use `cbth cli session list`, `cbth cli session inspect`, and `cbth cli session retire` for managed-session recovery. Operator retirement refuses `live` sessions, sessions that still own active delivery attempts, and sessions whose bound thread still has an open `manual_resolution_only` head batch. `detached`, `parked`, or `stale` sessions with no blockers can be retired manually; `cli run` can also auto-retire and replace retire-eligible `parked` / `stale` / profile-drift records. Same-profile reattach refuses the same active-attempt/manual-head blockers. A fail-closed accepted or pre-accept delivery path parks the session until the manual head batch is closed or swept.
 
-Desktop bridge foundation commands are implemented as operator/helper surfaces, not as an enabled Desktop automatic delivery path. `cbth desktop installation-state` owns installation-wide Desktop read/write capability state, `cbth desktop binding repair` durably binds a Desktop source thread to a caller heartbeat automation id, and `cbth desktop bridge-preflight` publishes a stable `~/.cbth/inbox/current-snapshot.json` manifest that points at revision-specific inbox snapshot skeleton files under `~/.cbth/inbox/snapshots/<revision>/`. It also exports `~/.cbth/inbox/desktop-installation-state.json` so a Desktop heartbeat can direct-read the current installation capability state. Current snapshot entries are intentionally empty until later Desktop delivery PRs add ready selection, arm writeback, and continuation-boundary helpers. See [docs/DESKTOP_BRIDGE_FOUNDATION.md](docs/DESKTOP_BRIDGE_FOUNDATION.md) and [docs/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](docs/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md).
+Desktop bridge foundation commands are implemented as operator/helper surfaces, not as an enabled Desktop automatic delivery path. `cbth desktop installation-state` owns installation-wide Desktop read/write capability state, `cbth desktop binding repair` durably binds a Desktop source thread to a caller heartbeat automation id, and `cbth desktop bridge-preflight` publishes a stable `~/.cbth/inbox/current-snapshot.json` manifest that points at revision-specific inbox snapshot skeleton files under `~/.cbth/inbox/snapshots/<revision>/`. It also exports `~/.cbth/inbox/desktop-installation-state.json` so a Desktop heartbeat can direct-read the current installation capability state. Default preflight remains daemon-routed; `--require-existing-daemon` avoids daemon autostart but still uses the same-user Unix socket, while `--helper-direct-store` is the narrow Desktop heartbeat validation path that bypasses daemon autostart, `startup.lock`, and socket IPC. Current snapshot entries are intentionally empty until later Desktop delivery PRs add ready selection, arm writeback, and continuation-boundary helpers. See [docs/DESKTOP_BRIDGE_FOUNDATION.md](docs/DESKTOP_BRIDGE_FOUNDATION.md) and [docs/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](docs/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md).
 
 ```bash
 cargo run --bin cbth -- \
@@ -184,6 +184,12 @@ cargo run --bin cbth -- \
 cargo run --bin cbth -- \
   desktop bridge-preflight \
   --bridge-thread-id <thread-id> \
+  --json
+
+cargo run --bin cbth -- \
+  desktop bridge-preflight \
+  --bridge-thread-id <thread-id> \
+  --helper-direct-store \
   --json
 ```
 

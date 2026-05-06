@@ -136,15 +136,58 @@ validated_at=null
 
 ## Next Retest Condition
 
-PR #38 (`08d196e76429836938e5bb6ba560c2f21c22cee7`) fixed the redundant private-permission mutation that caused the first failure. The next validation should keep mandatory Desktop `bridge-preflight` daemon-routed, but use an existing-daemon path so the heartbeat connects the already-running same-user daemon instead of autostarting and opening `~/.cbth/run/startup.lock`.
+PR #38 (`08d196e76429836938e5bb6ba560c2f21c22cee7`) fixed the redundant private-permission mutation that caused the first failure. PR #39 (`22309e4d9c13e311b1d5e496281cd752b54dd3ed`) proved the existing-daemon path avoids `startup.lock` but still fails when Desktop heartbeat tries to connect the same-user Unix socket.
 
-The existing-daemon path now fails at Desktop heartbeat socket connection, not at chmod, ownership, or startup-lock mutation. Before rerunning the Desktop heartbeat validation again, decide whether to introduce a narrower Desktop helper path that can publish/read inbox snapshots without connecting the daemon socket, or identify an app-side permission model that allows heartbeat code to connect `~/.cbth/run/cbth.sock` without approval.
+The existing-daemon path now fails at Desktop heartbeat socket connection, not at chmod, ownership, or startup-lock mutation. The next validation should use the narrower direct-helper path so heartbeat can publish/read inbox snapshots without daemon autostart, `startup.lock`, or Unix socket access.
 
-For local shell sanity checks, the existing-daemon command remains:
+For local shell sanity checks, the direct-helper command is:
 
 ```bash
-cbth daemon ensure --idle-timeout-seconds 3600 --startup-timeout-seconds 5
-cbth desktop bridge-preflight --bridge-thread-id 019db5e6-ba6a-7b80-95d2-a6867163281a --require-existing-daemon --json
+cbth desktop bridge-preflight --bridge-thread-id 019db5e6-ba6a-7b80-95d2-a6867163281a --helper-direct-store --json
 ```
 
 Do not mark `read_transport_capability=validated` until a real heartbeat completes both helper execution and direct snapshot reads.
+
+## 2026-05-06 Attempt: Direct Helper Blocked At SQLite WAL Setup
+
+Result: `VALIDATION_FAILED`
+
+Evidence:
+
+- Code branch: `codex/desktop-direct-helper-preflight`
+- Local binary: `/Users/hoteng/.cache/cargo-target/release/cbth`
+- Local binary version: `cbth 0.1.0`
+- Bridge thread id: `019db5e6-ba6a-7b80-95d2-a6867163281a`
+- Temporary heartbeat automation id: `cbth-desktop-direct-helper-preflight-validation`
+- Validation marker: `CBTH_DESKTOP_PREFLIGHT_20260506_DIRECT_HELPER_V1`
+- Target rollout file: `/Users/hoteng/.codex/sessions/2026/04/22/rollout-2026-04-22T16-54-50-019db5e6-ba6a-7b80-95d2-a6867163281a.jsonl`
+- Heartbeat run timestamp: `2026-05-06T18:17:37.188Z`
+
+The local shell direct-helper path succeeded with the same final binary and published snapshot revision `019dfe81-3d0d-7de1-983f-0dca71faa6a5`.
+
+The Desktop heartbeat executed the direct-helper prompt and got past daemon autostart, `startup.lock`, and Unix socket access. It failed while opening the store and enabling SQLite WAL mode:
+
+```text
+CBTH_DESKTOP_PREFLIGHT_20260506_DIRECT_HELPER_V1 VALIDATION_FAILED step2_bridge_preflight_failed:enable sqlite WAL journal mode: unable to open database file: Error code 14: Unable to open the database file
+```
+
+Local POSIX permission inspection after the failure showed the cbth home, database, inbox directory, and current snapshot were private and owned by the current user:
+
+```text
+/Users/hoteng/.cbth type=directory mode=drwx------ uid=501 gid=20
+/Users/hoteng/.cbth/cbth.sqlite3 type=regular file mode=-rw------- uid=501 gid=20
+/Users/hoteng/.cbth/inbox type=directory mode=drwx------ uid=501 gid=20
+/Users/hoteng/.cbth/inbox/current-snapshot.json type=regular file mode=-rw------- uid=501 gid=20
+```
+
+`cbth.sqlite3-wal` and `cbth.sqlite3-shm` were not present after the failed heartbeat run. The failure is therefore still not explained by ordinary POSIX mode / ownership drift. The next blocker is Desktop heartbeat access to SQLite WAL setup under `~/.cbth`; `read_transport_capability` remains unvalidated.
+
+The heartbeat thread reported that the temporary automation was deleted after the failed run.
+
+The durable installation state must remain unchanged:
+
+```text
+read_transport_capability=unknown
+artifact_read_capability=unknown
+writeback_capability=unknown
+```
