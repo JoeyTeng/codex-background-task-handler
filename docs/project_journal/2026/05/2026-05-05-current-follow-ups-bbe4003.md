@@ -3,9 +3,9 @@ id: 20260505-bbe4003-active
 title: Current Follow-ups
 status: active
 created: 2026-05-05
-updated: 2026-05-05
-branch: codex/project-journal-migration-main
-pr:
+updated: 2026-05-06
+branch: master
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/37
 supersedes: []
 superseded_by:
 ---
@@ -77,6 +77,7 @@ superseded_by:
 
 ## Evidence
 
+- Migration PR: https://github.com/JoeyTeng/codex-background-task-handler/pull/37
 - Desktop bridge foundation: [DESKTOP_BRIDGE_FOUNDATION.md](../../../DESKTOP_BRIDGE_FOUNDATION.md)
 - Desktop live validation: [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](../../../DESKTOP_LIVE_PREFLIGHT_VALIDATION.md)
 - Desktop bridge design: [DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](../../../DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md)

@@ -3,9 +3,9 @@ id: 20260505-bbe4003-completed
 title: Completed Work Archive
 status: completed
 created: 2026-05-05
-updated: 2026-05-05
-branch: codex/project-journal-migration-main
-pr:
+updated: 2026-05-06
+branch: master
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/37
 supersedes: []
 superseded_by:
 ---
@@ -33,6 +33,7 @@ superseded_by:
 
 ## Evidence
 
+- Migration PR: https://github.com/JoeyTeng/codex-background-task-handler/pull/37
 - Release: [v0.1.0](https://github.com/JoeyTeng/codex-background-task-handler/releases/tag/v0.1.0)
 - Live validation guide: [LIVE_E2E.md](../../../LIVE_E2E.md)
 - CLI dogfood plan: [CLI_DOGFOOD_V1_COMPLETION_PLAN.md](../../../CLI_DOGFOOD_V1_COMPLETION_PLAN.md)
