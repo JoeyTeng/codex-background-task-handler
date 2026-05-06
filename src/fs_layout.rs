@@ -5,6 +5,8 @@ use std::io;
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -312,6 +314,10 @@ fn set_private_dir_permissions(path: &Path) -> Result<()> {
     if !metadata.is_dir() {
         bail!("path exists but is not a directory: {}", path.display());
     }
+    ensure_current_user_owned(path, &metadata, "private directory")?;
+    if private_permissions_are_satisfied(&metadata, 0o700) {
+        return Ok(());
+    }
 
     let parent = path
         .parent()
@@ -332,7 +338,18 @@ fn set_private_dir_permissions(path: &Path) -> Result<()> {
         )
     };
     if rc == 0 {
-        Ok(())
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("stat private directory {}", path.display()))?;
+        ensure_current_user_owned(path, &metadata, "private directory")?;
+        if private_permissions_are_satisfied(&metadata, 0o700) {
+            Ok(())
+        } else {
+            bail!(
+                "private directory permissions are {:o}, expected 700: {}",
+                metadata.mode() & 0o7777,
+                path.display()
+            )
+        }
     } else {
         Err(io::Error::last_os_error()).with_context(|| format!("chmod 0700 {}", path.display()))
     }
@@ -345,9 +362,44 @@ fn set_private_dir_permissions(_path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn set_private_file_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("stat private file {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("path exists but is not a regular file: {}", path.display());
+    }
+    ensure_current_user_owned(path, &metadata, "private file")?;
+    if private_permissions_are_satisfied(&metadata, 0o600) {
+        return Ok(());
+    }
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", path.display()))
+        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("stat private file {}", path.display()))?;
+    ensure_current_user_owned(path, &metadata, "private file")?;
+    if private_permissions_are_satisfied(&metadata, 0o600) {
+        Ok(())
+    } else {
+        bail!(
+            "private file permissions are {:o}, expected 600: {}",
+            metadata.mode() & 0o7777,
+            path.display()
+        )
+    }
+}
+
+#[cfg(unix)]
+fn ensure_current_user_owned(path: &Path, metadata: &fs::Metadata, name: &str) -> Result<()> {
+    let current_uid = unsafe { libc::geteuid() };
+    if metadata.uid() == current_uid {
+        Ok(())
+    } else {
+        bail!("{name} is not owned by current user: {}", path.display())
+    }
+}
+
+#[cfg(unix)]
+fn private_permissions_are_satisfied(metadata: &fs::Metadata, expected_mode: u32) -> bool {
+    metadata.mode() & 0o7777 == expected_mode
 }
 
 #[cfg(not(unix))]
@@ -360,6 +412,8 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::PathBuf;
 
     use super::*;
 
@@ -397,5 +451,100 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_skips_chmod_when_already_private() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = dir.path().join("parent");
+        let target = parent.join("private");
+        fs::create_dir(&parent).expect("create parent");
+        fs::create_dir(&target).expect("create private dir");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+            .expect("set private dir mode");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o100)).expect("restrict parent");
+        let _restore_parent = RestoreMode {
+            path: parent.clone(),
+            mode: 0o700,
+        };
+
+        ensure_private_dir(&target).expect("already-private dir should not need chmod");
+
+        let mode = fs::symlink_metadata(&target)
+            .expect("private dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_repairs_wide_directory_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("private");
+        fs::create_dir(&target).expect("create private dir");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("widen private dir");
+
+        ensure_private_dir(&target).expect("repair private dir");
+
+        let mode = fs::symlink_metadata(&target)
+            .expect("private dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_file_exists_accepts_already_private_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("private-file");
+        fs::write(&target, b"payload").expect("write private file");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+            .expect("set private file mode");
+
+        ensure_private_file_exists(&target).expect("already-private file");
+
+        let mode = fs::symlink_metadata(&target)
+            .expect("private file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_file_exists_repairs_wide_file_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("private-file");
+        fs::write(&target, b"payload").expect("write private file");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+            .expect("widen private file");
+
+        ensure_private_file_exists(&target).expect("repair private file");
+
+        let mode = fs::symlink_metadata(&target)
+            .expect("private file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    struct RestoreMode {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+        }
     }
 }
