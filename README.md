@@ -25,7 +25,7 @@ Design docs:
 
 ## Project Journal
 
-Current repo state and cross-task backlog stay in the short entrypoints [docs/PROJECT_STATE.md](docs/PROJECT_STATE.md) and [docs/PROJECT_TODO.md](docs/PROJECT_TODO.md). Durable workstream detail lives under [docs/project_journal/](docs/project_journal/).
+Current repo state and cross-task backlog stay in the short entrypoints [docs/PROJECT_STATE.md](docs/PROJECT_STATE.md) and [docs/PROJECT_TODO.md](docs/PROJECT_TODO.md). Detailed project journal records live under [docs/project_journal/](docs/project_journal/).
 
 The migration journal includes:
 
