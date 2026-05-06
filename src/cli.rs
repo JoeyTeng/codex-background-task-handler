@@ -312,6 +312,12 @@ struct DesktopBridgePreflightArgs {
     #[arg(long, help = "Desktop bridge thread id running the preflight")]
     bridge_thread_id: String,
 
+    #[arg(
+        long,
+        help = "Require an already-running compatible daemon; never autostart one"
+    )]
+    require_existing_daemon: bool,
+
     #[arg(long, help = "Emit JSON output")]
     json: bool,
 
@@ -1124,6 +1130,25 @@ enum DispatchMode {
 
 fn dispatch(command: Commands, layout: &FsLayout, mode: DispatchMode) -> Result<Value> {
     if let DispatchMode::Client {
+        direct_store: true, ..
+    } = mode
+        && desktop_bridge_preflight_requires_existing_daemon(&command)
+    {
+        bail!(
+            "desktop bridge-preflight --require-existing-daemon cannot be combined with --direct-store"
+        );
+    }
+
+    if let DispatchMode::Client {
+        direct_store: false,
+        ..
+    } = mode
+        && desktop_bridge_preflight_requires_existing_daemon(&command)
+    {
+        return dispatch_existing_daemon_command(command, layout);
+    }
+
+    if let DispatchMode::Client {
         direct_store: false,
         startup_timeout_seconds,
     } = mode
@@ -1155,6 +1180,54 @@ fn dispatch(command: Commands, layout: &FsLayout, mode: DispatchMode) -> Result<
     }
 
     dispatch_direct(command, layout)
+}
+
+fn desktop_bridge_preflight_requires_existing_daemon(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Desktop {
+            command: DesktopCommand::BridgePreflight(DesktopBridgePreflightArgs {
+                require_existing_daemon: true,
+                ..
+            })
+        }
+    )
+}
+
+fn dispatch_existing_daemon_command(command: Commands, layout: &FsLayout) -> Result<Value> {
+    let argv = daemon_argv_for_mutating_command(&command)?
+        .context("command cannot be dispatched to an existing daemon")?;
+    let ping = daemon_request(layout, "ping").context("probe existing daemon")?;
+    validate_existing_daemon_compatible(&ping)?;
+    daemon_request_payload(layout, "dispatch", json!({ "argv": argv_payload(argv) }))
+}
+
+fn validate_existing_daemon_compatible(response: &Value) -> Result<()> {
+    let protocol_version = response["protocol_version"]
+        .as_u64()
+        .context("existing daemon ping missing protocol_version")?;
+    if protocol_version != 1 {
+        bail!("existing daemon protocol_version {protocol_version} is not supported");
+    }
+    let reported = response["capabilities"]
+        .as_array()
+        .context("existing daemon ping missing capabilities")?;
+    let missing = DOCTOR_REQUIRED_DAEMON_CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|required| {
+            !reported
+                .iter()
+                .any(|capability| capability.as_str() == Some(*required))
+        })
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "existing daemon is missing required capabilities: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn dispatch_daemon_task_command(
