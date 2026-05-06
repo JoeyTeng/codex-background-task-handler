@@ -34,6 +34,7 @@ The migration journal includes:
 - [legacy tracker snapshot](docs/project_journal/2026/05/2026-05-05-legacy-tracker-snapshot-bbe4003.md) for the exact pre-migration `PROJECT_STATE` and `PROJECT_TODO` text
 
 The legacy snapshot is intentionally a verbatim archive. Relative links inside its fenced copied tracker text remain in their original historical form and are not expected to resolve from the journal directory; use the entrypoint docs and archive summaries for live navigation.
+For merge-time project-journal bookkeeping rules, see [docs/README.md](docs/README.md).
 
 ## Repository Layout
 
