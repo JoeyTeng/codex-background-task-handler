@@ -111,6 +111,17 @@ The Desktop heartbeat executed the corrected helper prompt and failed before pub
 CBTH_DESKTOP_PREFLIGHT_20260506_EXISTING_DAEMON_V3 VALIDATION_FAILED step1_command_failed:probe existing daemon: connect daemon socket /Users/hoteng/.cbth/run/cbth.sock: connect unix socket: Operation not permitted (os error 1)
 ```
 
+Local POSIX permission inspection after the failure showed the cbth home, run directory, daemon socket, and startup lock were already private and owned by the current user (`uid=501`, `hoteng`):
+
+```text
+/Users/hoteng/.cbth type=Directory mode=drwx------ uid=501 gid=20 flags=0
+/Users/hoteng/.cbth/run type=Directory mode=drwx------ uid=501 gid=20 flags=0
+/Users/hoteng/.cbth/run/cbth.sock type=Socket mode=srw------- uid=501 gid=20 flags=0
+/Users/hoteng/.cbth/run/startup.lock type=Regular File mode=-rw------- uid=501 gid=20 flags=0
+```
+
+This means the live blocker is not a `chmod` / ownership misconfiguration. The evidence points to the Codex Desktop heartbeat tool sandbox or macOS app permission boundary denying `connect()` to the Unix domain socket with `EPERM`.
+
 The heartbeat thread reported that the temporary automation was deleted after the failed run.
 
 Therefore this attempt still does not validate `read_transport_capability`. The durable installation state was left unchanged:
@@ -127,7 +138,7 @@ validated_at=null
 
 PR #38 (`08d196e76429836938e5bb6ba560c2f21c22cee7`) fixed the redundant private-permission mutation that caused the first failure. The next validation should keep mandatory Desktop `bridge-preflight` daemon-routed, but use an existing-daemon path so the heartbeat connects the already-running same-user daemon instead of autostarting and opening `~/.cbth/run/startup.lock`.
 
-The existing-daemon path now fails at Desktop heartbeat socket connection, not at chmod or startup-lock mutation. Before rerunning the Desktop heartbeat validation again, decide whether to introduce a narrower Desktop helper path that can publish/read inbox snapshots without connecting the daemon socket, or identify an app-side permission model that allows heartbeat code to connect `~/.cbth/run/cbth.sock` without approval.
+The existing-daemon path now fails at Desktop heartbeat socket connection, not at chmod, ownership, or startup-lock mutation. Before rerunning the Desktop heartbeat validation again, decide whether to introduce a narrower Desktop helper path that can publish/read inbox snapshots without connecting the daemon socket, or identify an app-side permission model that allows heartbeat code to connect `~/.cbth/run/cbth.sock` without approval.
 
 For local shell sanity checks, the existing-daemon command remains:
 
