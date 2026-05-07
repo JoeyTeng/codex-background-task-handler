@@ -2212,7 +2212,7 @@ fn initial_passive_thread_resume_params(
             Value::String(path_to_utf8(cwd, "current directory")?),
         );
         params.insert("persistExtendedHistory".to_owned(), Value::Bool(true));
-        apply_codex_resume_foreground_args(&mut params, cwd, codex_args)?;
+        apply_codex_resume_foreground_args(&mut params, cwd, codex_args, false)?;
     }
     Ok(Value::Object(params))
 }
@@ -2223,7 +2223,7 @@ fn initial_thread_start_params(cwd: &Path, codex_args: &[OsString]) -> Result<Va
         "cwd".to_owned(),
         Value::String(path_to_utf8(cwd, "current directory")?),
     );
-    apply_codex_resume_foreground_args(&mut params, cwd, codex_args)?;
+    apply_codex_resume_foreground_args(&mut params, cwd, codex_args, true)?;
     Ok(Value::Object(params))
 }
 
@@ -2231,6 +2231,7 @@ fn apply_codex_resume_foreground_args(
     params: &mut serde_json::Map<String, Value>,
     caller_cwd: &Path,
     codex_args: &[OsString],
+    require_explicit_oss_provider: bool,
 ) -> Result<()> {
     let mut config_overrides = serde_json::Map::new();
     let mut oss = false;
@@ -2378,12 +2379,13 @@ fn apply_codex_resume_foreground_args(
     }
 
     if oss {
-        let Some(provider) = local_provider else {
+        if let Some(provider) = local_provider {
+            params.insert("modelProvider".to_owned(), Value::String(provider));
+        } else if require_explicit_oss_provider {
             bail!(
                 "managed CLI session requires --local-provider when forwarding --oss; fresh thread/start cannot infer the foreground OSS provider"
             );
-        };
-        params.insert("modelProvider".to_owned(), Value::String(provider));
+        }
     }
     if !config_overrides.is_empty() {
         params.insert("config".to_owned(), Value::Object(config_overrides));

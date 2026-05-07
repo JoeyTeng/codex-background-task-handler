@@ -2579,6 +2579,7 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
         .arg("gpt-test")
         .arg("--profile")
         .arg("work")
+        .arg("--oss")
         .arg("--sandbox")
         .arg("read-only")
         .arg("--ask-for-approval")
@@ -2614,6 +2615,7 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
     );
     assert_eq!(params["model"], serde_json::json!("gpt-test"));
     assert_eq!(params["config"]["profile"], serde_json::json!("work"));
+    assert!(params.get("modelProvider").is_none());
     assert_eq!(params["sandbox"], serde_json::json!("read-only"));
     assert_eq!(params["approvalPolicy"], serde_json::json!("never"));
     assert_eq!(params["persistExtendedHistory"], serde_json::json!(true));
@@ -2625,6 +2627,7 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
         .expect("foreground invocation log");
     assert_eq!(foreground_line.matches("\t--cd\t").count(), 1);
     assert!(log.contains(&format!("\t--cd\t{}", expected_cwd.display())));
+    assert!(log.contains("\t--oss"));
 
     stop_daemon(&home);
 }
