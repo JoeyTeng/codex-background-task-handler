@@ -2918,6 +2918,10 @@ impl PermissionProfilePermissions {
                 .any(|write_path| path.starts_with(write_path))
     }
 
+    fn write_covers_workspace_root(&self, path: &Path) -> bool {
+        self.write_covers_path(path) || self.write_special_kinds.contains("project_roots")
+    }
+
     fn write_covers_special(&self, kind: &str) -> bool {
         self.write_special_kinds.contains("root") || self.write_special_kinds.contains(kind)
     }
@@ -2964,7 +2968,10 @@ fn parse_permission_profile_permissions(value: &Value) -> Result<PermissionProfi
                         permissions.write_paths.push(path)
                     }
                     PermissionProfilePathScope::Special(kind)
-                        if matches!(kind.as_str(), "root" | "tmpdir" | "slash_tmp") =>
+                        if matches!(
+                            kind.as_str(),
+                            "root" | "tmpdir" | "slash_tmp" | "project_roots"
+                        ) =>
                     {
                         permissions.write_special_kinds.insert(kind);
                     }
@@ -3022,8 +3029,11 @@ fn parse_permission_profile_path(path: &Value) -> Result<PermissionProfilePathSc
                     | "slash_tmp"),
                 ) => kind,
                 Some(kind @ "project_roots") => {
-                    validate_optional_string_field(value, "subpath")?;
-                    kind
+                    if permission_profile_special_has_subpath(value, "subpath")? {
+                        "project_roots_subpath"
+                    } else {
+                        kind
+                    }
                 }
                 Some("unknown") => {
                     if value.get("path").and_then(Value::as_str).is_none() {
@@ -3095,7 +3105,7 @@ fn ensure_permission_profile_covers_workspace_write(
 ) -> Result<()> {
     for root in workspace_writable_roots(sandbox)? {
         let root = normalize_workspace_writable_root(&root)?;
-        if !profile.write_covers_path(&root) {
+        if !profile.write_covers_workspace_root(&root) {
             bail!(
                 "thread/resume permissionProfile does not cover legacy workspace writableRoot {}",
                 root.display()
@@ -3118,6 +3128,14 @@ fn ensure_permission_profile_covers_workspace_write(
 fn validate_optional_string_field(value: &Value, field: &str) -> Result<()> {
     match value.get(field) {
         Some(Value::String(_)) | Some(Value::Null) | None => Ok(()),
+        Some(_) => bail!("thread/resume permissionProfile special path {field} is not a string"),
+    }
+}
+
+fn permission_profile_special_has_subpath(value: &Value, field: &str) -> Result<bool> {
+    match value.get(field) {
+        Some(Value::String(subpath)) => Ok(!subpath.is_empty()),
+        Some(Value::Null) | None => Ok(false),
         Some(_) => bail!("thread/resume permissionProfile special path {field} is not a string"),
     }
 }
@@ -8606,6 +8624,79 @@ mod tests {
             snapshot.raw_json(resolved(&snapshot))["source"],
             serde_json::json!("permissionProfile")
         );
+    }
+
+    #[test]
+    fn permission_snapshot_accepts_project_roots_permission_profile_for_legacy_workspace_write() {
+        let snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "permissionProfile": {
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("project_roots should cover legacy workspace roots");
+
+        assert_eq!(
+            snapshot.source,
+            CliPermissionSnapshotSource::PermissionProfile
+        );
+        assert!(snapshot.allows_approval);
+        assert!(!snapshot.allows_network);
+        assert!(snapshot.allows_write_access);
+    }
+
+    #[test]
+    fn permission_snapshot_rejects_project_roots_subpath_for_legacy_workspace_write() {
+        let error = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "permissionProfile": {
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "project_roots",
+                                    "subpath": "src"
+                                }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect_err("project_roots subpath cannot cover full legacy workspace roots");
+
+        assert!(error.to_string().contains("cannot be safely represented"));
     }
 
     #[test]
