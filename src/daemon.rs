@@ -642,7 +642,8 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            .process_group(0);
         let mut child = spawn_command_locked(&mut command).context("spawn cbth daemon")?;
         let child_pid = child.id();
 
