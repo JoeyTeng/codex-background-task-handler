@@ -2081,8 +2081,8 @@ fn approval_policy_risk_rank(value: &Value) -> Result<u8> {
     match value.as_str() {
         Some("never") => Ok(0),
         Some("untrusted") => Ok(1),
-        Some("on-request") => Ok(2),
-        Some("on-failure") => Ok(3),
+        Some("on-failure") => Ok(2),
+        Some("on-request") => Ok(3),
         Some(other) => bail!("cannot pin unknown approvalPolicy {other:?}"),
         None => bail!("cannot pin unsupported approvalPolicy shape"),
     }
@@ -6357,7 +6357,7 @@ mod tests {
         let overrides =
             turn_start_permission_overrides(&startup, &current, effective).expect("pin");
 
-        assert_eq!(overrides["approvalPolicy"], json!("on-request"));
+        assert_eq!(overrides["approvalPolicy"], json!("on-failure"));
         assert_eq!(overrides["sandboxPolicy"]["type"], json!("workspaceWrite"));
         assert_eq!(
             overrides["sandboxPolicy"]["writableRoots"],
