@@ -2106,11 +2106,14 @@ fn pinned_sandbox_policy(
         ("readOnly", _) | (_, "readOnly") => {
             bail!("readOnly sandbox cannot be pinned to write access")
         }
-        ("workspaceWrite", _) | (_, "workspaceWrite") => {
-            pinned_workspace_write_sandbox(startup_sandbox, current_sandbox, effective)
+        ("externalSandbox", "workspaceWrite") | ("workspaceWrite", "externalSandbox") => {
+            bail!("cannot safely pin mixed externalSandbox/workspaceWrite sandbox")
         }
         ("externalSandbox", _) | (_, "externalSandbox") => {
             pinned_external_sandbox(startup_sandbox, current_sandbox, effective)
+        }
+        ("workspaceWrite", _) | (_, "workspaceWrite") => {
+            pinned_workspace_write_sandbox(startup_sandbox, current_sandbox, effective)
         }
         ("dangerFullAccess", "dangerFullAccess") if effective.allows_network => {
             Ok(startup_sandbox.clone())
@@ -2542,7 +2545,9 @@ fn refresh_cli_auto_delivery_permissions(
     if !config.permission_inputs.uses_auto() {
         return Ok(None);
     }
-    let (resume_result, resume_messages) = passive_adapter_request(
+    // Notifications drained while waiting for this response are older than the
+    // authoritative resume snapshot and must not reopen an idle proof.
+    let (resume_result, _resume_messages) = passive_adapter_request(
         client,
         "thread/resume",
         json!({ "threadId": config.bound_thread_id }),
@@ -2555,29 +2560,35 @@ fn refresh_cli_auto_delivery_permissions(
             return Err(error.into());
         }
     };
-    match thread_result_activity_snapshot(&resume, &config.bound_thread_id) {
-        ThreadActivitySnapshot::Active => {
-            record_passive_adapter_activity(
-                config,
-                state,
-                CliSessionActivityState::Active,
-                Some(running),
-            )?;
-        }
-        ThreadActivitySnapshot::Idle => {
-            record_passive_adapter_activity(
-                config,
-                state,
-                CliSessionActivityState::Idle,
-                Some(running),
-            )?;
-        }
-        ThreadActivitySnapshot::Missing => {}
-        ThreadActivitySnapshot::Untrusted => {
-            invalidate_passive_adapter_proof(config, state, Some(running))?;
-            bail!("app-server thread/resume returned untrusted current-state snapshot");
-        }
-    }
+    let resume_activity_state =
+        match thread_result_activity_snapshot(&resume, &config.bound_thread_id) {
+            ThreadActivitySnapshot::Active => {
+                record_passive_adapter_activity(
+                    config,
+                    state,
+                    CliSessionActivityState::Active,
+                    Some(running),
+                )?;
+                CliSessionActivityState::Active
+            }
+            ThreadActivitySnapshot::Idle => {
+                record_passive_adapter_activity(
+                    config,
+                    state,
+                    CliSessionActivityState::Idle,
+                    Some(running),
+                )?;
+                CliSessionActivityState::Idle
+            }
+            ThreadActivitySnapshot::Missing => {
+                invalidate_passive_adapter_proof(config, state, Some(running))?;
+                bail!("app-server thread/resume did not return the bound thread");
+            }
+            ThreadActivitySnapshot::Untrusted => {
+                invalidate_passive_adapter_proof(config, state, Some(running))?;
+                bail!("app-server thread/resume returned untrusted current-state snapshot");
+            }
+        };
     let snapshot = parse_thread_resume_permission_snapshot(&resume)?;
     let effective = sync_passive_adapter_permissions_from_snapshot(
         config,
@@ -2587,12 +2598,7 @@ fn refresh_cli_auto_delivery_permissions(
         Some(batch_id),
         Some(running),
     )?;
-    for message in resume_messages {
-        if let Some(notification) = decode_notification(&message) {
-            record_passive_adapter_notification(config, state, notification, Some(running))?;
-        }
-    }
-    if state.last_activity_state != Some(CliSessionActivityState::Idle) {
+    if resume_activity_state != CliSessionActivityState::Idle {
         return Ok(None);
     }
     let startup_snapshot = state
@@ -6432,6 +6438,40 @@ mod tests {
         assert_eq!(
             overrides["sandboxPolicy"]["excludeTmpdirEnvVar"],
             json!(true)
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_reject_mixed_workspace_external_sandbox() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "externalSandbox",
+                "networkAccess": "enabled"
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let error = turn_start_permission_overrides(&startup, &current, effective)
+            .expect_err("mixed workspace/external sandbox should fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("mixed externalSandbox/workspaceWrite"),
+            "{error:#}"
         );
     }
 
