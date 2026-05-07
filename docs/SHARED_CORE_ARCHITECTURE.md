@@ -864,10 +864,11 @@ cooldown -> superseded
   - explicit `true` / `false` 是调用方给出的 bootstrap profile
   - `auto` 必须从 `thread/resume.approvalPolicy` 与 `thread/resume.sandbox` 取可信 snapshot，无法解析时 fail-closed
   - 第一次可信 auto snapshot pin 为 startup upper bound
+  - 当前 proof invalidation / resync 只清理 epoch-local current proof，不清理同一前台 managed session 的 startup upper bound
   - 每次自动 `turn/start` 前重新读取 current snapshot，并逐维计算 `effective_allows = startup_allows && current_allows`
   - 当前收紧时按当前更紧权限投递；当前放宽时仍受 startup 限制；混合变化逐维取更紧值
   - drift 必须写 stderr warning 与 audit record，包含 startup/current/effective、方向和 changed dimensions
-- `turn/start` request 必须显式携带 effective 权限对应的 pinned `approvalPolicy` / `sandboxPolicy`，避免 durable 记录和真实 turn 权限不一致。
+- `turn/start` request 必须显式携带 effective 权限对应的 pinned `approvalPolicy` / `sandboxPolicy`，避免 durable 记录和真实 turn 权限不一致；如果 explicit / effective no-write 把 `workspaceWrite` 降级为 `readOnly`，pinned sandbox 必须从 `readOnlyAccess` 保留或收紧可读范围，而不是退化成空读集合。
 - 只有当前 effective 三者都为 `false` 时，CLI strict-safe detached auto-delivery 才允许开启；`trusted-all` 可以绕过该 gate，但 auto snapshot / drift 记录仍然适用。
 - `attach-or-create` 发现 requested bootstrap profile 与 durable effective profile 不一致时，不得原地改写：
   - 如果旧 session 仍有 active foreground client、未收口 accepted attempt、或其他未解决 delivery work，则必须 fail-closed 为 `session_profile_mismatch`

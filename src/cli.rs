@@ -2154,8 +2154,26 @@ fn pinned_read_only_sandbox(
             sandbox_access(startup_sandbox, "access")?,
             sandbox_access(current_sandbox, "access")?,
         )?,
+        ("readOnly", "workspaceWrite") => pinned_read_only_access(
+            sandbox_access(startup_sandbox, "access")?,
+            sandbox_access(current_sandbox, "readOnlyAccess")?,
+        )?,
+        ("workspaceWrite", "readOnly") => pinned_read_only_access(
+            sandbox_access(startup_sandbox, "readOnlyAccess")?,
+            sandbox_access(current_sandbox, "access")?,
+        )?,
+        ("workspaceWrite", "workspaceWrite") => pinned_read_only_access(
+            sandbox_access(startup_sandbox, "readOnlyAccess")?,
+            sandbox_access(current_sandbox, "readOnlyAccess")?,
+        )?,
         ("readOnly", _) => sandbox_access(startup_sandbox, "access")?.clone(),
         (_, "readOnly") => sandbox_access(current_sandbox, "access")?.clone(),
+        ("workspaceWrite", "dangerFullAccess") => {
+            sandbox_access(startup_sandbox, "readOnlyAccess")?.clone()
+        }
+        ("dangerFullAccess", "workspaceWrite") => {
+            sandbox_access(current_sandbox, "readOnlyAccess")?.clone()
+        }
         _ => strict_read_only_access(),
     };
     Ok(json!({
@@ -4504,8 +4522,6 @@ fn invalidate_passive_adapter_proof(
         state.last_activity_state = None;
         state.passive_capabilities_recorded = false;
         state.last_auto_delivery_poll = None;
-        state.startup_permissions = None;
-        state.startup_permission_snapshot = None;
         state.last_current_permissions = None;
         state.last_current_permission_snapshot = None;
         state.last_effective_permissions = None;
@@ -4561,8 +4577,6 @@ fn apply_passive_adapter_invalidated_session(
     state.passive_capabilities_recorded = false;
     state.durable_proof_may_exist = false;
     state.last_auto_delivery_poll = None;
-    state.startup_permissions = None;
-    state.startup_permission_snapshot = None;
     state.last_current_permissions = None;
     state.last_current_permission_snapshot = None;
     state.last_effective_permissions = None;
@@ -6737,6 +6751,49 @@ mod tests {
             restricted_access(&["/tmp/read-a"])
         );
         assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(true));
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_explicit_no_write_preserves_workspace_read_access() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read-a", "/tmp/read-b"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/a", "/tmp/b"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access_without_platform_defaults(&["/tmp/read-b", "/tmp/read-c"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/b", "/tmp/c"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = CliResolvedPermissions {
+            allows_approval: true,
+            allows_network: true,
+            allows_write_access: false,
+        };
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("readOnly"));
+        assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(true));
+        assert_eq!(
+            overrides["sandboxPolicy"]["access"],
+            restricted_access_without_platform_defaults(&["/tmp/read-b"])
+        );
     }
 
     #[test]

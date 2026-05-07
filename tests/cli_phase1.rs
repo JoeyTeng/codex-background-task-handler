@@ -5,13 +5,34 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 fn cbth(home: &TempDir, args: &[&str]) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .env("CBTH_ALLOW_DIRECT_STORE", "1")
+        .arg("--direct-store")
+        .arg("--home")
+        .arg(home.path())
+        .args(args)
+        .output()
+        .expect("run cbth");
+
+    assert!(
+        output.status.success(),
+        "cbth failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    serde_json::from_slice(&output.stdout).expect("valid json output")
+}
+
+fn cbth_owned(home: &TempDir, args: &[String]) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .env("CBTH_ALLOW_DIRECT_STORE", "1")
         .arg("--direct-store")
@@ -175,6 +196,57 @@ fn note_cli_session_minimum_capabilities(home: &TempDir, managed_session_id: &st
         session["cli_session"]["session"]["capability_current_state_sync"],
         true
     );
+}
+
+fn note_cli_session_permissions(
+    home: &TempDir,
+    managed_session_id: &str,
+    startup: Option<(bool, bool, bool)>,
+    effective: (bool, bool, bool),
+    snapshot_json: &str,
+) -> Value {
+    let inspected = cbth(
+        home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            managed_session_id,
+        ],
+    );
+    let session_epoch = inspected["cli_session"]["session_epoch"]
+        .as_i64()
+        .expect("session epoch")
+        .to_string();
+    let mut args = vec![
+        "cli".to_owned(),
+        "session".to_owned(),
+        "note-permissions".to_owned(),
+        "--managed-session-id".to_owned(),
+        managed_session_id.to_owned(),
+        "--session-epoch".to_owned(),
+        session_epoch,
+        "--effective-allows-approval".to_owned(),
+        effective.0.to_string(),
+        "--effective-allows-network".to_owned(),
+        effective.1.to_string(),
+        "--effective-allows-write-access".to_owned(),
+        effective.2.to_string(),
+        "--snapshot-json".to_owned(),
+        snapshot_json.to_owned(),
+    ];
+    if let Some((approval, network, write_access)) = startup {
+        args.extend([
+            "--startup-allows-approval".to_owned(),
+            approval.to_string(),
+            "--startup-allows-network".to_owned(),
+            network.to_string(),
+            "--startup-allows-write-access".to_owned(),
+            write_access.to_string(),
+        ]);
+    }
+    cbth_owned(home, &args)
 }
 
 fn bind_idle_cli_session(home: &TempDir, bound_thread_id: &str) -> String {
@@ -1218,6 +1290,119 @@ fn cli_session_invalidate_proof_resets_activity_and_capabilities() {
         ],
     );
     assert!(stale_epoch.contains("is at epoch 2, not 1"));
+}
+
+#[test]
+fn cli_session_invalidate_proof_preserves_startup_permission_cap() {
+    let home = tempfile::tempdir().expect("temp home");
+    let managed_session_id = bind_idle_cli_session(&home, "thread-cli-permission-invalidation");
+    let startup_snapshot = json!({
+        "approvalPolicy": "never",
+        "sandbox": {
+            "type": "readOnly",
+            "access": {
+                "type": "restricted",
+                "includePlatformDefaults": false,
+                "readableRoots": ["/tmp/start-read"]
+            },
+            "networkAccess": false
+        },
+        "derived": {
+            "allows_approval": false,
+            "allows_network": false,
+            "allows_write_access": false
+        },
+        "effective": {
+            "allows_approval": false,
+            "allows_network": false,
+            "allows_write_access": false
+        }
+    })
+    .to_string();
+
+    let noted = note_cli_session_permissions(
+        &home,
+        &managed_session_id,
+        Some((false, false, false)),
+        (false, false, false),
+        &startup_snapshot,
+    );
+    assert_eq!(
+        noted["cli_session"]["session"]["startup_session_allows_approval"],
+        false
+    );
+    assert_eq!(
+        noted["cli_session"]["session"]["startup_permission_snapshot_json"]
+            .as_str()
+            .expect("startup snapshot json"),
+        startup_snapshot
+    );
+    assert_eq!(
+        noted["cli_session"]["session"]["permission_snapshot_revision"],
+        1
+    );
+
+    let invalidated = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "invalidate-proof",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--now",
+            "300",
+        ],
+    );
+    assert_eq!(invalidated["cli_session"]["session_epoch"], 2);
+    assert_eq!(
+        invalidated["cli_session"]["startup_session_allows_approval"],
+        false
+    );
+    assert_eq!(
+        invalidated["cli_session"]["startup_session_allows_network"],
+        false
+    );
+    assert_eq!(
+        invalidated["cli_session"]["startup_session_allows_write_access"],
+        false
+    );
+    assert_eq!(
+        invalidated["cli_session"]["startup_permission_snapshot_json"]
+            .as_str()
+            .expect("startup snapshot json"),
+        startup_snapshot
+    );
+    assert!(invalidated["cli_session"]["last_permission_snapshot_json"].is_null());
+    assert_eq!(
+        invalidated["cli_session"]["permission_snapshot_revision"],
+        0
+    );
+
+    let replayed_invalidation = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "invalidate-proof",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--now",
+            "301",
+        ],
+    );
+    assert_eq!(replayed_invalidation["cli_session"]["session_epoch"], 2);
+    assert_eq!(
+        replayed_invalidation["cli_session"]["startup_permission_snapshot_json"]
+            .as_str()
+            .expect("startup snapshot json"),
+        startup_snapshot
+    );
+    assert_eq!(replayed_invalidation["cli_session"]["updated_at"], 300);
 }
 
 #[test]

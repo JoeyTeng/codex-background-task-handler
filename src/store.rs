@@ -2944,10 +2944,6 @@ fn invalidate_cli_managed_session_activity_tx(
              capability_negative_terminal_events = 0,
              capability_thread_start = 0,
              capability_turn_steer = 0,
-             startup_session_allows_approval = NULL,
-             startup_session_allows_network = NULL,
-             startup_session_allows_write_access = NULL,
-             startup_permission_snapshot_json = NULL,
              last_permission_snapshot_json = NULL,
              permission_snapshot_revision = 0,
              updated_at = ?
@@ -4550,10 +4546,6 @@ fn cli_session_proof_is_clear(session: &CliManagedSessionRecord) -> bool {
         && !session.capability_negative_terminal_events
         && !session.capability_thread_start
         && !session.capability_turn_steer
-        && session.startup_session_allows_approval.is_none()
-        && session.startup_session_allows_network.is_none()
-        && session.startup_session_allows_write_access.is_none()
-        && session.startup_permission_snapshot_json.is_none()
         && session.last_permission_snapshot_json.is_none()
         && session.permission_snapshot_revision == 0
 }
