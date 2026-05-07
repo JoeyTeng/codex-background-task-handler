@@ -2381,7 +2381,7 @@ fn apply_codex_resume_foreground_args(
     if oss {
         if let Some(provider) = local_provider {
             params.insert("modelProvider".to_owned(), Value::String(provider));
-        } else if require_explicit_oss_provider {
+        } else if require_explicit_oss_provider && !params.contains_key("modelProvider") {
             bail!(
                 "managed CLI session requires --local-provider when forwarding --oss; fresh thread/start cannot infer the foreground OSS provider"
             );
