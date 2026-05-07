@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -2039,22 +2040,56 @@ fn effective_permissions(
 }
 
 fn turn_start_permission_overrides(
+    startup_snapshot: &CliPermissionSnapshot,
     current_snapshot: &CliPermissionSnapshot,
     effective: CliResolvedPermissions,
 ) -> Result<Value> {
-    let approval_policy = if effective.allows_approval {
-        current_snapshot.approval_policy.clone()
-    } else {
-        Value::String("never".to_owned())
-    };
-    let sandbox_policy = pinned_sandbox_policy(&current_snapshot.sandbox_policy, effective)?;
+    let approval_policy = pinned_approval_policy(
+        &startup_snapshot.approval_policy,
+        &current_snapshot.approval_policy,
+        effective.allows_approval,
+    )?;
+    let sandbox_policy = pinned_sandbox_policy(
+        &startup_snapshot.sandbox_policy,
+        &current_snapshot.sandbox_policy,
+        effective,
+    )?;
     Ok(json!({
         "approvalPolicy": approval_policy,
         "sandboxPolicy": sandbox_policy,
     }))
 }
 
+fn pinned_approval_policy(
+    startup_approval: &Value,
+    current_approval: &Value,
+    allows_approval: bool,
+) -> Result<Value> {
+    if !allows_approval {
+        return Ok(Value::String("never".to_owned()));
+    }
+    let startup_rank = approval_policy_risk_rank(startup_approval)?;
+    let current_rank = approval_policy_risk_rank(current_approval)?;
+    Ok(if startup_rank <= current_rank {
+        startup_approval.clone()
+    } else {
+        current_approval.clone()
+    })
+}
+
+fn approval_policy_risk_rank(value: &Value) -> Result<u8> {
+    match value.as_str() {
+        Some("never") => Ok(0),
+        Some("untrusted") => Ok(1),
+        Some("on-request") => Ok(2),
+        Some("on-failure") => Ok(3),
+        Some(other) => bail!("cannot pin unknown approvalPolicy {other:?}"),
+        None => bail!("cannot pin unsupported approvalPolicy shape"),
+    }
+}
+
 fn pinned_sandbox_policy(
+    startup_sandbox: &Value,
     current_sandbox: &Value,
     effective: CliResolvedPermissions,
 ) -> Result<Value> {
@@ -2065,45 +2100,132 @@ fn pinned_sandbox_policy(
         }));
     }
 
-    let sandbox_type = current_sandbox
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("current sandbox missing type"))?;
-    let mut sandbox = current_sandbox.clone();
-    match sandbox_type {
-        "workspaceWrite" => {
-            let object = sandbox
-                .as_object_mut()
-                .ok_or_else(|| anyhow::anyhow!("workspaceWrite sandbox is not an object"))?;
-            object.insert(
-                "networkAccess".to_owned(),
-                Value::Bool(effective.allows_network),
-            );
-            Ok(sandbox)
+    let startup_type = sandbox_policy_type(startup_sandbox)?;
+    let current_type = sandbox_policy_type(current_sandbox)?;
+    match (startup_type, current_type) {
+        ("readOnly", _) | (_, "readOnly") => {
+            bail!("readOnly sandbox cannot be pinned to write access")
         }
-        "externalSandbox" => {
-            let object = sandbox
-                .as_object_mut()
-                .ok_or_else(|| anyhow::anyhow!("externalSandbox sandbox is not an object"))?;
-            object.insert(
-                "networkAccess".to_owned(),
-                Value::String(
-                    if effective.allows_network {
-                        "enabled"
-                    } else {
-                        "restricted"
-                    }
-                    .to_owned(),
-                ),
-            );
-            Ok(sandbox)
+        ("workspaceWrite", _) | (_, "workspaceWrite") => {
+            pinned_workspace_write_sandbox(startup_sandbox, current_sandbox, effective)
         }
-        "dangerFullAccess" if effective.allows_network => Ok(sandbox),
-        "dangerFullAccess" => {
+        ("externalSandbox", _) | (_, "externalSandbox") => {
+            pinned_external_sandbox(startup_sandbox, current_sandbox, effective)
+        }
+        ("dangerFullAccess", "dangerFullAccess") if effective.allows_network => {
+            Ok(startup_sandbox.clone())
+        }
+        ("dangerFullAccess", "dangerFullAccess") => {
             bail!("dangerFullAccess sandbox cannot be pinned to networkAccess=false")
         }
-        other => bail!("cannot pin unsupported sandbox type {other:?}"),
+        (startup, current) => {
+            bail!("cannot pin unsupported sandbox transition {startup:?} -> {current:?}")
+        }
     }
+}
+
+fn sandbox_policy_type(sandbox: &Value) -> Result<&str> {
+    sandbox
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("sandbox policy missing type"))
+}
+
+fn pinned_workspace_write_sandbox(
+    startup_sandbox: &Value,
+    current_sandbox: &Value,
+    effective: CliResolvedPermissions,
+) -> Result<Value> {
+    let startup_workspace = sandbox_policy_type(startup_sandbox)? == "workspaceWrite";
+    let current_workspace = sandbox_policy_type(current_sandbox)? == "workspaceWrite";
+    let writable_roots = match (startup_workspace, current_workspace) {
+        (true, true) => workspace_writable_roots_intersection(startup_sandbox, current_sandbox)?,
+        (true, false) => workspace_writable_roots(startup_sandbox)?,
+        (false, true) => workspace_writable_roots(current_sandbox)?,
+        (false, false) => bail!("workspaceWrite pin requested without workspace sandbox"),
+    };
+    let exclude_tmpdir_env_var =
+        workspace_bool_if_workspace(startup_sandbox, startup_workspace, "excludeTmpdirEnvVar")?
+            || workspace_bool_if_workspace(
+                current_sandbox,
+                current_workspace,
+                "excludeTmpdirEnvVar",
+            )?;
+    let exclude_slash_tmp =
+        workspace_bool_if_workspace(startup_sandbox, startup_workspace, "excludeSlashTmp")?
+            || workspace_bool_if_workspace(current_sandbox, current_workspace, "excludeSlashTmp")?;
+    Ok(json!({
+        "type": "workspaceWrite",
+        "writableRoots": writable_roots,
+        "networkAccess": effective.allows_network,
+        "excludeTmpdirEnvVar": exclude_tmpdir_env_var,
+        "excludeSlashTmp": exclude_slash_tmp,
+    }))
+}
+
+fn workspace_writable_roots_intersection(
+    startup_sandbox: &Value,
+    current_sandbox: &Value,
+) -> Result<Vec<String>> {
+    let startup_roots = workspace_writable_roots(startup_sandbox)?;
+    let current_roots = workspace_writable_roots(current_sandbox)?;
+    let current_set = current_roots.iter().cloned().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    Ok(startup_roots
+        .into_iter()
+        .filter(|root| current_set.contains(root) && seen.insert(root.clone()))
+        .collect())
+}
+
+fn workspace_writable_roots(sandbox: &Value) -> Result<Vec<String>> {
+    let roots = sandbox
+        .get("writableRoots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("workspaceWrite sandbox missing writableRoots"))?;
+    roots
+        .iter()
+        .map(|root| {
+            root.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("workspaceWrite writableRoots contains non-string"))
+        })
+        .collect()
+}
+
+fn workspace_bool_if_workspace(sandbox: &Value, is_workspace: bool, field: &str) -> Result<bool> {
+    if is_workspace {
+        sandbox_bool_field(sandbox, field, false)
+    } else {
+        Ok(false)
+    }
+}
+
+fn pinned_external_sandbox(
+    startup_sandbox: &Value,
+    current_sandbox: &Value,
+    effective: CliResolvedPermissions,
+) -> Result<Value> {
+    let external_sandbox = if sandbox_policy_type(startup_sandbox)? == "externalSandbox" {
+        startup_sandbox
+    } else {
+        current_sandbox
+    };
+    let mut sandbox = external_sandbox.clone();
+    let object = sandbox
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("externalSandbox sandbox is not an object"))?;
+    object.insert(
+        "networkAccess".to_owned(),
+        Value::String(
+            if effective.allows_network {
+                "enabled"
+            } else {
+                "restricted"
+            }
+            .to_owned(),
+        ),
+    );
+    Ok(sandbox)
 }
 
 impl Drop for CliAppServerPassiveAdapterHandle {
@@ -2125,6 +2247,7 @@ struct CliAppServerPassiveAdapterState {
     durable_proof_may_exist: bool,
     last_auto_delivery_poll: Option<Instant>,
     startup_permissions: Option<CliResolvedPermissions>,
+    startup_permission_snapshot: Option<CliPermissionSnapshot>,
     last_current_permissions: Option<CliResolvedPermissions>,
     last_effective_permissions: Option<CliResolvedPermissions>,
 }
@@ -2178,6 +2301,7 @@ fn spawn_cli_app_server_passive_adapter(
         durable_proof_may_exist: config.activity_revision != 0 || config.capability_revision != 0,
         last_auto_delivery_poll: None,
         startup_permissions: None,
+        startup_permission_snapshot: None,
         last_current_permissions: None,
         last_effective_permissions: None,
     }));
@@ -2471,7 +2595,15 @@ fn refresh_cli_auto_delivery_permissions(
     if state.last_activity_state != Some(CliSessionActivityState::Idle) {
         return Ok(None);
     }
-    Ok(Some(turn_start_permission_overrides(&snapshot, effective)?))
+    let startup_snapshot = state
+        .startup_permission_snapshot
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing startup permission snapshot"))?;
+    Ok(Some(turn_start_permission_overrides(
+        startup_snapshot,
+        &snapshot,
+        effective,
+    )?))
 }
 
 fn maybe_run_cli_auto_delivery(
@@ -3429,6 +3561,7 @@ fn stop_passive_adapter_after_session_parked(
     state.durable_proof_may_exist = false;
     state.last_auto_delivery_poll = None;
     state.startup_permissions = None;
+    state.startup_permission_snapshot = None;
     state.last_current_permissions = None;
     state.last_effective_permissions = None;
     running.store(false, Ordering::Release);
@@ -3947,6 +4080,7 @@ fn record_passive_adapter_permissions(
         Ok(_) => {
             if let Some(startup) = startup {
                 state.startup_permissions = Some(startup);
+                state.startup_permission_snapshot = Some(snapshot.clone());
             }
             state.last_effective_permissions = Some(effective);
             Ok(())
@@ -4030,6 +4164,7 @@ fn invalidate_passive_adapter_proof(
         state.passive_capabilities_recorded = false;
         state.last_auto_delivery_poll = None;
         state.startup_permissions = None;
+        state.startup_permission_snapshot = None;
         state.last_current_permissions = None;
         state.last_effective_permissions = None;
         return Ok(());
@@ -4085,6 +4220,7 @@ fn apply_passive_adapter_invalidated_session(
     state.durable_proof_may_exist = false;
     state.last_auto_delivery_poll = None;
     state.startup_permissions = None;
+    state.startup_permission_snapshot = None;
     state.last_current_permissions = None;
     state.last_effective_permissions = None;
     Ok(())
@@ -6104,6 +6240,14 @@ fn write_json<T: Serialize>(value: &T) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn resolved(snapshot: &CliPermissionSnapshot) -> CliResolvedPermissions {
+        CliResolvedPermissions {
+            allows_approval: snapshot.allows_approval,
+            allows_network: snapshot.allows_network,
+            allows_write_access: snapshot.allows_write_access,
+        }
+    }
+
     #[test]
     fn permission_snapshot_derives_read_only_no_network_no_approval() {
         let snapshot = parse_thread_resume_permission_snapshot(&json!({
@@ -6152,6 +6296,14 @@ mod tests {
 
     #[test]
     fn pinned_turn_start_overrides_keep_startup_tighter_than_current() {
+        let startup_snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "never",
+            "sandbox": {
+                "type": "readOnly",
+                "networkAccess": false
+            }
+        }))
+        .expect("parse startup snapshot");
         let current = parse_thread_resume_permission_snapshot(&json!({
             "approvalPolicy": "on-request",
             "sandbox": {
@@ -6161,22 +6313,126 @@ mod tests {
             }
         }))
         .expect("parse snapshot");
-        let startup = CliResolvedPermissions {
-            allows_approval: false,
-            allows_network: false,
-            allows_write_access: false,
-        };
-        let current_permissions = CliResolvedPermissions {
-            allows_approval: true,
-            allows_network: true,
-            allows_write_access: true,
-        };
-        let effective = effective_permissions(startup, current_permissions);
-        let overrides = turn_start_permission_overrides(&current, effective).expect("pin");
+        let effective = effective_permissions(resolved(&startup_snapshot), resolved(&current));
+        let overrides =
+            turn_start_permission_overrides(&startup_snapshot, &current, effective).expect("pin");
 
         assert_eq!(overrides["approvalPolicy"], json!("never"));
         assert_eq!(overrides["sandboxPolicy"]["type"], json!("readOnly"));
         assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(false));
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_cap_loosened_workspace_roots_to_startup() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": true,
+                "writableRoots": ["/tmp/a"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-failure",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": true,
+                "writableRoots": ["/tmp/a", "/tmp/b"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(overrides["approvalPolicy"], json!("on-request"));
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("workspaceWrite"));
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/a"])
+        );
+        assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(true));
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_use_current_tighter_workspace_roots() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-failure",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": true,
+                "writableRoots": ["/tmp/a", "/tmp/b"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "untrusted",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/tmp/b"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": true
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(overrides["approvalPolicy"], json!("untrusted"));
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("workspaceWrite"));
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/b"])
+        );
+        assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(false));
+        assert_eq!(overrides["sandboxPolicy"]["excludeSlashTmp"], json!(true));
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_keep_startup_workspace_against_current_danger_full_access() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "dangerFullAccess"
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("workspaceWrite"));
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/work"])
+        );
+        assert_eq!(
+            overrides["sandboxPolicy"]["excludeTmpdirEnvVar"],
+            json!(true)
+        );
     }
 
     #[test]
