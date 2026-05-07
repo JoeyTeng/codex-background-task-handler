@@ -1898,6 +1898,12 @@ fn foreground_codex_args(
         } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
             let cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
             normalized[index] = OsString::from(format!("-C{}", cwd.to_string_lossy()));
+        } else if arg.strip_prefix("--image=").is_some()
+            || arg
+                .strip_prefix("-i")
+                .is_some_and(|value| !value.is_empty())
+        {
+            skip_variadic_codex_arg_values(&normalized, &mut index, arg.as_str(), true)?;
         } else {
             match arg.as_str() {
                 "--cd" | "-C" => {
@@ -1925,12 +1931,11 @@ fn foreground_codex_args(
                 | "--disable"
                 | "--remote"
                 | "--remote-auth-token-env"
-                | "--image"
-                | "-i" => {
-                    index += 1;
-                    if index >= normalized.len() {
-                        bail!("codex argument {arg} requires a value");
-                    }
+                | "--add-dir" => {
+                    skip_codex_arg_value(&normalized, &mut index, arg.as_str())?;
+                }
+                "--image" | "-i" => {
+                    skip_variadic_codex_arg_values(&normalized, &mut index, arg.as_str(), false)?;
                 }
                 _ => {}
             }
@@ -2000,6 +2005,8 @@ fn apply_codex_resume_foreground_args(
             apply_codex_config_override(params, &mut config_overrides, value)?;
         } else if let Some(value) = arg.strip_prefix("--local-provider=") {
             local_provider = Some(value.to_owned());
+        } else if arg.strip_prefix("--image=").is_some() {
+            skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), true)?;
         } else if let Some(value) = arg.strip_prefix("-m").filter(|value| !value.is_empty()) {
             params.insert("model".to_owned(), Value::String(value.to_owned()));
         } else if let Some(value) = arg.strip_prefix("-p").filter(|value| !value.is_empty()) {
@@ -2021,6 +2028,11 @@ fn apply_codex_resume_foreground_args(
             );
         } else if let Some(value) = arg.strip_prefix("-c").filter(|value| !value.is_empty()) {
             apply_codex_config_override(params, &mut config_overrides, value)?;
+        } else if arg
+            .strip_prefix("-i")
+            .is_some_and(|value| !value.is_empty())
+        {
+            skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), true)?;
         } else {
             match arg.as_str() {
                 "--model" | "-m" => {
@@ -2060,13 +2072,11 @@ fn apply_codex_resume_foreground_args(
                     local_provider =
                         Some(next_codex_arg_value(codex_args, &mut index, arg.as_str())?);
                 }
-                "--enable"
-                | "--disable"
-                | "--remote"
-                | "--remote-auth-token-env"
-                | "--image"
-                | "-i" => {
+                "--enable" | "--disable" | "--remote" | "--remote-auth-token-env" | "--add-dir" => {
                     let _ = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                }
+                "--image" | "-i" => {
+                    skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), false)?;
                 }
                 "--oss" => {
                     oss = true;
@@ -2097,6 +2107,40 @@ fn apply_codex_resume_foreground_args(
     }
     if !config_overrides.is_empty() {
         params.insert("config".to_owned(), Value::Object(config_overrides));
+    }
+    Ok(())
+}
+
+fn skip_codex_arg_value(args: &[OsString], index: &mut usize, flag: &str) -> Result<()> {
+    *index += 1;
+    if *index >= args.len() {
+        bail!("codex argument {flag} requires a value");
+    }
+    Ok(())
+}
+
+fn skip_variadic_codex_arg_values(
+    args: &[OsString],
+    index: &mut usize,
+    flag: &str,
+    has_attached_value: bool,
+) -> Result<()> {
+    if !has_attached_value {
+        *index += 1;
+        let Some(value) = args.get(*index) else {
+            bail!("codex argument {flag} requires a value");
+        };
+        let value = os_arg_to_utf8(value, flag)?;
+        if value == "--" || value.starts_with('-') {
+            bail!("codex argument {flag} requires a value");
+        }
+    }
+    while let Some(next) = args.get(*index + 1) {
+        let next = os_arg_to_utf8(next, "codex argument")?;
+        if next == "--" || next.starts_with('-') {
+            break;
+        }
+        *index += 1;
     }
     Ok(())
 }
@@ -2577,8 +2621,8 @@ fn pinned_workspace_write_sandbox(
     let current_workspace = sandbox_policy_type(current_sandbox)? == "workspaceWrite";
     let writable_roots = match (startup_workspace, current_workspace) {
         (true, true) => workspace_writable_roots_intersection(startup_sandbox, current_sandbox)?,
-        (true, false) => workspace_writable_roots(startup_sandbox)?,
-        (false, true) => workspace_writable_roots(current_sandbox)?,
+        (true, false) => normalized_workspace_writable_roots(startup_sandbox)?,
+        (false, true) => normalized_workspace_writable_roots(current_sandbox)?,
         (false, false) => bail!("workspaceWrite pin requested without workspace sandbox"),
     };
     let exclude_tmpdir_env_var =
@@ -2634,6 +2678,13 @@ fn workspace_writable_roots_intersection(
         }
     }
     Ok(narrowed_roots)
+}
+
+fn normalized_workspace_writable_roots(sandbox: &Value) -> Result<Vec<String>> {
+    workspace_writable_roots(sandbox)?
+        .into_iter()
+        .map(|root| path_to_string(&normalize_workspace_writable_root(&root)?))
+        .collect()
 }
 
 fn narrower_writable_root(startup_root: &str, current_root: &str) -> Result<Option<String>> {
@@ -7419,6 +7470,68 @@ mod tests {
             json!(true)
         );
         assert!(overrides["sandboxPolicy"].get("readOnlyAccess").is_none());
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_reject_parent_dir_single_workspace_startup_root() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work/../other"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "dangerFullAccess"
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let error = turn_start_permission_overrides(&startup, &current, effective)
+            .expect_err("parent directory startup root rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("contains parent directory component")
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_reject_relative_single_workspace_current_root() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "dangerFullAccess"
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["relative/work"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let error = turn_start_permission_overrides(&startup, &current, effective)
+            .expect_err("relative current root rejected");
+
+        assert!(error.to_string().contains("is not absolute"));
     }
 
     #[test]

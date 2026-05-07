@@ -56,11 +56,15 @@ superseded_by:
 - Drift warning/audit now also compares raw `approvalPolicy` / `sandbox` details, so root or read-only access changes are visible even when the derived boolean permissions are unchanged.
 - Proof invalidation and post-turn resync preserve the original startup permission cap for the same foreground managed session; only epoch-local current proof is cleared, and strict-safe delivery requires a refreshed current permission snapshot before reusing recorded risk booleans.
 - Workspace-write pinning preserves safe nested writable-root intersections, such as a current root narrowed to a startup root's subdirectory, and rejects parent-directory components before containment checks.
+- Review follow-up keeps forwarded native resume option scanning aligned with Codex single-value and variadic options, so `--add-dir` or `--image <FILE>...` cannot hide later `--cd` / sandbox overrides from the initial sidecar `thread/resume`.
+- Single-source workspace-write pins now normalize and validate writable roots before emission, matching the intersection path and failing closed on relative or parent-directory roots.
 - Default `auto` reattach no longer treats the fail-closed initial false profile as fixed, avoiding profile-drift replacement after a prior auto-derived effective profile was wider.
 - Explicit no-write effective permissions now downgrade `workspaceWrite` snapshots to a protocol-valid legacy `readOnly` sandboxPolicy instead of emitting rejected read-access fields.
 - Validation:
   - `cargo fmt --check`
   - `cargo clippy --locked --all-targets -- -D warnings`
   - `cargo test --locked`
+  - `cargo test --locked cbth_resume_initial_sidecar_resume_carries_foreground_overrides`
+  - `cargo test --locked pinned_turn_start_overrides_reject`
   - `cargo test --test cli_run`
   - `uv run python /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/hoteng/.codex/worktrees/aef0/codex-background-task-handler`
