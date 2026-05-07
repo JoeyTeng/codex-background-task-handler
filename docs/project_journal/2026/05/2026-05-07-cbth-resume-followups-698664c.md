@@ -46,6 +46,7 @@ superseded_by:
   - Codex PR review gate found that canonical `permissionProfile` workspace writes can use `special.kind: "project_roots"` in normal Codex 0.128 responses. The fix treats unsuffixed `project_roots` as covering legacy workspace writable roots while still rejecting narrower `project_roots` subpaths as unrepresentable for legacy sandbox pinning.
   - A later clean-context review found four follow-up gaps: mixed-shape `thread/read` cwd identity, permission-affecting `--config` forwarding, malformed canonical `permissionProfile` shapes, and nested-root drift direction. The next fix requires the cwd-bearing nested thread to carry a matching id, rejects known sandbox-scope config overrides, validates canonical profile object/network/fileSystem shapes strictly, and computes root drift by normalized containment instead of exact string-set subset checks.
   - Follow-up clean-context review found that the `--config` guard missed canonical permission config roots. The guard now also rejects `sandbox_permissions.*`, `permissions.*`, and likely permission-profile aliases until those overrides can be represented in the sidecar's initial `thread/resume`.
+  - Follow-up clean-context review found that read-only canonical profiles with nested `access: "none"` denials were accepted even though automatic `turn/start` can only emit legacy sandbox fields. The parser now fail-closes any canonical deny scope until exact permission profile pinning exists.
 - Validation:
   - `cargo fmt --all -- --check`
   - `cargo clippy --locked --all-targets -- -D warnings`
@@ -54,6 +55,7 @@ superseded_by:
   - `cargo test --locked thread_read_cwd --lib`
   - `cargo test --locked permission_snapshot_rejects_malformed_permission_profiles --lib`
   - `cargo test --locked permission_drift_tracks_nested_workspace_roots_by_containment --lib`
+  - `cargo test --locked permission_snapshot_rejects_permission_profile_denials_for_legacy_read_only --lib`
   - `cargo test --locked permission_snapshot_accepts_project_roots_permission_profile_for_legacy_workspace_write --lib`
   - `cargo test --locked permission_snapshot_rejects_project_roots_subpath_for_legacy_workspace_write --lib`
   - `cargo test --locked cbth_resume_rejects_permission_affecting_config_overrides --test cli_run` (including canonical permission config root cases)

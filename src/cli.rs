@@ -2946,7 +2946,7 @@ struct PermissionProfilePermissions {
     write_paths: Vec<PathBuf>,
     write_special_kinds: HashSet<String>,
     has_unrepresentable_write_scope: bool,
-    has_write_denials: bool,
+    has_access_denials: bool,
 }
 
 impl PermissionProfilePermissions {
@@ -2957,7 +2957,7 @@ impl PermissionProfilePermissions {
             write_paths: Vec::new(),
             write_special_kinds: HashSet::new(),
             has_unrepresentable_write_scope: false,
-            has_write_denials: false,
+            has_access_denials: false,
         }
     }
 
@@ -3028,7 +3028,7 @@ fn parse_permission_profile_permissions(value: &Value) -> Result<PermissionProfi
         let path_scope = parse_permission_profile_entry_path(entry)?;
         match entry.get("access").and_then(Value::as_str) {
             Some("read") => {}
-            Some("none") => permissions.has_write_denials = true,
+            Some("none") => permissions.has_access_denials = true,
             Some("write") => {
                 permissions.allows_write_access = true;
                 match path_scope {
@@ -3145,10 +3145,15 @@ fn ensure_permission_profile_legacy_write_equivalence(
     profile: &PermissionProfilePermissions,
     sandbox: &Value,
 ) -> Result<()> {
+    if profile.has_access_denials {
+        bail!(
+            "thread/resume permissionProfile deny scope cannot be safely represented by legacy sandbox"
+        );
+    }
     if !profile.allows_write_access {
         return Ok(());
     }
-    if profile.has_write_denials || profile.has_unrepresentable_write_scope {
+    if profile.has_unrepresentable_write_scope {
         bail!(
             "thread/resume permissionProfile write scope cannot be safely represented by legacy sandbox"
         );
@@ -8950,6 +8955,36 @@ mod tests {
         .expect_err("profile denials should not pin legacy sandbox");
 
         assert!(error.to_string().contains("cannot be safely represented"));
+    }
+
+    #[test]
+    fn permission_snapshot_rejects_permission_profile_denials_for_legacy_read_only() {
+        let error = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "never",
+            "sandbox": {
+                "type": "readOnly",
+                "access": restricted_access(&["/tmp/read"]),
+                "networkAccess": false
+            },
+            "permissionProfile": {
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": { "type": "path", "path": "/tmp/read" },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/read/secret" },
+                            "access": "none"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect_err("read-side profile denials should not pin legacy read-only sandbox");
+
+        assert!(error.to_string().contains("deny scope"));
     }
 
     #[test]
