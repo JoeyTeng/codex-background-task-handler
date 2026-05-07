@@ -306,6 +306,12 @@ fn process_group_exists(pid: u32) -> bool {
     )
 }
 
+fn process_group_id(pid: u32) -> libc::pid_t {
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    assert!(pgid > 0, "getpgid({pid}) failed");
+    pgid
+}
+
 fn wait_for_process_group_gone(pid: u32) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while process_group_exists(pid) {
@@ -375,6 +381,29 @@ fn concurrent_daemon_ensure_uses_one_daemon() {
     }
 
     assert_eq!(started_count, 1);
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_removed(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_starts_daemon_in_own_process_group() {
+    let home = temp_home();
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    let daemon_pid = ensured["daemon"]["pid"].as_u64().expect("daemon pid") as u32;
+    assert_eq!(process_group_id(daemon_pid), daemon_pid as libc::pid_t);
+
     cbth(&home, &["daemon", "stop"]);
     wait_for_socket_removed(&home);
 }
