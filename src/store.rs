@@ -1847,6 +1847,7 @@ impl Store {
                     attempt.attempt_id
                 );
             }
+            ensure_desktop_binding_bound_for_arm(&binding)?;
             let lease_id = attempt
                 .bridge_arm_lease_id
                 .as_ref()

@@ -837,6 +837,25 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
         degraded["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["count"],
         0
     );
+    let degraded_retry = cbth_failure(
+        &degraded_home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-degraded-export",
+            "--attempt-id",
+            "attempt-degraded-export",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-attempt-degraded-export",
+            "--json",
+            "--now",
+            "2406",
+        ],
+    );
+    assert!(degraded_retry.contains("Desktop binding thread-degraded-export is degraded"));
 
     let non_head_home = temp_home();
     cbth(
