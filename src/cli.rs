@@ -7,7 +7,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2256,7 +2256,7 @@ fn workspace_writable_roots_intersection(
     let mut narrowed_roots = Vec::new();
     for startup_root in &startup_roots {
         for current_root in &current_roots {
-            let Some(root) = narrower_writable_root(startup_root, current_root) else {
+            let Some(root) = narrower_writable_root(startup_root, current_root)? else {
                 continue;
             };
             if seen.insert(root.clone()) {
@@ -2267,16 +2267,44 @@ fn workspace_writable_roots_intersection(
     Ok(narrowed_roots)
 }
 
-fn narrower_writable_root(startup_root: &str, current_root: &str) -> Option<String> {
-    let startup_path = Path::new(startup_root);
-    let current_path = Path::new(current_root);
-    if current_path.starts_with(startup_path) {
-        Some(current_root.to_owned())
-    } else if startup_path.starts_with(current_path) {
-        Some(startup_root.to_owned())
+fn narrower_writable_root(startup_root: &str, current_root: &str) -> Result<Option<String>> {
+    let startup_path = normalize_workspace_writable_root(startup_root)?;
+    let current_path = normalize_workspace_writable_root(current_root)?;
+    if current_path.starts_with(&startup_path) {
+        Ok(Some(path_to_string(&current_path)?))
+    } else if startup_path.starts_with(&current_path) {
+        Ok(Some(path_to_string(&startup_path)?))
     } else {
-        None
+        Ok(None)
     }
+}
+
+fn normalize_workspace_writable_root(root: &str) -> Result<PathBuf> {
+    let path = Path::new(root);
+    if !path.is_absolute() {
+        bail!("workspaceWrite writableRoot is not absolute: {root:?}");
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                bail!("workspaceWrite writableRoot contains parent directory component: {root:?}")
+            }
+            Component::Prefix(_) => {
+                bail!("workspaceWrite writableRoot contains unsupported prefix: {root:?}")
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn path_to_string(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("workspaceWrite writableRoot is not valid UTF-8"))
 }
 
 fn workspace_writable_roots(sandbox: &Value) -> Result<Vec<String>> {
@@ -6855,6 +6883,44 @@ mod tests {
         assert_eq!(
             overrides["sandboxPolicy"]["writableRoots"],
             json!(["/tmp/repo/subdir"])
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_reject_parent_dir_workspace_root() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo/../other"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let error = turn_start_permission_overrides(&startup, &current, effective)
+            .expect_err("parent directory root rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("contains parent directory component")
         );
     }
 

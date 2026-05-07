@@ -869,6 +869,7 @@ cooldown -> superseded
   - 当前收紧时按当前更紧权限投递；当前放宽时仍受 startup 限制；混合变化逐维取更紧值
 - drift 必须写 stderr warning 与 audit record，包含 startup/current/effective、方向和 changed dimensions
 - `turn/start` request 必须显式携带 effective 权限对应的 pinned `approvalPolicy` / legacy `sandboxPolicy`，避免 durable 记录和真实 turn 权限不一致；Codex 0.128 的 legacy `sandboxPolicy` 不再接受 restricted-read `access` / `readOnlyAccess` 字段，因此 pinned request 只发送可表示的 `type`、`networkAccess`、`writableRoots` 与 workspace exclude flags，restricted-read shape 只进入解析、收紧计算和 drift/audit。
+- workspace writable root 收紧必须先做安全规范化；含 parent-directory component 的 root 直接 fail-closed，避免路径解析后落到 startup cap 之外。
 - auto-pinned session 的 proof invalidation 只清掉 epoch-local current proof 并保留 startup cap；strict-safe 投递在 current permission snapshot 重新刷新前不得把旧 `session_allows_*` 风险布尔值当作可信证明。
 - 默认 `auto` reattach 不应把 fail-closed 初始 false 作为固定 profile 来匹配 durable `session_allows_*`；显式 `true` / `false` 仍按固定 profile 处理，profile drift、manual batch blocker、active attempt blocker 继续拒绝 reattach。
 - 只有当前 effective 三者都为 `false` 时，CLI strict-safe detached auto-delivery 才允许开启；`trusted-all` 可以绕过该 gate，但 auto snapshot / drift 记录仍然适用。
