@@ -2614,7 +2614,7 @@ fn apply_codex_config_override(
 fn reject_permission_affecting_codex_config_override(key: &str) -> Result<()> {
     if managed_resume_config_override_affects_sandbox_scope(key) {
         bail!(
-            "managed resume does not allow forwarded --config sandbox permission override {key:?}; cbth cannot faithfully carry it into initial thread/resume"
+            "managed resume does not allow forwarded --config sandbox/permission override {key:?}; cbth cannot faithfully carry it into initial thread/resume"
         );
     }
     Ok(())
@@ -2629,6 +2629,14 @@ fn managed_resume_config_override_affects_sandbox_scope(key: &str) -> bool {
             .is_some_and(managed_resume_workspace_write_config_field_affects_sandbox_scope)
         || key == "sandbox_read_only"
         || key.starts_with("sandbox_read_only.")
+        || key == "sandbox_permissions"
+        || key.starts_with("sandbox_permissions.")
+        || key == "permissions"
+        || key.starts_with("permissions.")
+        || key == "permission_profile"
+        || key.starts_with("permission_profile.")
+        || key == "permissionProfile"
+        || key.starts_with("permissionProfile.")
         || key == "writable_roots"
         || key.ends_with(".writable_roots")
         || key == "readable_roots"

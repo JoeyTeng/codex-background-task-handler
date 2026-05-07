@@ -2558,6 +2558,10 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
         vec!["--config=sandbox_workspace_write.network_access=true"],
         vec!["-c", "sandbox_read_only.readable_roots=[\"/tmp/read\"]"],
         vec!["-csandbox-workspace-write.exclude-slash-tmp=false"],
+        vec!["--config", "sandbox_permissions.mode=\"workspace-write\""],
+        vec!["--config=permissions.network.enabled=true"],
+        vec!["-cpermissions.file_system.entries=[]"],
+        vec!["--config=permission_profile.network.enabled=true"],
     ];
 
     for (index, args) in cases.into_iter().enumerate() {
@@ -2589,9 +2593,7 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains(
-                "managed resume does not allow forwarded --config sandbox permission override"
-            ),
+            stderr.contains("managed resume does not allow forwarded --config sandbox/permission"),
             "unexpected stderr: {stderr}"
         );
         let log = fs::read_to_string(&log_path).unwrap_or_default();
