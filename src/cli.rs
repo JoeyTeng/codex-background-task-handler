@@ -2943,6 +2943,9 @@ fn parse_sandbox_permissions(value: &Value) -> Result<(bool, bool)> {
 struct PermissionProfilePermissions {
     allows_network: bool,
     allows_write_access: bool,
+    read_paths: Vec<PathBuf>,
+    read_special_kinds: HashSet<String>,
+    has_unrepresentable_read_scope: bool,
     write_paths: Vec<PathBuf>,
     write_special_kinds: HashSet<String>,
     has_unrepresentable_write_scope: bool,
@@ -2954,6 +2957,9 @@ impl PermissionProfilePermissions {
         Self {
             allows_network,
             allows_write_access: false,
+            read_paths: Vec::new(),
+            read_special_kinds: HashSet::new(),
+            has_unrepresentable_read_scope: false,
             write_paths: Vec::new(),
             write_special_kinds: HashSet::new(),
             has_unrepresentable_write_scope: false,
@@ -2981,6 +2987,31 @@ impl PermissionProfilePermissions {
 
     fn write_covers_special(&self, kind: &str) -> bool {
         self.write_special_kinds.contains("root") || self.write_special_kinds.contains(kind)
+    }
+
+    fn record_read_scope(&mut self, path_scope: &PermissionProfilePathScope) {
+        match path_scope {
+            PermissionProfilePathScope::Absolute(path) => self.read_paths.push(path.clone()),
+            PermissionProfilePathScope::Special(kind)
+                if matches!(kind.as_str(), "root" | "slash_tmp") =>
+            {
+                self.read_special_kinds.insert(kind.clone());
+            }
+            PermissionProfilePathScope::Special(_) | PermissionProfilePathScope::GlobPattern => {
+                self.has_unrepresentable_read_scope = true;
+            }
+        }
+    }
+
+    fn read_covers_path(&self, path: &Path) -> bool {
+        self.read_special_kinds.contains("root")
+            || self.write_covers_path(path)
+            || (self.read_special_kinds.contains("slash_tmp")
+                && path.starts_with(Path::new("/tmp")))
+            || self
+                .read_paths
+                .iter()
+                .any(|read_path| path.starts_with(read_path))
     }
 }
 
@@ -3027,10 +3058,11 @@ fn parse_permission_profile_permissions(value: &Value) -> Result<PermissionProfi
     for entry in entries {
         let path_scope = parse_permission_profile_entry_path(entry)?;
         match entry.get("access").and_then(Value::as_str) {
-            Some("read") => {}
+            Some("read") => permissions.record_read_scope(&path_scope),
             Some("none") => permissions.has_access_denials = true,
             Some("write") => {
                 permissions.allows_write_access = true;
+                permissions.record_read_scope(&path_scope);
                 match path_scope {
                     PermissionProfilePathScope::Absolute(path) => {
                         permissions.write_paths.push(path)
@@ -3150,6 +3182,7 @@ fn ensure_permission_profile_legacy_write_equivalence(
             "thread/resume permissionProfile deny scope cannot be safely represented by legacy sandbox"
         );
     }
+    ensure_permission_profile_covers_legacy_read_access(profile, sandbox)?;
     if !profile.allows_write_access {
         return Ok(());
     }
@@ -3169,6 +3202,55 @@ fn ensure_permission_profile_legacy_write_equivalence(
         }
         "readOnly" => bail!("readOnly sandbox cannot match a writable permissionProfile"),
         other => bail!("thread/resume returned unknown sandbox type {other:?}"),
+    }
+}
+
+fn ensure_permission_profile_covers_legacy_read_access(
+    profile: &PermissionProfilePermissions,
+    sandbox: &Value,
+) -> Result<()> {
+    match sandbox_policy_type(sandbox)? {
+        "readOnly" => ensure_permission_profile_covers_read_access(
+            profile,
+            sandbox_access(sandbox, "access")?,
+        ),
+        "workspaceWrite" => ensure_permission_profile_covers_read_access(
+            profile,
+            sandbox_access(sandbox, "readOnlyAccess")?,
+        ),
+        "dangerFullAccess" if profile.read_covers_path(Path::new("/")) => Ok(()),
+        "dangerFullAccess" => {
+            bail!("thread/resume permissionProfile does not cover legacy full read access")
+        }
+        "externalSandbox" => {
+            bail!("thread/resume permissionProfile cannot be compared to externalSandbox")
+        }
+        other => bail!("thread/resume returned unknown sandbox type {other:?}"),
+    }
+}
+
+fn ensure_permission_profile_covers_read_access(
+    profile: &PermissionProfilePermissions,
+    access: &Value,
+) -> Result<()> {
+    match read_only_access_type(access)? {
+        "fullAccess" if profile.read_covers_path(Path::new("/")) => Ok(()),
+        "fullAccess" => {
+            bail!("thread/resume permissionProfile does not cover legacy full read access")
+        }
+        "restricted" => {
+            for root in read_only_readable_roots(access)? {
+                let root = normalize_absolute_permission_profile_path(&root)?;
+                if !profile.read_covers_path(&root) {
+                    bail!(
+                        "thread/resume permissionProfile does not cover legacy readableRoot {}",
+                        root.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        other => bail!("sandbox read-only access has unknown type {other:?}"),
     }
 }
 
@@ -8765,6 +8847,10 @@ mod tests {
                 "fileSystem": {
                     "entries": [
                         {
+                            "path": { "type": "path", "path": "/tmp/read" },
+                            "access": "read"
+                        },
+                        {
                             "path": {
                                 "type": "special",
                                 "value": { "kind": "project_roots" }
@@ -8802,6 +8888,10 @@ mod tests {
                 "network": { "enabled": false },
                 "fileSystem": {
                     "entries": [
+                        {
+                            "path": { "type": "path", "path": "/tmp/read" },
+                            "access": "read"
+                        },
                         {
                             "path": {
                                 "type": "special",
@@ -8908,6 +8998,10 @@ mod tests {
                 "fileSystem": {
                     "entries": [
                         {
+                            "path": { "type": "path", "path": "/tmp/read" },
+                            "access": "read"
+                        },
+                        {
                             "path": { "type": "path", "path": "/tmp/work/narrow" },
                             "access": "write"
                         }
@@ -8985,6 +9079,45 @@ mod tests {
         .expect_err("read-side profile denials should not pin legacy read-only sandbox");
 
         assert!(error.to_string().contains("deny scope"));
+    }
+
+    #[test]
+    fn permission_snapshot_rejects_permission_profile_narrower_than_legacy_readable_root() {
+        let cases = [
+            json!({
+                "network": { "enabled": false },
+                "fileSystem": { "entries": [] }
+            }),
+            json!({
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": { "type": "path", "path": "/tmp/read/src" },
+                            "access": "read"
+                        }
+                    ]
+                }
+            }),
+        ];
+
+        for permission_profile in cases {
+            let error = parse_thread_resume_permission_snapshot(&json!({
+                "approvalPolicy": "never",
+                "sandbox": {
+                    "type": "readOnly",
+                    "access": restricted_access(&["/tmp/read"]),
+                    "networkAccess": false
+                },
+                "permissionProfile": permission_profile
+            }))
+            .expect_err("narrower read profile should not pin broader legacy read sandbox");
+
+            assert!(
+                error.to_string().contains("legacy readableRoot"),
+                "unexpected error: {error:#}"
+            );
+        }
     }
 
     #[test]
@@ -9569,6 +9702,10 @@ mod tests {
                         {
                             "path": { "type": "path", "path": "/tmp/work" },
                             "access": "write"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/read" },
+                            "access": "read"
                         },
                         {
                             "path": { "type": "path", "path": "/tmp/other-read" },
