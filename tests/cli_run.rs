@@ -2562,6 +2562,9 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
         vec!["--config=permissions.network.enabled=true"],
         vec!["-cpermissions.file_system.entries=[]"],
         vec!["--config=permission_profile.network.enabled=true"],
+        vec!["--config=default_permissions=\"read-only\""],
+        vec!["-cdefault-permissions=\"workspace-write\""],
+        vec!["--config=defaultPermissions=\"trusted-all\""],
     ];
 
     for (index, args) in cases.into_iter().enumerate() {

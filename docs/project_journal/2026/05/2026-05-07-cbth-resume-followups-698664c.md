@@ -48,6 +48,7 @@ superseded_by:
   - Follow-up clean-context review found that the `--config` guard missed canonical permission config roots. The guard now also rejects `sandbox_permissions.*`, `permissions.*`, and likely permission-profile aliases until those overrides can be represented in the sidecar's initial `thread/resume`.
   - Follow-up clean-context review found that read-only canonical profiles with nested `access: "none"` denials were accepted even though automatic `turn/start` can only emit legacy sandbox fields. The parser now fail-closes any canonical deny scope until exact permission profile pinning exists.
   - A further clean-context review found canonical read allow scopes could also be narrower than legacy readable roots. The parser now requires canonical read/write coverage to cover legacy `access` / `readOnlyAccess` readable roots before trusting a canonical profile.
+  - Follow-up clean-context review found `--config default_permissions=...` also selects a canonical permission profile while bypassing initial sidecar resume params. The managed resume config guard now rejects `default_permissions` / `default-permissions` / `defaultPermissions`, and resume arg validation now runs before daemon startup so invalid forwarded args fail before managed flow setup.
 - Validation:
   - `cargo fmt --all -- --check`
   - `cargo clippy --locked --all-targets -- -D warnings`
@@ -61,6 +62,7 @@ superseded_by:
   - `cargo test --locked permission_snapshot_accepts_project_roots_permission_profile_for_legacy_workspace_write --lib`
   - `cargo test --locked permission_snapshot_rejects_project_roots_subpath_for_legacy_workspace_write --lib`
   - `cargo test --locked cbth_resume_rejects_permission_affecting_config_overrides --test cli_run` (including canonical permission config root cases)
+  - `cargo test --locked cbth_resume_rejects_permission_affecting_config_overrides --test cli_run` after adding `default_permissions` aliases to the rejection matrix.
   - `cargo test --locked permission_drift_tracks_permission_profile_body_changes --lib`
   - `CARGO_TARGET_DIR=.codex-tmp/cargo-target-precommit git commit -S ...` pre-commit hook passed `cargo fmt --all`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked` in an isolated target directory after the shared target produced a cross-worktree binary mismatch.
   - `uv run python /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/hoteng/.codex/worktrees/aef0/codex-background-task-handler`

@@ -1795,6 +1795,8 @@ fn run_cli_session(
     let lease_id = new_id();
     layout.ensure_run_dir()?;
     warn_if_codex_cli_version_unvalidated(&codex_binary, layout);
+    let mut foreground = foreground_codex_args(&config.foreground_mode, &cwd, &config.codex_args)?;
+    validate_codex_resume_foreground_args(&config.foreground_mode, &cwd, &foreground.codex_args)?;
 
     validate_daemon_autostart_endpoint(layout)?;
     daemon_ensure(
@@ -1808,24 +1810,6 @@ fn run_cli_session(
     let target =
         resolve_cli_run_thread_target(layout, &config.target, &codex_binary, &cwd, &lease_id)?;
     let bound_thread_id = target.bound_thread_id.clone();
-    let mut foreground =
-        match foreground_codex_args(&config.foreground_mode, &cwd, &config.codex_args) {
-            Ok(args) => args,
-            Err(error) => {
-                abort_cli_thread_start_bootstrap_best_effort(
-                    layout,
-                    &target.bootstrap_id,
-                    &lease_id,
-                );
-                return Err(error);
-            }
-        };
-    if let Err(error) =
-        validate_codex_resume_foreground_args(&config.foreground_mode, &cwd, &foreground.codex_args)
-    {
-        abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
-        return Err(error);
-    }
     reserve_cli_app_server_for_thread(layout, &bound_thread_id, &lease_id).inspect_err(|_| {
         abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
     })?;
@@ -2637,6 +2621,10 @@ fn managed_resume_config_override_affects_sandbox_scope(key: &str) -> bool {
         || key.starts_with("permission_profile.")
         || key == "permissionProfile"
         || key.starts_with("permissionProfile.")
+        || key == "default_permissions"
+        || key.starts_with("default_permissions.")
+        || key == "defaultPermissions"
+        || key.starts_with("defaultPermissions.")
         || key == "writable_roots"
         || key.ends_with(".writable_roots")
         || key == "readable_roots"
