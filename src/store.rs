@@ -16,14 +16,16 @@ use crate::fs_layout::{
 use crate::models::{
     ArtifactRecord, AuditDecisionRecord, BatchInspect, BatchJobRecord, BatchRecord,
     CliManagedSessionActivityUpdate, CliManagedSessionAttach, CliManagedSessionCapabilities,
-    CliManagedSessionCapabilityUpdate, CliManagedSessionProfile,
+    CliManagedSessionCapabilityUpdate, CliManagedSessionPermissionUpdate,
+    CliManagedSessionPermissions, CliManagedSessionProfile, CliManagedSessionProfileRequirement,
     CliManagedSessionProofInvalidation, CliManagedSessionRecord, CliManagedSessionRetirement,
     DEFAULT_REDELIVERY_WINDOW_SECONDS, DaemonLifecycleStatus, DeliveryAttemptRecord,
     DeliveryPolicy, DesktopArmPendingRecord, DesktopArmRecord, DesktopBindingRecord,
     DesktopBindingRepairRecord, DesktopInstallationRepairRecord, DesktopInstallationStateRecord,
     JobRecord, LostPendingTaskProcess, NewArtifact, NewAuditDecision, NewBatch,
-    NewCliAcceptPendingAttempt, NewDesktopInstallationRepair, NewJob, NewTask,
-    ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport, TaskRecord,
+    NewCliAcceptPendingAttempt, NewCliManagedSessionPermissionSnapshot,
+    NewDesktopInstallationRepair, NewJob, NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS,
+    POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport, TaskRecord,
 };
 
 const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
@@ -917,6 +919,7 @@ impl Store {
         &mut self,
         bound_thread_id: &str,
         profile: CliManagedSessionProfile,
+        profile_requirement: CliManagedSessionProfileRequirement,
         now: i64,
     ) -> Result<CliManagedSessionAttach> {
         let tx = self
@@ -925,7 +928,8 @@ impl Store {
         if let Some(existing) =
             query_non_retired_cli_managed_session_by_thread_tx(&tx, bound_thread_id)?
         {
-            if ensure_cli_session_profile_matches(&existing, &profile).is_ok()
+            if ensure_cli_session_profile_matches_requirement(&existing, &profile_requirement)
+                .is_ok()
                 && ensure_cli_session_attachable(&existing).is_ok()
             {
                 ensure_cli_session_has_no_recovery_blockers_tx(&tx, &existing, "reattaching")?;
@@ -948,6 +952,12 @@ impl Store {
                          capability_negative_terminal_events = 0,
                          capability_thread_start = 0,
                          capability_turn_steer = 0,
+                         startup_session_allows_approval = NULL,
+                         startup_session_allows_network = NULL,
+                         startup_session_allows_write_access = NULL,
+                         startup_permission_snapshot_json = NULL,
+                         last_permission_snapshot_json = NULL,
+                         permission_snapshot_revision = 0,
                          updated_at = ?
                      WHERE managed_session_id = ?",
                     params![now, existing.managed_session_id],
@@ -1151,6 +1161,84 @@ impl Store {
         let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
         tx.commit()?;
         Ok(CliManagedSessionCapabilityUpdate { session })
+    }
+
+    pub fn note_cli_managed_session_permissions(
+        &mut self,
+        managed_session_id: &str,
+        session_epoch: i64,
+        snapshot: NewCliManagedSessionPermissionSnapshot,
+        now: i64,
+    ) -> Result<CliManagedSessionPermissionUpdate> {
+        ensure_nonempty_value("permission_snapshot_json", &snapshot.snapshot_json)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
+        ensure_cli_session_epoch_matches(&session, session_epoch)?;
+        ensure_cli_session_attachable(&session)?;
+        if let Some(startup) = &snapshot.startup {
+            ensure_cli_session_startup_permissions_can_pin(
+                &session,
+                startup,
+                &snapshot.snapshot_json,
+            )?;
+        } else if !cli_session_startup_permissions_are_pinned(&session) {
+            bail!(
+                "CLI managed session {} has no startup permission snapshot",
+                session.managed_session_id
+            );
+        }
+
+        let (startup_approval, startup_network, startup_write, startup_json) =
+            match &snapshot.startup {
+                Some(startup) if !cli_session_startup_permissions_are_pinned(&session) => (
+                    Some(bool_to_i64(startup.session_allows_approval)),
+                    Some(bool_to_i64(startup.session_allows_network)),
+                    Some(bool_to_i64(startup.session_allows_write_access)),
+                    Some(snapshot.snapshot_json.clone()),
+                ),
+                _ => (
+                    session.startup_session_allows_approval.map(bool_to_i64),
+                    session.startup_session_allows_network.map(bool_to_i64),
+                    session.startup_session_allows_write_access.map(bool_to_i64),
+                    session.startup_permission_snapshot_json.clone(),
+                ),
+            };
+        let next_revision = session
+            .permission_snapshot_revision
+            .checked_add(1)
+            .context("CLI permission snapshot revision overflow")?;
+        tx.execute(
+            "UPDATE cli_managed_sessions
+             SET session_allows_approval = ?,
+                 session_allows_network = ?,
+                 session_allows_write_access = ?,
+                 startup_session_allows_approval = ?,
+                 startup_session_allows_network = ?,
+                 startup_session_allows_write_access = ?,
+                 startup_permission_snapshot_json = ?,
+                 last_permission_snapshot_json = ?,
+                 permission_snapshot_revision = ?,
+                 updated_at = ?
+             WHERE managed_session_id = ?",
+            params![
+                bool_to_i64(snapshot.effective.session_allows_approval),
+                bool_to_i64(snapshot.effective.session_allows_network),
+                bool_to_i64(snapshot.effective.session_allows_write_access),
+                startup_approval,
+                startup_network,
+                startup_write,
+                startup_json,
+                snapshot.snapshot_json,
+                next_revision,
+                now,
+                managed_session_id,
+            ],
+        )?;
+        let session = query_cli_managed_session_tx(&tx, managed_session_id)?;
+        tx.commit()?;
+        Ok(CliManagedSessionPermissionUpdate { session })
     }
 
     pub fn invalidate_cli_managed_session_proof(
@@ -2738,6 +2826,12 @@ fn migrate(conn: &Connection) -> Result<()> {
             session_allows_approval INTEGER NOT NULL,
             session_allows_network INTEGER NOT NULL,
             session_allows_write_access INTEGER NOT NULL,
+            startup_session_allows_approval INTEGER,
+            startup_session_allows_network INTEGER,
+            startup_session_allows_write_access INTEGER,
+            startup_permission_snapshot_json TEXT,
+            last_permission_snapshot_json TEXT,
+            permission_snapshot_revision INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             retired_at INTEGER
@@ -2928,6 +3022,42 @@ fn migrate(conn: &Connection) -> Result<()> {
         "cli_managed_sessions",
         "capability_turn_steer",
         "ALTER TABLE cli_managed_sessions ADD COLUMN capability_turn_steer INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "startup_session_allows_approval",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN startup_session_allows_approval INTEGER",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "startup_session_allows_network",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN startup_session_allows_network INTEGER",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "startup_session_allows_write_access",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN startup_session_allows_write_access INTEGER",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "startup_permission_snapshot_json",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN startup_permission_snapshot_json TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "last_permission_snapshot_json",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN last_permission_snapshot_json TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "cli_managed_sessions",
+        "permission_snapshot_revision",
+        "ALTER TABLE cli_managed_sessions ADD COLUMN permission_snapshot_revision INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
         conn,
@@ -3192,6 +3322,12 @@ fn retire_cli_managed_session_tx(
              capability_negative_terminal_events = 0,
              capability_thread_start = 0,
              capability_turn_steer = 0,
+             startup_session_allows_approval = NULL,
+             startup_session_allows_network = NULL,
+             startup_session_allows_write_access = NULL,
+             startup_permission_snapshot_json = NULL,
+             last_permission_snapshot_json = NULL,
+             permission_snapshot_revision = 0,
              updated_at = ?,
              retired_at = ?
          WHERE managed_session_id = ?
@@ -3266,6 +3402,8 @@ fn invalidate_cli_managed_session_activity_tx(
              capability_negative_terminal_events = 0,
              capability_thread_start = 0,
              capability_turn_steer = 0,
+             last_permission_snapshot_json = NULL,
+             permission_snapshot_revision = 0,
              updated_at = ?
          WHERE managed_session_id = ?
            AND session_epoch = ?
@@ -3312,6 +3450,12 @@ fn park_cli_managed_session_tx(
              capability_negative_terminal_events = 0,
              capability_thread_start = 0,
              capability_turn_steer = 0,
+             startup_session_allows_approval = NULL,
+             startup_session_allows_network = NULL,
+             startup_session_allows_write_access = NULL,
+             startup_permission_snapshot_json = NULL,
+             last_permission_snapshot_json = NULL,
+             permission_snapshot_revision = 0,
              updated_at = ?
          WHERE managed_session_id = ?
            AND session_state IN ('live', 'detached', 'stale')",
@@ -4535,6 +4679,18 @@ fn cli_managed_session_from_row(
         session_allows_approval: row.get::<_, i64>("session_allows_approval")? != 0,
         session_allows_network: row.get::<_, i64>("session_allows_network")? != 0,
         session_allows_write_access: row.get::<_, i64>("session_allows_write_access")? != 0,
+        startup_session_allows_approval: optional_i64_to_bool(
+            row.get::<_, Option<i64>>("startup_session_allows_approval")?,
+        ),
+        startup_session_allows_network: optional_i64_to_bool(
+            row.get::<_, Option<i64>>("startup_session_allows_network")?,
+        ),
+        startup_session_allows_write_access: optional_i64_to_bool(
+            row.get::<_, Option<i64>>("startup_session_allows_write_access")?,
+        ),
+        startup_permission_snapshot_json: row.get("startup_permission_snapshot_json")?,
+        last_permission_snapshot_json: row.get("last_permission_snapshot_json")?,
+        permission_snapshot_revision: row.get("permission_snapshot_revision")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         retired_at: row.get("retired_at")?,
@@ -4843,18 +4999,57 @@ fn ensure_desktop_attempt_head_and_batch_eligible(
     ensure_attempt_is_current_generation_tx(tx, attempt)
 }
 
-fn ensure_cli_session_profile_matches(
+fn ensure_cli_session_profile_matches_requirement(
     session: &CliManagedSessionRecord,
-    profile: &CliManagedSessionProfile,
+    requirement: &CliManagedSessionProfileRequirement,
 ) -> Result<()> {
-    if session.session_allows_approval == profile.session_allows_approval
-        && session.session_allows_network == profile.session_allows_network
-        && session.session_allows_write_access == profile.session_allows_write_access
-    {
+    let approval_matches = requirement
+        .session_allows_approval
+        .is_none_or(|required| session.session_allows_approval == required);
+    let network_matches = requirement
+        .session_allows_network
+        .is_none_or(|required| session.session_allows_network == required);
+    let write_matches = requirement
+        .session_allows_write_access
+        .is_none_or(|required| session.session_allows_write_access == required);
+    if approval_matches && network_matches && write_matches {
         Ok(())
     } else {
         bail!(
             "CLI managed session {} profile does not match requested profile",
+            session.managed_session_id
+        )
+    }
+}
+
+fn cli_session_startup_permissions_are_pinned(session: &CliManagedSessionRecord) -> bool {
+    session.startup_session_allows_approval.is_some()
+        && session.startup_session_allows_network.is_some()
+        && session.startup_session_allows_write_access.is_some()
+        && session.startup_permission_snapshot_json.is_some()
+}
+
+fn cli_session_current_permission_snapshot_is_fresh(session: &CliManagedSessionRecord) -> bool {
+    session.last_permission_snapshot_json.is_some() && session.permission_snapshot_revision > 0
+}
+
+fn ensure_cli_session_startup_permissions_can_pin(
+    session: &CliManagedSessionRecord,
+    startup: &CliManagedSessionPermissions,
+    snapshot_json: &str,
+) -> Result<()> {
+    if !cli_session_startup_permissions_are_pinned(session) {
+        return Ok(());
+    }
+    if session.startup_session_allows_approval == Some(startup.session_allows_approval)
+        && session.startup_session_allows_network == Some(startup.session_allows_network)
+        && session.startup_session_allows_write_access == Some(startup.session_allows_write_access)
+        && session.startup_permission_snapshot_json.as_deref() == Some(snapshot_json)
+    {
+        Ok(())
+    } else {
+        bail!(
+            "CLI managed session {} startup permission snapshot is already pinned",
             session.managed_session_id
         )
     }
@@ -4956,6 +5151,8 @@ fn cli_session_proof_is_clear(session: &CliManagedSessionRecord) -> bool {
         && !session.capability_negative_terminal_events
         && !session.capability_thread_start
         && !session.capability_turn_steer
+        && session.last_permission_snapshot_json.is_none()
+        && session.permission_snapshot_revision == 0
 }
 
 fn ensure_cli_session_activity_revision_can_advance(
@@ -5123,6 +5320,14 @@ fn ensure_cli_session_identity_allows_delivery(
         ),
     }
     if authorization_mode == "strict_safe" {
+        if cli_session_startup_permissions_are_pinned(session)
+            && !cli_session_current_permission_snapshot_is_fresh(session)
+        {
+            bail!(
+                "CLI managed session {} does not have a fresh permission snapshot",
+                session.managed_session_id
+            )
+        }
         if !session.session_allows_approval
             && !session.session_allows_network
             && !session.session_allows_write_access
@@ -5389,6 +5594,10 @@ fn cli_turn_observation_is_after_deadline(
 
 fn bool_to_i64(value: bool) -> i64 {
     i64::from(value)
+}
+
+fn optional_i64_to_bool(value: Option<i64>) -> Option<bool> {
+    value.map(|value| value != 0)
 }
 
 fn checked_timestamp_add(now: i64, delta: i64, field_name: &str) -> Result<i64> {
@@ -5987,6 +6196,11 @@ mod tests {
                     session_allows_approval: false,
                     session_allows_network: false,
                     session_allows_write_access: false,
+                },
+                CliManagedSessionProfileRequirement {
+                    session_allows_approval: Some(false),
+                    session_allows_network: Some(false),
+                    session_allows_write_access: Some(false),
                 },
                 0,
             )

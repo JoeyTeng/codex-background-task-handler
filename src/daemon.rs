@@ -80,6 +80,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "cli-thread-start-bootstrap",
     "cli-session-dispatch",
     "cli-session-capability-dispatch",
+    "cli-session-permission-dispatch",
     "cli-session-proof-invalidation-dispatch",
     "cli-session-recovery-dispatch",
     "cli-turn-observation-dispatch",
@@ -5097,6 +5098,11 @@ mod tests {
                     session_allows_approval: false,
                     session_allows_network: false,
                     session_allows_write_access: false,
+                },
+                crate::models::CliManagedSessionProfileRequirement {
+                    session_allows_approval: Some(false),
+                    session_allows_network: Some(false),
+                    session_allows_write_access: Some(false),
                 },
                 100,
             )

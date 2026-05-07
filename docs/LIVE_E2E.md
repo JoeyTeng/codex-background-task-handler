@@ -124,6 +124,8 @@ cbth cli run \
   -- --model gpt-5.5
 ```
 
+For an already materialized thread, `cbth resume <thread-id> [-- <codex_args>]` is the preferred native-resume wrapper. The three `--session-allows-*` flags default to `auto` there: the sidecar reads `approvalPolicy` / `sandbox` from `thread/resume`, pins the startup permission snapshot, refreshes current permissions before automatic `turn/start`, and warns/audits if permissions drift. This fresh-thread smoke keeps explicit `false` flags because the unmaterialized `--new-thread` bootstrap may not have a trusted `thread/resume` permission snapshot before the first user message.
+
 Copy the thread id from the stderr line:
 
 ```text

@@ -1,12 +1,15 @@
+use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,10 +38,11 @@ use crate::fs_layout::{
     validate_id_path_component,
 };
 use crate::models::{
-    CliManagedSessionCapabilities, CliManagedSessionProfile, DEFAULT_MAX_DELIVERY_ATTEMPTS,
+    CliManagedSessionCapabilities, CliManagedSessionPermissions, CliManagedSessionProfile,
+    CliManagedSessionProfileRequirement, DEFAULT_MAX_DELIVERY_ATTEMPTS,
     DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, DesktopInstallationStateRecord,
-    NewAuditDecision, NewCliAcceptPendingAttempt, NewDesktopInstallationRepair, NewJob,
-    PartialDeliveryPolicy, SubmitMetadata, SweepReport,
+    NewAuditDecision, NewCliAcceptPendingAttempt, NewCliManagedSessionPermissionSnapshot,
+    NewDesktopInstallationRepair, NewJob, PartialDeliveryPolicy, SubmitMetadata, SweepReport,
 };
 use crate::self_update::{SelfUpdateOptions, current_release_target_triple, run_self_update};
 use crate::store::{Store, new_id};
@@ -78,6 +82,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "cli-thread-start-bootstrap",
     "cli-session-dispatch",
     "cli-session-capability-dispatch",
+    "cli-session-permission-dispatch",
     "cli-session-proof-invalidation-dispatch",
     "cli-session-recovery-dispatch",
     "cli-turn-observation-dispatch",
@@ -140,6 +145,8 @@ enum Commands {
         #[command(subcommand)]
         command: SelfCommand,
     },
+    #[command(about = "Resume an existing Codex thread through the managed cbth CLI bridge")]
+    Resume(CliResumeArgs),
     Cli {
         #[command(subcommand)]
         command: CliCommand,
@@ -640,6 +647,8 @@ enum CliSessionCommand {
     #[command(hide = true)]
     NoteCapabilities(CliSessionNoteCapabilitiesArgs),
     #[command(hide = true)]
+    NotePermissions(CliSessionNotePermissionsArgs),
+    #[command(hide = true)]
     InvalidateProof(CliSessionInvalidateProofArgs),
     #[command(about = "Inspect one managed CLI session")]
     Inspect(CliSessionInspectArgs),
@@ -657,14 +666,68 @@ struct CliRunArgs {
     #[arg(long, conflicts_with = "bind_thread_id")]
     new_thread: bool,
 
-    #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
-    session_allows_approval: bool,
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_approval: SessionAllowsValue,
 
-    #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
-    session_allows_network: bool,
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_network: SessionAllowsValue,
 
-    #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
-    session_allows_write_access: bool,
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_write_access: SessionAllowsValue,
+
+    #[arg(long, default_value = "codex")]
+    codex_bin: OsString,
+
+    #[arg(long, value_enum, default_value_t = CliAutoDeliveryPolicy::Off)]
+    auto_delivery_policy: CliAutoDeliveryPolicy,
+
+    #[arg(last = true)]
+    codex_args: Vec<OsString>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionAllowsValue {
+    Auto,
+    Explicit(bool),
+}
+
+impl fmt::Display for SessionAllowsValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Explicit(true) => f.write_str("true"),
+            Self::Explicit(false) => f.write_str("false"),
+        }
+    }
+}
+
+impl FromStr for SessionAllowsValue {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "true" => Ok(Self::Explicit(true)),
+            "false" => Ok(Self::Explicit(false)),
+            other => Err(format!(
+                "invalid session permission value {other:?}; expected auto, true, or false"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct CliResumeArgs {
+    thread_id: String,
+
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_approval: SessionAllowsValue,
+
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_network: SessionAllowsValue,
+
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_write_access: SessionAllowsValue,
 
     #[arg(long, default_value = "codex")]
     codex_bin: OsString,
@@ -960,6 +1023,150 @@ impl CliAutoDeliveryPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CliSessionPermissionInputs {
+    approval: SessionAllowsValue,
+    network: SessionAllowsValue,
+    write_access: SessionAllowsValue,
+}
+
+impl CliSessionPermissionInputs {
+    fn initial_profile(&self) -> CliManagedSessionProfile {
+        CliManagedSessionProfile {
+            session_allows_approval: self.approval.explicit_value().unwrap_or(false),
+            session_allows_network: self.network.explicit_value().unwrap_or(false),
+            session_allows_write_access: self.write_access.explicit_value().unwrap_or(false),
+        }
+    }
+
+    fn profile_requirement(
+        &self,
+        profile: &CliManagedSessionProfile,
+    ) -> CliManagedSessionProfileRequirement {
+        if !self.uses_auto() {
+            return CliManagedSessionProfileRequirement::all(profile);
+        }
+        CliManagedSessionProfileRequirement {
+            session_allows_approval: self
+                .approval
+                .is_explicit()
+                .then_some(profile.session_allows_approval),
+            session_allows_network: self
+                .network
+                .is_explicit()
+                .then_some(profile.session_allows_network),
+            session_allows_write_access: self
+                .write_access
+                .is_explicit()
+                .then_some(profile.session_allows_write_access),
+        }
+    }
+
+    fn uses_auto(&self) -> bool {
+        matches!(self.approval, SessionAllowsValue::Auto)
+            || matches!(self.network, SessionAllowsValue::Auto)
+            || matches!(self.write_access, SessionAllowsValue::Auto)
+    }
+
+    fn resolve(&self, snapshot: &CliPermissionSnapshot) -> CliResolvedPermissions {
+        CliResolvedPermissions {
+            allows_approval: self
+                .approval
+                .explicit_value()
+                .unwrap_or(snapshot.allows_approval),
+            allows_network: self
+                .network
+                .explicit_value()
+                .unwrap_or(snapshot.allows_network),
+            allows_write_access: self
+                .write_access
+                .explicit_value()
+                .unwrap_or(snapshot.allows_write_access),
+        }
+    }
+}
+
+impl SessionAllowsValue {
+    fn explicit_value(&self) -> Option<bool> {
+        match self {
+            Self::Auto => None,
+            Self::Explicit(value) => Some(*value),
+        }
+    }
+
+    fn is_explicit(&self) -> bool {
+        matches!(self, Self::Explicit(_))
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CliSessionTargetConfig {
+    BindThread { thread_id: String },
+    NewThread,
+}
+
+#[derive(Clone, Debug)]
+enum CliForegroundMode {
+    Remote,
+    Resume { thread_id: String },
+}
+
+#[derive(Clone, Debug)]
+struct CliSessionRunConfig {
+    target: CliSessionTargetConfig,
+    permission_inputs: CliSessionPermissionInputs,
+    codex_bin: OsString,
+    auto_delivery_policy: CliAutoDeliveryPolicy,
+    codex_args: Vec<OsString>,
+    foreground_mode: CliForegroundMode,
+}
+
+impl CliSessionRunConfig {
+    fn from_cli_run_args(args: CliRunArgs) -> Result<Self> {
+        let target = match (args.bind_thread_id, args.new_thread) {
+            (Some(thread_id), false) => CliSessionTargetConfig::BindThread { thread_id },
+            (None, true) => CliSessionTargetConfig::NewThread,
+            (None, false) => {
+                bail!("cli run requires either --bind-thread-id <thread-id> or --new-thread")
+            }
+            (Some(_), true) => {
+                bail!("cli run accepts only one of --bind-thread-id or --new-thread")
+            }
+        };
+        Ok(Self {
+            target,
+            permission_inputs: CliSessionPermissionInputs {
+                approval: args.session_allows_approval,
+                network: args.session_allows_network,
+                write_access: args.session_allows_write_access,
+            },
+            codex_bin: args.codex_bin,
+            auto_delivery_policy: args.auto_delivery_policy,
+            codex_args: args.codex_args,
+            foreground_mode: CliForegroundMode::Remote,
+        })
+    }
+
+    fn from_cli_resume_args(args: CliResumeArgs) -> Self {
+        Self {
+            target: CliSessionTargetConfig::BindThread {
+                thread_id: args.thread_id.clone(),
+            },
+            permission_inputs: CliSessionPermissionInputs {
+                approval: args.session_allows_approval,
+                network: args.session_allows_network,
+                write_access: args.session_allows_write_access,
+            },
+            codex_bin: args.codex_bin,
+            auto_delivery_policy: args.auto_delivery_policy,
+            codex_args: args.codex_args,
+            foreground_mode: CliForegroundMode::Resume {
+                thread_id: args.thread_id,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct CliSessionBindArgs {
     #[arg(long)]
@@ -973,6 +1180,18 @@ struct CliSessionBindArgs {
 
     #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
     session_allows_write_access: bool,
+
+    #[arg(long, hide = true, default_value_t = false)]
+    auto_profile: bool,
+
+    #[arg(long, hide = true, default_value_t = false)]
+    session_allows_approval_explicit: bool,
+
+    #[arg(long, hide = true, default_value_t = false)]
+    session_allows_network_explicit: bool,
+
+    #[arg(long, hide = true, default_value_t = false)]
+    session_allows_write_access_explicit: bool,
 
     #[arg(long, hide = true)]
     now: Option<i64>,
@@ -1049,6 +1268,39 @@ struct CliSessionNoteCapabilitiesArgs {
 
     #[arg(long, value_parser = clap::value_parser!(bool), default_value_t = false, action = clap::ArgAction::Set)]
     turn_steer: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct CliSessionNotePermissionsArgs {
+    #[arg(long)]
+    managed_session_id: String,
+
+    #[arg(long)]
+    session_epoch: i64,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    effective_allows_approval: bool,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    effective_allows_network: bool,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    effective_allows_write_access: bool,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    startup_allows_approval: Option<bool>,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    startup_allows_network: Option<bool>,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    startup_allows_write_access: Option<bool>,
+
+    #[arg(long)]
+    snapshot_json: String,
 
     #[arg(long, hide = true)]
     now: Option<i64>,
@@ -1190,8 +1442,18 @@ pub fn run() -> Result<()> {
             if cli.direct_store {
                 bail!("cli run does not support --direct-store");
             }
+            let config = CliSessionRunConfig::from_cli_run_args(args)?;
             let exit_code =
-                run_cli_session(args, &layout, cli.auto_daemon_startup_timeout_seconds)?;
+                run_cli_session(config, &layout, cli.auto_daemon_startup_timeout_seconds)?;
+            std::process::exit(exit_code);
+        }
+        Commands::Resume(args) => {
+            if cli.direct_store {
+                bail!("resume does not support --direct-store");
+            }
+            let config = CliSessionRunConfig::from_cli_resume_args(args);
+            let exit_code =
+                run_cli_session(config, &layout, cli.auto_daemon_startup_timeout_seconds)?;
             std::process::exit(exit_code);
         }
         Commands::Self_ {
@@ -1476,6 +1738,7 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
             check: args.check,
             yes: args.yes,
         }),
+        Commands::Resume(_) => bail!("resume must execute from the foreground client"),
         Commands::Cli { command } => dispatch_cli(command, layout),
         Commands::Desktop { command } => dispatch_desktop(command, layout),
         Commands::Maintenance { command } => dispatch_maintenance(command, layout),
@@ -1484,12 +1747,12 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
 }
 
 fn run_cli_session(
-    args: CliRunArgs,
+    config: CliSessionRunConfig,
     layout: &FsLayout,
     startup_timeout_seconds: u64,
 ) -> Result<i32> {
-    validate_cli_run_target_args(&args)?;
-    let codex_binary = resolve_executable(&args.codex_bin)?;
+    validate_cli_session_target(&config.target)?;
+    let codex_binary = resolve_executable(&config.codex_bin)?;
     let cwd = env::current_dir().context("read current directory")?;
     let lease_id = new_id();
 
@@ -1502,20 +1765,59 @@ fn run_cli_session(
             startup_sweep_now: Some(now_epoch_seconds()?),
         },
     )?;
-    let target = resolve_cli_run_thread_target(layout, &args, &codex_binary, &cwd, &lease_id)?;
+    let target =
+        resolve_cli_run_thread_target(layout, &config.target, &codex_binary, &cwd, &lease_id)?;
     let bound_thread_id = target.bound_thread_id.clone();
+    let (foreground_cwd, foreground_codex_args) =
+        match foreground_codex_args(&config.foreground_mode, &cwd, &config.codex_args) {
+            Ok(args) => args,
+            Err(error) => {
+                abort_cli_thread_start_bootstrap_best_effort(
+                    layout,
+                    &target.bootstrap_id,
+                    &lease_id,
+                );
+                return Err(error);
+            }
+        };
+    let initial_thread_resume_params = match initial_passive_thread_resume_params(
+        &config.foreground_mode,
+        &bound_thread_id,
+        &foreground_cwd,
+        &foreground_codex_args,
+    ) {
+        Ok(params) => params,
+        Err(error) => {
+            abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
+            return Err(error);
+        }
+    };
     reserve_cli_app_server_for_thread(layout, &bound_thread_id, &lease_id).inspect_err(|_| {
         abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
     })?;
 
+    let initial_profile = config.permission_inputs.initial_profile();
+    let profile_requirement = config
+        .permission_inputs
+        .profile_requirement(&initial_profile);
     let bind = match dispatch(
         Commands::Cli {
             command: CliCommand::Session {
                 command: CliSessionCommand::Bind(CliSessionBindArgs {
                     bound_thread_id: bound_thread_id.clone(),
-                    session_allows_approval: args.session_allows_approval,
-                    session_allows_network: args.session_allows_network,
-                    session_allows_write_access: args.session_allows_write_access,
+                    session_allows_approval: initial_profile.session_allows_approval,
+                    session_allows_network: initial_profile.session_allows_network,
+                    session_allows_write_access: initial_profile.session_allows_write_access,
+                    auto_profile: config.permission_inputs.uses_auto(),
+                    session_allows_approval_explicit: profile_requirement
+                        .session_allows_approval
+                        .is_some(),
+                    session_allows_network_explicit: profile_requirement
+                        .session_allows_network
+                        .is_some(),
+                    session_allows_write_access_explicit: profile_requirement
+                        .session_allows_write_access
+                        .is_some(),
                     now: None,
                 }),
             },
@@ -1572,16 +1874,25 @@ fn run_cli_session(
             session_epoch,
             activity_revision,
             capability_revision,
-            auto_delivery_policy: args.auto_delivery_policy,
+            auto_delivery_policy: config.auto_delivery_policy,
             fresh_thread_bootstrap: target.bootstrap_id.is_some(),
+            permission_inputs: config.permission_inputs,
+            initial_thread_resume_params,
         });
 
-    let foreground_status = Command::new(&codex_binary)
+    let mut foreground = Command::new(&codex_binary);
+    match &config.foreground_mode {
+        CliForegroundMode::Remote => {}
+        CliForegroundMode::Resume { thread_id } => {
+            foreground.arg("resume").arg(thread_id);
+        }
+    }
+    let foreground_status = foreground
         .arg("--remote")
         .arg(&url)
         .arg("--cd")
-        .arg(&cwd)
-        .args(args.codex_args)
+        .arg(&foreground_cwd)
+        .args(foreground_codex_args)
         .status()
         .with_context(|| format!("spawn foreground codex via {:?}", codex_binary));
     let passive_stop_result = passive_adapter.stop();
@@ -1603,14 +1914,12 @@ fn run_cli_session(
     Ok(status.code().unwrap_or(1))
 }
 
-fn validate_cli_run_target_args(args: &CliRunArgs) -> Result<()> {
-    match (&args.bind_thread_id, args.new_thread) {
-        (Some(bound_thread_id), false) => validate_nonempty("bind_thread_id", bound_thread_id),
-        (None, true) => Ok(()),
-        (None, false) => {
-            bail!("cli run requires either --bind-thread-id <thread-id> or --new-thread")
+fn validate_cli_session_target(target: &CliSessionTargetConfig) -> Result<()> {
+    match target {
+        CliSessionTargetConfig::BindThread { thread_id } => {
+            validate_nonempty("thread_id", thread_id)
         }
-        (Some(_), true) => bail!("cli run accepts only one of --bind-thread-id or --new-thread"),
+        CliSessionTargetConfig::NewThread => Ok(()),
     }
 }
 
@@ -1621,16 +1930,19 @@ struct CliRunThreadTarget {
 
 fn resolve_cli_run_thread_target(
     layout: &FsLayout,
-    args: &CliRunArgs,
+    target: &CliSessionTargetConfig,
     codex_binary: &OsStr,
     cwd: &Path,
     lease_id: &str,
 ) -> Result<CliRunThreadTarget> {
-    if let Some(bound_thread_id) = &args.bind_thread_id {
-        return Ok(CliRunThreadTarget {
-            bound_thread_id: bound_thread_id.clone(),
-            bootstrap_id: None,
-        });
+    match target {
+        CliSessionTargetConfig::BindThread { thread_id } => {
+            return Ok(CliRunThreadTarget {
+                bound_thread_id: thread_id.clone(),
+                bootstrap_id: None,
+            });
+        }
+        CliSessionTargetConfig::NewThread => {}
     }
     let cwd = cwd
         .as_os_str()
@@ -1699,6 +2011,437 @@ fn ensure_cli_run_app_server(
         command.1,
         Duration::from_secs(CLI_APP_SERVER_ENSURE_TIMEOUT_SECONDS),
     )
+}
+
+fn foreground_codex_args(
+    foreground_mode: &CliForegroundMode,
+    caller_cwd: &Path,
+    codex_args: &[OsString],
+) -> Result<(PathBuf, Vec<OsString>)> {
+    if !matches!(foreground_mode, CliForegroundMode::Resume { .. }) {
+        return Ok((caller_cwd.to_path_buf(), codex_args.to_vec()));
+    }
+    let mut foreground_cwd = caller_cwd.to_path_buf();
+    let mut filtered = Vec::with_capacity(codex_args.len());
+    let mut index = 0;
+    while index < codex_args.len() {
+        let arg = os_arg_to_utf8(&codex_args[index], "codex argument")?;
+        if arg == "--" || arg == "-" || !arg.starts_with('-') {
+            filtered.extend(codex_args[index..].iter().cloned());
+            break;
+        }
+        if let Some(flag) = managed_resume_remote_override_flag(&arg) {
+            reject_managed_resume_remote_override(flag)?;
+        } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
+            reject_managed_resume_add_dir_override(flag)?;
+        } else if let Some(value) = arg.strip_prefix("--cd=") {
+            foreground_cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
+        } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
+            foreground_cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
+        } else if arg.strip_prefix("--image=").is_some()
+            || arg
+                .strip_prefix("-i")
+                .is_some_and(|value| !value.is_empty())
+        {
+            let start = index;
+            skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), true)?;
+            filtered.extend(codex_args[start..=index].iter().cloned());
+        } else {
+            match arg.as_str() {
+                "--cd" | "-C" => {
+                    index += 1;
+                    foreground_cwd = {
+                        let Some(value) = codex_args.get(index) else {
+                            bail!("codex argument {arg} requires a value");
+                        };
+                        resolve_codex_cwd_arg(caller_cwd, value)
+                    };
+                }
+                "--model" | "-m" | "--profile" | "-p" | "--sandbox" | "-s"
+                | "--ask-for-approval" | "-a" | "--config" | "-c" | "--local-provider"
+                | "--enable" | "--disable" => {
+                    let start = index;
+                    skip_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    filtered.extend(codex_args[start..=index].iter().cloned());
+                }
+                "--add-dir" => {
+                    reject_managed_resume_add_dir_override(arg.as_str())?;
+                }
+                "--remote" | "--remote-auth-token-env" => {
+                    reject_managed_resume_remote_override(arg.as_str())?;
+                }
+                "--image" | "-i" => {
+                    let start = index;
+                    skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), false)?;
+                    filtered.extend(codex_args[start..=index].iter().cloned());
+                }
+                _ => {
+                    filtered.push(codex_args[index].clone());
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok((foreground_cwd, filtered))
+}
+
+fn managed_resume_remote_override_flag(arg: &str) -> Option<&'static str> {
+    if arg == "--remote" || arg.starts_with("--remote=") {
+        Some("--remote")
+    } else if arg == "--remote-auth-token-env" || arg.starts_with("--remote-auth-token-env=") {
+        Some("--remote-auth-token-env")
+    } else {
+        None
+    }
+}
+
+fn reject_managed_resume_remote_override(flag: &str) -> Result<()> {
+    bail!(
+        "managed resume does not allow forwarded {flag}; cbth owns the remote app-server connection"
+    )
+}
+
+fn managed_resume_add_dir_override_flag(arg: &str) -> Option<&'static str> {
+    if arg == "--add-dir" || arg.starts_with("--add-dir=") {
+        Some("--add-dir")
+    } else {
+        None
+    }
+}
+
+fn reject_managed_resume_add_dir_override(flag: &str) -> Result<()> {
+    bail!(
+        "managed resume does not allow forwarded {flag}; Codex thread/resume cannot faithfully carry additional writable roots"
+    )
+}
+
+fn initial_passive_thread_resume_params(
+    foreground_mode: &CliForegroundMode,
+    bound_thread_id: &str,
+    cwd: &Path,
+    codex_args: &[OsString],
+) -> Result<Value> {
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "threadId".to_owned(),
+        Value::String(bound_thread_id.to_owned()),
+    );
+    if matches!(foreground_mode, CliForegroundMode::Resume { .. }) {
+        params.insert(
+            "cwd".to_owned(),
+            Value::String(path_to_utf8(cwd, "current directory")?),
+        );
+        params.insert("persistExtendedHistory".to_owned(), Value::Bool(true));
+        apply_codex_resume_foreground_args(&mut params, cwd, codex_args)?;
+    }
+    Ok(Value::Object(params))
+}
+
+fn apply_codex_resume_foreground_args(
+    params: &mut serde_json::Map<String, Value>,
+    caller_cwd: &Path,
+    codex_args: &[OsString],
+) -> Result<()> {
+    let mut config_overrides = serde_json::Map::new();
+    let mut oss = false;
+    let mut local_provider: Option<String> = None;
+    let mut index = 0;
+    while index < codex_args.len() {
+        let arg = os_arg_to_utf8(&codex_args[index], "codex argument")?;
+        if arg == "--" || arg == "-" || !arg.starts_with('-') {
+            break;
+        }
+
+        if let Some(flag) = managed_resume_remote_override_flag(&arg) {
+            reject_managed_resume_remote_override(flag)?;
+        } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
+            reject_managed_resume_add_dir_override(flag)?;
+        } else if let Some(value) = arg.strip_prefix("--model=") {
+            params.insert("model".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("--profile=") {
+            config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("--sandbox=") {
+            params.insert(
+                "sandbox".to_owned(),
+                Value::String(normalize_codex_sandbox_mode(value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("--ask-for-approval=") {
+            params.insert(
+                "approvalPolicy".to_owned(),
+                Value::String(normalize_codex_approval_policy(value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("--cd=") {
+            params.insert(
+                "cwd".to_owned(),
+                Value::String(codex_cwd_arg_to_resume_cwd(caller_cwd, value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            apply_codex_config_override(params, &mut config_overrides, value)?;
+        } else if let Some(value) = arg.strip_prefix("--local-provider=") {
+            local_provider = Some(value.to_owned());
+        } else if arg.strip_prefix("--image=").is_some() {
+            skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), true)?;
+        } else if let Some(value) = arg.strip_prefix("-m").filter(|value| !value.is_empty()) {
+            params.insert("model".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("-p").filter(|value| !value.is_empty()) {
+            config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("-s").filter(|value| !value.is_empty()) {
+            params.insert(
+                "sandbox".to_owned(),
+                Value::String(normalize_codex_sandbox_mode(value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("-a").filter(|value| !value.is_empty()) {
+            params.insert(
+                "approvalPolicy".to_owned(),
+                Value::String(normalize_codex_approval_policy(value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
+            params.insert(
+                "cwd".to_owned(),
+                Value::String(codex_cwd_arg_to_resume_cwd(caller_cwd, value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("-c").filter(|value| !value.is_empty()) {
+            apply_codex_config_override(params, &mut config_overrides, value)?;
+        } else if arg
+            .strip_prefix("-i")
+            .is_some_and(|value| !value.is_empty())
+        {
+            skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), true)?;
+        } else {
+            match arg.as_str() {
+                "--model" | "-m" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    params.insert("model".to_owned(), Value::String(value));
+                }
+                "--profile" | "-p" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    config_overrides.insert("profile".to_owned(), Value::String(value));
+                }
+                "--sandbox" | "-s" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    params.insert(
+                        "sandbox".to_owned(),
+                        Value::String(normalize_codex_sandbox_mode(&value)?),
+                    );
+                }
+                "--ask-for-approval" | "-a" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    params.insert(
+                        "approvalPolicy".to_owned(),
+                        Value::String(normalize_codex_approval_policy(&value)?),
+                    );
+                }
+                "--cd" | "-C" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    params.insert(
+                        "cwd".to_owned(),
+                        Value::String(codex_cwd_arg_to_resume_cwd(caller_cwd, &value)?),
+                    );
+                }
+                "--config" | "-c" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    apply_codex_config_override(params, &mut config_overrides, &value)?;
+                }
+                "--local-provider" => {
+                    local_provider =
+                        Some(next_codex_arg_value(codex_args, &mut index, arg.as_str())?);
+                }
+                "--enable" | "--disable" => {
+                    let _ = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                }
+                "--add-dir" => {
+                    reject_managed_resume_add_dir_override(arg.as_str())?;
+                }
+                "--remote" | "--remote-auth-token-env" => {
+                    reject_managed_resume_remote_override(arg.as_str())?;
+                }
+                "--image" | "-i" => {
+                    skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), false)?;
+                }
+                "--oss" => {
+                    oss = true;
+                }
+                "--dangerously-bypass-approvals-and-sandbox" => {
+                    params.insert(
+                        "approvalPolicy".to_owned(),
+                        Value::String("never".to_owned()),
+                    );
+                    params.insert(
+                        "sandbox".to_owned(),
+                        Value::String("danger-full-access".to_owned()),
+                    );
+                }
+                "--search"
+                | "--no-alt-screen"
+                | "--last"
+                | "--all"
+                | "--include-non-interactive" => {}
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+
+    if oss && let Some(provider) = local_provider {
+        params.insert("modelProvider".to_owned(), Value::String(provider));
+    }
+    if !config_overrides.is_empty() {
+        params.insert("config".to_owned(), Value::Object(config_overrides));
+    }
+    Ok(())
+}
+
+fn skip_codex_arg_value(args: &[OsString], index: &mut usize, flag: &str) -> Result<()> {
+    *index += 1;
+    if *index >= args.len() {
+        bail!("codex argument {flag} requires a value");
+    }
+    Ok(())
+}
+
+fn skip_variadic_codex_arg_values(
+    args: &[OsString],
+    index: &mut usize,
+    flag: &str,
+    has_attached_value: bool,
+) -> Result<()> {
+    if !has_attached_value {
+        *index += 1;
+        let Some(value) = args.get(*index) else {
+            bail!("codex argument {flag} requires a value");
+        };
+        let value = os_arg_to_utf8(value, flag)?;
+        if value == "--" || value.starts_with('-') {
+            bail!("codex argument {flag} requires a value");
+        }
+    }
+    while let Some(next) = args.get(*index + 1) {
+        let next = os_arg_to_utf8(next, "codex argument")?;
+        if next == "--" || next.starts_with('-') {
+            break;
+        }
+        *index += 1;
+    }
+    Ok(())
+}
+
+fn apply_codex_config_override(
+    params: &mut serde_json::Map<String, Value>,
+    config_overrides: &mut serde_json::Map<String, Value>,
+    override_arg: &str,
+) -> Result<()> {
+    let Some((key, raw_value)) = override_arg.split_once('=') else {
+        return Ok(());
+    };
+    let value = strip_cli_value_quotes(raw_value.trim());
+    match key.trim() {
+        "model" => {
+            params.insert("model".to_owned(), Value::String(value.to_owned()));
+        }
+        "model_provider" | "model_provider_id" => {
+            params.insert("modelProvider".to_owned(), Value::String(value.to_owned()));
+        }
+        "approval_policy" => {
+            params.insert(
+                "approvalPolicy".to_owned(),
+                Value::String(normalize_codex_approval_policy(value)?),
+            );
+        }
+        "sandbox_mode" => {
+            params.insert(
+                "sandbox".to_owned(),
+                Value::String(normalize_codex_sandbox_mode(value)?),
+            );
+        }
+        "profile" | "config_profile" => {
+            config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
+        }
+        "approvals_reviewer" => {
+            params.insert(
+                "approvalsReviewer".to_owned(),
+                Value::String(normalize_codex_approvals_reviewer(value)?),
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn next_codex_arg_value(args: &[OsString], index: &mut usize, flag: &str) -> Result<String> {
+    *index += 1;
+    let Some(value) = args.get(*index) else {
+        bail!("codex argument {flag} requires a value");
+    };
+    os_arg_to_utf8(value, flag)
+}
+
+fn normalize_codex_approval_policy(value: &str) -> Result<String> {
+    match value {
+        "untrusted" | "unless-trusted" | "unless_trusted" => Ok("untrusted".to_owned()),
+        "on-failure" | "on_failure" => Ok("on-failure".to_owned()),
+        "on-request" | "on_request" => Ok("on-request".to_owned()),
+        "never" => Ok("never".to_owned()),
+        other => bail!("unsupported codex approval policy override {other:?}"),
+    }
+}
+
+fn normalize_codex_sandbox_mode(value: &str) -> Result<String> {
+    match value {
+        "read-only" | "read_only" => Ok("read-only".to_owned()),
+        "workspace-write" | "workspace_write" => Ok("workspace-write".to_owned()),
+        "danger-full-access" | "danger_full_access" => Ok("danger-full-access".to_owned()),
+        other => bail!("unsupported codex sandbox override {other:?}"),
+    }
+}
+
+fn normalize_codex_approvals_reviewer(value: &str) -> Result<String> {
+    match value {
+        "user" => Ok("user".to_owned()),
+        "guardian_subagent" | "guardian-subagent" => Ok("guardian_subagent".to_owned()),
+        other => bail!("unsupported codex approvals reviewer override {other:?}"),
+    }
+}
+
+fn strip_cli_value_quotes(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(value)
+}
+
+fn codex_cwd_arg_to_resume_cwd(caller_cwd: &Path, value: &str) -> Result<String> {
+    path_to_utf8(
+        &resolve_codex_cwd_arg(caller_cwd, OsStr::new(value)),
+        "codex --cd",
+    )
+}
+
+fn resolve_codex_cwd_arg(caller_cwd: &Path, value: &OsStr) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        caller_cwd.join(path)
+    }
+}
+
+fn path_to_utf8(path: &Path, field: &str) -> Result<String> {
+    path.as_os_str()
+        .to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{field} path is not valid UTF-8"))
+}
+
+fn os_arg_to_utf8(value: &OsStr, field: &str) -> Result<String> {
+    value
+        .to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{field} is not valid UTF-8"))
 }
 
 fn abort_cli_thread_start_bootstrap_best_effort(
@@ -1790,6 +2533,8 @@ struct CliAppServerPassiveAdapterConfig {
     capability_revision: i64,
     auto_delivery_policy: CliAutoDeliveryPolicy,
     fresh_thread_bootstrap: bool,
+    permission_inputs: CliSessionPermissionInputs,
+    initial_thread_resume_params: Value,
 }
 
 struct CliAppServerPassiveAdapterHandle {
@@ -1814,6 +2559,494 @@ impl CliAppServerPassiveAdapterHandle {
     }
 }
 
+fn parse_thread_resume_permission_snapshot(result: &Value) -> Result<CliPermissionSnapshot> {
+    let approval_policy = result
+        .get("approvalPolicy")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("thread/resume response missing approvalPolicy"))?;
+    let sandbox_policy = result
+        .get("sandbox")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("thread/resume response missing sandbox"))?;
+    let allows_approval = parse_approval_policy_allows_approval(&approval_policy)?;
+    let (allows_network, allows_write_access) = parse_sandbox_permissions(&sandbox_policy)?;
+    Ok(CliPermissionSnapshot {
+        allows_approval,
+        allows_network,
+        allows_write_access,
+        approval_policy,
+        sandbox_policy,
+    })
+}
+
+fn parse_approval_policy_allows_approval(value: &Value) -> Result<bool> {
+    match value.as_str() {
+        Some("never") => Ok(false),
+        Some("untrusted" | "on-failure" | "on-request") => Ok(true),
+        Some(other) => bail!("thread/resume returned unknown approvalPolicy {other:?}"),
+        None => bail!("thread/resume returned unsupported approvalPolicy shape"),
+    }
+}
+
+fn parse_sandbox_permissions(value: &Value) -> Result<(bool, bool)> {
+    let sandbox_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("thread/resume sandbox missing type"))?;
+    match sandbox_type {
+        "readOnly" => {
+            sandbox_access(value, "access")?;
+            Ok((sandbox_required_bool_field(value, "networkAccess")?, false))
+        }
+        "workspaceWrite" => {
+            sandbox_access(value, "readOnlyAccess")?;
+            workspace_writable_roots(value)?;
+            sandbox_required_bool_field(value, "excludeTmpdirEnvVar")?;
+            sandbox_required_bool_field(value, "excludeSlashTmp")?;
+            Ok((sandbox_required_bool_field(value, "networkAccess")?, true))
+        }
+        "dangerFullAccess" => Ok((true, true)),
+        "externalSandbox" => {
+            let network = match value.get("networkAccess").and_then(Value::as_str) {
+                Some("enabled") => true,
+                Some("restricted") => false,
+                Some(other) => bail!("thread/resume sandbox has unknown networkAccess {other:?}"),
+                None => bail!("thread/resume externalSandbox missing networkAccess"),
+            };
+            Ok((network, true))
+        }
+        other => bail!("thread/resume returned unknown sandbox type {other:?}"),
+    }
+}
+
+fn sandbox_required_bool_field(value: &Value, field: &str) -> Result<bool> {
+    match value.get(field) {
+        Some(Value::Bool(value)) => Ok(*value),
+        None => bail!("thread/resume sandbox missing {field}"),
+        Some(_) => bail!("thread/resume sandbox field {field} is not a boolean"),
+    }
+}
+
+fn sandbox_bool_field(value: &Value, field: &str, default: bool) -> Result<bool> {
+    match value.get(field) {
+        Some(Value::Bool(value)) => Ok(*value),
+        None => Ok(default),
+        Some(_) => bail!("thread/resume sandbox field {field} is not a boolean"),
+    }
+}
+
+fn effective_permissions(
+    startup: CliResolvedPermissions,
+    current: CliResolvedPermissions,
+) -> CliResolvedPermissions {
+    CliResolvedPermissions {
+        allows_approval: startup.allows_approval && current.allows_approval,
+        allows_network: startup.allows_network && current.allows_network,
+        allows_write_access: startup.allows_write_access && current.allows_write_access,
+    }
+}
+
+fn turn_start_permission_overrides(
+    startup_snapshot: &CliPermissionSnapshot,
+    current_snapshot: &CliPermissionSnapshot,
+    effective: CliResolvedPermissions,
+) -> Result<Value> {
+    let approval_policy = pinned_approval_policy(
+        &startup_snapshot.approval_policy,
+        &current_snapshot.approval_policy,
+        effective.allows_approval,
+    )?;
+    let sandbox_policy = pinned_sandbox_policy(
+        &startup_snapshot.sandbox_policy,
+        &current_snapshot.sandbox_policy,
+        effective,
+    )?;
+    Ok(json!({
+        "approvalPolicy": approval_policy,
+        "sandboxPolicy": sandbox_policy,
+    }))
+}
+
+fn pinned_approval_policy(
+    startup_approval: &Value,
+    current_approval: &Value,
+    allows_approval: bool,
+) -> Result<Value> {
+    if !allows_approval {
+        return Ok(Value::String("never".to_owned()));
+    }
+    let startup_rank = approval_policy_risk_rank(startup_approval)?;
+    let current_rank = approval_policy_risk_rank(current_approval)?;
+    Ok(if startup_rank <= current_rank {
+        startup_approval.clone()
+    } else {
+        current_approval.clone()
+    })
+}
+
+fn approval_policy_risk_rank(value: &Value) -> Result<u8> {
+    match value.as_str() {
+        Some("never") => Ok(0),
+        Some("untrusted") => Ok(1),
+        Some("on-failure") => Ok(2),
+        Some("on-request") => Ok(3),
+        Some(other) => bail!("cannot pin unknown approvalPolicy {other:?}"),
+        None => bail!("cannot pin unsupported approvalPolicy shape"),
+    }
+}
+
+fn pinned_sandbox_policy(
+    startup_sandbox: &Value,
+    current_sandbox: &Value,
+    effective: CliResolvedPermissions,
+) -> Result<Value> {
+    if !effective.allows_write_access {
+        return pinned_read_only_sandbox(startup_sandbox, current_sandbox, effective);
+    }
+
+    let startup_type = sandbox_policy_type(startup_sandbox)?;
+    let current_type = sandbox_policy_type(current_sandbox)?;
+    match (startup_type, current_type) {
+        ("readOnly", _) | (_, "readOnly") => {
+            bail!("readOnly sandbox cannot be pinned to write access")
+        }
+        ("externalSandbox", "workspaceWrite") | ("workspaceWrite", "externalSandbox") => {
+            bail!("cannot safely pin mixed externalSandbox/workspaceWrite sandbox")
+        }
+        ("externalSandbox", _) | (_, "externalSandbox") => {
+            pinned_external_sandbox(startup_sandbox, current_sandbox, effective)
+        }
+        ("workspaceWrite", _) | (_, "workspaceWrite") => {
+            pinned_workspace_write_sandbox(startup_sandbox, current_sandbox, effective)
+        }
+        ("dangerFullAccess", "dangerFullAccess") if effective.allows_network => {
+            Ok(startup_sandbox.clone())
+        }
+        ("dangerFullAccess", "dangerFullAccess") => {
+            bail!("dangerFullAccess sandbox cannot be pinned to networkAccess=false")
+        }
+        (startup, current) => {
+            bail!("cannot pin unsupported sandbox transition {startup:?} -> {current:?}")
+        }
+    }
+}
+
+fn pinned_read_only_sandbox(
+    startup_sandbox: &Value,
+    current_sandbox: &Value,
+    effective: CliResolvedPermissions,
+) -> Result<Value> {
+    let startup_type = sandbox_policy_type(startup_sandbox)?;
+    let current_type = sandbox_policy_type(current_sandbox)?;
+    match (startup_type, current_type) {
+        ("readOnly", "readOnly") => {
+            pinned_read_only_access(
+                sandbox_access(startup_sandbox, "access")?,
+                sandbox_access(current_sandbox, "access")?,
+            )?;
+        }
+        ("readOnly", "workspaceWrite") => {
+            pinned_read_only_access(
+                sandbox_access(startup_sandbox, "access")?,
+                sandbox_access(current_sandbox, "readOnlyAccess")?,
+            )?;
+        }
+        ("workspaceWrite", "readOnly") => {
+            pinned_read_only_access(
+                sandbox_access(startup_sandbox, "readOnlyAccess")?,
+                sandbox_access(current_sandbox, "access")?,
+            )?;
+        }
+        ("workspaceWrite", "workspaceWrite") => {
+            pinned_read_only_access(
+                sandbox_access(startup_sandbox, "readOnlyAccess")?,
+                sandbox_access(current_sandbox, "readOnlyAccess")?,
+            )?;
+        }
+        ("readOnly", _) => {
+            sandbox_access(startup_sandbox, "access")?;
+        }
+        (_, "readOnly") => {
+            sandbox_access(current_sandbox, "access")?;
+        }
+        ("workspaceWrite", "dangerFullAccess") => {
+            sandbox_access(startup_sandbox, "readOnlyAccess")?;
+        }
+        ("dangerFullAccess", "workspaceWrite") => {
+            sandbox_access(current_sandbox, "readOnlyAccess")?;
+        }
+        _ => {
+            strict_read_only_access();
+        }
+    };
+    Ok(json!({
+        "type": "readOnly",
+        "networkAccess": effective.allows_network,
+    }))
+}
+
+fn sandbox_policy_type(sandbox: &Value) -> Result<&str> {
+    sandbox
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("sandbox policy missing type"))
+}
+
+fn pinned_workspace_write_sandbox(
+    startup_sandbox: &Value,
+    current_sandbox: &Value,
+    effective: CliResolvedPermissions,
+) -> Result<Value> {
+    let startup_workspace = sandbox_policy_type(startup_sandbox)? == "workspaceWrite";
+    let current_workspace = sandbox_policy_type(current_sandbox)? == "workspaceWrite";
+    let writable_roots = match (startup_workspace, current_workspace) {
+        (true, true) => workspace_writable_roots_intersection(startup_sandbox, current_sandbox)?,
+        (true, false) => normalized_workspace_writable_roots(startup_sandbox)?,
+        (false, true) => normalized_workspace_writable_roots(current_sandbox)?,
+        (false, false) => bail!("workspaceWrite pin requested without workspace sandbox"),
+    };
+    let exclude_tmpdir_env_var =
+        workspace_bool_if_workspace(startup_sandbox, startup_workspace, "excludeTmpdirEnvVar")?
+            || workspace_bool_if_workspace(
+                current_sandbox,
+                current_workspace,
+                "excludeTmpdirEnvVar",
+            )?;
+    let exclude_slash_tmp =
+        workspace_bool_if_workspace(startup_sandbox, startup_workspace, "excludeSlashTmp")?
+            || workspace_bool_if_workspace(current_sandbox, current_workspace, "excludeSlashTmp")?;
+    match (startup_workspace, current_workspace) {
+        (true, true) => {
+            pinned_read_only_access(
+                sandbox_access(startup_sandbox, "readOnlyAccess")?,
+                sandbox_access(current_sandbox, "readOnlyAccess")?,
+            )?;
+        }
+        (true, false) => {
+            sandbox_access(startup_sandbox, "readOnlyAccess")?;
+        }
+        (false, true) => {
+            sandbox_access(current_sandbox, "readOnlyAccess")?;
+        }
+        (false, false) => bail!("workspaceWrite pin requested without workspace sandbox"),
+    }
+    Ok(json!({
+        "type": "workspaceWrite",
+        "writableRoots": writable_roots,
+        "networkAccess": effective.allows_network,
+        "excludeTmpdirEnvVar": exclude_tmpdir_env_var,
+        "excludeSlashTmp": exclude_slash_tmp,
+    }))
+}
+
+fn workspace_writable_roots_intersection(
+    startup_sandbox: &Value,
+    current_sandbox: &Value,
+) -> Result<Vec<String>> {
+    let startup_roots = workspace_writable_roots(startup_sandbox)?;
+    let current_roots = workspace_writable_roots(current_sandbox)?;
+    let mut seen = HashSet::new();
+    let mut narrowed_roots = Vec::new();
+    for startup_root in &startup_roots {
+        for current_root in &current_roots {
+            let Some(root) = narrower_writable_root(startup_root, current_root)? else {
+                continue;
+            };
+            if seen.insert(root.clone()) {
+                narrowed_roots.push(root);
+            }
+        }
+    }
+    Ok(narrowed_roots)
+}
+
+fn normalized_workspace_writable_roots(sandbox: &Value) -> Result<Vec<String>> {
+    workspace_writable_roots(sandbox)?
+        .into_iter()
+        .map(|root| path_to_string(&normalize_workspace_writable_root(&root)?))
+        .collect()
+}
+
+fn narrower_writable_root(startup_root: &str, current_root: &str) -> Result<Option<String>> {
+    let startup_path = normalize_workspace_writable_root(startup_root)?;
+    let current_path = normalize_workspace_writable_root(current_root)?;
+    if current_path.starts_with(&startup_path) {
+        Ok(Some(path_to_string(&current_path)?))
+    } else if startup_path.starts_with(&current_path) {
+        Ok(Some(path_to_string(&startup_path)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn normalize_workspace_writable_root(root: &str) -> Result<PathBuf> {
+    let path = Path::new(root);
+    if !path.is_absolute() {
+        bail!("workspaceWrite writableRoot is not absolute: {root:?}");
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                bail!("workspaceWrite writableRoot contains parent directory component: {root:?}")
+            }
+            Component::Prefix(_) => {
+                bail!("workspaceWrite writableRoot contains unsupported prefix: {root:?}")
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn path_to_string(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("workspaceWrite writableRoot is not valid UTF-8"))
+}
+
+fn workspace_writable_roots(sandbox: &Value) -> Result<Vec<String>> {
+    let roots = sandbox
+        .get("writableRoots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("workspaceWrite sandbox missing writableRoots"))?;
+    roots
+        .iter()
+        .map(|root| {
+            root.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("workspaceWrite writableRoots contains non-string"))
+        })
+        .collect()
+}
+
+fn workspace_bool_if_workspace(sandbox: &Value, is_workspace: bool, field: &str) -> Result<bool> {
+    if is_workspace {
+        sandbox_bool_field(sandbox, field, false)
+    } else {
+        Ok(false)
+    }
+}
+
+fn sandbox_access<'a>(sandbox: &'a Value, field: &str) -> Result<&'a Value> {
+    let access = sandbox
+        .get(field)
+        .ok_or_else(|| anyhow::anyhow!("sandbox policy missing {field}"))?;
+    validate_read_only_access(access)?;
+    Ok(access)
+}
+
+fn validate_read_only_access(access: &Value) -> Result<()> {
+    match access.get("type").and_then(Value::as_str) {
+        Some("fullAccess") => Ok(()),
+        Some("restricted") => {
+            sandbox_bool_field(access, "includePlatformDefaults", false)?;
+            read_only_readable_roots(access)?;
+            Ok(())
+        }
+        Some(other) => bail!("sandbox read-only access has unknown type {other:?}"),
+        None => bail!("sandbox read-only access missing type"),
+    }
+}
+
+fn pinned_read_only_access(startup_access: &Value, current_access: &Value) -> Result<Value> {
+    let startup_type = read_only_access_type(startup_access)?;
+    let current_type = read_only_access_type(current_access)?;
+    match (startup_type, current_type) {
+        ("fullAccess", "fullAccess") => Ok(json!({ "type": "fullAccess" })),
+        ("restricted", "fullAccess") => Ok(startup_access.clone()),
+        ("fullAccess", "restricted") => Ok(current_access.clone()),
+        ("restricted", "restricted") => {
+            let include_platform_defaults =
+                sandbox_bool_field(startup_access, "includePlatformDefaults", false)?
+                    && sandbox_bool_field(current_access, "includePlatformDefaults", false)?;
+            Ok(json!({
+                "type": "restricted",
+                "includePlatformDefaults": include_platform_defaults,
+                "readableRoots": readable_roots_intersection(startup_access, current_access)?,
+            }))
+        }
+        (startup, current) => {
+            bail!("cannot pin unsupported read-only access transition {startup:?} -> {current:?}")
+        }
+    }
+}
+
+fn read_only_access_type(access: &Value) -> Result<&str> {
+    validate_read_only_access(access)?;
+    access
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("sandbox read-only access missing type"))
+}
+
+fn readable_roots_intersection(
+    startup_access: &Value,
+    current_access: &Value,
+) -> Result<Vec<String>> {
+    let startup_roots = read_only_readable_roots(startup_access)?;
+    let current_roots = read_only_readable_roots(current_access)?;
+    let current_set = current_roots.iter().cloned().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    Ok(startup_roots
+        .into_iter()
+        .filter(|root| current_set.contains(root) && seen.insert(root.clone()))
+        .collect())
+}
+
+fn read_only_readable_roots(access: &Value) -> Result<Vec<String>> {
+    let roots = access
+        .get("readableRoots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("restricted read-only access missing readableRoots"))?;
+    roots
+        .iter()
+        .map(|root| {
+            root.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("restricted readableRoots contains non-string"))
+        })
+        .collect()
+}
+
+fn strict_read_only_access() -> Value {
+    json!({
+        "type": "restricted",
+        "includePlatformDefaults": false,
+        "readableRoots": [],
+    })
+}
+
+fn pinned_external_sandbox(
+    startup_sandbox: &Value,
+    current_sandbox: &Value,
+    effective: CliResolvedPermissions,
+) -> Result<Value> {
+    let external_sandbox = if sandbox_policy_type(startup_sandbox)? == "externalSandbox" {
+        startup_sandbox
+    } else {
+        current_sandbox
+    };
+    let mut sandbox = external_sandbox.clone();
+    let object = sandbox
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("externalSandbox sandbox is not an object"))?;
+    object.insert(
+        "networkAccess".to_owned(),
+        Value::String(
+            if effective.allows_network {
+                "enabled"
+            } else {
+                "restricted"
+            }
+            .to_owned(),
+        ),
+    );
+    Ok(sandbox)
+}
+
 impl Drop for CliAppServerPassiveAdapterHandle {
     fn drop(&mut self) {
         if let Err(error) = self.stop()
@@ -1832,6 +3065,47 @@ struct CliAppServerPassiveAdapterState {
     passive_capabilities_recorded: bool,
     durable_proof_may_exist: bool,
     last_auto_delivery_poll: Option<Instant>,
+    startup_permissions: Option<CliResolvedPermissions>,
+    startup_permission_snapshot: Option<CliPermissionSnapshot>,
+    last_current_permissions: Option<CliResolvedPermissions>,
+    last_current_permission_snapshot: Option<CliPermissionSnapshot>,
+    last_effective_permissions: Option<CliResolvedPermissions>,
+    initial_thread_resume_params_sent: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct CliResolvedPermissions {
+    allows_approval: bool,
+    allows_network: bool,
+    allows_write_access: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CliPermissionSnapshot {
+    allows_approval: bool,
+    allows_network: bool,
+    allows_write_access: bool,
+    approval_policy: Value,
+    sandbox_policy: Value,
+}
+
+impl CliPermissionSnapshot {
+    fn raw_json(&self, effective: CliResolvedPermissions) -> Value {
+        json!({
+            "approvalPolicy": self.approval_policy,
+            "sandbox": self.sandbox_policy,
+            "derived": {
+                "allows_approval": self.allows_approval,
+                "allows_network": self.allows_network,
+                "allows_write_access": self.allows_write_access,
+            },
+            "effective": {
+                "allows_approval": effective.allows_approval,
+                "allows_network": effective.allows_network,
+                "allows_write_access": effective.allows_write_access,
+            }
+        })
+    }
 }
 
 fn spawn_cli_app_server_passive_adapter(
@@ -1847,6 +3121,12 @@ fn spawn_cli_app_server_passive_adapter(
         passive_capabilities_recorded: false,
         durable_proof_may_exist: config.activity_revision != 0 || config.capability_revision != 0,
         last_auto_delivery_poll: None,
+        startup_permissions: None,
+        startup_permission_snapshot: None,
+        last_current_permissions: None,
+        last_current_permission_snapshot: None,
+        last_effective_permissions: None,
+        initial_thread_resume_params_sent: false,
     }));
     let thread_state = Arc::clone(&state);
     let thread_config = config.clone();
@@ -1910,31 +3190,59 @@ fn run_cli_app_server_passive_adapter_once(
     )?;
     client.notify_initialized()?;
 
+    let resume_params = if state.initial_thread_resume_params_sent {
+        json!({ "threadId": config.bound_thread_id })
+    } else {
+        config.initial_thread_resume_params.clone()
+    };
     let (resume_result, resume_messages) = passive_adapter_request(
         &mut client,
         "thread/resume",
-        json!({ "threadId": config.bound_thread_id }),
+        resume_params,
         Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
     );
     let mut thread_resume_capability = false;
     let mut thread_start_capability = config.fresh_thread_bootstrap;
+    let mut resume_current_state_sync = false;
     let mut current_state_sync = false;
     let mut active = false;
     match resume_result {
         Ok(resume) => {
+            state.initial_thread_resume_params_sent = true;
             thread_resume_capability = true;
             match thread_result_activity_snapshot(&resume, &config.bound_thread_id) {
                 ThreadActivitySnapshot::Active => {
+                    resume_current_state_sync = true;
                     current_state_sync = true;
                     active = true;
                 }
                 ThreadActivitySnapshot::Idle => {
+                    resume_current_state_sync = true;
                     current_state_sync = true;
                 }
                 ThreadActivitySnapshot::Missing => {}
                 ThreadActivitySnapshot::Untrusted => {
                     invalidate_passive_adapter_proof(config, state, Some(running))?;
                     bail!("app-server thread/resume returned untrusted current-state snapshot");
+                }
+            }
+            if config.permission_inputs.uses_auto() && resume_current_state_sync {
+                match parse_thread_resume_permission_snapshot(&resume) {
+                    Ok(snapshot) => {
+                        sync_passive_adapter_permissions_from_snapshot(
+                            config,
+                            state,
+                            &snapshot,
+                            Some(&config.bound_thread_id),
+                            None,
+                            Some(running),
+                        )?;
+                    }
+                    Err(_error) => {
+                        state.last_current_permissions = None;
+                        state.last_current_permission_snapshot = None;
+                        state.last_effective_permissions = None;
+                    }
                 }
             }
         }
@@ -1984,6 +3292,13 @@ fn run_cli_app_server_passive_adapter_once(
     }
 
     if current_state_sync {
+        if config.auto_delivery_policy.enabled()
+            && config.permission_inputs.uses_auto()
+            && state.startup_permissions.is_none()
+        {
+            invalidate_passive_adapter_proof(config, state, Some(running))?;
+            bail!("app-server did not provide a trusted startup permission snapshot");
+        }
         record_passive_adapter_capabilities(
             config,
             state,
@@ -2059,6 +3374,84 @@ fn is_unmaterialized_thread_resume_error(error: &AppServerRequestError) -> bool 
         && error.message().contains("no rollout found for thread id")
 }
 
+fn refresh_cli_auto_delivery_permissions(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    client: &mut AppServerJsonRpcClient,
+    running: &AtomicBool,
+    source_thread_id: &str,
+    batch_id: &str,
+) -> Result<Option<Value>> {
+    if !config.permission_inputs.uses_auto() {
+        return Ok(None);
+    }
+    // Notifications drained while waiting for this response are older than the
+    // authoritative resume snapshot and must not reopen an idle proof.
+    let (resume_result, _resume_messages) = passive_adapter_request(
+        client,
+        "thread/resume",
+        json!({ "threadId": config.bound_thread_id }),
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+    );
+    let resume = match resume_result {
+        Ok(resume) => resume,
+        Err(error) => {
+            invalidate_passive_adapter_proof(config, state, Some(running))?;
+            return Err(error.into());
+        }
+    };
+    let resume_activity_state =
+        match thread_result_activity_snapshot(&resume, &config.bound_thread_id) {
+            ThreadActivitySnapshot::Active => {
+                record_passive_adapter_activity(
+                    config,
+                    state,
+                    CliSessionActivityState::Active,
+                    Some(running),
+                )?;
+                CliSessionActivityState::Active
+            }
+            ThreadActivitySnapshot::Idle => {
+                record_passive_adapter_activity(
+                    config,
+                    state,
+                    CliSessionActivityState::Idle,
+                    Some(running),
+                )?;
+                CliSessionActivityState::Idle
+            }
+            ThreadActivitySnapshot::Missing => {
+                invalidate_passive_adapter_proof(config, state, Some(running))?;
+                bail!("app-server thread/resume did not return the bound thread");
+            }
+            ThreadActivitySnapshot::Untrusted => {
+                invalidate_passive_adapter_proof(config, state, Some(running))?;
+                bail!("app-server thread/resume returned untrusted current-state snapshot");
+            }
+        };
+    let snapshot = parse_thread_resume_permission_snapshot(&resume)?;
+    let effective = sync_passive_adapter_permissions_from_snapshot(
+        config,
+        state,
+        &snapshot,
+        Some(source_thread_id),
+        Some(batch_id),
+        Some(running),
+    )?;
+    if resume_activity_state != CliSessionActivityState::Idle {
+        return Ok(None);
+    }
+    let startup_snapshot = state
+        .startup_permission_snapshot
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing startup permission snapshot"))?;
+    Ok(Some(turn_start_permission_overrides(
+        startup_snapshot,
+        &snapshot,
+        effective,
+    )?))
+}
+
 fn maybe_run_cli_auto_delivery(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
@@ -2118,6 +3511,17 @@ fn maybe_run_cli_auto_delivery(
                 details: json!({ "bound_thread_id": config.bound_thread_id }),
             },
         )?;
+        return Ok(());
+    }
+    let turn_start_permission_overrides = refresh_cli_auto_delivery_permissions(
+        config,
+        state,
+        client,
+        running,
+        &source_thread_id,
+        &batch_id,
+    )?;
+    if state.last_activity_state != Some(CliSessionActivityState::Idle) {
         return Ok(());
     }
     let attempt_id = new_id();
@@ -2266,19 +3670,28 @@ fn maybe_run_cli_auto_delivery(
         )?;
         return Ok(());
     }
+    let mut turn_start_params = json!({
+        "threadId": config.bound_thread_id,
+        "input": [
+            {
+                "type": "text",
+                "text": prompt,
+                "textElements": []
+            }
+        ]
+    });
+    if let Some(overrides) = turn_start_permission_overrides
+        && let (Some(params), Some(overrides)) =
+            (turn_start_params.as_object_mut(), overrides.as_object())
+    {
+        for (key, value) in overrides {
+            params.insert(key.clone(), value.clone());
+        }
+    }
     let (turn_start_result, turn_start_messages) = passive_adapter_request(
         client,
         "turn/start",
-        json!({
-            "threadId": config.bound_thread_id,
-            "input": [
-                {
-                    "type": "text",
-                    "text": prompt,
-                    "textElements": []
-                }
-            ]
-        }),
+        turn_start_params,
         Duration::from_secs(CLI_APP_SERVER_TURN_START_ACCEPTANCE_TIMEOUT_SECONDS),
     );
     let turn_start = match turn_start_result {
@@ -2993,6 +4406,11 @@ fn stop_passive_adapter_after_session_parked(
     state.passive_capabilities_recorded = false;
     state.durable_proof_may_exist = false;
     state.last_auto_delivery_poll = None;
+    state.startup_permissions = None;
+    state.startup_permission_snapshot = None;
+    state.last_current_permissions = None;
+    state.last_current_permission_snapshot = None;
+    state.last_effective_permissions = None;
     running.store(false, Ordering::Release);
 }
 
@@ -3207,6 +4625,294 @@ fn record_cli_auto_delivery_audit_best_effort(
     let _ = record_cli_auto_delivery_audit(config, event);
 }
 
+struct CliPermissionDriftObservation<'a> {
+    source_thread_id: Option<&'a str>,
+    batch_id: Option<&'a str>,
+    startup: CliResolvedPermissions,
+    current: CliResolvedPermissions,
+    effective: CliResolvedPermissions,
+    startup_snapshot: &'a CliPermissionSnapshot,
+    snapshot: &'a CliPermissionSnapshot,
+}
+
+fn record_permission_drift_if_needed(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &CliAppServerPassiveAdapterState,
+    observation: CliPermissionDriftObservation<'_>,
+) -> Result<()> {
+    let mut changes = permission_drift_changes(observation.startup, observation.current);
+    changes.extend(permission_snapshot_drift_changes(
+        observation.startup_snapshot,
+        observation.snapshot,
+    )?);
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let tightened = changes
+        .iter()
+        .any(|(_, direction)| *direction == "tightened");
+    let loosened = changes
+        .iter()
+        .any(|(_, direction)| *direction == "loosened");
+    let mixed = changes.iter().any(|(_, direction)| *direction == "mixed");
+    let changed = changes.iter().any(|(_, direction)| *direction == "changed");
+    let direction = match (tightened, loosened, mixed, changed) {
+        (_, _, true, _) | (true, true, _, _) | (true, _, _, true) | (_, true, _, true) => "mixed",
+        (true, false, false, false) => "tightened",
+        (false, true, false, false) => "loosened",
+        (false, false, false, true) => "changed",
+        (false, false, false, false) => "unchanged",
+    };
+    let changed_dimensions = changes
+        .iter()
+        .map(|(dimension, direction)| {
+            json!({
+                "dimension": dimension,
+                "direction": direction,
+            })
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "warning: cbth CLI permission drift for thread {}: direction={direction}, changes={:?}; using tighter effective permissions {:?}",
+        config.bound_thread_id, changes, observation.effective
+    );
+    record_cli_auto_delivery_audit(
+        config,
+        CliAutoDeliveryAuditEvent {
+            source_thread_id: observation.source_thread_id,
+            batch_id: observation.batch_id,
+            attempt_id: None,
+            session_epoch: state.session_epoch,
+            decision: "warn",
+            reason: "permission_drift",
+            details: json!({
+                "direction": direction,
+                "changed_dimensions": changed_dimensions,
+                "startup": observation.startup,
+                "current": observation.current,
+                "effective": observation.effective,
+                "startup_snapshot": observation.startup_snapshot.raw_json(observation.startup),
+                "current_snapshot": observation.snapshot.raw_json(observation.current),
+                "snapshot": observation.snapshot.raw_json(observation.effective),
+            }),
+        },
+    )
+}
+
+fn permission_drift_changes(
+    startup: CliResolvedPermissions,
+    current: CliResolvedPermissions,
+) -> Vec<(&'static str, &'static str)> {
+    let mut changes = Vec::new();
+    push_permission_drift_change(
+        &mut changes,
+        "approval",
+        startup.allows_approval,
+        current.allows_approval,
+    );
+    push_permission_drift_change(
+        &mut changes,
+        "network",
+        startup.allows_network,
+        current.allows_network,
+    );
+    push_permission_drift_change(
+        &mut changes,
+        "write_access",
+        startup.allows_write_access,
+        current.allows_write_access,
+    );
+    changes
+}
+
+fn permission_snapshot_drift_changes(
+    startup: &CliPermissionSnapshot,
+    current: &CliPermissionSnapshot,
+) -> Result<Vec<(&'static str, &'static str)>> {
+    let mut changes = Vec::new();
+    if startup.approval_policy != current.approval_policy {
+        changes.push((
+            "approval_policy",
+            approval_policy_drift_direction(&startup.approval_policy, &current.approval_policy)?,
+        ));
+    }
+    if startup.sandbox_policy != current.sandbox_policy {
+        changes.push((
+            "sandbox_policy",
+            sandbox_policy_drift_direction(&startup.sandbox_policy, &current.sandbox_policy)?,
+        ));
+    }
+    Ok(changes)
+}
+
+fn approval_policy_drift_direction(startup: &Value, current: &Value) -> Result<&'static str> {
+    let startup_rank = approval_policy_risk_rank(startup)?;
+    let current_rank = approval_policy_risk_rank(current)?;
+    Ok(match current_rank.cmp(&startup_rank) {
+        std::cmp::Ordering::Less => "tightened",
+        std::cmp::Ordering::Greater => "loosened",
+        std::cmp::Ordering::Equal => "changed",
+    })
+}
+
+fn sandbox_policy_drift_direction(startup: &Value, current: &Value) -> Result<&'static str> {
+    let startup_type = sandbox_policy_type(startup)?;
+    let current_type = sandbox_policy_type(current)?;
+    if startup_type != current_type {
+        return Ok("changed");
+    }
+    let mut directions = Vec::new();
+    match startup_type {
+        "readOnly" => push_optional_direction(
+            &mut directions,
+            read_only_access_drift_direction(
+                sandbox_access(startup, "access")?,
+                sandbox_access(current, "access")?,
+            )?,
+        ),
+        "workspaceWrite" => {
+            push_optional_direction(
+                &mut directions,
+                roots_drift_direction(
+                    workspace_writable_roots(startup)?,
+                    workspace_writable_roots(current)?,
+                ),
+            );
+            push_optional_direction(
+                &mut directions,
+                read_only_access_drift_direction(
+                    sandbox_access(startup, "readOnlyAccess")?,
+                    sandbox_access(current, "readOnlyAccess")?,
+                )?,
+            );
+            push_optional_direction(
+                &mut directions,
+                restrictive_bool_drift_direction(
+                    sandbox_required_bool_field(startup, "excludeTmpdirEnvVar")?,
+                    sandbox_required_bool_field(current, "excludeTmpdirEnvVar")?,
+                ),
+            );
+            push_optional_direction(
+                &mut directions,
+                restrictive_bool_drift_direction(
+                    sandbox_required_bool_field(startup, "excludeSlashTmp")?,
+                    sandbox_required_bool_field(current, "excludeSlashTmp")?,
+                ),
+            );
+        }
+        "dangerFullAccess" | "externalSandbox" => {}
+        _ => return Ok("changed"),
+    }
+    Ok(combine_drift_directions(&directions).unwrap_or("changed"))
+}
+
+fn read_only_access_drift_direction(
+    startup: &Value,
+    current: &Value,
+) -> Result<Option<&'static str>> {
+    if startup == current {
+        return Ok(None);
+    }
+    let startup_type = read_only_access_type(startup)?;
+    let current_type = read_only_access_type(current)?;
+    match (startup_type, current_type) {
+        ("fullAccess", "restricted") => Ok(Some("tightened")),
+        ("restricted", "fullAccess") => Ok(Some("loosened")),
+        ("fullAccess", "fullAccess") => Ok(Some("changed")),
+        ("restricted", "restricted") => {
+            let mut directions = Vec::new();
+            push_optional_direction(
+                &mut directions,
+                roots_drift_direction(
+                    read_only_readable_roots(startup)?,
+                    read_only_readable_roots(current)?,
+                ),
+            );
+            push_optional_direction(
+                &mut directions,
+                permissive_bool_drift_direction(
+                    sandbox_bool_field(startup, "includePlatformDefaults", false)?,
+                    sandbox_bool_field(current, "includePlatformDefaults", false)?,
+                ),
+            );
+            Ok(Some(
+                combine_drift_directions(&directions).unwrap_or("changed"),
+            ))
+        }
+        _ => Ok(Some("changed")),
+    }
+}
+
+fn roots_drift_direction(
+    startup_roots: Vec<String>,
+    current_roots: Vec<String>,
+) -> Option<&'static str> {
+    let startup = startup_roots.into_iter().collect::<HashSet<_>>();
+    let current = current_roots.into_iter().collect::<HashSet<_>>();
+    if startup == current {
+        return None;
+    }
+    let current_is_subset = current.is_subset(&startup);
+    let startup_is_subset = startup.is_subset(&current);
+    Some(match (current_is_subset, startup_is_subset) {
+        (true, false) => "tightened",
+        (false, true) => "loosened",
+        _ => "mixed",
+    })
+}
+
+fn permissive_bool_drift_direction(startup: bool, current: bool) -> Option<&'static str> {
+    match (startup, current) {
+        (true, false) => Some("tightened"),
+        (false, true) => Some("loosened"),
+        _ => None,
+    }
+}
+
+fn restrictive_bool_drift_direction(startup: bool, current: bool) -> Option<&'static str> {
+    match (startup, current) {
+        (false, true) => Some("tightened"),
+        (true, false) => Some("loosened"),
+        _ => None,
+    }
+}
+
+fn push_optional_direction(directions: &mut Vec<&'static str>, direction: Option<&'static str>) {
+    if let Some(direction) = direction {
+        directions.push(direction);
+    }
+}
+
+fn combine_drift_directions(directions: &[&'static str]) -> Option<&'static str> {
+    if directions.is_empty() {
+        return None;
+    }
+    let tightened = directions.contains(&"tightened");
+    let loosened = directions.contains(&"loosened");
+    let mixed = directions.contains(&"mixed");
+    let changed = directions.contains(&"changed");
+    Some(match (tightened, loosened, mixed, changed) {
+        (_, _, true, _) | (true, true, _, _) | (true, _, _, true) | (_, true, _, true) => "mixed",
+        (true, false, false, false) => "tightened",
+        (false, true, false, false) => "loosened",
+        (false, false, false, true) => "changed",
+        (false, false, false, false) => return None,
+    })
+}
+
+fn push_permission_drift_change(
+    changes: &mut Vec<(&'static str, &'static str)>,
+    dimension: &'static str,
+    startup_allows: bool,
+    current_allows: bool,
+) {
+    match (startup_allows, current_allows) {
+        (true, false) => changes.push((dimension, "tightened")),
+        (false, true) => changes.push((dimension, "loosened")),
+        _ => {}
+    }
+}
+
 fn record_passive_adapter_notification(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
@@ -3369,6 +5075,124 @@ fn record_passive_adapter_capabilities(
     }
 }
 
+fn record_passive_adapter_permissions(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    startup: Option<CliResolvedPermissions>,
+    effective: CliResolvedPermissions,
+    snapshot: &CliPermissionSnapshot,
+    running: Option<&AtomicBool>,
+) -> Result<()> {
+    let snapshot_json = serde_json::to_string(&snapshot.raw_json(effective))?;
+    let result = dispatch_cli_adapter_command_with_retry_timeout(
+        config,
+        || Commands::Cli {
+            command: CliCommand::Session {
+                command: CliSessionCommand::NotePermissions(CliSessionNotePermissionsArgs {
+                    managed_session_id: config.managed_session_id.clone(),
+                    session_epoch: state.session_epoch,
+                    effective_allows_approval: effective.allows_approval,
+                    effective_allows_network: effective.allows_network,
+                    effective_allows_write_access: effective.allows_write_access,
+                    startup_allows_approval: startup.map(|startup| startup.allows_approval),
+                    startup_allows_network: startup.map(|startup| startup.allows_network),
+                    startup_allows_write_access: startup.map(|startup| startup.allows_write_access),
+                    snapshot_json: snapshot_json.clone(),
+                    now: None,
+                }),
+            },
+        },
+        false,
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_PROOF_WRITE_RETRY_TIMEOUT_SECONDS),
+        running,
+        "persist passive CLI permission snapshot",
+    );
+    state.durable_proof_may_exist = true;
+    match result {
+        Ok(_) => {
+            if let Some(startup) = startup {
+                state.startup_permissions = Some(startup);
+                state.startup_permission_snapshot = Some(snapshot.clone());
+            }
+            state.last_effective_permissions = Some(effective);
+            Ok(())
+        }
+        Err(error) => {
+            invalidate_passive_adapter_proof(config, state, running).with_context(|| {
+                format!("invalidate passive adapter proof after permission write failed: {error:#}")
+            })?;
+            Err(error)
+        }
+    }
+}
+
+fn sync_passive_adapter_permissions_from_snapshot(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    snapshot: &CliPermissionSnapshot,
+    source_thread_id: Option<&str>,
+    batch_id: Option<&str>,
+    running: Option<&AtomicBool>,
+) -> Result<CliResolvedPermissions> {
+    if !config.permission_inputs.uses_auto() {
+        return Ok(CliResolvedPermissions {
+            allows_approval: config
+                .permission_inputs
+                .approval
+                .explicit_value()
+                .unwrap_or(false),
+            allows_network: config
+                .permission_inputs
+                .network
+                .explicit_value()
+                .unwrap_or(false),
+            allows_write_access: config
+                .permission_inputs
+                .write_access
+                .explicit_value()
+                .unwrap_or(false),
+        });
+    }
+    let current = config.permission_inputs.resolve(snapshot);
+    let startup = state.startup_permissions.unwrap_or(current);
+    let effective = effective_permissions(startup, current);
+    let current_snapshot_changed =
+        state.last_current_permission_snapshot.as_ref() != Some(snapshot);
+    if state.startup_permissions.is_some()
+        && (state.last_current_permissions != Some(current) || current_snapshot_changed)
+    {
+        let startup_snapshot = state
+            .startup_permission_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing startup permission snapshot"))?;
+        record_permission_drift_if_needed(
+            config,
+            state,
+            CliPermissionDriftObservation {
+                source_thread_id,
+                batch_id,
+                startup,
+                current,
+                effective,
+                startup_snapshot,
+                snapshot,
+            },
+        )?;
+    }
+    let startup_to_record = state.startup_permissions.is_none().then_some(startup);
+    record_passive_adapter_permissions(
+        config,
+        state,
+        startup_to_record,
+        effective,
+        snapshot,
+        running,
+    )?;
+    state.last_current_permissions = Some(current);
+    state.last_current_permission_snapshot = Some(snapshot.clone());
+    Ok(effective)
+}
+
 fn invalidate_passive_adapter_proof(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
@@ -3381,6 +5205,9 @@ fn invalidate_passive_adapter_proof(
         state.last_activity_state = None;
         state.passive_capabilities_recorded = false;
         state.last_auto_delivery_poll = None;
+        state.last_current_permissions = None;
+        state.last_current_permission_snapshot = None;
+        state.last_effective_permissions = None;
         return Ok(());
     }
     let value = dispatch_cli_adapter_command_with_retry_timeout(
@@ -3433,6 +5260,9 @@ fn apply_passive_adapter_invalidated_session(
     state.passive_capabilities_recorded = false;
     state.durable_proof_may_exist = false;
     state.last_auto_delivery_poll = None;
+    state.last_current_permissions = None;
+    state.last_current_permission_snapshot = None;
+    state.last_effective_permissions = None;
     Ok(())
 }
 
@@ -3699,6 +5529,18 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
                 "--session-allows-write-access",
                 args.session_allows_write_access,
             );
+            if args.auto_profile {
+                argv.push(OsString::from("--auto-profile"));
+            }
+            if args.session_allows_approval_explicit {
+                argv.push(OsString::from("--session-allows-approval-explicit"));
+            }
+            if args.session_allows_network_explicit {
+                argv.push(OsString::from("--session-allows-network-explicit"));
+            }
+            if args.session_allows_write_access_explicit {
+                argv.push(OsString::from("--session-allows-write-access-explicit"));
+            }
             if let Some(now) = args.now {
                 push_i64_arg(&mut argv, "--now", now);
             }
@@ -3757,6 +5599,55 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             );
             push_bool_arg(&mut argv, "--thread-start", args.thread_start);
             push_bool_arg(&mut argv, "--turn-steer", args.turn_steer);
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Cli {
+            command:
+                CliCommand::Session {
+                    command: CliSessionCommand::NotePermissions(args),
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("cli"),
+                OsString::from("session"),
+                OsString::from("note-permissions"),
+            ];
+            push_string_arg(&mut argv, "--managed-session-id", &args.managed_session_id);
+            push_i64_arg(&mut argv, "--session-epoch", args.session_epoch);
+            push_bool_arg(
+                &mut argv,
+                "--effective-allows-approval",
+                args.effective_allows_approval,
+            );
+            push_bool_arg(
+                &mut argv,
+                "--effective-allows-network",
+                args.effective_allows_network,
+            );
+            push_bool_arg(
+                &mut argv,
+                "--effective-allows-write-access",
+                args.effective_allows_write_access,
+            );
+            push_optional_bool_arg(
+                &mut argv,
+                "--startup-allows-approval",
+                args.startup_allows_approval,
+            );
+            push_optional_bool_arg(
+                &mut argv,
+                "--startup-allows-network",
+                args.startup_allows_network,
+            );
+            push_optional_bool_arg(
+                &mut argv,
+                "--startup-allows-write-access",
+                args.startup_allows_write_access,
+            );
+            push_string_arg(&mut argv, "--snapshot-json", &args.snapshot_json);
             if let Some(now) = args.now {
                 push_i64_arg(&mut argv, "--now", now);
             }
@@ -3953,6 +5844,7 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             command: AuditCommand::List(_),
         }
         | Commands::Self_ { .. }
+        | Commands::Resume(_)
         | Commands::Cli {
             command: CliCommand::Run(_),
         }
@@ -4891,13 +6783,30 @@ fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
                     Some(value) => value,
                     None => now_epoch_seconds()?,
                 };
+                let profile = CliManagedSessionProfile {
+                    session_allows_approval: args.session_allows_approval,
+                    session_allows_network: args.session_allows_network,
+                    session_allows_write_access: args.session_allows_write_access,
+                };
+                let profile_requirement = if args.auto_profile {
+                    CliManagedSessionProfileRequirement {
+                        session_allows_approval: args
+                            .session_allows_approval_explicit
+                            .then_some(args.session_allows_approval),
+                        session_allows_network: args
+                            .session_allows_network_explicit
+                            .then_some(args.session_allows_network),
+                        session_allows_write_access: args
+                            .session_allows_write_access_explicit
+                            .then_some(args.session_allows_write_access),
+                    }
+                } else {
+                    CliManagedSessionProfileRequirement::all(&profile)
+                };
                 let session = store.attach_or_create_cli_managed_session(
                     &args.bound_thread_id,
-                    CliManagedSessionProfile {
-                        session_allows_approval: args.session_allows_approval,
-                        session_allows_network: args.session_allows_network,
-                        session_allows_write_access: args.session_allows_write_access,
-                    },
+                    profile,
+                    profile_requirement,
                     now,
                 )?;
                 Ok(json!({ "cli_session": session }))
@@ -4937,6 +6846,46 @@ fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
                         capability_negative_terminal_events: args.negative_terminal_events,
                         capability_thread_start: args.thread_start,
                         capability_turn_steer: args.turn_steer,
+                    },
+                    now,
+                )?;
+                Ok(json!({ "cli_session": session }))
+            }
+            CliSessionCommand::NotePermissions(args) => {
+                validate_positive("session_epoch", args.session_epoch)?;
+                validate_nonempty("snapshot_json", &args.snapshot_json)?;
+                let now = match args.now {
+                    Some(value) => value,
+                    None => now_epoch_seconds()?,
+                };
+                let startup = match (
+                    args.startup_allows_approval,
+                    args.startup_allows_network,
+                    args.startup_allows_write_access,
+                ) {
+                    (Some(approval), Some(network), Some(write_access)) => {
+                        Some(CliManagedSessionPermissions {
+                            session_allows_approval: approval,
+                            session_allows_network: network,
+                            session_allows_write_access: write_access,
+                        })
+                    }
+                    (None, None, None) => None,
+                    _ => bail!(
+                        "startup permission flags must either all be present or all be omitted"
+                    ),
+                };
+                let session = store.note_cli_managed_session_permissions(
+                    &args.managed_session_id,
+                    args.session_epoch,
+                    NewCliManagedSessionPermissionSnapshot {
+                        startup,
+                        effective: CliManagedSessionPermissions {
+                            session_allows_approval: args.effective_allows_approval,
+                            session_allows_network: args.effective_allows_network,
+                            session_allows_write_access: args.effective_allows_write_access,
+                        },
+                        snapshot_json: args.snapshot_json,
                     },
                     now,
                 )?;
@@ -5643,6 +7592,7 @@ fn cli_command_uses_lifecycle_store_timeout(command: &CliCommand) -> bool {
         CliCommand::Session {
             command: CliSessionCommand::NoteActivity(_)
                 | CliSessionCommand::NoteCapabilities(_)
+                | CliSessionCommand::NotePermissions(_)
                 | CliSessionCommand::InvalidateProof(_)
                 | CliSessionCommand::Retire(_),
         }
@@ -5814,4 +7764,577 @@ fn write_json<T: Serialize>(value: &T) -> Result<()> {
     serde_json::to_writer_pretty(&mut lock, value)?;
     lock.write_all(b"\n")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolved(snapshot: &CliPermissionSnapshot) -> CliResolvedPermissions {
+        CliResolvedPermissions {
+            allows_approval: snapshot.allows_approval,
+            allows_network: snapshot.allows_network,
+            allows_write_access: snapshot.allows_write_access,
+        }
+    }
+
+    fn restricted_access(roots: &[&str]) -> Value {
+        json!({
+            "type": "restricted",
+            "includePlatformDefaults": true,
+            "readableRoots": roots,
+        })
+    }
+
+    fn restricted_access_without_platform_defaults(roots: &[&str]) -> Value {
+        json!({
+            "type": "restricted",
+            "includePlatformDefaults": false,
+            "readableRoots": roots,
+        })
+    }
+
+    #[test]
+    fn permission_snapshot_derives_read_only_no_network_no_approval() {
+        let snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "never",
+            "sandbox": {
+                "type": "readOnly",
+                "access": restricted_access(&["/tmp/read"]),
+                "networkAccess": false
+            }
+        }))
+        .expect("parse snapshot");
+
+        assert!(!snapshot.allows_approval);
+        assert!(!snapshot.allows_network);
+        assert!(!snapshot.allows_write_access);
+    }
+
+    #[test]
+    fn permission_snapshot_treats_workspace_write_network_as_higher_risk() {
+        let snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse snapshot");
+
+        assert!(snapshot.allows_approval);
+        assert!(snapshot.allows_network);
+        assert!(snapshot.allows_write_access);
+    }
+
+    #[test]
+    fn permission_snapshot_rejects_unknown_shapes() {
+        let error = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "mystery",
+            "sandbox": {
+                "type": "readOnly",
+                "access": restricted_access(&["/tmp/read"]),
+                "networkAccess": false
+            }
+        }))
+        .expect_err("unknown approval policy should fail closed");
+
+        assert!(error.to_string().contains("unknown approvalPolicy"));
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_keep_startup_tighter_than_current() {
+        let startup_snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "never",
+            "sandbox": {
+                "type": "readOnly",
+                "access": restricted_access(&["/tmp/start-read"]),
+                "networkAccess": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/start-read", "/tmp/work"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse snapshot");
+        let effective = effective_permissions(resolved(&startup_snapshot), resolved(&current));
+        let overrides =
+            turn_start_permission_overrides(&startup_snapshot, &current, effective).expect("pin");
+
+        assert_eq!(overrides["approvalPolicy"], json!("never"));
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("readOnly"));
+        assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(false));
+        assert!(overrides["sandboxPolicy"].get("access").is_none());
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_cap_loosened_workspace_roots_to_startup() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read-a"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/a"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-failure",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read-a", "/tmp/read-b"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/a", "/tmp/b"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(overrides["approvalPolicy"], json!("on-failure"));
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("workspaceWrite"));
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/a"])
+        );
+        assert!(overrides["sandboxPolicy"].get("readOnlyAccess").is_none());
+        assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(true));
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_preserve_nested_tighter_workspace_roots() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo", "/tmp/other"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo/subdir", "/tmp/repo/another", "/tmp/unrelated"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/repo/subdir", "/tmp/repo/another"])
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_preserve_startup_nested_workspace_root() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo/subdir"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/repo/subdir"])
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_reject_parent_dir_workspace_root() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo/../other"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let error = turn_start_permission_overrides(&startup, &current, effective)
+            .expect_err("parent directory root rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("contains parent directory component")
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_explicit_no_write_uses_legacy_read_only_shape() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read-a", "/tmp/read-b"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/a", "/tmp/b"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access_without_platform_defaults(&["/tmp/read-b", "/tmp/read-c"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/b", "/tmp/c"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = CliResolvedPermissions {
+            allows_approval: true,
+            allows_network: true,
+            allows_write_access: false,
+        };
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("readOnly"));
+        assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(true));
+        assert!(overrides["sandboxPolicy"].get("access").is_none());
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_use_current_tighter_workspace_roots() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-failure",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read-a", "/tmp/read-b"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/a", "/tmp/b"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "untrusted",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access_without_platform_defaults(&["/tmp/read-b"]),
+                "networkAccess": false,
+                "writableRoots": ["/tmp/b"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": true
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(overrides["approvalPolicy"], json!("untrusted"));
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("workspaceWrite"));
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/b"])
+        );
+        assert!(overrides["sandboxPolicy"].get("readOnlyAccess").is_none());
+        assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(false));
+        assert_eq!(overrides["sandboxPolicy"]["excludeSlashTmp"], json!(true));
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_keep_startup_workspace_against_current_danger_full_access() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "dangerFullAccess"
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("workspaceWrite"));
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/work"])
+        );
+        assert_eq!(
+            overrides["sandboxPolicy"]["excludeTmpdirEnvVar"],
+            json!(true)
+        );
+        assert!(overrides["sandboxPolicy"].get("readOnlyAccess").is_none());
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_reject_parent_dir_single_workspace_startup_root() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work/../other"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "dangerFullAccess"
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let error = turn_start_permission_overrides(&startup, &current, effective)
+            .expect_err("parent directory startup root rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("contains parent directory component")
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_reject_relative_single_workspace_current_root() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "dangerFullAccess"
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["relative/work"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let error = turn_start_permission_overrides(&startup, &current, effective)
+            .expect_err("relative current root rejected");
+
+        assert!(error.to_string().contains("is not absolute"));
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_reject_mixed_workspace_external_sandbox() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "externalSandbox",
+                "networkAccess": "enabled"
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let error = turn_start_permission_overrides(&startup, &current, effective)
+            .expect_err("mixed workspace/external sandbox should fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("mixed externalSandbox/workspaceWrite"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn permission_drift_tracks_mixed_dimension_changes() {
+        let startup = CliResolvedPermissions {
+            allows_approval: false,
+            allows_network: true,
+            allows_write_access: false,
+        };
+        let current = CliResolvedPermissions {
+            allows_approval: false,
+            allows_network: false,
+            allows_write_access: true,
+        };
+
+        assert_eq!(
+            permission_drift_changes(startup, current),
+            vec![("network", "tightened"), ("write_access", "loosened")]
+        );
+    }
+
+    #[test]
+    fn permission_drift_tracks_raw_sandbox_policy_changes() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/a"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read", "/tmp/extra-read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/a", "/tmp/b"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+
+        assert_eq!(
+            permission_drift_changes(resolved(&startup), resolved(&current)),
+            Vec::<(&'static str, &'static str)>::new()
+        );
+        assert_eq!(
+            permission_snapshot_drift_changes(&startup, &current).expect("snapshot drift"),
+            vec![("sandbox_policy", "loosened")]
+        );
+    }
+
+    #[test]
+    fn permission_drift_defaults_missing_include_platform_defaults() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "readOnly",
+                "access": {
+                    "type": "restricted",
+                    "readableRoots": ["/tmp/read"]
+                },
+                "networkAccess": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "readOnly",
+                "access": {
+                    "type": "restricted",
+                    "readableRoots": ["/tmp/read", "/tmp/extra-read"]
+                },
+                "networkAccess": false
+            }
+        }))
+        .expect("parse current snapshot");
+
+        assert_eq!(
+            permission_snapshot_drift_changes(&startup, &current).expect("snapshot drift"),
+            vec![("sandbox_policy", "loosened")]
+        );
+    }
 }

@@ -267,6 +267,12 @@ pub struct CliManagedSessionRecord {
     pub session_allows_approval: bool,
     pub session_allows_network: bool,
     pub session_allows_write_access: bool,
+    pub startup_session_allows_approval: Option<bool>,
+    pub startup_session_allows_network: Option<bool>,
+    pub startup_session_allows_write_access: Option<bool>,
+    pub startup_permission_snapshot_json: Option<String>,
+    pub last_permission_snapshot_json: Option<String>,
+    pub permission_snapshot_revision: i64,
     pub created_at: i64,
     pub updated_at: i64,
     pub retired_at: Option<i64>,
@@ -290,6 +296,23 @@ pub struct CliManagedSessionProfile {
     pub session_allows_write_access: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct CliManagedSessionProfileRequirement {
+    pub session_allows_approval: Option<bool>,
+    pub session_allows_network: Option<bool>,
+    pub session_allows_write_access: Option<bool>,
+}
+
+impl CliManagedSessionProfileRequirement {
+    pub fn all(profile: &CliManagedSessionProfile) -> Self {
+        Self {
+            session_allows_approval: Some(profile.session_allows_approval),
+            session_allows_network: Some(profile.session_allows_network),
+            session_allows_write_access: Some(profile.session_allows_write_access),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CliManagedSessionActivityUpdate {
     pub session: CliManagedSessionRecord,
@@ -308,6 +331,25 @@ pub struct CliManagedSessionCapabilities {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CliManagedSessionCapabilityUpdate {
+    pub session: CliManagedSessionRecord,
+}
+
+#[derive(Clone, Debug)]
+pub struct CliManagedSessionPermissions {
+    pub session_allows_approval: bool,
+    pub session_allows_network: bool,
+    pub session_allows_write_access: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewCliManagedSessionPermissionSnapshot {
+    pub startup: Option<CliManagedSessionPermissions>,
+    pub effective: CliManagedSessionPermissions,
+    pub snapshot_json: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CliManagedSessionPermissionUpdate {
     pub session: CliManagedSessionRecord,
 }
 

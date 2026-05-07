@@ -61,6 +61,7 @@ superseded_by:
 
 ## CLI And Daemon Follow-ups
 
+- Follow up PR #43 `cbth resume` hardening in order: native resume cwd UX parity, exact `permissionProfile` snapshot parsing with legacy fallback, then soft Codex CLI validated-version warnings.
 - Finish CLI attach / recovery `activity_state=unknown -> current-state sync -> active/idle`; no auto-idle before authoritative sync and fail closed on continuity loss.
 - Finish daemon overdue sweep / next-start reconcile so every entrypoint first closes, reconciles, or GC's due work, while `delivery_observation_deadline` remains the live-observation exception.
 - Fix caller heartbeat long-term lifecycle: pre-bound `caller_automation_id`, normal `pause` / `update` / `reuse`, no normal-path delete, and operator-only unbind / destroy.
