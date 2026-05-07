@@ -2415,6 +2415,11 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
     assert_eq!(params["persistExtendedHistory"], serde_json::json!(true));
 
     let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    let foreground_line = log
+        .lines()
+        .find(|line| line.starts_with("foreground\t"))
+        .expect("foreground invocation log");
+    assert_eq!(foreground_line.matches("\t--cd\t").count(), 1);
     assert!(log.contains(&format!("\t--cd\t{}", expected_cwd.display())));
 
     stop_daemon(&home);

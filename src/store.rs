@@ -1172,7 +1172,11 @@ impl Store {
         ensure_cli_session_epoch_matches(&session, session_epoch)?;
         ensure_cli_session_attachable(&session)?;
         if let Some(startup) = &snapshot.startup {
-            ensure_cli_session_startup_permissions_can_pin(&session, startup)?;
+            ensure_cli_session_startup_permissions_can_pin(
+                &session,
+                startup,
+                &snapshot.snapshot_json,
+            )?;
         } else if !cli_session_startup_permissions_are_pinned(&session) {
             bail!(
                 "CLI managed session {} has no startup permission snapshot",
@@ -4438,6 +4442,7 @@ fn cli_session_current_permission_snapshot_is_fresh(session: &CliManagedSessionR
 fn ensure_cli_session_startup_permissions_can_pin(
     session: &CliManagedSessionRecord,
     startup: &CliManagedSessionPermissions,
+    snapshot_json: &str,
 ) -> Result<()> {
     if !cli_session_startup_permissions_are_pinned(session) {
         return Ok(());
@@ -4445,6 +4450,7 @@ fn ensure_cli_session_startup_permissions_can_pin(
     if session.startup_session_allows_approval == Some(startup.session_allows_approval)
         && session.startup_session_allows_network == Some(startup.session_allows_network)
         && session.startup_session_allows_write_access == Some(startup.session_allows_write_access)
+        && session.startup_permission_snapshot_json.as_deref() == Some(snapshot_json)
     {
         Ok(())
     } else {

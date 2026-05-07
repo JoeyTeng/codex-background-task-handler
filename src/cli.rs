@@ -1644,7 +1644,7 @@ fn run_cli_session(
     let target =
         resolve_cli_run_thread_target(layout, &config.target, &codex_binary, &cwd, &lease_id)?;
     let bound_thread_id = target.bound_thread_id.clone();
-    let foreground_codex_args =
+    let (foreground_cwd, foreground_codex_args) =
         match foreground_codex_args(&config.foreground_mode, &cwd, &config.codex_args) {
             Ok(args) => args,
             Err(error) => {
@@ -1659,7 +1659,7 @@ fn run_cli_session(
     let initial_thread_resume_params = match initial_passive_thread_resume_params(
         &config.foreground_mode,
         &bound_thread_id,
-        &cwd,
+        &foreground_cwd,
         &foreground_codex_args,
     ) {
         Ok(params) => params,
@@ -1755,7 +1755,7 @@ fn run_cli_session(
         .arg("--remote")
         .arg(&url)
         .arg("--cd")
-        .arg(&cwd)
+        .arg(&foreground_cwd)
         .args(foreground_codex_args)
         .status()
         .with_context(|| format!("spawn foreground codex via {:?}", codex_binary));
@@ -1881,40 +1881,41 @@ fn foreground_codex_args(
     foreground_mode: &CliForegroundMode,
     caller_cwd: &Path,
     codex_args: &[OsString],
-) -> Result<Vec<OsString>> {
+) -> Result<(PathBuf, Vec<OsString>)> {
     if !matches!(foreground_mode, CliForegroundMode::Resume { .. }) {
-        return Ok(codex_args.to_vec());
+        return Ok((caller_cwd.to_path_buf(), codex_args.to_vec()));
     }
-    let mut normalized = codex_args.to_vec();
+    let mut foreground_cwd = caller_cwd.to_path_buf();
+    let mut filtered = Vec::with_capacity(codex_args.len());
     let mut index = 0;
-    while index < normalized.len() {
-        let arg = os_arg_to_utf8(&normalized[index], "codex argument")?;
+    while index < codex_args.len() {
+        let arg = os_arg_to_utf8(&codex_args[index], "codex argument")?;
         if arg == "--" || arg == "-" || !arg.starts_with('-') {
+            filtered.extend(codex_args[index..].iter().cloned());
             break;
         }
         if let Some(value) = arg.strip_prefix("--cd=") {
-            let cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
-            normalized[index] = OsString::from(format!("--cd={}", cwd.to_string_lossy()));
+            foreground_cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
         } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
-            let cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
-            normalized[index] = OsString::from(format!("-C{}", cwd.to_string_lossy()));
+            foreground_cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
         } else if arg.strip_prefix("--image=").is_some()
             || arg
                 .strip_prefix("-i")
                 .is_some_and(|value| !value.is_empty())
         {
-            skip_variadic_codex_arg_values(&normalized, &mut index, arg.as_str(), true)?;
+            let start = index;
+            skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), true)?;
+            filtered.extend(codex_args[start..=index].iter().cloned());
         } else {
             match arg.as_str() {
                 "--cd" | "-C" => {
                     index += 1;
-                    let cwd = {
-                        let Some(value) = normalized.get(index) else {
+                    foreground_cwd = {
+                        let Some(value) = codex_args.get(index) else {
                             bail!("codex argument {arg} requires a value");
                         };
-                        resolve_codex_cwd_arg(caller_cwd, value).into_os_string()
+                        resolve_codex_cwd_arg(caller_cwd, value)
                     };
-                    normalized[index] = cwd;
                 }
                 "--model"
                 | "-m"
@@ -1932,17 +1933,23 @@ fn foreground_codex_args(
                 | "--remote"
                 | "--remote-auth-token-env"
                 | "--add-dir" => {
-                    skip_codex_arg_value(&normalized, &mut index, arg.as_str())?;
+                    let start = index;
+                    skip_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    filtered.extend(codex_args[start..=index].iter().cloned());
                 }
                 "--image" | "-i" => {
-                    skip_variadic_codex_arg_values(&normalized, &mut index, arg.as_str(), false)?;
+                    let start = index;
+                    skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), false)?;
+                    filtered.extend(codex_args[start..=index].iter().cloned());
                 }
-                _ => {}
+                _ => {
+                    filtered.push(codex_args[index].clone());
+                }
             }
         }
         index += 1;
     }
-    Ok(normalized)
+    Ok((foreground_cwd, filtered))
 }
 
 fn initial_passive_thread_resume_params(

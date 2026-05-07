@@ -1358,6 +1358,117 @@ fn cli_session_invalidate_proof_resets_activity_and_capabilities() {
 }
 
 #[test]
+fn cli_session_note_permissions_rejects_startup_raw_snapshot_drift() {
+    let home = tempfile::tempdir().expect("temp home");
+    let managed_session_id = bind_cli_session(&home, "thread-cli-permission-raw-startup");
+    let startup_snapshot = json!({
+        "approvalPolicy": "on-request",
+        "sandbox": {
+            "type": "workspaceWrite",
+            "readOnlyAccess": {
+                "type": "restricted",
+                "includePlatformDefaults": false,
+                "readableRoots": ["/tmp/read"]
+            },
+            "networkAccess": true,
+            "writableRoots": ["/tmp/work-a"],
+            "excludeTmpdirEnvVar": false,
+            "excludeSlashTmp": false
+        },
+        "derived": {
+            "allows_approval": true,
+            "allows_network": true,
+            "allows_write_access": true
+        },
+        "effective": {
+            "allows_approval": true,
+            "allows_network": true,
+            "allows_write_access": true
+        }
+    })
+    .to_string();
+    note_cli_session_permissions(
+        &home,
+        &managed_session_id,
+        Some((true, true, true)),
+        (true, true, true),
+        &startup_snapshot,
+    );
+
+    let drifted_snapshot = json!({
+        "approvalPolicy": "on-request",
+        "sandbox": {
+            "type": "workspaceWrite",
+            "readOnlyAccess": {
+                "type": "restricted",
+                "includePlatformDefaults": false,
+                "readableRoots": ["/tmp/read"]
+            },
+            "networkAccess": true,
+            "writableRoots": ["/tmp/work-b"],
+            "excludeTmpdirEnvVar": false,
+            "excludeSlashTmp": false
+        },
+        "derived": {
+            "allows_approval": true,
+            "allows_network": true,
+            "allows_write_access": true
+        },
+        "effective": {
+            "allows_approval": true,
+            "allows_network": true,
+            "allows_write_access": true
+        }
+    })
+    .to_string();
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "cli",
+            "session",
+            "note-permissions",
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "1",
+            "--effective-allows-approval",
+            "true",
+            "--effective-allows-network",
+            "true",
+            "--effective-allows-write-access",
+            "true",
+            "--startup-allows-approval",
+            "true",
+            "--startup-allows-network",
+            "true",
+            "--startup-allows-write-access",
+            "true",
+            "--snapshot-json",
+            drifted_snapshot.as_str(),
+        ],
+    );
+    assert!(stderr.contains("startup permission snapshot is already pinned"));
+
+    let inspected = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &managed_session_id,
+        ],
+    );
+    assert_eq!(
+        inspected["cli_session"]["startup_permission_snapshot_json"]
+            .as_str()
+            .expect("startup snapshot json"),
+        startup_snapshot
+    );
+    assert_eq!(inspected["cli_session"]["permission_snapshot_revision"], 1);
+}
+
+#[test]
 fn cli_session_invalidate_proof_preserves_startup_permission_cap() {
     let home = tempfile::tempdir().expect("temp home");
     let managed_session_id = bind_idle_cli_session(&home, "thread-cli-permission-invalidation");
