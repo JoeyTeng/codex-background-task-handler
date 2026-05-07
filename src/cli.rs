@@ -2262,21 +2262,28 @@ fn read_managed_resume_thread_cwd(
 }
 
 fn thread_read_cwd_from_response<'a>(read: &'a Value, thread_id: &str) -> Option<&'a str> {
+    if let Some(thread) = read.get("thread")
+        && let Some(cwd) = thread.get("cwd").and_then(Value::as_str)
+    {
+        return (thread.get("id").and_then(Value::as_str) == Some(thread_id)).then_some(cwd);
+    }
     if !thread_read_response_matches_thread(read, thread_id) {
         return None;
     }
-    read.get("thread")
-        .and_then(|thread| thread.get("cwd"))
-        .and_then(Value::as_str)
-        .or_else(|| read.get("cwd").and_then(Value::as_str))
+    read.get("cwd").and_then(Value::as_str)
 }
 
 fn thread_read_response_matches_thread(read: &Value, thread_id: &str) -> bool {
+    if let Some(thread) = read.get("thread")
+        && thread.get("id").and_then(Value::as_str) != Some(thread_id)
+    {
+        return false;
+    }
     let mut matched = false;
     for candidate in [
-        read.get("thread").and_then(|thread| thread.get("id")),
         read.get("id"),
         read.get("threadId"),
+        read.get("thread").and_then(|thread| thread.get("id")),
     ] {
         let Some(candidate) = candidate else {
             continue;
@@ -2569,7 +2576,9 @@ fn apply_codex_config_override(
         return Ok(());
     };
     let value = strip_cli_value_quotes(raw_value.trim());
-    match key.trim() {
+    let key = key.trim();
+    reject_permission_affecting_codex_config_override(key)?;
+    match key {
         "model" => {
             params.insert("model".to_owned(), Value::String(value.to_owned()));
         }
@@ -2600,6 +2609,46 @@ fn apply_codex_config_override(
         _ => {}
     }
     Ok(())
+}
+
+fn reject_permission_affecting_codex_config_override(key: &str) -> Result<()> {
+    if managed_resume_config_override_affects_sandbox_scope(key) {
+        bail!(
+            "managed resume does not allow forwarded --config sandbox permission override {key:?}; cbth cannot faithfully carry it into initial thread/resume"
+        );
+    }
+    Ok(())
+}
+
+fn managed_resume_config_override_affects_sandbox_scope(key: &str) -> bool {
+    let normalized = key.replace('-', "_");
+    let key = normalized.as_str();
+    key == "sandbox_workspace_write"
+        || key
+            .strip_prefix("sandbox_workspace_write.")
+            .is_some_and(managed_resume_workspace_write_config_field_affects_sandbox_scope)
+        || key == "sandbox_read_only"
+        || key.starts_with("sandbox_read_only.")
+        || key == "writable_roots"
+        || key.ends_with(".writable_roots")
+        || key == "readable_roots"
+        || key.ends_with(".readable_roots")
+        || key == "network_access"
+        || key.ends_with(".network_access")
+}
+
+fn managed_resume_workspace_write_config_field_affects_sandbox_scope(field: &str) -> bool {
+    matches!(
+        field,
+        "writable_roots"
+            | "network_access"
+            | "exclude_tmpdir_env_var"
+            | "exclude_slash_tmp"
+            | "read_only_access"
+            | "read_only_access.type"
+            | "read_only_access.readable_roots"
+            | "read_only_access.include_platform_defaults"
+    )
 }
 
 fn next_codex_arg_value(args: &[OsString], index: &mut usize, flag: &str) -> Result<String> {
@@ -2934,17 +2983,28 @@ enum PermissionProfilePathScope {
 }
 
 fn parse_permission_profile_permissions(value: &Value) -> Result<PermissionProfilePermissions> {
+    let value = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("thread/resume permissionProfile is not an object"))?;
     let allows_network = match value.get("network") {
         Some(Value::Null) | None => false,
-        Some(network) => network
+        Some(Value::Object(network)) => network
             .get("enabled")
             .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "thread/resume permissionProfile network.enabled missing or not a boolean"
+                )
+            })?,
+        Some(_) => bail!("thread/resume permissionProfile network is not an object"),
     };
     let mut permissions = PermissionProfilePermissions::new(allows_network);
     let Some(file_system) = value.get("fileSystem").filter(|value| !value.is_null()) else {
         return Ok(permissions);
     };
+    let file_system = file_system.as_object().ok_or_else(|| {
+        anyhow::anyhow!("thread/resume permissionProfile fileSystem is not an object")
+    })?;
     let entries = file_system
         .get("entries")
         .and_then(Value::as_array)
@@ -5319,7 +5379,7 @@ fn sandbox_policy_drift_direction(startup: &Value, current: &Value) -> Result<&'
                 roots_drift_direction(
                     workspace_writable_roots(startup)?,
                     workspace_writable_roots(current)?,
-                ),
+                )?,
             );
             push_optional_direction(
                 &mut directions,
@@ -5369,7 +5429,7 @@ fn read_only_access_drift_direction(
                 roots_drift_direction(
                     read_only_readable_roots(startup)?,
                     read_only_readable_roots(current)?,
-                ),
+                )?,
             );
             push_optional_direction(
                 &mut directions,
@@ -5389,18 +5449,57 @@ fn read_only_access_drift_direction(
 fn roots_drift_direction(
     startup_roots: Vec<String>,
     current_roots: Vec<String>,
-) -> Option<&'static str> {
-    let startup = startup_roots.into_iter().collect::<HashSet<_>>();
-    let current = current_roots.into_iter().collect::<HashSet<_>>();
-    if startup == current {
-        return None;
-    }
-    let current_is_subset = current.is_subset(&startup);
-    let startup_is_subset = startup.is_subset(&current);
-    Some(match (current_is_subset, startup_is_subset) {
+) -> Result<Option<&'static str>> {
+    let startup = normalize_permission_roots_for_drift(startup_roots)?;
+    let current = normalize_permission_roots_for_drift(current_roots)?;
+    let current_is_subset = permission_roots_covered_by(&current, &startup);
+    let startup_is_subset = permission_roots_covered_by(&startup, &current);
+    let direction = match (current_is_subset, startup_is_subset) {
+        (true, true) => return Ok(None),
         (true, false) => "tightened",
         (false, true) => "loosened",
         _ => "mixed",
+    };
+    Ok(Some(direction))
+}
+
+fn normalize_permission_roots_for_drift(roots: Vec<String>) -> Result<Vec<PathBuf>> {
+    let mut seen = HashSet::new();
+    let mut normalized_roots = Vec::new();
+    for root in roots {
+        let root = normalize_absolute_permission_root_for_drift(&root)?;
+        if seen.insert(root.clone()) {
+            normalized_roots.push(root);
+        }
+    }
+    Ok(normalized_roots)
+}
+
+fn normalize_absolute_permission_root_for_drift(root: &str) -> Result<PathBuf> {
+    let root_path = Path::new(root);
+    if !root_path.is_absolute() {
+        bail!("permission root is not absolute: {root:?}");
+    }
+    let mut normalized = PathBuf::new();
+    for component in root_path.components() {
+        match component {
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                bail!("permission root contains parent directory component: {root:?}")
+            }
+            Component::Prefix(_) => bail!("permission root contains unsupported prefix: {root:?}"),
+        }
+    }
+    Ok(normalized)
+}
+
+fn permission_roots_covered_by(roots: &[PathBuf], covering_roots: &[PathBuf]) -> bool {
+    roots.iter().all(|root| {
+        covering_roots
+            .iter()
+            .any(|covering| root.starts_with(covering))
     })
 }
 
@@ -8534,6 +8633,16 @@ mod tests {
         assert_eq!(
             thread_read_cwd_from_response(
                 &json!({
+                    "threadId": "thread-1",
+                    "thread": { "cwd": "/tmp/thread" }
+                }),
+                "thread-1"
+            ),
+            None
+        );
+        assert_eq!(
+            thread_read_cwd_from_response(
+                &json!({
                     "thread": { "id": "thread-1" },
                     "id": "thread-other",
                     "cwd": "/tmp/top"
@@ -8723,6 +8832,50 @@ mod tests {
         .expect_err("mismatched permission profile should fail closed");
 
         assert!(error.to_string().contains("disagree"));
+    }
+
+    #[test]
+    fn permission_snapshot_rejects_malformed_permission_profiles() {
+        let cases = [
+            (
+                json!("invalid"),
+                "thread/resume permissionProfile is not an object",
+            ),
+            (
+                json!({ "network": "invalid", "fileSystem": null }),
+                "thread/resume permissionProfile network is not an object",
+            ),
+            (
+                json!({ "network": {}, "fileSystem": null }),
+                "thread/resume permissionProfile network.enabled missing or not a boolean",
+            ),
+            (
+                json!({ "network": { "enabled": "false" }, "fileSystem": null }),
+                "thread/resume permissionProfile network.enabled missing or not a boolean",
+            ),
+            (
+                json!({ "network": null, "fileSystem": "invalid" }),
+                "thread/resume permissionProfile fileSystem is not an object",
+            ),
+        ];
+
+        for (permission_profile, expected) in cases {
+            let error = parse_thread_resume_permission_snapshot(&json!({
+                "approvalPolicy": "never",
+                "sandbox": {
+                    "type": "readOnly",
+                    "access": restricted_access(&["/tmp/read"]),
+                    "networkAccess": false
+                },
+                "permissionProfile": permission_profile
+            }))
+            .expect_err("malformed permissionProfile should fail closed");
+
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error:#}"
+            );
+        }
     }
 
     #[test]
@@ -9286,6 +9439,43 @@ mod tests {
         );
         assert_eq!(
             permission_snapshot_drift_changes(&startup, &current).expect("snapshot drift"),
+            vec![("sandbox_policy", "loosened")]
+        );
+    }
+
+    #[test]
+    fn permission_drift_tracks_nested_workspace_roots_by_containment() {
+        let broad = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            }
+        }))
+        .expect("parse broad snapshot");
+        let narrow = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo/subdir"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            }
+        }))
+        .expect("parse narrow snapshot");
+
+        assert_eq!(
+            permission_snapshot_drift_changes(&broad, &narrow).expect("tightened drift"),
+            vec![("sandbox_policy", "tightened")]
+        );
+        assert_eq!(
+            permission_snapshot_drift_changes(&narrow, &broad).expect("loosened drift"),
             vec![("sandbox_policy", "loosened")]
         );
     }

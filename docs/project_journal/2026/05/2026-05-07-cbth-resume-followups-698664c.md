@@ -44,14 +44,18 @@ superseded_by:
   - Final internal `codex-readonly` review on `origin/master..HEAD` returned `LGTM`.
   - Clean-context reviewer on PR #45 found that interactive resume cwd probing accepted `thread/read` cwd without proving the response belonged to the requested thread. The fix now requires nested `thread.id`, top-level `id`, or top-level `threadId` to explicitly match before using cwd, and treats missing/foreign ids as no history cwd so native no-`--cd` fallback remains intact.
   - Codex PR review gate found that canonical `permissionProfile` workspace writes can use `special.kind: "project_roots"` in normal Codex 0.128 responses. The fix treats unsuffixed `project_roots` as covering legacy workspace writable roots while still rejecting narrower `project_roots` subpaths as unrepresentable for legacy sandbox pinning.
+  - A later clean-context review found four follow-up gaps: mixed-shape `thread/read` cwd identity, permission-affecting `--config` forwarding, malformed canonical `permissionProfile` shapes, and nested-root drift direction. The next fix requires the cwd-bearing nested thread to carry a matching id, rejects known sandbox-scope config overrides, validates canonical profile object/network/fileSystem shapes strictly, and computes root drift by normalized containment instead of exact string-set subset checks.
 - Validation:
   - `cargo fmt --all -- --check`
   - `cargo clippy --locked --all-targets -- -D warnings`
   - `cargo test --locked`
   - `cargo test --locked thread_read_cwd_reads_nested_and_top_level_shapes --lib`
   - `cargo test --locked thread_read_cwd --lib`
+  - `cargo test --locked permission_snapshot_rejects_malformed_permission_profiles --lib`
+  - `cargo test --locked permission_drift_tracks_nested_workspace_roots_by_containment --lib`
   - `cargo test --locked permission_snapshot_accepts_project_roots_permission_profile_for_legacy_workspace_write --lib`
   - `cargo test --locked permission_snapshot_rejects_project_roots_subpath_for_legacy_workspace_write --lib`
+  - `cargo test --locked cbth_resume_rejects_permission_affecting_config_overrides --test cli_run`
   - `cargo test --locked permission_drift_tracks_permission_profile_body_changes --lib`
   - `CARGO_TARGET_DIR=.codex-tmp/cargo-target-precommit git commit -S ...` pre-commit hook passed `cargo fmt --all`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked` in an isolated target directory after the shared target produced a cross-worktree binary mismatch.
   - `uv run python /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/hoteng/.codex/worktrees/aef0/codex-background-task-handler`
