@@ -5,7 +5,7 @@ status: completed
 created: 2026-05-07
 updated: 2026-05-07
 branch: codex/desktop-no-db-inbox-reader
-pr:
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/41
 supersedes: []
 superseded_by:
 ---
