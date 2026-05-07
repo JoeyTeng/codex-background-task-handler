@@ -25,7 +25,7 @@ superseded_by:
   - `cbth desktop list-arm-pending --bridge-thread-id <thread-id> --json`
   - `cbth desktop list-pause-due --bridge-thread-id <thread-id> --json`
   - `cbth desktop claim-next-ready --bridge-thread-id <thread-id> --json`
-- The helpers must only read `~/.cbth/inbox/current-snapshot.json`, the referenced revision snapshots, and `desktop-installation-state.json`.
+- The helpers must only read `~/.cbth/inbox/current-snapshot.json`, the referenced revision snapshots, and the revision-specific `desktop-installation-state.json` referenced by the manifest.
 - The helpers must not open SQLite, connect the daemon, autostart, create `startup.lock`, write files, or depend on hidden `--direct-store`.
 - Shared reader validation must fail closed on schema mismatch, revision mismatch, bridge thread mismatch, missing files, malformed JSON, oversized files, or referenced paths outside the cbth inbox.
 - `claim-next-ready` is v1 read/peek only: return the first ready entry or `null`; do not reserve, hide, or mutate durable state.
@@ -41,16 +41,18 @@ superseded_by:
 ## Current State
 
 - `cbth desktop read-snapshot`, `list-arm-pending`, `list-pause-due`, and read/peek `claim-next-ready` are implemented as no-DB, no-daemon, no-write inbox readers.
-- The shared reader validates the current manifest, revision-specific snapshots, installation-state export, schema version, bridge thread id, snapshot revision, manifest paths, regular-file type, JSON size limit, and entry counts before returning data.
+- The shared reader validates the current manifest, revision-specific snapshots, revision-specific installation-state export, schema version, bridge thread id, snapshot revision, manifest paths, regular-file type, JSON size limit, and entry counts before returning data. The latest-only `~/.cbth/inbox/desktop-installation-state.json` remains an operator convenience export and is not used for revision-consistent reads.
 - Fake integration coverage proves the helpers can consume published snapshots even when SQLite is no longer openable and that they fail closed on missing, malformed, oversized, mismatched, or path-escaped snapshot inputs.
-- Real Desktop heartbeat validation succeeded with the no-DB helper path on 2026-05-07. The local installation was repaired to `read_transport_capability=validated`; `artifact_read_capability` and `writeback_capability` remain `unknown`.
+- Real Desktop heartbeat validation succeeded with the no-DB helper path on 2026-05-07. The V5 evidence used a revision-specific installation-state export at `~/.cbth/inbox/snapshots/<snapshot_revision>/desktop-installation-state.json`, and the local installation remains `read_transport_capability=validated`; `artifact_read_capability` and `writeback_capability` remain `unknown`.
 
 ## Evidence
 
 - Base merge commit: `98dc2b42f8edd595d1ede6dd846634ab09a86779`
 - Prior live evidence: [Desktop live preflight evidence](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md)
 - Foundation design: [Desktop bridge foundation](../../../DESKTOP_BRIDGE_FOUNDATION.md)
-- Live validation marker: `CBTH_DESKTOP_NO_DB_INBOX_READ_V4 VALIDATION_OK`
-- Live validation snapshot revision: `019e0188-51de-77a2-87e9-af4a6cd15379`
+- Initial live validation marker: `CBTH_DESKTOP_NO_DB_INBOX_READ_V4 VALIDATION_OK`
+- Initial live validation snapshot revision: `019e0188-51de-77a2-87e9-af4a6cd15379`
+- Revision-specific installation-state validation marker: `CBTH_DESKTOP_NO_DB_INBOX_READ_V5 VALIDATION_OK`
+- Revision-specific installation-state snapshot revision: `019e01a8-82e2-7701-be48-cf1a35933253`
 - Post-repair exported snapshot revision: `019e0190-6ceb-7cd3-91bd-ae17c82383ed`
 - Local validation: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets -- -D warnings`; `cargo test --test desktop_foundation --locked`; `cargo test --locked`; `cargo test`; project journal validate; `git diff --check`

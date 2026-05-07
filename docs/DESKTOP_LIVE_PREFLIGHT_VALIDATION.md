@@ -75,7 +75,7 @@ A valid run proves only these capabilities for the current Desktop / `cbth` / lo
 - Heartbeat can execute no-DB `cbth desktop ...` read helpers without approval.
 - Heartbeat can direct-read `~/.cbth/inbox/current-snapshot.json` through `read-snapshot`.
 - Heartbeat can direct-read the three revision-specific snapshot files referenced by the manifest.
-- Heartbeat can direct-read `~/.cbth/inbox/desktop-installation-state.json`.
+- Heartbeat can direct-read the revision-specific `desktop-installation-state.json` referenced by the manifest.
 - Helper outputs agree on `schema_version`, `snapshot_revision`, and `bridge_thread_id`.
 
 After recording this evidence, the operator may mark `read_transport_capability=validated`. This does not validate writeback helpers or artifact payload reads.
@@ -86,7 +86,7 @@ After recording this evidence, the operator may mark `read_transport_capability=
 - If any read helper attempts to publish snapshots, open SQLite, connect a daemon socket, or write files, treat that as a bug and leave `read_transport_capability=unknown`.
 - If any file read asks for approval or fails, leave `read_transport_capability=unknown`.
 - If helper outputs disagree on snapshot revision or bridge thread, treat it as a snapshot/export bug and do not repair capability state.
-- If `desktop-installation-state.json` is missing, rerun with a `cbth` build that includes this validation foundation.
+- If the manifest-referenced `desktop-installation-state.json` is missing, rerun with a `cbth` build that includes this validation foundation.
 - If the Desktop app is closed, this validation is inconclusive; v1 only targets the app-alive heartbeat case.
 
 ## Cleanup

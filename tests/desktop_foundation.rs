@@ -353,6 +353,8 @@ fn desktop_bridge_preflight_publishes_revision_consistent_private_snapshots() {
         installation_state_path,
         home.path()
             .join("inbox")
+            .join("snapshots")
+            .join(revision)
             .join("desktop-installation-state.json")
             .display()
             .to_string()
@@ -383,12 +385,14 @@ fn desktop_bridge_preflight_publishes_revision_consistent_private_snapshots() {
 
     for key in [
         "snapshot_manifest_path",
+        "installation_state_path",
         "snapshots.ready_threads.path",
         "snapshots.arm_pending_bindings.path",
         "snapshots.pause_due_bindings.path",
     ] {
         let path = match key {
             "snapshot_manifest_path" => preflight[key].as_str().expect(key),
+            "installation_state_path" => preflight[key].as_str().expect(key),
             "snapshots.ready_threads.path" => preflight["snapshots"]["ready_threads"]["path"]
                 .as_str()
                 .expect(key),
@@ -448,7 +452,8 @@ fn desktop_bridge_preflight_publishes_revision_consistent_private_snapshots() {
     )
     .unwrap_or_else(|error| panic!("parse {installation_state_path}: {error}"));
     assert_eq!(installation_state["schema_version"], 1);
-    assert_eq!(installation_state["published_at"], 2001);
+    assert_eq!(installation_state["snapshot_revision"], revision);
+    assert_eq!(installation_state["published_at"], 2000);
     assert_eq!(installation_state["bridge_thread_id"], "bridge-thread");
     assert_eq!(
         installation_state["desktop_installation_state"]["read_transport_generation"],
@@ -458,6 +463,25 @@ fn desktop_bridge_preflight_publishes_revision_consistent_private_snapshots() {
         installation_state["desktop_installation_state"]["read_transport_capability"],
         "unknown"
     );
+    let latest_installation_state_path = home
+        .path()
+        .join("inbox")
+        .join("desktop-installation-state.json");
+    let latest_installation_state: Value =
+        serde_json::from_slice(&fs::read(&latest_installation_state_path).unwrap_or_else(
+            |error| panic!("read {}: {error}", latest_installation_state_path.display()),
+        ))
+        .unwrap_or_else(|error| {
+            panic!(
+                "parse {}: {error}",
+                latest_installation_state_path.display()
+            )
+        });
+    assert_eq!(
+        latest_installation_state["snapshot_revision"],
+        second_revision
+    );
+    assert_eq!(latest_installation_state["published_at"], 2001);
     let durable_state = cbth(&home, &["desktop", "installation-state", "--json"]);
     assert_eq!(
         durable_state["desktop_installation_state"]["read_transport_generation"],
@@ -663,6 +687,89 @@ fn desktop_no_db_read_helpers_consume_published_snapshot_without_store_or_daemon
     assert!(
         !home.path().join("run").join("startup.lock").exists(),
         "no-DB read helpers must not autostart the daemon"
+    );
+}
+
+#[test]
+fn desktop_no_db_read_helpers_use_revision_specific_installation_state_export() {
+    let home = temp_home();
+    let first = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-race",
+            "--helper-direct-store",
+            "--json",
+            "--now",
+            "2400",
+        ],
+    );
+    let first = &first["desktop_bridge_preflight"];
+    let first_revision = first["snapshot_revision"]
+        .as_str()
+        .expect("first revision")
+        .to_owned();
+    let manifest_path = first["snapshot_manifest_path"]
+        .as_str()
+        .expect("manifest path")
+        .to_owned();
+    let first_manifest = read_json_file(&manifest_path);
+
+    let second = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-race",
+            "--helper-direct-store",
+            "--json",
+            "--now",
+            "2401",
+        ],
+    );
+    let second_revision = second["desktop_bridge_preflight"]["snapshot_revision"]
+        .as_str()
+        .expect("second revision");
+    assert_ne!(second_revision, first_revision);
+
+    let latest_installation_state_path = home
+        .path()
+        .join("inbox")
+        .join("desktop-installation-state.json");
+    let latest_installation_state =
+        read_json_file(&latest_installation_state_path.display().to_string());
+    assert_eq!(
+        latest_installation_state["snapshot_revision"],
+        second_revision
+    );
+    assert_eq!(latest_installation_state["published_at"], 2401);
+
+    write_json_file(&manifest_path, &first_manifest);
+    let snapshot = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "read-snapshot",
+            "--bridge-thread-id",
+            "bridge-thread-race",
+            "--json",
+        ],
+    );
+    let snapshot = &snapshot["desktop_snapshot"];
+    assert_eq!(snapshot["snapshot_revision"], first_revision);
+    assert_eq!(
+        snapshot["installation_state"]["snapshot_revision"],
+        first_revision
+    );
+    assert_eq!(snapshot["installation_state"]["published_at"], 2400);
+    assert!(
+        snapshot["installation_state_path"]
+            .as_str()
+            .expect("installation state path")
+            .contains(&format!("/snapshots/{first_revision}/"))
     );
 }
 
@@ -1169,6 +1276,10 @@ fn desktop_bridge_preflight_exports_repaired_installation_state_for_direct_read(
     )
     .unwrap_or_else(|error| panic!("parse {installation_state_path}: {error}"));
     assert_eq!(installation_state["schema_version"], 1);
+    assert_eq!(
+        installation_state["snapshot_revision"],
+        preflight["snapshot_revision"]
+    );
     assert_eq!(installation_state["published_at"], 2101);
     assert_eq!(installation_state["bridge_thread_id"], "bridge-thread-live");
     assert_eq!(

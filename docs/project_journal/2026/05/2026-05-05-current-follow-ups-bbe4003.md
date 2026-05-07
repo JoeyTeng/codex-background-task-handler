@@ -30,7 +30,7 @@ superseded_by:
 - Validate whether external process edits to Desktop automation schedule state, especially `next_run_at` and status transitions, are hot-observed by the caller thread heartbeat.
 - Desktop heartbeat preflight attempts are recorded in [Desktop live preflight evidence](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md): direct heartbeat access to redundant chmod, `startup.lock`, Unix socket, and SQLite WAL paths failed under Desktop sandboxing even when POSIX ownership / mode looked correct.
 - The Desktop boundary is now split: a normal shell / daemon / future sidecar publishes the inbox snapshot, while the heartbeat consumes it through no-DB read helpers. Real heartbeat validation succeeded for `read-snapshot`, `list-arm-pending`, `list-pause-due`, and read/peek `claim-next-ready` without approval.
-- `read_transport_capability=validated` now covers the no-DB direct-file-read helper path against an already-published snapshot. It does not validate heartbeat-owned `bridge-preflight`, SQLite access, artifact payload reads, or writeback helpers.
+- `read_transport_capability=validated` now covers the no-DB direct-file-read helper path against an already-published revision-consistent snapshot, including the manifest-referenced installation-state export. It does not validate heartbeat-owned `bridge-preflight`, SQLite access, artifact payload reads, or writeback helpers.
 - Separately validate no-approval execution for narrow Desktop writeback / lifecycle helpers: `note-arm-pending`, `note-arm`, and `note-boundary-crossed`.
 - If large artifacts ever enter the automatic caller path, separately validate `cbth desktop read-artifact ...` in heartbeat / caller contexts and write the result back to `artifact_read_capability`.
 

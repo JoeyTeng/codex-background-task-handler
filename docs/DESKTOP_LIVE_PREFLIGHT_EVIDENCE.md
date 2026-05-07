@@ -245,7 +245,13 @@ The fourth retry used the exact wrapper / nested JSON paths and succeeded:
 CBTH_DESKTOP_NO_DB_INBOX_READ_V4 VALIDATION_OK snapshot_revision=019e0188-51de-77a2-87e9-af4a6cd15379 ready_path=/Users/hoteng/.cbth/inbox/snapshots/019e0188-51de-77a2-87e9-af4a6cd15379/ready-threads.json arm_path=/Users/hoteng/.cbth/inbox/snapshots/019e0188-51de-77a2-87e9-af4a6cd15379/arm-pending-bindings.json pause_path=/Users/hoteng/.cbth/inbox/snapshots/019e0188-51de-77a2-87e9-af4a6cd15379/pause-due-bindings.json installation_path=/Users/hoteng/.cbth/inbox/desktop-installation-state.json arm_entries=0 pause_entries=0 claim_entry=null
 ```
 
-This validates that a real Desktop heartbeat can execute the no-DB read helpers without approval and consume a revision-consistent, already-published inbox snapshot through direct file read. It does not validate Desktop heartbeat access to SQLite, daemon sockets, `startup.lock`, artifact payloads, or writeback helpers.
+The follow-up V5 retry used a build that publishes a revision-specific installation-state export and requires `read-snapshot` to consume that manifest-referenced file instead of the latest-only singleton:
+
+```text
+CBTH_DESKTOP_NO_DB_INBOX_READ_V5 VALIDATION_OK snapshot_revision=019e01a8-82e2-7701-be48-cf1a35933253 ready_path=/Users/hoteng/.cbth/inbox/snapshots/019e01a8-82e2-7701-be48-cf1a35933253/ready-threads.json arm_path=/Users/hoteng/.cbth/inbox/snapshots/019e01a8-82e2-7701-be48-cf1a35933253/arm-pending-bindings.json pause_path=/Users/hoteng/.cbth/inbox/snapshots/019e01a8-82e2-7701-be48-cf1a35933253/pause-due-bindings.json installation_path=/Users/hoteng/.cbth/inbox/snapshots/019e01a8-82e2-7701-be48-cf1a35933253/desktop-installation-state.json arm_entries=0 pause_entries=0 claim_entry=null
+```
+
+This validates that a real Desktop heartbeat can execute the no-DB read helpers without approval and consume a revision-consistent, already-published inbox snapshot through direct file read, including the revision-specific installation-state export. It does not validate Desktop heartbeat access to SQLite, daemon sockets, `startup.lock`, artifact payloads, or writeback helpers.
 
 After the successful heartbeat run, the local installation state was repaired:
 
@@ -257,6 +263,8 @@ read_transport_generation=1
 validated_at=1778142693
 validation_fingerprint=cbth_version=0.1.0;os=macos;arch=aarch64;exe=/Users/hoteng/.cache/cargo-target/release/cbth;inbox_schema=1;read_transport=direct_file_read
 ```
+
+After the V5 retry, the same repair command was a no-op (`changed=false`, `degraded_bindings=0`), confirming the local installation still records `read_transport_capability=validated` with artifact and writeback capabilities unchanged at `unknown`.
 
 A follow-up local preflight refreshed the inbox export after the repair:
 

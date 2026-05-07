@@ -5087,7 +5087,8 @@ fn read_desktop_inbox_snapshot(
     let ready_threads_path = layout.desktop_ready_threads_path(&snapshot_revision);
     let arm_pending_bindings_path = layout.desktop_arm_pending_bindings_path(&snapshot_revision);
     let pause_due_bindings_path = layout.desktop_pause_due_bindings_path(&snapshot_revision);
-    let installation_state_path = layout.desktop_installation_state_path();
+    let installation_state_path =
+        layout.desktop_snapshot_installation_state_path(&snapshot_revision);
 
     let snapshots = json_object_field(&manifest, "snapshots")?;
     ensure_snapshot_path_matches(
@@ -5140,6 +5141,7 @@ fn read_desktop_inbox_snapshot(
     )?;
     validate_desktop_installation_state_export(
         &installation_state,
+        &snapshot_revision,
         bridge_thread_id,
         "desktop-installation-state.json",
     )?;
@@ -5207,10 +5209,12 @@ fn validate_desktop_revision_snapshot(
 
 fn validate_desktop_installation_state_export(
     value: &Value,
+    snapshot_revision: &str,
     bridge_thread_id: &str,
     context: &str,
 ) -> Result<()> {
     validate_desktop_schema(value, context)?;
+    ensure_json_str_equals(value, "snapshot_revision", snapshot_revision, context)?;
     ensure_json_str_equals(value, "bridge_thread_id", bridge_thread_id, context)?;
     let state = json_object_field(value, "desktop_installation_state")?;
     let read_transport = json_map_str_field(state, "read_transport", "desktop_installation_state")?;
@@ -5358,7 +5362,9 @@ fn publish_desktop_bridge_preflight(
     let arm_pending_path = layout.desktop_arm_pending_bindings_path(&snapshot_revision);
     let pause_due_path = layout.desktop_pause_due_bindings_path(&snapshot_revision);
     let manifest_path = layout.desktop_current_snapshot_path();
-    let installation_state_path = layout.desktop_installation_state_path();
+    let latest_installation_state_path = layout.desktop_installation_state_path();
+    let installation_state_path =
+        layout.desktop_snapshot_installation_state_path(&snapshot_revision);
 
     let base = json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
@@ -5376,11 +5382,13 @@ fn publish_desktop_bridge_preflight(
     });
     let installation_state_export = json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "snapshot_revision": snapshot_revision,
         "published_at": now,
         "bridge_thread_id": bridge_thread_id,
         "desktop_installation_state": installation_state,
     });
-    write_desktop_snapshot(&installation_state_path, installation_state_export)?;
+    write_desktop_snapshot(&installation_state_path, installation_state_export.clone())?;
+    write_desktop_snapshot(&latest_installation_state_path, installation_state_export)?;
     write_desktop_snapshot(
         &ready_threads_path,
         json!({

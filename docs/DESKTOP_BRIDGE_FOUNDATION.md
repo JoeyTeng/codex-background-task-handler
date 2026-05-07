@@ -88,17 +88,17 @@ cbth desktop claim-next-ready --bridge-thread-id <thread-id> --json
 
 默认 preflight 仍通过 same-user daemon 路由。`--require-existing-daemon` 只连接已经存在且兼容的 daemon，不 autostart，也不触碰 `startup.lock`。`--helper-direct-store` 不使用 daemon autostart、`startup.lock` 或 Unix socket，而是在当前 `cbth` 进程内打开 store、执行 sweep 并发布同样的 snapshot set。`--helper-direct-store` 与 `--require-existing-daemon` 互斥；direct-helper 失败时必须 fail closed，不 fallback 到 daemon 或旧 snapshot。
 
-当前 preflight 发布一个稳定 manifest、一个稳定 installation-state export，和三份 revision-specific data snapshot：
+当前 preflight 发布一个稳定 manifest、一个 latest-only installation-state export，以及四份 revision-specific snapshot 文件：
 
 - `~/.cbth/inbox/current-snapshot.json`
-- `~/.cbth/inbox/desktop-installation-state.json`
 - `~/.cbth/inbox/snapshots/<snapshot_revision>/ready-threads.json`
 - `~/.cbth/inbox/snapshots/<snapshot_revision>/arm-pending-bindings.json`
 - `~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json`
+- `~/.cbth/inbox/snapshots/<snapshot_revision>/desktop-installation-state.json`
 
-`current-snapshot.json` 必须最后写入，并且只引用 immutable revision-specific data files。这样即使新的 preflight 正在发布或中途失败，旧 manifest 引用的旧 data files 仍保持一致，不会因为固定文件名被覆盖而变成 revision mismatch。
+`current-snapshot.json` 必须最后写入，并且只引用 immutable revision-specific snapshot files。这样即使新的 preflight 正在发布或中途失败，旧 manifest 引用的旧 files 仍保持一致，不会因为固定文件名被覆盖而变成 revision mismatch。
 
-`desktop-installation-state.json` 是 preferred direct-file-read 路径，用于让 Desktop heartbeat 读取 installation generation、fingerprint、read transport、capability states 和 timestamps。它由 `bridge-preflight` 原子刷新；它不是 capability 写入口，capability 仍只能通过 `installation-state repair` 写入。
+`~/.cbth/inbox/desktop-installation-state.json` 仍作为 latest-only convenience export 保留，用于 operator inspection。它由 `bridge-preflight` 原子刷新，但不是 revision-consistent snapshot 的一部分；no-DB readers 必须使用 manifest 指向的 `snapshots/<snapshot_revision>/desktop-installation-state.json`。它也不是 capability 写入口，capability 仍只能通过 `installation-state repair` 写入。
 
 每个 snapshot 文件都包含：
 
@@ -113,7 +113,7 @@ cbth desktop claim-next-ready --bridge-thread-id <thread-id> --json
 
 真实 Desktop heartbeat 可能无法打开 SQLite、daemon socket 或 `startup.lock`。因此 heartbeat v1 可以改用 no-DB read helpers 消费已经发布的 inbox snapshot：
 
-- `read-snapshot` 读取并校验 current manifest、三份 revision snapshot 和 `desktop-installation-state.json`。
+- `read-snapshot` 读取并校验 current manifest、三份 revision data snapshot 和 revision-specific `desktop-installation-state.json`。
 - `list-arm-pending` 读取 `arm-pending-bindings.json` 的 entries。
 - `list-pause-due` 读取 `pause-due-bindings.json` 的 entries。
 - `claim-next-ready` 读取 `ready-threads.json` 并返回第一条 ready entry 或 `null`。
