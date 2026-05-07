@@ -35,6 +35,7 @@ use crate::daemon::{
 };
 use crate::fs_layout::{
     FsLayout, atomic_write_private, create_private_file, remove_dir_all_durable,
+    validate_id_path_component,
 };
 use crate::models::{
     CliManagedSessionCapabilities, CliManagedSessionPermissions, CliManagedSessionProfile,
@@ -71,6 +72,7 @@ const CLI_APP_SERVER_RECONCILE_INTERVAL_MS: u64 = 2_000;
 const DOCTOR_CODEX_VERSION_TIMEOUT_SECONDS: u64 = 5;
 const DOCTOR_APP_SERVER_PROBE_TIMEOUT_SECONDS: u64 = 15;
 const DESKTOP_INBOX_SCHEMA_VERSION: i64 = 1;
+const DESKTOP_INBOX_MAX_JSON_BYTES: u64 = 1024 * 1024;
 const DESKTOP_SNAPSHOT_REVISION_RETENTION: usize = 128;
 const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "dispatch",
@@ -89,6 +91,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "task-supervisor",
     "desktop-bridge-foundation-dispatch",
     "desktop-inbox-revisioned-installation-state",
+    "desktop-writeback-helper-foundation",
 ];
 
 #[derive(Debug, Parser)]
@@ -199,6 +202,36 @@ enum DesktopCommand {
         about = "Publish revision-consistent Desktop bridge inbox snapshots"
     )]
     BridgePreflight(DesktopBridgePreflightArgs),
+    #[command(
+        name = "read-snapshot",
+        about = "Read and validate the current Desktop bridge inbox snapshot without opening the store"
+    )]
+    ReadSnapshot(DesktopReadSnapshotArgs),
+    #[command(
+        name = "list-arm-pending",
+        about = "Read arm-pending Desktop bridge entries from the current inbox snapshot"
+    )]
+    ListArmPending(DesktopReadSnapshotArgs),
+    #[command(
+        name = "list-pause-due",
+        about = "Read pause-due Desktop bridge entries from the current inbox snapshot"
+    )]
+    ListPauseDue(DesktopReadSnapshotArgs),
+    #[command(
+        name = "claim-next-ready",
+        about = "Peek the next ready Desktop bridge entry from the current inbox snapshot without mutating state"
+    )]
+    ClaimNextReady(DesktopReadSnapshotArgs),
+    #[command(
+        name = "note-arm-pending",
+        about = "Record a durable Desktop arm-pending barrier for a prepared attempt"
+    )]
+    NoteArmPending(DesktopNoteArmPendingArgs),
+    #[command(
+        name = "note-arm",
+        about = "Record that a Desktop caller heartbeat arm was accepted"
+    )]
+    NoteArm(DesktopNoteArmArgs),
 }
 
 #[derive(Debug, Args)]
@@ -331,6 +364,60 @@ struct DesktopBridgePreflightArgs {
         help = "Run this Desktop preflight helper directly without daemon autostart or socket IPC"
     )]
     helper_direct_store: bool,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopReadSnapshotArgs {
+    #[arg(long, help = "Desktop bridge thread id expected in the inbox snapshot")]
+    bridge_thread_id: String,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct DesktopNoteArmPendingArgs {
+    #[arg(long, help = "Desktop caller/source thread id")]
+    source_thread_id: String,
+
+    #[arg(long, help = "Prepared Desktop delivery attempt id")]
+    attempt_id: String,
+
+    #[arg(long, help = "Expected Desktop delivery attempt generation")]
+    generation: i64,
+
+    #[arg(long, help = "Unique bridge request id for this arm pipeline")]
+    bridge_request_id: String,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopNoteArmArgs {
+    #[arg(long, help = "Desktop caller/source thread id")]
+    source_thread_id: String,
+
+    #[arg(long, help = "Arm-pending Desktop delivery attempt id")]
+    attempt_id: String,
+
+    #[arg(long, help = "Expected Desktop delivery attempt generation")]
+    generation: i64,
+
+    #[arg(long, help = "Unique bridge request id returned by note-arm-pending")]
+    bridge_request_id: String,
+
+    #[arg(long, help = "Bridge arm lease id returned by note-arm-pending")]
+    bridge_arm_lease_id: String,
 
     #[arg(long, help = "Emit JSON output")]
     json: bool,
@@ -5685,6 +5772,46 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             }
             argv
         }
+        Commands::Desktop {
+            command: DesktopCommand::NoteArmPending(args),
+        } => {
+            let mut argv = vec![
+                OsString::from("desktop"),
+                OsString::from("note-arm-pending"),
+            ];
+            push_string_arg(&mut argv, "--source-thread-id", &args.source_thread_id);
+            push_string_arg(&mut argv, "--attempt-id", &args.attempt_id);
+            push_i64_arg(&mut argv, "--generation", args.generation);
+            push_string_arg(&mut argv, "--bridge-request-id", &args.bridge_request_id);
+            if args.json {
+                argv.push(OsString::from("--json"));
+            }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Desktop {
+            command: DesktopCommand::NoteArm(args),
+        } => {
+            let mut argv = vec![OsString::from("desktop"), OsString::from("note-arm")];
+            push_string_arg(&mut argv, "--source-thread-id", &args.source_thread_id);
+            push_string_arg(&mut argv, "--attempt-id", &args.attempt_id);
+            push_i64_arg(&mut argv, "--generation", args.generation);
+            push_string_arg(&mut argv, "--bridge-request-id", &args.bridge_request_id);
+            push_string_arg(
+                &mut argv,
+                "--bridge-arm-lease-id",
+                &args.bridge_arm_lease_id,
+            );
+            if args.json {
+                argv.push(OsString::from("--json"));
+            }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
         Commands::Maintenance {
             command: MaintenanceCommand::Sweep(args),
         } => {
@@ -5729,6 +5856,13 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
                 DesktopCommand::InstallationState(DesktopInstallationStateArgs {
                     command: None, ..
                 }),
+        }
+        | Commands::Desktop {
+            command:
+                DesktopCommand::ReadSnapshot(_)
+                | DesktopCommand::ListArmPending(_)
+                | DesktopCommand::ListPauseDue(_)
+                | DesktopCommand::ClaimNextReady(_),
         }
         | Commands::Doctor { .. }
         | Commands::Daemon { .. } => return Ok(None),
@@ -6801,43 +6935,95 @@ fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
 }
 
 fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value> {
-    let mut store = Store::open(layout)?;
     match command {
-        DesktopCommand::InstallationState(args) => match args.command {
-            None => {
-                let fingerprint =
-                    desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
-                let state = store.desktop_installation_state(&fingerprint)?;
-                Ok(json!({ "desktop_installation_state": state }))
+        DesktopCommand::ReadSnapshot(args) => {
+            let snapshot = read_desktop_inbox_snapshot(layout, &args.bridge_thread_id)?;
+            Ok(json!({ "desktop_snapshot": snapshot.as_summary() }))
+        }
+        DesktopCommand::ListArmPending(args) => {
+            let snapshot = read_desktop_inbox_snapshot(layout, &args.bridge_thread_id)?;
+            Ok(
+                json!({ "desktop_arm_pending_bindings": snapshot.list_entries("arm_pending_bindings")? }),
+            )
+        }
+        DesktopCommand::ListPauseDue(args) => {
+            let snapshot = read_desktop_inbox_snapshot(layout, &args.bridge_thread_id)?;
+            Ok(
+                json!({ "desktop_pause_due_bindings": snapshot.list_entries("pause_due_bindings")? }),
+            )
+        }
+        DesktopCommand::ClaimNextReady(args) => {
+            let snapshot = read_desktop_inbox_snapshot(layout, &args.bridge_thread_id)?;
+            Ok(json!({ "desktop_ready_claim": snapshot.claim_next_ready()? }))
+        }
+        DesktopCommand::NoteArmPending(args) => {
+            let mut store = Store::open(layout)?;
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            let record = store.note_desktop_arm_pending(
+                &args.source_thread_id,
+                &args.attempt_id,
+                args.generation,
+                &args.bridge_request_id,
+                now,
+            )?;
+            Ok(json!({ "desktop_arm_pending": record }))
+        }
+        DesktopCommand::NoteArm(args) => {
+            let mut store = Store::open(layout)?;
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            let record = store.note_desktop_arm(
+                &args.source_thread_id,
+                &args.attempt_id,
+                args.generation,
+                &args.bridge_request_id,
+                &args.bridge_arm_lease_id,
+                now,
+            )?;
+            Ok(json!({ "desktop_arm": record }))
+        }
+        DesktopCommand::InstallationState(args) => {
+            let mut store = Store::open(layout)?;
+            match args.command {
+                None => {
+                    let fingerprint = desktop_validation_fingerprint(
+                        DesktopReadTransport::DirectFileRead.as_str(),
+                    )?;
+                    let state = store.desktop_installation_state(&fingerprint)?;
+                    Ok(json!({ "desktop_installation_state": state }))
+                }
+                Some(DesktopInstallationStateCommand::Repair(args)) => {
+                    let now = args.now.unwrap_or(now_epoch_seconds()?);
+                    let read_transport = args.read_transport.as_str();
+                    let fingerprint = match args.validation_fingerprint {
+                        Some(value) => {
+                            validate_nonempty("validation_fingerprint", &value)?;
+                            value
+                        }
+                        None => desktop_validation_fingerprint(read_transport)?,
+                    };
+                    let repair =
+                        store.repair_desktop_installation_state(NewDesktopInstallationRepair {
+                            read_transport: read_transport.to_owned(),
+                            read_transport_capability: args
+                                .read_transport_capability
+                                .as_str()
+                                .to_owned(),
+                            artifact_read_capability: args
+                                .artifact_read_capability
+                                .as_str()
+                                .to_owned(),
+                            writeback_capability: args.writeback_capability.as_str().to_owned(),
+                            validation_fingerprint: fingerprint,
+                            now,
+                        })?;
+                    Ok(json!({ "desktop_installation_state": repair }))
+                }
             }
-            Some(DesktopInstallationStateCommand::Repair(args)) => {
-                let now = args.now.unwrap_or(now_epoch_seconds()?);
-                let read_transport = args.read_transport.as_str();
-                let fingerprint = match args.validation_fingerprint {
-                    Some(value) => {
-                        validate_nonempty("validation_fingerprint", &value)?;
-                        value
-                    }
-                    None => desktop_validation_fingerprint(read_transport)?,
-                };
-                let repair =
-                    store.repair_desktop_installation_state(NewDesktopInstallationRepair {
-                        read_transport: read_transport.to_owned(),
-                        read_transport_capability: args
-                            .read_transport_capability
-                            .as_str()
-                            .to_owned(),
-                        artifact_read_capability: args.artifact_read_capability.as_str().to_owned(),
-                        writeback_capability: args.writeback_capability.as_str().to_owned(),
-                        validation_fingerprint: fingerprint,
-                        now,
-                    })?;
-                Ok(json!({ "desktop_installation_state": repair }))
-            }
-        },
+        }
         DesktopCommand::Binding {
             command: DesktopBindingCommand::Repair(args),
         } => {
+            let mut store = Store::open(layout)?;
             validate_nonempty("source_thread_id", &args.source_thread_id)?;
             validate_nonempty("caller_automation_id", &args.caller_automation_id)?;
             let now = args.now.unwrap_or(now_epoch_seconds()?);
@@ -6852,22 +7038,374 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
             Ok(json!({ "desktop_binding": repair }))
         }
         DesktopCommand::BridgePreflight(args) => {
+            let mut store = Store::open(layout)?;
             validate_nonempty("bridge_thread_id", &args.bridge_thread_id)?;
             let now = args.now.unwrap_or(now_epoch_seconds()?);
             let sweep = store.sweep(layout, now)?;
             let fingerprint =
                 desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
             let state = store.desktop_installation_state(&fingerprint)?;
+            let arm_pending_bindings = store.list_desktop_arm_pending_bindings(now)?;
+            let pause_due_bindings = store.list_desktop_pause_due_bindings(now)?;
             let preflight = publish_desktop_bridge_preflight(
                 layout,
                 &args.bridge_thread_id,
                 &state,
+                arm_pending_bindings,
+                pause_due_bindings,
                 sweep,
                 now,
             )?;
             Ok(json!({ "desktop_bridge_preflight": preflight }))
         }
     }
+}
+
+struct DesktopInboxSnapshot {
+    manifest: Value,
+    ready_threads: Value,
+    arm_pending_bindings: Value,
+    pause_due_bindings: Value,
+    installation_state: Value,
+    snapshot_revision: String,
+    bridge_thread_id: String,
+}
+
+impl DesktopInboxSnapshot {
+    fn as_summary(&self) -> Value {
+        json!({
+            "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+            "snapshot_revision": &self.snapshot_revision,
+            "created_at": self.manifest["created_at"].clone(),
+            "bridge_thread_id": &self.bridge_thread_id,
+            "snapshot_manifest_path": self.manifest["snapshot_manifest_path"].clone(),
+            "installation_state_path": self.manifest["installation_state_path"].clone(),
+            "installation_state": self.installation_state.clone(),
+            "snapshots": {
+                "ready_threads": self.snapshot_summary("ready_threads", &self.ready_threads),
+                "arm_pending_bindings": self.snapshot_summary(
+                    "arm_pending_bindings",
+                    &self.arm_pending_bindings
+                ),
+                "pause_due_bindings": self.snapshot_summary(
+                    "pause_due_bindings",
+                    &self.pause_due_bindings
+                ),
+            },
+        })
+    }
+
+    fn snapshot_summary(&self, section: &str, snapshot: &Value) -> Value {
+        json!({
+            "path": self.manifest["snapshots"][section]["path"].clone(),
+            "entries": snapshot[section]["entries"].clone(),
+            "count": snapshot[section]["count"].clone(),
+        })
+    }
+
+    fn list_entries(&self, section: &str) -> Result<Value> {
+        let snapshot = match section {
+            "arm_pending_bindings" => &self.arm_pending_bindings,
+            "pause_due_bindings" => &self.pause_due_bindings,
+            "ready_threads" => &self.ready_threads,
+            _ => bail!("unsupported Desktop snapshot section {section}"),
+        };
+        let section_value = json_object_field(snapshot, section)?;
+        Ok(json!({
+            "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+            "snapshot_revision": &self.snapshot_revision,
+            "bridge_thread_id": &self.bridge_thread_id,
+            "entries": json_map_array_field(section_value, "entries")?.clone(),
+            "count": json_map_i64_field(section_value, "count")?,
+        }))
+    }
+
+    fn claim_next_ready(&self) -> Result<Value> {
+        let ready = self.list_entries("ready_threads")?;
+        let entries = json_array_field(&ready, "entries")?;
+        Ok(json!({
+            "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+            "snapshot_revision": &self.snapshot_revision,
+            "bridge_thread_id": &self.bridge_thread_id,
+            "entry": entries.first().cloned().unwrap_or(Value::Null),
+        }))
+    }
+}
+
+fn read_desktop_inbox_snapshot(
+    layout: &FsLayout,
+    bridge_thread_id: &str,
+) -> Result<DesktopInboxSnapshot> {
+    validate_nonempty("bridge_thread_id", bridge_thread_id)?;
+    let manifest_path = layout.desktop_current_snapshot_path();
+    let manifest = read_desktop_inbox_json(&manifest_path)?;
+    validate_desktop_schema(&manifest, "current-snapshot.json")?;
+    ensure_json_str_equals(
+        &manifest,
+        "bridge_thread_id",
+        bridge_thread_id,
+        "current-snapshot.json",
+    )?;
+    ensure_json_path_equals(
+        &manifest,
+        "snapshot_manifest_path",
+        &manifest_path,
+        "current-snapshot.json",
+    )?;
+    let snapshot_revision =
+        json_str_field(&manifest, "snapshot_revision", "current-snapshot.json")?.to_owned();
+    validate_id_path_component(&snapshot_revision, "snapshot_revision")?;
+
+    let ready_threads_path = layout.desktop_ready_threads_path(&snapshot_revision);
+    let arm_pending_bindings_path = layout.desktop_arm_pending_bindings_path(&snapshot_revision);
+    let pause_due_bindings_path = layout.desktop_pause_due_bindings_path(&snapshot_revision);
+    let installation_state_path =
+        layout.desktop_snapshot_installation_state_path(&snapshot_revision);
+
+    let snapshots = json_object_field(&manifest, "snapshots")?;
+    ensure_snapshot_path_matches(
+        snapshots,
+        "ready_threads",
+        &ready_threads_path,
+        "current-snapshot.json",
+    )?;
+    ensure_snapshot_path_matches(
+        snapshots,
+        "arm_pending_bindings",
+        &arm_pending_bindings_path,
+        "current-snapshot.json",
+    )?;
+    ensure_snapshot_path_matches(
+        snapshots,
+        "pause_due_bindings",
+        &pause_due_bindings_path,
+        "current-snapshot.json",
+    )?;
+    ensure_json_path_equals(
+        &manifest,
+        "installation_state_path",
+        &installation_state_path,
+        "current-snapshot.json",
+    )?;
+
+    let ready_threads = read_desktop_inbox_json(&ready_threads_path)?;
+    let arm_pending_bindings = read_desktop_inbox_json(&arm_pending_bindings_path)?;
+    let pause_due_bindings = read_desktop_inbox_json(&pause_due_bindings_path)?;
+    let installation_state = read_desktop_inbox_json(&installation_state_path)?;
+
+    validate_desktop_revision_snapshot(
+        &ready_threads,
+        "ready_threads",
+        &snapshot_revision,
+        bridge_thread_id,
+    )?;
+    validate_desktop_revision_snapshot(
+        &arm_pending_bindings,
+        "arm_pending_bindings",
+        &snapshot_revision,
+        bridge_thread_id,
+    )?;
+    validate_desktop_revision_snapshot(
+        &pause_due_bindings,
+        "pause_due_bindings",
+        &snapshot_revision,
+        bridge_thread_id,
+    )?;
+    validate_desktop_installation_state_export(
+        &installation_state,
+        &snapshot_revision,
+        bridge_thread_id,
+        "desktop-installation-state.json",
+    )?;
+
+    Ok(DesktopInboxSnapshot {
+        manifest,
+        ready_threads,
+        arm_pending_bindings,
+        pause_due_bindings,
+        installation_state,
+        snapshot_revision,
+        bridge_thread_id: bridge_thread_id.to_owned(),
+    })
+}
+
+fn read_desktop_inbox_json(path: &Path) -> Result<Value> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "Desktop inbox path is not a regular file: {}",
+            path.display()
+        );
+    }
+    if metadata.len() > DESKTOP_INBOX_MAX_JSON_BYTES {
+        bail!(
+            "Desktop inbox file exceeds {} bytes: {}",
+            DESKTOP_INBOX_MAX_JSON_BYTES,
+            path.display()
+        );
+    }
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() as u64 > DESKTOP_INBOX_MAX_JSON_BYTES {
+        bail!(
+            "Desktop inbox file exceeds {} bytes: {}",
+            DESKTOP_INBOX_MAX_JSON_BYTES,
+            path.display()
+        );
+    }
+    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+}
+
+fn validate_desktop_revision_snapshot(
+    value: &Value,
+    section: &str,
+    snapshot_revision: &str,
+    bridge_thread_id: &str,
+) -> Result<()> {
+    validate_desktop_schema(value, section)?;
+    ensure_json_str_equals(value, "snapshot_revision", snapshot_revision, section)?;
+    ensure_json_str_equals(value, "bridge_thread_id", bridge_thread_id, section)?;
+    let section_value = json_object_field(value, section)?;
+    let entries = json_map_array_field(section_value, "entries")?;
+    let count = json_map_i64_field(section_value, "count")?;
+    if count < 0 {
+        bail!("{section}.count must not be negative");
+    }
+    let entry_count =
+        i64::try_from(entries.len()).context("Desktop snapshot entry count overflow")?;
+    if count != entry_count {
+        bail!("{section}.count does not match entries length");
+    }
+    Ok(())
+}
+
+fn validate_desktop_installation_state_export(
+    value: &Value,
+    snapshot_revision: &str,
+    bridge_thread_id: &str,
+    context: &str,
+) -> Result<()> {
+    validate_desktop_schema(value, context)?;
+    ensure_json_str_equals(value, "snapshot_revision", snapshot_revision, context)?;
+    ensure_json_str_equals(value, "bridge_thread_id", bridge_thread_id, context)?;
+    let state = json_object_field(value, "desktop_installation_state")?;
+    let read_transport = json_map_str_field(state, "read_transport", "desktop_installation_state")?;
+    if read_transport != DesktopReadTransport::DirectFileRead.as_str() {
+        bail!("desktop_installation_state.read_transport is unsupported: {read_transport}");
+    }
+    Ok(())
+}
+
+fn validate_desktop_schema(value: &Value, context: &str) -> Result<()> {
+    let schema = json_i64_field(value, "schema_version", context)?;
+    if schema == DESKTOP_INBOX_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        bail!("{context}.schema_version must be {DESKTOP_INBOX_SCHEMA_VERSION}, got {schema}")
+    }
+}
+
+fn ensure_snapshot_path_matches(
+    snapshots: &serde_json::Map<String, Value>,
+    section: &str,
+    expected: &Path,
+    context: &str,
+) -> Result<()> {
+    let section_value = json_object_field_map(snapshots, section, context)?;
+    ensure_json_path_equals(section_value, "path", expected, section)
+}
+
+fn ensure_json_path_equals(
+    value: &Value,
+    field: &str,
+    expected: &Path,
+    context: &str,
+) -> Result<()> {
+    let actual = json_str_field(value, field, context)?;
+    let expected = expected.display().to_string();
+    if actual == expected {
+        Ok(())
+    } else {
+        bail!("{context}.{field} must be {expected}, got {actual}")
+    }
+}
+
+fn ensure_json_str_equals(value: &Value, field: &str, expected: &str, context: &str) -> Result<()> {
+    let actual = json_str_field(value, field, context)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        bail!("{context}.{field} must be {expected}, got {actual}")
+    }
+}
+
+fn json_object_field<'a>(
+    value: &'a Value,
+    field: &str,
+) -> Result<&'a serde_json::Map<String, Value>> {
+    value
+        .get(field)
+        .and_then(Value::as_object)
+        .with_context(|| format!("expected object field {field}"))
+}
+
+fn json_object_field_map<'a>(
+    value: &'a serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<&'a Value> {
+    value
+        .get(field)
+        .with_context(|| format!("expected object field {context}.{field}"))
+}
+
+fn json_array_field<'a>(value: &'a Value, field: &str) -> Result<&'a Vec<Value>> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .with_context(|| format!("expected array field {field}"))
+}
+
+fn json_map_array_field<'a>(
+    value: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<&'a Vec<Value>> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .with_context(|| format!("expected array field {field}"))
+}
+
+fn json_i64_field(value: &Value, field: &str, context: &str) -> Result<i64> {
+    value
+        .get(field)
+        .and_then(Value::as_i64)
+        .with_context(|| format!("expected integer field {context}.{field}"))
+}
+
+fn json_map_i64_field(value: &serde_json::Map<String, Value>, field: &str) -> Result<i64> {
+    value
+        .get(field)
+        .and_then(Value::as_i64)
+        .with_context(|| format!("expected integer field {field}"))
+}
+
+fn json_str_field<'a>(value: &'a Value, field: &str, context: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("expected string field {context}.{field}"))
+}
+
+fn json_map_str_field<'a>(
+    value: &'a serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("expected string field {context}.{field}"))
 }
 
 fn desktop_validation_fingerprint(read_transport: &str) -> Result<String> {
@@ -6888,6 +7426,8 @@ fn publish_desktop_bridge_preflight(
     layout: &FsLayout,
     bridge_thread_id: &str,
     installation_state: &DesktopInstallationStateRecord,
+    arm_pending_bindings: Vec<Value>,
+    pause_due_bindings: Vec<Value>,
     sweep: SweepReport,
     now: i64,
 ) -> Result<Value> {
@@ -6896,7 +7436,13 @@ fn publish_desktop_bridge_preflight(
     let arm_pending_path = layout.desktop_arm_pending_bindings_path(&snapshot_revision);
     let pause_due_path = layout.desktop_pause_due_bindings_path(&snapshot_revision);
     let manifest_path = layout.desktop_current_snapshot_path();
-    let installation_state_path = layout.desktop_installation_state_path();
+    let latest_installation_state_path = layout.desktop_installation_state_path();
+    let installation_state_path =
+        layout.desktop_snapshot_installation_state_path(&snapshot_revision);
+    let arm_pending_count =
+        i64::try_from(arm_pending_bindings.len()).context("arm_pending_bindings count overflow")?;
+    let pause_due_count =
+        i64::try_from(pause_due_bindings.len()).context("pause_due_bindings count overflow")?;
 
     let base = json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
@@ -6914,11 +7460,13 @@ fn publish_desktop_bridge_preflight(
     });
     let installation_state_export = json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "snapshot_revision": snapshot_revision,
         "published_at": now,
         "bridge_thread_id": bridge_thread_id,
         "desktop_installation_state": installation_state,
     });
-    write_desktop_snapshot(&installation_state_path, installation_state_export)?;
+    write_desktop_snapshot(&installation_state_path, installation_state_export.clone())?;
+    write_desktop_snapshot(&latest_installation_state_path, installation_state_export)?;
     write_desktop_snapshot(
         &ready_threads_path,
         json!({
@@ -6941,8 +7489,8 @@ fn publish_desktop_bridge_preflight(
             "created_at": now,
             "bridge_thread_id": bridge_thread_id,
             "arm_pending_bindings": {
-                "entries": [],
-                "count": 0,
+                "entries": arm_pending_bindings,
+                "count": arm_pending_count,
             },
             "base": base.clone(),
         }),
@@ -6955,8 +7503,8 @@ fn publish_desktop_bridge_preflight(
             "created_at": now,
             "bridge_thread_id": bridge_thread_id,
             "pause_due_bindings": {
-                "entries": [],
-                "count": 0,
+                "entries": pause_due_bindings,
+                "count": pause_due_count,
             },
             "base": base,
         }),
@@ -6975,11 +7523,11 @@ fn publish_desktop_bridge_preflight(
             },
             "arm_pending_bindings": {
                 "path": arm_pending_path.display().to_string(),
-                "count": 0,
+                "count": arm_pending_count,
             },
             "pause_due_bindings": {
                 "path": pause_due_path.display().to_string(),
-                "count": 0,
+                "count": pause_due_count,
             },
         },
         "installation_state": installation_state,

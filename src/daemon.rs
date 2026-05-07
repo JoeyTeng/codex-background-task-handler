@@ -89,6 +89,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "task-supervisor",
     "desktop-bridge-foundation-dispatch",
     "desktop-inbox-revisioned-installation-state",
+    "desktop-writeback-helper-foundation",
 ];
 const MAX_DISPATCH_WORKERS: usize = 32;
 const RESERVED_CONTROL_WORKERS: usize = 8;

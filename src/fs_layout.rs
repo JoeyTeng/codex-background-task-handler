@@ -104,6 +104,11 @@ impl FsLayout {
             .join("pause-due-bindings.json")
     }
 
+    pub fn desktop_snapshot_installation_state_path(&self, snapshot_revision: &str) -> PathBuf {
+        self.desktop_snapshot_revision_dir(snapshot_revision)
+            .join("desktop-installation-state.json")
+    }
+
     pub fn ensure(&self) -> Result<()> {
         ensure_private_dir(&self.home)?;
         ensure_private_dir(&self.artifacts_dir())?;
