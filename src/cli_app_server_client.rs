@@ -458,17 +458,10 @@ pub(crate) fn thread_result_activity_snapshot(
     result: &Value,
     bound_thread_id: &str,
 ) -> ThreadActivitySnapshot {
+    if !thread_result_identifiers_match(result, bound_thread_id) {
+        return ThreadActivitySnapshot::Untrusted;
+    }
     let thread = result.get("thread").unwrap_or(result);
-    if let Some(thread_id) = thread.get("id").and_then(Value::as_str)
-        && thread_id != bound_thread_id
-    {
-        return ThreadActivitySnapshot::Untrusted;
-    }
-    if result.get("thread").is_some()
-        && thread.get("id").and_then(Value::as_str) != Some(bound_thread_id)
-    {
-        return ThreadActivitySnapshot::Untrusted;
-    }
     let status_type = match thread.get("status") {
         Some(status) => match status.get("type").and_then(Value::as_str) {
             Some(status_type) => Some(status_type),
@@ -513,6 +506,9 @@ pub(crate) fn thread_result_turn_status(
     bound_thread_id: &str,
     turn_id: &str,
 ) -> ThreadActivitySnapshotOrTurnStatus {
+    if !thread_result_identifiers_match(result, bound_thread_id) {
+        return ThreadActivitySnapshotOrTurnStatus::Untrusted;
+    }
     let thread = result.get("thread").unwrap_or(result);
     if thread.get("id").and_then(Value::as_str) != Some(bound_thread_id) {
         return ThreadActivitySnapshotOrTurnStatus::Untrusted;
@@ -536,6 +532,24 @@ pub(crate) fn thread_result_turn_status(
         }
     }
     ThreadActivitySnapshotOrTurnStatus::Missing
+}
+
+fn thread_result_identifiers_match(result: &Value, bound_thread_id: &str) -> bool {
+    let mut matched = false;
+    for candidate in [
+        result.get("id"),
+        result.get("threadId"),
+        result.get("thread").and_then(|thread| thread.get("id")),
+    ] {
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        if candidate.as_str() != Some(bound_thread_id) {
+            return false;
+        }
+        matched = true;
+    }
+    matched
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1212,6 +1226,30 @@ mod tests {
             thread_result_activity_snapshot(&foreign, "thread-1"),
             ThreadActivitySnapshot::Untrusted
         );
+
+        let contradictory_top_level_id = json!({
+            "id": "thread-other",
+            "thread": {
+                "id": "thread-1",
+                "status": { "type": "idle" }
+            }
+        });
+        assert_eq!(
+            thread_result_activity_snapshot(&contradictory_top_level_id, "thread-1"),
+            ThreadActivitySnapshot::Untrusted
+        );
+
+        let contradictory_thread_id = json!({
+            "threadId": "thread-other",
+            "thread": {
+                "id": "thread-1",
+                "status": { "type": "idle" }
+            }
+        });
+        assert_eq!(
+            thread_result_activity_snapshot(&contradictory_thread_id, "thread-1"),
+            ThreadActivitySnapshot::Untrusted
+        );
     }
 
     #[test]
@@ -1304,6 +1342,21 @@ mod tests {
         assert_eq!(
             thread_result_turn_status(&result, "thread-1", "turn-1"),
             ThreadActivitySnapshotOrTurnStatus::Turn(TurnStatusSnapshot::Completed)
+        );
+
+        let contradictory = json!({
+            "threadId": "thread-other",
+            "thread": {
+                "id": "thread-1",
+                "status": { "type": "idle" }
+            },
+            "turns": [
+                { "id": "turn-1", "status": "completed" }
+            ]
+        });
+        assert_eq!(
+            thread_result_turn_status(&contradictory, "thread-1", "turn-1"),
+            ThreadActivitySnapshotOrTurnStatus::Untrusted
         );
     }
 }

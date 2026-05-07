@@ -27,7 +27,7 @@ if [ "${1:-}" = "--version" ]; then
   if [ "${FAKE_CODEX_VERSION_GRANDCHILD_STDOUT:-}" = "1" ]; then
     (trap '' TERM; while :; do sleep 1; done) &
   fi
-  printf '%s\n' "${FAKE_CODEX_VERSION:-codex-cli 9.9.9}"
+  printf '%s\n' "${FAKE_CODEX_VERSION:-codex-cli 0.128.0}"
   exit 0
 fi
 
@@ -232,6 +232,39 @@ fn doctor_cli_readiness_accepts_stderr_listener() {
     let value = parse_stdout(&output);
     assert_eq!(value["doctor"]["ok"], true);
     assert_eq!(check_status(&value, "codex-app-server-listener"), "ok");
+}
+
+#[test]
+fn doctor_cli_warns_when_codex_version_is_outside_validated_range() {
+    let home = temp_home();
+    let fake_codex = write_fake_codex_script(&home.path().join("fake-codex"));
+    let output = run_doctor(
+        &home,
+        &fake_codex,
+        &[("FAKE_CODEX_VERSION", "codex-cli 0.129.0")],
+    );
+    stop_daemon(&home);
+
+    assert!(
+        output.status.success(),
+        "doctor failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value = parse_stdout(&output);
+    assert_eq!(value["doctor"]["ok"], true);
+    let codex_binary = check(&value, "codex-binary");
+    assert_eq!(codex_binary["status"], "warn");
+    assert_eq!(
+        codex_binary["details"]["compatibility"]["validated_range"],
+        "0.128.x"
+    );
+    assert!(
+        codex_binary["details"]["compatibility"]["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("0.129.0")),
+        "missing version warning: {codex_binary}"
+    );
 }
 
 #[test]

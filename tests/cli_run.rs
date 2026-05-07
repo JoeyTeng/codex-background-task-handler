@@ -30,8 +30,13 @@ fn write_fake_codex_script(path: &Path) -> PathBuf {
     fs::write(
         path,
         r#"#!/bin/sh
-log="${FAKE_CODEX_LOG:?}"
-if [ "${1:-}" = "app-server" ]; then
+	log="${FAKE_CODEX_LOG:?}"
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' "${FAKE_CODEX_VERSION:-codex-cli 0.128.0}"
+  exit 0
+fi
+
+	if [ "${1:-}" = "app-server" ]; then
   printf 'app-server' >> "$log"
   for arg in "$@"; do
     printf '\t%s' "$arg" >> "$log"
@@ -2522,18 +2527,20 @@ fn cli_run_binds_session_starts_foreground_codex_and_stops_app_server() {
 
 #[cfg(unix)]
 #[test]
-fn cbth_resume_launches_codex_resume_with_remote_and_cwd() {
+fn cbth_resume_without_explicit_cd_preserves_native_resume_cwd_choice() {
     let home = temp_home();
     let client_cwd = tempfile::tempdir().expect("client cwd");
     let script_dir = tempfile::tempdir().expect("script dir");
     let fake_codex = fake_codex_script(&script_dir);
     let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cli-resume";
+    let (app_server_url, captured_resume) = spawn_fake_app_server_capture_initial_resume(thread_id);
 
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("--home")
         .arg(home.path())
         .arg("resume")
-        .arg("thread-cli-resume")
+        .arg(thread_id)
         .arg("--codex-bin")
         .arg(&fake_codex)
         .arg("--")
@@ -2541,6 +2548,8 @@ fn cbth_resume_launches_codex_resume_with_remote_and_cwd() {
         .arg("gpt-test")
         .current_dir(client_cwd.path())
         .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "1")
         .output()
         .expect("run cbth resume");
 
@@ -2554,13 +2563,23 @@ fn cbth_resume_launches_codex_resume_with_remote_and_cwd() {
 
     let log = fs::read_to_string(&log_path).expect("read fake codex log");
     assert!(log.contains("app-server\tapp-server\t--listen\tws://127.0.0.1:0"));
-    assert!(
-        log.contains(
-            "foreground\tresume\tthread-cli-resume\t--remote\tws://127.0.0.1:45678\t--cd\t"
-        )
-    );
-    assert!(log.contains(&client_cwd.path().display().to_string()));
+    assert!(log.contains(&format!(
+        "foreground\tresume\tthread-cli-resume\t--remote\t{app_server_url}"
+    )));
+    assert!(!log.contains("\t--cd\t"));
     assert!(log.contains("\t--model\tgpt-test"));
+    let params = match captured_resume.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(params)) => params,
+        Ok(Err(error)) => panic!("fake app-server failed: {error}"),
+        Err(error) => panic!("timed out waiting for fake app-server: {error}"),
+    };
+    assert_eq!(params["threadId"], serde_json::json!(thread_id));
+    assert!(
+        params.get("cwd").is_none(),
+        "unexpected cwd in params: {params}"
+    );
+    assert_eq!(params["model"], serde_json::json!("gpt-test"));
+    assert_eq!(params["persistExtendedHistory"], serde_json::json!(true));
 
     stop_daemon(&home);
 }
@@ -2592,11 +2611,6 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
         .arg("gpt-test")
         .arg("--profile")
         .arg("work")
-        .arg("--oss")
-        .arg("--sandbox")
-        .arg("read-only")
-        .arg("--ask-for-approval")
-        .arg("never")
         .arg("--cd")
         .arg("subdir")
         .current_dir(client_cwd.path())
@@ -2628,9 +2642,6 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
     );
     assert_eq!(params["model"], serde_json::json!("gpt-test"));
     assert_eq!(params["config"]["profile"], serde_json::json!("work"));
-    assert!(params.get("modelProvider").is_none());
-    assert_eq!(params["sandbox"], serde_json::json!("read-only"));
-    assert_eq!(params["approvalPolicy"], serde_json::json!("never"));
     assert_eq!(params["persistExtendedHistory"], serde_json::json!(true));
 
     let log = fs::read_to_string(&log_path).expect("read fake codex log");
@@ -2640,7 +2651,6 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
         .expect("foreground invocation log");
     assert_eq!(foreground_line.matches("\t--cd\t").count(), 1);
     assert!(log.contains(&format!("\t--cd\t{}", expected_cwd.display())));
-    assert!(log.contains("\t--oss"));
 
     stop_daemon(&home);
 }
@@ -2692,6 +2702,413 @@ fn cbth_resume_rejects_forwarded_add_dir() {
 
 #[cfg(unix)]
 #[test]
+fn cbth_resume_rejects_permission_affecting_config_overrides() {
+    let cases = [
+        vec![
+            "--config",
+            "sandbox_workspace_write.writable_roots=[\"/tmp/extra\"]",
+        ],
+        vec!["--config=sandbox_workspace_write.network_access=true"],
+        vec!["-c", "sandbox_read_only.readable_roots=[\"/tmp/read\"]"],
+        vec!["-csandbox-workspace-write.exclude-slash-tmp=false"],
+        vec!["--config=approval_policy=\"never\""],
+        vec!["--config=\"sandbox_mode\"=\"workspace-write\""],
+        vec!["--config=sandbox_mode=\"workspace-write\""],
+        vec!["--config", "sandbox_permissions.mode=\"workspace-write\""],
+        vec!["--config=permissions.network.enabled=true"],
+        vec!["-cpermissions.file_system.entries=[]"],
+        vec!["--config=permission_profile.network.enabled=true"],
+        vec!["--config=default_permissions=\"read-only\""],
+        vec!["-cdefault-permissions=\"workspace-write\""],
+        vec!["--config=defaultPermissions=\"trusted-all\""],
+        vec!["--config=profiles.temp.sandbox_mode=\"danger-full-access\""],
+        vec![
+            "--config",
+            "profiles={temp={sandbox_mode=\"danger-full-access\"}}",
+        ],
+        vec!["--config=projects.\"/tmp/project\".trust_level=\"trusted\""],
+        vec![
+            "--config",
+            "projects={\"/tmp/project\"={trust_level=\"trusted\"}}",
+        ],
+        vec!["--config=trust_level=\"trusted\""],
+        vec!["--config=use_legacy_landlock=true"],
+        vec!["-cuse-legacy-landlock=true"],
+        vec!["--config=request_permissions=true"],
+        vec!["--config=features.web_search=true"],
+        vec!["--config=features.use_legacy_landlock=true"],
+        vec!["--config=features.request_permissions=true"],
+        vec!["--config=features.experimental=true"],
+        vec!["--config", "features={web_search=true}"],
+        vec!["--config=web_search=\"live\""],
+        vec!["--config=tools.\"web_search\".context_size=\"high\""],
+        vec!["--config=\"tools\".\"web_search\".context_size=\"high\""],
+        vec!["--config=tools.web_search.context_size=\"high\""],
+        vec!["--config", "tools={web_search={context_size=\"high\"}}"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-config-sandbox-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("managed resume does not allow forwarded --config sandbox/permission"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_unmirrored_config_overrides() {
+    let cases = [
+        vec!["--config=model_reasoning_effort=\"high\""],
+        vec!["--config=model-reasoning-summary=\"auto\""],
+        vec!["--config=unknown_key=true"],
+        vec!["--config", "unknown-key=true"],
+        vec!["--config", "unknown_key"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-config-unmirrored-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("managed resume does not allow forwarded --config override"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_forwarded_permission_policy_overrides() {
+    let cases = [
+        vec!["--sandbox", "read-only"],
+        vec!["--sandbox=read-only"],
+        vec!["-s", "read-only"],
+        vec!["-sread-only"],
+        vec!["--ask-for-approval", "never"],
+        vec!["--ask-for-approval=never"],
+        vec!["-a", "never"],
+        vec!["-anever"],
+        vec!["--dangerously-bypass-approvals-and-sandbox"],
+        vec!["--dangerously-bypass-approvals-and-sandbox=true"],
+        vec!["--full-auto"],
+        vec!["--full-auto=true"],
+        vec!["--yolo"],
+        vec!["--yolo=true"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-permission-override-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("managed resume does not allow forwarded"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_forwarded_provider_overrides() {
+    let cases = [
+        vec!["--oss"],
+        vec!["--oss=true"],
+        vec!["--local-provider", "ollama"],
+        vec!["--local-provider=ollama"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-provider-override-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("provider overrides"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_forwarded_thread_selectors() {
+    let cases = [
+        vec!["--last"],
+        vec!["--last=true"],
+        vec!["--all"],
+        vec!["--all=true"],
+        vec!["--include-non-interactive"],
+        vec!["--include-non-interactive=true"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-selector-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("native resume selectors"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_post_prompt_forwarded_options() {
+    let cases = [
+        vec!["please help", "--sandbox", "danger-full-access"],
+        vec!["please help", "--search"],
+        vec!["please help", "-C", "/tmp"],
+        vec!["please help", "--profile", "broad"],
+        vec!["please help", "--config", "model=\"gpt-test\""],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-post-prompt-option-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("after the resume prompt"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_forwarded_live_web_search() {
+    let cases = [
+        vec!["--search"],
+        vec!["--search=true"],
+        vec!["--enable", "web_search"],
+        vec!["--enable=web-search"],
+        vec!["--enable", "web_search_request"],
+        vec!["--enable=web-search-request"],
+        vec!["--enable", "use_legacy_landlock"],
+        vec!["--enable=request_permissions"],
+        vec!["--disable", "use_legacy_landlock"],
+        vec!["--disable=request_permissions"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-search-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("managed resume does not allow forwarded"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn cbth_resume_invalid_forwarded_args_do_not_start_app_server() {
     let home = temp_home();
     let client_cwd = tempfile::tempdir().expect("client cwd");
@@ -2720,7 +3137,10 @@ fn cbth_resume_invalid_forwarded_args_do_not_start_app_server() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported codex sandbox override"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("managed resume does not allow forwarded --sandbox")
+    );
     let log = fs::read_to_string(&log_path).unwrap_or_default();
     assert!(!log.contains("app-server\tapp-server"));
     assert!(!log.contains("foreground"));
