@@ -1403,6 +1403,80 @@ fn cli_session_invalidate_proof_preserves_startup_permission_cap() {
         startup_snapshot
     );
     assert_eq!(replayed_invalidation["cli_session"]["updated_at"], 300);
+
+    note_cli_session_minimum_capabilities(&home, &managed_session_id);
+    note_cli_session_idle(&home, &managed_session_id);
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-cli-permission-invalidation",
+            "--summary",
+            "ready after permission invalidation",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        &home,
+        &["job", "fail", "--job-id", job_id, "--reason", "ready"],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id");
+    let stale_permission = cbth_failure(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "2",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-stale-permission-proof",
+        ],
+    );
+    assert!(stale_permission.contains("does not have a fresh permission snapshot"));
+
+    note_cli_session_permissions(
+        &home,
+        &managed_session_id,
+        None,
+        (false, false, false),
+        &startup_snapshot,
+    );
+    let accepted = cbth(
+        &home,
+        &[
+            "attempt",
+            "begin-cli-accept",
+            "--batch-id",
+            batch_id,
+            "--managed-session-id",
+            &managed_session_id,
+            "--session-epoch",
+            "2",
+            "--rpc-kind",
+            "turn-start",
+            "--rpc-request-id",
+            "rpc-fresh-permission-proof",
+        ],
+    );
+    assert_eq!(accepted["attempt"]["state"], "accept_pending");
 }
 
 #[test]

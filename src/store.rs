@@ -4430,6 +4430,10 @@ fn cli_session_startup_permissions_are_pinned(session: &CliManagedSessionRecord)
         && session.startup_permission_snapshot_json.is_some()
 }
 
+fn cli_session_current_permission_snapshot_is_fresh(session: &CliManagedSessionRecord) -> bool {
+    session.last_permission_snapshot_json.is_some() && session.permission_snapshot_revision > 0
+}
+
 fn ensure_cli_session_startup_permissions_can_pin(
     session: &CliManagedSessionRecord,
     startup: &CliManagedSessionPermissions,
@@ -4715,6 +4719,14 @@ fn ensure_cli_session_identity_allows_delivery(
         ),
     }
     if authorization_mode == "strict_safe" {
+        if cli_session_startup_permissions_are_pinned(session)
+            && !cli_session_current_permission_snapshot_is_fresh(session)
+        {
+            bail!(
+                "CLI managed session {} does not have a fresh permission snapshot",
+                session.managed_session_id
+            )
+        }
         if !session.session_allows_approval
             && !session.session_allows_network
             && !session.session_allows_write_access

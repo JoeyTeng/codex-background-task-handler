@@ -2256,12 +2256,31 @@ fn workspace_writable_roots_intersection(
 ) -> Result<Vec<String>> {
     let startup_roots = workspace_writable_roots(startup_sandbox)?;
     let current_roots = workspace_writable_roots(current_sandbox)?;
-    let current_set = current_roots.iter().cloned().collect::<HashSet<_>>();
     let mut seen = HashSet::new();
-    Ok(startup_roots
-        .into_iter()
-        .filter(|root| current_set.contains(root) && seen.insert(root.clone()))
-        .collect())
+    let mut narrowed_roots = Vec::new();
+    for startup_root in &startup_roots {
+        for current_root in &current_roots {
+            let Some(root) = narrower_writable_root(startup_root, current_root) else {
+                continue;
+            };
+            if seen.insert(root.clone()) {
+                narrowed_roots.push(root);
+            }
+        }
+    }
+    Ok(narrowed_roots)
+}
+
+fn narrower_writable_root(startup_root: &str, current_root: &str) -> Option<String> {
+    let startup_path = Path::new(startup_root);
+    let current_path = Path::new(current_root);
+    if current_path.starts_with(startup_path) {
+        Some(current_root.to_owned())
+    } else if startup_path.starts_with(current_path) {
+        Some(startup_root.to_owned())
+    } else {
+        None
+    }
 }
 
 fn workspace_writable_roots(sandbox: &Value) -> Result<Vec<String>> {
@@ -6763,6 +6782,80 @@ mod tests {
         );
         assert!(overrides["sandboxPolicy"].get("readOnlyAccess").is_none());
         assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(true));
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_preserve_nested_tighter_workspace_roots() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo", "/tmp/other"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo/subdir", "/tmp/repo/another", "/tmp/unrelated"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/repo/subdir", "/tmp/repo/another"])
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_preserve_startup_nested_workspace_root() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo/subdir"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/repo"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/repo/subdir"])
+        );
     }
 
     #[test]
