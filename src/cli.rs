@@ -2103,6 +2103,8 @@ fn foreground_codex_args(
             reject_managed_resume_remote_override(flag)?;
         } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
             reject_managed_resume_add_dir_override(flag)?;
+        } else if let Some(flag) = managed_resume_permission_override_flag(&arg) {
+            reject_managed_resume_permission_override(flag)?;
         } else if let Some(flag) = managed_resume_search_override_flag(&arg) {
             reject_managed_resume_search_override(flag)?;
         } else if let Some(feature) = arg.strip_prefix("--enable=") {
@@ -2131,8 +2133,7 @@ fn foreground_codex_args(
                         resolve_codex_cwd_arg(caller_cwd, value)
                     });
                 }
-                "--model" | "-m" | "--profile" | "-p" | "--sandbox" | "-s"
-                | "--ask-for-approval" | "-a" | "--config" | "-c" | "--local-provider"
+                "--model" | "-m" | "--profile" | "-p" | "--config" | "-c" | "--local-provider"
                 | "--disable" => {
                     let start = index;
                     skip_codex_arg_value(codex_args, &mut index, arg.as_str())?;
@@ -2195,6 +2196,28 @@ fn managed_resume_add_dir_override_flag(arg: &str) -> Option<&'static str> {
 fn reject_managed_resume_add_dir_override(flag: &str) -> Result<()> {
     bail!(
         "managed resume does not allow forwarded {flag}; Codex thread/resume cannot faithfully carry additional writable roots"
+    )
+}
+
+fn managed_resume_permission_override_flag(arg: &str) -> Option<&'static str> {
+    if arg == "--sandbox" || arg.starts_with("--sandbox=") || arg == "-s" || arg.starts_with("-s") {
+        Some("--sandbox")
+    } else if arg == "--ask-for-approval"
+        || arg.starts_with("--ask-for-approval=")
+        || arg == "-a"
+        || arg.starts_with("-a")
+    {
+        Some("--ask-for-approval")
+    } else if arg == "--dangerously-bypass-approvals-and-sandbox" {
+        Some("--dangerously-bypass-approvals-and-sandbox")
+    } else {
+        None
+    }
+}
+
+fn reject_managed_resume_permission_override(flag: &str) -> Result<()> {
+    bail!(
+        "managed resume does not allow forwarded {flag}; Codex thread/resume permission scope must come from the managed resume snapshot"
     )
 }
 
@@ -2423,6 +2446,8 @@ fn apply_codex_resume_foreground_args(
             reject_managed_resume_remote_override(flag)?;
         } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
             reject_managed_resume_add_dir_override(flag)?;
+        } else if let Some(flag) = managed_resume_permission_override_flag(&arg) {
+            reject_managed_resume_permission_override(flag)?;
         } else if let Some(flag) = managed_resume_search_override_flag(&arg) {
             reject_managed_resume_search_override(flag)?;
         } else if let Some(feature) = arg.strip_prefix("--enable=") {
@@ -2431,16 +2456,6 @@ fn apply_codex_resume_foreground_args(
             params.insert("model".to_owned(), Value::String(value.to_owned()));
         } else if let Some(value) = arg.strip_prefix("--profile=") {
             config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
-        } else if let Some(value) = arg.strip_prefix("--sandbox=") {
-            params.insert(
-                "sandbox".to_owned(),
-                Value::String(normalize_codex_sandbox_mode(value)?),
-            );
-        } else if let Some(value) = arg.strip_prefix("--ask-for-approval=") {
-            params.insert(
-                "approvalPolicy".to_owned(),
-                Value::String(normalize_codex_approval_policy(value)?),
-            );
         } else if let Some(value) = arg.strip_prefix("--cd=") {
             params.insert(
                 "cwd".to_owned(),
@@ -2456,16 +2471,6 @@ fn apply_codex_resume_foreground_args(
             params.insert("model".to_owned(), Value::String(value.to_owned()));
         } else if let Some(value) = arg.strip_prefix("-p").filter(|value| !value.is_empty()) {
             config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
-        } else if let Some(value) = arg.strip_prefix("-s").filter(|value| !value.is_empty()) {
-            params.insert(
-                "sandbox".to_owned(),
-                Value::String(normalize_codex_sandbox_mode(value)?),
-            );
-        } else if let Some(value) = arg.strip_prefix("-a").filter(|value| !value.is_empty()) {
-            params.insert(
-                "approvalPolicy".to_owned(),
-                Value::String(normalize_codex_approval_policy(value)?),
-            );
         } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
             params.insert(
                 "cwd".to_owned(),
@@ -2487,20 +2492,6 @@ fn apply_codex_resume_foreground_args(
                 "--profile" | "-p" => {
                     let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
                     config_overrides.insert("profile".to_owned(), Value::String(value));
-                }
-                "--sandbox" | "-s" => {
-                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
-                    params.insert(
-                        "sandbox".to_owned(),
-                        Value::String(normalize_codex_sandbox_mode(&value)?),
-                    );
-                }
-                "--ask-for-approval" | "-a" => {
-                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
-                    params.insert(
-                        "approvalPolicy".to_owned(),
-                        Value::String(normalize_codex_approval_policy(&value)?),
-                    );
                 }
                 "--cd" | "-C" => {
                     let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
@@ -2535,16 +2526,6 @@ fn apply_codex_resume_foreground_args(
                 }
                 "--oss" => {
                     oss = true;
-                }
-                "--dangerously-bypass-approvals-and-sandbox" => {
-                    params.insert(
-                        "approvalPolicy".to_owned(),
-                        Value::String("never".to_owned()),
-                    );
-                    params.insert(
-                        "sandbox".to_owned(),
-                        Value::String("danger-full-access".to_owned()),
-                    );
                 }
                 "--no-alt-screen" | "--last" | "--all" | "--include-non-interactive" => {}
                 _ => {}
@@ -2614,18 +2595,6 @@ fn apply_codex_config_override(
         "model_provider" | "model_provider_id" => {
             params.insert("modelProvider".to_owned(), Value::String(value.to_owned()));
         }
-        "approval_policy" => {
-            params.insert(
-                "approvalPolicy".to_owned(),
-                Value::String(normalize_codex_approval_policy(value)?),
-            );
-        }
-        "sandbox_mode" => {
-            params.insert(
-                "sandbox".to_owned(),
-                Value::String(normalize_codex_sandbox_mode(value)?),
-            );
-        }
         "profile" | "config_profile" => {
             config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
         }
@@ -2658,6 +2627,16 @@ fn managed_resume_config_override_affects_sandbox_scope(key: &str) -> bool {
             .is_some_and(managed_resume_workspace_write_config_field_affects_sandbox_scope)
         || key == "sandbox_read_only"
         || key.starts_with("sandbox_read_only.")
+        || key == "sandbox"
+        || key.starts_with("sandbox.")
+        || key == "sandbox_mode"
+        || key.starts_with("sandbox_mode.")
+        || key == "sandboxMode"
+        || key.starts_with("sandboxMode.")
+        || key == "approval_policy"
+        || key.starts_with("approval_policy.")
+        || key == "approvalPolicy"
+        || key.starts_with("approvalPolicy.")
         || key == "sandbox_permissions"
         || key.starts_with("sandbox_permissions.")
         || key == "permissions"
@@ -2702,25 +2681,6 @@ fn next_codex_arg_value(args: &[OsString], index: &mut usize, flag: &str) -> Res
         bail!("codex argument {flag} requires a value");
     };
     os_arg_to_utf8(value, flag)
-}
-
-fn normalize_codex_approval_policy(value: &str) -> Result<String> {
-    match value {
-        "untrusted" | "unless-trusted" | "unless_trusted" => Ok("untrusted".to_owned()),
-        "on-failure" | "on_failure" => Ok("on-failure".to_owned()),
-        "on-request" | "on_request" => Ok("on-request".to_owned()),
-        "never" => Ok("never".to_owned()),
-        other => bail!("unsupported codex approval policy override {other:?}"),
-    }
-}
-
-fn normalize_codex_sandbox_mode(value: &str) -> Result<String> {
-    match value {
-        "read-only" | "read_only" => Ok("read-only".to_owned()),
-        "workspace-write" | "workspace_write" => Ok("workspace-write".to_owned()),
-        "danger-full-access" | "danger_full_access" => Ok("danger-full-access".to_owned()),
-        other => bail!("unsupported codex sandbox override {other:?}"),
-    }
 }
 
 fn normalize_codex_approvals_reviewer(value: &str) -> Result<String> {
@@ -3099,7 +3059,6 @@ fn parse_permission_profile_permissions(value: &Value) -> Result<PermissionProfi
             Some("none") => permissions.has_access_denials = true,
             Some("write") => {
                 permissions.allows_write_access = true;
-                permissions.record_read_scope(&path_scope);
                 match path_scope {
                     PermissionProfilePathScope::Absolute(path) => {
                         permissions.write_paths.push(path)
@@ -3217,6 +3176,11 @@ fn ensure_permission_profile_legacy_write_equivalence(
     if profile.has_access_denials {
         bail!(
             "thread/resume permissionProfile deny scope cannot be safely represented by legacy sandbox"
+        );
+    }
+    if profile.has_unrepresentable_read_scope {
+        bail!(
+            "thread/resume permissionProfile read scope cannot be safely represented by legacy sandbox"
         );
     }
     ensure_permission_profile_covers_legacy_read_access(profile, sandbox)?;
@@ -9136,6 +9100,72 @@ mod tests {
         .expect_err("read-side profile denials should not pin legacy read-only sandbox");
 
         assert!(error.to_string().contains("deny scope"));
+    }
+
+    #[test]
+    fn permission_snapshot_rejects_unrepresentable_permission_profile_read_scopes() {
+        let cases = [
+            json!({
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": { "type": "glob_pattern", "pattern": "**/*.rs" },
+                            "access": "read"
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "current_working_directory" }
+                            },
+                            "access": "read"
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "project_roots",
+                                    "subpath": "src"
+                                }
+                            },
+                            "access": "read"
+                        }
+                    ]
+                }
+            }),
+        ];
+
+        for permission_profile in cases {
+            let error = parse_thread_resume_permission_snapshot(&json!({
+                "approvalPolicy": "never",
+                "sandbox": {
+                    "type": "readOnly",
+                    "access": restricted_access(&["/tmp/read"]),
+                    "networkAccess": false
+                },
+                "permissionProfile": permission_profile
+            }))
+            .expect_err("unrepresentable read scope should fail closed");
+
+            assert!(
+                error.to_string().contains("read scope"),
+                "unexpected error: {error:#}"
+            );
+        }
     }
 
     #[test]

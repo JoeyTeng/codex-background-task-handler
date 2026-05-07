@@ -2452,10 +2452,6 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
         .arg("gpt-test")
         .arg("--profile")
         .arg("work")
-        .arg("--sandbox")
-        .arg("read-only")
-        .arg("--ask-for-approval")
-        .arg("never")
         .arg("--cd")
         .arg("subdir")
         .current_dir(client_cwd.path())
@@ -2487,8 +2483,6 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
     );
     assert_eq!(params["model"], serde_json::json!("gpt-test"));
     assert_eq!(params["config"]["profile"], serde_json::json!("work"));
-    assert_eq!(params["sandbox"], serde_json::json!("read-only"));
-    assert_eq!(params["approvalPolicy"], serde_json::json!("never"));
     assert_eq!(params["persistExtendedHistory"], serde_json::json!(true));
 
     let log = fs::read_to_string(&log_path).expect("read fake codex log");
@@ -2558,6 +2552,8 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
         vec!["--config=sandbox_workspace_write.network_access=true"],
         vec!["-c", "sandbox_read_only.readable_roots=[\"/tmp/read\"]"],
         vec!["-csandbox-workspace-write.exclude-slash-tmp=false"],
+        vec!["--config=approval_policy=\"never\""],
+        vec!["--config=sandbox_mode=\"workspace-write\""],
         vec!["--config", "sandbox_permissions.mode=\"workspace-write\""],
         vec!["--config=permissions.network.enabled=true"],
         vec!["-cpermissions.file_system.entries=[]"],
@@ -2598,6 +2594,61 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("managed resume does not allow forwarded --config sandbox/permission"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_forwarded_permission_policy_overrides() {
+    let cases = [
+        vec!["--sandbox", "read-only"],
+        vec!["--sandbox=read-only"],
+        vec!["-s", "read-only"],
+        vec!["-sread-only"],
+        vec!["--ask-for-approval", "never"],
+        vec!["--ask-for-approval=never"],
+        vec!["-a", "never"],
+        vec!["-anever"],
+        vec!["--dangerously-bypass-approvals-and-sandbox"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-permission-override-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("managed resume does not allow forwarded"),
             "unexpected stderr: {stderr}"
         );
         let log = fs::read_to_string(&log_path).unwrap_or_default();
@@ -2688,7 +2739,10 @@ fn cbth_resume_invalid_forwarded_args_do_not_start_app_server() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported codex sandbox override"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("managed resume does not allow forwarded --sandbox")
+    );
     let log = fs::read_to_string(&log_path).unwrap_or_default();
     assert!(!log.contains("app-server\tapp-server"));
     assert!(!log.contains("foreground"));
