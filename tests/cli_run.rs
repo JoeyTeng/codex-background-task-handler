@@ -2565,6 +2565,7 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
         vec!["--config=default_permissions=\"read-only\""],
         vec!["-cdefault-permissions=\"workspace-write\""],
         vec!["--config=defaultPermissions=\"trusted-all\""],
+        vec!["--config=features.web_search=true"],
     ];
 
     for (index, args) in cases.into_iter().enumerate() {
@@ -2597,6 +2598,56 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("managed resume does not allow forwarded --config sandbox/permission"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_forwarded_live_web_search() {
+    let cases = [
+        vec!["--search"],
+        vec!["--search=true"],
+        vec!["--enable", "web_search"],
+        vec!["--enable=web-search"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-search-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("live web search tool enablement"),
             "unexpected stderr: {stderr}"
         );
         let log = fs::read_to_string(&log_path).unwrap_or_default();

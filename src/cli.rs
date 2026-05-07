@@ -2103,6 +2103,11 @@ fn foreground_codex_args(
             reject_managed_resume_remote_override(flag)?;
         } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
             reject_managed_resume_add_dir_override(flag)?;
+        } else if let Some(flag) = managed_resume_search_override_flag(&arg) {
+            reject_managed_resume_search_override(flag)?;
+        } else if let Some(feature) = arg.strip_prefix("--enable=") {
+            reject_managed_resume_live_web_search_feature("--enable", feature)?;
+            filtered.push(codex_args[index].clone());
         } else if let Some(value) = arg.strip_prefix("--cd=") {
             foreground_cwd = Some(resolve_codex_cwd_arg(caller_cwd, OsStr::new(value)));
         } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
@@ -2128,9 +2133,15 @@ fn foreground_codex_args(
                 }
                 "--model" | "-m" | "--profile" | "-p" | "--sandbox" | "-s"
                 | "--ask-for-approval" | "-a" | "--config" | "-c" | "--local-provider"
-                | "--enable" | "--disable" => {
+                | "--disable" => {
                     let start = index;
                     skip_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    filtered.extend(codex_args[start..=index].iter().cloned());
+                }
+                "--enable" => {
+                    let start = index;
+                    let feature = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    reject_managed_resume_live_web_search_feature(arg.as_str(), &feature)?;
                     filtered.extend(codex_args[start..=index].iter().cloned());
                 }
                 "--add-dir" => {
@@ -2184,6 +2195,36 @@ fn managed_resume_add_dir_override_flag(arg: &str) -> Option<&'static str> {
 fn reject_managed_resume_add_dir_override(flag: &str) -> Result<()> {
     bail!(
         "managed resume does not allow forwarded {flag}; Codex thread/resume cannot faithfully carry additional writable roots"
+    )
+}
+
+fn managed_resume_search_override_flag(arg: &str) -> Option<&'static str> {
+    if arg == "--search" || arg.starts_with("--search=") {
+        Some("--search")
+    } else {
+        None
+    }
+}
+
+fn reject_managed_resume_search_override(flag: &str) -> Result<()> {
+    bail!(
+        "managed resume does not allow forwarded {flag}; Codex thread/resume cannot faithfully carry live web search tool enablement"
+    )
+}
+
+fn reject_managed_resume_live_web_search_feature(flag: &str, feature: &str) -> Result<()> {
+    if codex_feature_enables_live_web_search(feature) {
+        bail!(
+            "managed resume does not allow forwarded {flag} {feature:?}; Codex thread/resume cannot faithfully carry live web search tool enablement"
+        );
+    }
+    Ok(())
+}
+
+fn codex_feature_enables_live_web_search(feature: &str) -> bool {
+    matches!(
+        feature.trim().replace('-', "_").as_str(),
+        "web_search" | "search"
     )
 }
 
@@ -2246,13 +2287,13 @@ fn read_managed_resume_thread_cwd(
 }
 
 fn thread_read_cwd_from_response<'a>(read: &'a Value, thread_id: &str) -> Option<&'a str> {
+    if !thread_read_response_matches_thread(read, thread_id) {
+        return None;
+    }
     if let Some(thread) = read.get("thread")
         && let Some(cwd) = thread.get("cwd").and_then(Value::as_str)
     {
-        return (thread.get("id").and_then(Value::as_str) == Some(thread_id)).then_some(cwd);
-    }
-    if !thread_read_response_matches_thread(read, thread_id) {
-        return None;
+        return Some(cwd);
     }
     read.get("cwd").and_then(Value::as_str)
 }
@@ -2382,6 +2423,10 @@ fn apply_codex_resume_foreground_args(
             reject_managed_resume_remote_override(flag)?;
         } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
             reject_managed_resume_add_dir_override(flag)?;
+        } else if let Some(flag) = managed_resume_search_override_flag(&arg) {
+            reject_managed_resume_search_override(flag)?;
+        } else if let Some(feature) = arg.strip_prefix("--enable=") {
+            reject_managed_resume_live_web_search_feature("--enable", feature)?;
         } else if let Some(value) = arg.strip_prefix("--model=") {
             params.insert("model".to_owned(), Value::String(value.to_owned()));
         } else if let Some(value) = arg.strip_prefix("--profile=") {
@@ -2472,7 +2517,11 @@ fn apply_codex_resume_foreground_args(
                     local_provider =
                         Some(next_codex_arg_value(codex_args, &mut index, arg.as_str())?);
                 }
-                "--enable" | "--disable" => {
+                "--enable" => {
+                    let feature = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    reject_managed_resume_live_web_search_feature(arg.as_str(), &feature)?;
+                }
+                "--disable" => {
                     let _ = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
                 }
                 "--add-dir" => {
@@ -2497,11 +2546,7 @@ fn apply_codex_resume_foreground_args(
                         Value::String("danger-full-access".to_owned()),
                     );
                 }
-                "--search"
-                | "--no-alt-screen"
-                | "--last"
-                | "--all"
-                | "--include-non-interactive" => {}
+                "--no-alt-screen" | "--last" | "--all" | "--include-non-interactive" => {}
                 _ => {}
             }
         }
@@ -2631,6 +2676,10 @@ fn managed_resume_config_override_affects_sandbox_scope(key: &str) -> bool {
         || key.ends_with(".readable_roots")
         || key == "network_access"
         || key.ends_with(".network_access")
+        || key == "features.web_search"
+        || key.starts_with("features.web_search.")
+        || key == "features.search"
+        || key.starts_with("features.search.")
 }
 
 fn managed_resume_workspace_write_config_field_affects_sandbox_scope(field: &str) -> bool {
@@ -8729,6 +8778,26 @@ mod tests {
                     "thread": { "id": "thread-1" },
                     "id": "thread-other",
                     "cwd": "/tmp/top"
+                }),
+                "thread-1"
+            ),
+            None
+        );
+        assert_eq!(
+            thread_read_cwd_from_response(
+                &json!({
+                    "id": "thread-other",
+                    "thread": { "id": "thread-1", "cwd": "/tmp/thread" }
+                }),
+                "thread-1"
+            ),
+            None
+        );
+        assert_eq!(
+            thread_read_cwd_from_response(
+                &json!({
+                    "threadId": "thread-other",
+                    "thread": { "id": "thread-1", "cwd": "/tmp/thread" }
                 }),
                 "thread-1"
             ),
