@@ -1,7 +1,7 @@
 ---
 id: 20260507-98dc2b4-desktop-no-db-reader
 title: Desktop No-DB Inbox Reader
-status: active
+status: completed
 created: 2026-05-07
 updated: 2026-05-07
 branch: codex/desktop-no-db-inbox-reader
@@ -40,11 +40,17 @@ superseded_by:
 
 ## Current State
 
-- This journal entry records the implementation plan as the first commit for the PR.
-- Implementation, docs updates, tests, live validation, and final review remain to be completed.
+- `cbth desktop read-snapshot`, `list-arm-pending`, `list-pause-due`, and read/peek `claim-next-ready` are implemented as no-DB, no-daemon, no-write inbox readers.
+- The shared reader validates the current manifest, revision-specific snapshots, installation-state export, schema version, bridge thread id, snapshot revision, manifest paths, regular-file type, JSON size limit, and entry counts before returning data.
+- Fake integration coverage proves the helpers can consume published snapshots even when SQLite is no longer openable and that they fail closed on missing, malformed, oversized, mismatched, or path-escaped snapshot inputs.
+- Real Desktop heartbeat validation succeeded with the no-DB helper path on 2026-05-07. The local installation was repaired to `read_transport_capability=validated`; `artifact_read_capability` and `writeback_capability` remain `unknown`.
 
 ## Evidence
 
 - Base merge commit: `98dc2b42f8edd595d1ede6dd846634ab09a86779`
 - Prior live evidence: [Desktop live preflight evidence](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md)
 - Foundation design: [Desktop bridge foundation](../../../DESKTOP_BRIDGE_FOUNDATION.md)
+- Live validation marker: `CBTH_DESKTOP_NO_DB_INBOX_READ_V4 VALIDATION_OK`
+- Live validation snapshot revision: `019e0188-51de-77a2-87e9-af4a6cd15379`
+- Post-repair exported snapshot revision: `019e0190-6ceb-7cd3-91bd-ae17c82383ed`
+- Local validation: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets -- -D warnings`; `cargo test --test desktop_foundation --locked`; `cargo test --locked`; `cargo test`; project journal validate; `git diff --check`

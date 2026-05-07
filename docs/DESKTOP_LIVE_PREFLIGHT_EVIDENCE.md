@@ -191,3 +191,78 @@ read_transport_capability=unknown
 artifact_read_capability=unknown
 writeback_capability=unknown
 ```
+
+## Next Retest Condition From SQLite WAL Blocker
+
+The direct-helper publisher path proved Desktop heartbeat can execute `cbth` without daemon autostart, `startup.lock`, or Unix socket access, but it still failed when the heartbeat process tried to open SQLite and enable WAL mode.
+
+The next validation should stop asking Desktop heartbeat to publish snapshots. A normal shell, daemon, or future non-Desktop sidecar should publish the inbox snapshot first; the heartbeat should only run no-DB read helpers:
+
+```bash
+cbth desktop read-snapshot --bridge-thread-id 019db5e6-ba6a-7b80-95d2-a6867163281a --json
+cbth desktop list-arm-pending --bridge-thread-id 019db5e6-ba6a-7b80-95d2-a6867163281a --json
+cbth desktop list-pause-due --bridge-thread-id 019db5e6-ba6a-7b80-95d2-a6867163281a --json
+cbth desktop claim-next-ready --bridge-thread-id 019db5e6-ba6a-7b80-95d2-a6867163281a --json
+```
+
+Do not mark `read_transport_capability=validated` until a real heartbeat completes those read-only helpers against a freshly published snapshot without approval. This validation still does not cover `artifact_read_capability` or `writeback_capability`.
+
+## 2026-05-07 Attempt: No-DB Inbox Read Helpers Succeeded
+
+Result: `VALIDATION_OK`
+
+Evidence:
+
+- Code branch: `codex/desktop-no-db-inbox-reader`
+- Base merge commit: `98dc2b42f8edd595d1ede6dd846634ab09a86779`
+- Local binary: `/Users/hoteng/.cache/cargo-target/release/cbth`
+- Local binary version: `cbth 0.1.0`
+- Bridge thread id: `019db5e6-ba6a-7b80-95d2-a6867163281a`
+- Successful heartbeat automation id: `cbth-desktop-no-db-inbox-read-validation-v4`
+- Successful validation marker: `CBTH_DESKTOP_NO_DB_INBOX_READ_V4`
+- Target rollout file: `/Users/hoteng/.codex/sessions/2026/04/22/rollout-2026-04-22T16-54-50-019db5e6-ba6a-7b80-95d2-a6867163281a.jsonl`
+- Heartbeat run timestamp: `2026-05-07T08:30:07.707Z`
+
+The local shell first published a fresh snapshot through the direct-helper publisher path:
+
+```text
+snapshot_revision=019e0188-51de-77a2-87e9-af4a6cd15379
+snapshot_manifest_path=/Users/hoteng/.cbth/inbox/current-snapshot.json
+installation_state_path=/Users/hoteng/.cbth/inbox/desktop-installation-state.json
+```
+
+The first three no-DB heartbeat retries proved the commands executed but the validation prompt used the wrong JSON paths. Those runs failed at parser checks only:
+
+```text
+CBTH_DESKTOP_PREFLIGHT_20260507_NO_DB_INBOX_READ VALIDATION_FAILED step5_inconsistent_json
+CBTH_DESKTOP_NO_DB_INBOX_READ_V2 VALIDATION_FAILED step9_read_snapshot_missing_required_sections
+CBTH_DESKTOP_NO_DB_INBOX_READ_V3 VALIDATION_FAILED step9_read_transport_not_direct_file_read:
+```
+
+The fourth retry used the exact wrapper / nested JSON paths and succeeded:
+
+```text
+CBTH_DESKTOP_NO_DB_INBOX_READ_V4 VALIDATION_OK snapshot_revision=019e0188-51de-77a2-87e9-af4a6cd15379 ready_path=/Users/hoteng/.cbth/inbox/snapshots/019e0188-51de-77a2-87e9-af4a6cd15379/ready-threads.json arm_path=/Users/hoteng/.cbth/inbox/snapshots/019e0188-51de-77a2-87e9-af4a6cd15379/arm-pending-bindings.json pause_path=/Users/hoteng/.cbth/inbox/snapshots/019e0188-51de-77a2-87e9-af4a6cd15379/pause-due-bindings.json installation_path=/Users/hoteng/.cbth/inbox/desktop-installation-state.json arm_entries=0 pause_entries=0 claim_entry=null
+```
+
+This validates that a real Desktop heartbeat can execute the no-DB read helpers without approval and consume a revision-consistent, already-published inbox snapshot through direct file read. It does not validate Desktop heartbeat access to SQLite, daemon sockets, `startup.lock`, artifact payloads, or writeback helpers.
+
+After the successful heartbeat run, the local installation state was repaired:
+
+```text
+read_transport_capability=validated
+artifact_read_capability=unknown
+writeback_capability=unknown
+read_transport_generation=1
+validated_at=1778142693
+validation_fingerprint=cbth_version=0.1.0;os=macos;arch=aarch64;exe=/Users/hoteng/.cache/cargo-target/release/cbth;inbox_schema=1;read_transport=direct_file_read
+```
+
+A follow-up local preflight refreshed the inbox export after the repair:
+
+```text
+snapshot_revision=019e0190-6ceb-7cd3-91bd-ae17c82383ed
+read_transport_capability=validated
+artifact_read_capability=unknown
+writeback_capability=unknown
+```

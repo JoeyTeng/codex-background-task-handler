@@ -85,6 +85,16 @@ fn stop_daemon(home: &TempDir) {
         .output();
 }
 
+fn read_json_file(path: &str) -> Value {
+    serde_json::from_slice(&fs::read(path).unwrap_or_else(|error| panic!("read {path}: {error}")))
+        .unwrap_or_else(|error| panic!("parse {path}: {error}"))
+}
+
+fn write_json_file(path: &str, value: &Value) {
+    let bytes = serde_json::to_vec_pretty(value).expect("serialize json");
+    fs::write(path, bytes).unwrap_or_else(|error| panic!("write {path}: {error}"));
+}
+
 #[test]
 fn desktop_installation_state_defaults_and_repairs_without_extra_writes() {
     let home = temp_home();
@@ -554,6 +564,254 @@ fn desktop_bridge_preflight_helper_direct_store_bypasses_daemon() {
         0
     );
     assert_eq!(durable_state["desktop_installation_state"]["updated_at"], 0);
+}
+
+#[test]
+fn desktop_no_db_read_helpers_consume_published_snapshot_without_store_or_daemon() {
+    let home = temp_home();
+    let preflight = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-reader",
+            "--helper-direct-store",
+            "--json",
+            "--now",
+            "2300",
+        ],
+    );
+    let preflight = &preflight["desktop_bridge_preflight"];
+    let revision = preflight["snapshot_revision"]
+        .as_str()
+        .expect("snapshot revision")
+        .to_owned();
+    fs::remove_file(home.path().join("cbth.sqlite3")).expect("remove db file");
+    fs::create_dir(home.path().join("cbth.sqlite3")).expect("replace db with directory");
+
+    let snapshot = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "read-snapshot",
+            "--bridge-thread-id",
+            "bridge-thread-reader",
+            "--json",
+        ],
+    );
+    let snapshot = &snapshot["desktop_snapshot"];
+    assert_eq!(snapshot["snapshot_revision"], revision);
+    assert_eq!(snapshot["bridge_thread_id"], "bridge-thread-reader");
+    assert_eq!(snapshot["snapshots"]["ready_threads"]["count"], 0);
+    assert_eq!(snapshot["snapshots"]["arm_pending_bindings"]["count"], 0);
+    assert_eq!(snapshot["snapshots"]["pause_due_bindings"]["count"], 0);
+
+    let arm_pending = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "list-arm-pending",
+            "--bridge-thread-id",
+            "bridge-thread-reader",
+            "--json",
+        ],
+    );
+    assert_eq!(arm_pending["desktop_arm_pending_bindings"]["count"], 0);
+    assert_eq!(
+        arm_pending["desktop_arm_pending_bindings"]["entries"]
+            .as_array()
+            .expect("arm entries")
+            .len(),
+        0
+    );
+
+    let pause_due = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "list-pause-due",
+            "--bridge-thread-id",
+            "bridge-thread-reader",
+            "--json",
+        ],
+    );
+    assert_eq!(pause_due["desktop_pause_due_bindings"]["count"], 0);
+
+    let first_claim = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "claim-next-ready",
+            "--bridge-thread-id",
+            "bridge-thread-reader",
+            "--json",
+        ],
+    );
+    let second_claim = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "claim-next-ready",
+            "--bridge-thread-id",
+            "bridge-thread-reader",
+            "--json",
+        ],
+    );
+    assert_eq!(first_claim["desktop_ready_claim"]["entry"], Value::Null);
+    assert_eq!(second_claim, first_claim);
+    assert!(
+        !home.path().join("run").join("startup.lock").exists(),
+        "no-DB read helpers must not autostart the daemon"
+    );
+}
+
+#[test]
+fn desktop_no_db_read_helpers_fail_closed_for_snapshot_mismatch_and_path_escape() {
+    let home = temp_home();
+    let preflight = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-invalid",
+            "--helper-direct-store",
+            "--json",
+        ],
+    );
+    let preflight = &preflight["desktop_bridge_preflight"];
+    let ready_path = preflight["snapshots"]["ready_threads"]["path"]
+        .as_str()
+        .expect("ready path")
+        .to_owned();
+    let mut ready = read_json_file(&ready_path);
+    ready["snapshot_revision"] = json!("different-revision");
+    write_json_file(&ready_path, &ready);
+    let revision_mismatch = cbth_daemon_failure(
+        &home,
+        &[
+            "desktop",
+            "read-snapshot",
+            "--bridge-thread-id",
+            "bridge-thread-invalid",
+            "--json",
+        ],
+    );
+    assert!(
+        revision_mismatch.contains("ready_threads.snapshot_revision must be"),
+        "unexpected stderr: {revision_mismatch}"
+    );
+
+    ready["snapshot_revision"] = preflight["snapshot_revision"].clone();
+    write_json_file(&ready_path, &ready);
+    let manifest_path = preflight["snapshot_manifest_path"]
+        .as_str()
+        .expect("manifest path")
+        .to_owned();
+    let mut manifest = read_json_file(&manifest_path);
+    manifest["snapshots"]["ready_threads"]["path"] =
+        json!(home.path().join("outside.json").display().to_string());
+    write_json_file(&manifest_path, &manifest);
+    let path_escape = cbth_daemon_failure(
+        &home,
+        &[
+            "desktop",
+            "read-snapshot",
+            "--bridge-thread-id",
+            "bridge-thread-invalid",
+            "--json",
+        ],
+    );
+    assert!(
+        path_escape.contains("ready_threads.path must be"),
+        "unexpected stderr: {path_escape}"
+    );
+}
+
+#[test]
+fn desktop_no_db_read_helpers_fail_closed_for_missing_malformed_and_oversized_files() {
+    let missing_home = temp_home();
+    let missing = cbth_daemon_failure(
+        &missing_home,
+        &[
+            "desktop",
+            "read-snapshot",
+            "--bridge-thread-id",
+            "bridge-thread-missing",
+            "--json",
+        ],
+    );
+    assert!(
+        missing.contains("current-snapshot.json"),
+        "unexpected stderr: {missing}"
+    );
+
+    let malformed_home = temp_home();
+    let malformed_preflight = cbth_daemon(
+        &malformed_home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-malformed",
+            "--helper-direct-store",
+            "--json",
+        ],
+    );
+    let installation_state_path =
+        malformed_preflight["desktop_bridge_preflight"]["installation_state_path"]
+            .as_str()
+            .expect("installation state path")
+            .to_owned();
+    fs::write(&installation_state_path, b"{not json").expect("write malformed json");
+    let malformed = cbth_daemon_failure(
+        &malformed_home,
+        &[
+            "desktop",
+            "read-snapshot",
+            "--bridge-thread-id",
+            "bridge-thread-malformed",
+            "--json",
+        ],
+    );
+    assert!(
+        malformed.contains("parse") && malformed.contains("desktop-installation-state.json"),
+        "unexpected stderr: {malformed}"
+    );
+
+    let oversized_home = temp_home();
+    let oversized_preflight = cbth_daemon(
+        &oversized_home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--bridge-thread-id",
+            "bridge-thread-oversized",
+            "--helper-direct-store",
+            "--json",
+        ],
+    );
+    let ready_path = oversized_preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]
+        ["path"]
+        .as_str()
+        .expect("ready path")
+        .to_owned();
+    fs::write(&ready_path, vec![b' '; 1024 * 1024 + 1]).expect("write oversized snapshot");
+    let oversized = cbth_daemon_failure(
+        &oversized_home,
+        &[
+            "desktop",
+            "read-snapshot",
+            "--bridge-thread-id",
+            "bridge-thread-oversized",
+            "--json",
+        ],
+    );
+    assert!(
+        oversized.contains("Desktop inbox file exceeds"),
+        "unexpected stderr: {oversized}"
+    );
 }
 
 #[test]
