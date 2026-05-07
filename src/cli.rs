@@ -2386,6 +2386,11 @@ fn apply_codex_resume_foreground_args(
                 "managed CLI session requires --local-provider when forwarding --oss; fresh thread/start cannot infer the foreground OSS provider"
             );
         }
+        if require_explicit_oss_provider && !params.contains_key("model") {
+            bail!(
+                "managed CLI session requires --model when forwarding --oss; fresh thread/start cannot infer the foreground OSS model"
+            );
+        }
     }
     if !config_overrides.is_empty() {
         params.insert("config".to_owned(), Value::Object(config_overrides));

@@ -2996,6 +2996,8 @@ fn cbth_new_provider_override_does_not_merge_default_model_from_other_provider()
         .arg("--oss")
         .arg("--local-provider")
         .arg("ollama")
+        .arg("--model")
+        .arg("qwen2.5-coder")
         .current_dir(client_cwd.path())
         .env("FAKE_CODEX_LOG", &log_path)
         .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
@@ -3017,13 +3019,17 @@ fn cbth_new_provider_override_does_not_merge_default_model_from_other_provider()
         capture.thread_start_params["modelProvider"],
         serde_json::json!("ollama")
     );
-    assert!(capture.thread_start_params.get("model").is_none());
+    assert_eq!(
+        capture.thread_start_params["model"],
+        serde_json::json!("qwen2.5-coder")
+    );
     assert!(capture.thread_start_params.get("config").is_none());
 
     let log = fs::read_to_string(&log_path).expect("read fake codex log");
     assert!(log.contains("foreground\t--remote\t"));
     assert!(log.contains("\t--oss"));
     assert!(log.contains("\t--local-provider\tollama"));
+    assert!(log.contains("\t--model\tqwen2.5-coder"));
     stop_daemon(&home);
 }
 
@@ -3048,6 +3054,8 @@ fn cbth_new_oss_accepts_config_provider_override() {
         .arg("--oss")
         .arg("-c")
         .arg("model_provider=ollama")
+        .arg("-c")
+        .arg("model=qwen2.5-coder")
         .current_dir(client_cwd.path())
         .env("FAKE_CODEX_LOG", &log_path)
         .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
@@ -3068,13 +3076,17 @@ fn cbth_new_oss_accepts_config_provider_override() {
         capture.thread_start_params["modelProvider"],
         serde_json::json!("ollama")
     );
-    assert!(capture.thread_start_params.get("model").is_none());
+    assert_eq!(
+        capture.thread_start_params["model"],
+        serde_json::json!("qwen2.5-coder")
+    );
     assert!(capture.thread_start_params.get("config").is_none());
 
     let log = fs::read_to_string(&log_path).expect("read fake codex log");
     assert!(log.contains("foreground\t--remote\t"));
     assert!(log.contains("\t--oss"));
     assert!(log.contains("\t-c\tmodel_provider=ollama"));
+    assert!(log.contains("\t-c\tmodel=qwen2.5-coder"));
     stop_daemon(&home);
 }
 
@@ -3235,6 +3247,8 @@ fn cbth_new_rejects_oss_without_local_provider_before_thread_start() {
         .arg("--codex-bin")
         .arg(&fake_codex)
         .arg("--oss")
+        .arg("--model")
+        .arg("qwen2.5-coder")
         .current_dir(client_cwd.path())
         .env("FAKE_CODEX_LOG", &log_path)
         .output()
@@ -3249,6 +3263,46 @@ fn cbth_new_rejects_oss_without_local_provider_before_thread_start() {
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .contains("managed CLI session requires --local-provider when forwarding --oss")
+    );
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!log.contains("app-server\tapp-server"));
+    assert!(!log.contains("foreground"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_rejects_oss_without_model_before_thread_start() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--oss")
+        .arg("--local-provider")
+        .arg("ollama")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .output()
+        .expect("run cbth new with oss without model");
+
+    assert!(
+        !output.status.success(),
+        "cbth new unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("managed CLI session requires --model when forwarding --oss")
     );
 
     let log = fs::read_to_string(&log_path).unwrap_or_default();
