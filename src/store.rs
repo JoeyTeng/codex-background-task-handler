@@ -1837,9 +1837,48 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let binding = query_desktop_binding_tx(&tx, source_thread_id)?;
-        ensure_desktop_binding_bound_for_arm(&binding)?;
         let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
         ensure_desktop_attempt_tokens(&attempt, source_thread_id, generation)?;
+
+        if attempt.state == "arm_pending" {
+            if attempt.bridge_request_id.as_deref() != Some(bridge_request_id) {
+                bail!(
+                    "delivery attempt {} is already arm_pending for another bridge request",
+                    attempt.attempt_id
+                );
+            }
+            let lease_id = attempt
+                .bridge_arm_lease_id
+                .as_ref()
+                .context("arm_pending Desktop attempt is missing bridge_arm_lease_id")?
+                .clone();
+            tx.commit()?;
+            return Ok(DesktopArmPendingRecord {
+                outcome: "already_pending".to_owned(),
+                bridge_arm_lease_id: Some(lease_id),
+                bridge_arm_lease_deadline: attempt.bridge_arm_lease_deadline,
+                arm_pending_deadline: attempt.arm_pending_deadline,
+                attempt,
+                binding,
+            });
+        }
+
+        if matches!(attempt.state.as_str(), "cooldown" | "closed")
+            && attempt.bridge_request_id.as_deref() == Some(bridge_request_id)
+            && binding.armed_generation == Some(generation)
+        {
+            tx.commit()?;
+            return Ok(DesktopArmPendingRecord {
+                outcome: "already_armed".to_owned(),
+                bridge_arm_lease_id: attempt.bridge_arm_lease_id.clone(),
+                bridge_arm_lease_deadline: attempt.bridge_arm_lease_deadline,
+                arm_pending_deadline: attempt.arm_pending_deadline,
+                attempt,
+                binding,
+            });
+        }
+
+        ensure_desktop_binding_bound_for_arm(&binding)?;
         let batch = query_batch_tx(&tx, &attempt.batch_id)?;
         ensure_desktop_attempt_head_and_batch_eligible(&tx, &attempt, &batch)?;
 
@@ -1893,41 +1932,6 @@ impl Store {
                     binding,
                 })
             }
-            "arm_pending" => {
-                if attempt.bridge_request_id.as_deref() != Some(bridge_request_id) {
-                    bail!(
-                        "delivery attempt {} is already arm_pending for another bridge request",
-                        attempt.attempt_id
-                    );
-                }
-                let lease_id = attempt
-                    .bridge_arm_lease_id
-                    .as_ref()
-                    .context("arm_pending Desktop attempt is missing bridge_arm_lease_id")?
-                    .clone();
-                let binding = query_desktop_binding_tx(&tx, source_thread_id)?;
-                tx.commit()?;
-                Ok(DesktopArmPendingRecord {
-                    outcome: "already_pending".to_owned(),
-                    bridge_arm_lease_id: Some(lease_id),
-                    bridge_arm_lease_deadline: attempt.bridge_arm_lease_deadline,
-                    arm_pending_deadline: attempt.arm_pending_deadline,
-                    attempt,
-                    binding,
-                })
-            }
-            "cooldown" if attempt.bridge_request_id.as_deref() == Some(bridge_request_id) => {
-                let binding = query_desktop_binding_tx(&tx, source_thread_id)?;
-                tx.commit()?;
-                Ok(DesktopArmPendingRecord {
-                    outcome: "already_armed".to_owned(),
-                    bridge_arm_lease_id: attempt.bridge_arm_lease_id.clone(),
-                    bridge_arm_lease_deadline: attempt.bridge_arm_lease_deadline,
-                    arm_pending_deadline: attempt.arm_pending_deadline,
-                    attempt,
-                    binding,
-                })
-            }
             _ => bail!(
                 "delivery attempt {} is not eligible for Desktop arm-pending transition",
                 attempt.attempt_id
@@ -1953,13 +1957,11 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let binding = query_desktop_binding_tx(&tx, source_thread_id)?;
-        ensure_desktop_binding_bound_for_arm(&binding)?;
         let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
         ensure_desktop_attempt_tokens(&attempt, source_thread_id, generation)?;
         let batch = query_batch_tx(&tx, &attempt.batch_id)?;
-        ensure_desktop_attempt_head_and_batch_eligible(&tx, &attempt, &batch)?;
 
-        if attempt.state == "cooldown"
+        if matches!(attempt.state.as_str(), "cooldown" | "closed")
             && attempt.bridge_request_id.as_deref() == Some(bridge_request_id)
             && attempt.bridge_arm_lease_id.as_deref() == Some(bridge_arm_lease_id)
             && binding.armed_generation == Some(generation)
@@ -1974,6 +1976,9 @@ impl Store {
                 binding,
             });
         }
+
+        ensure_desktop_binding_bound_for_arm(&binding)?;
+        ensure_desktop_attempt_head_and_batch_eligible(&tx, &attempt, &batch)?;
 
         if attempt.state != "arm_pending" {
             bail!(

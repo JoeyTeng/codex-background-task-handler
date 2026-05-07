@@ -684,6 +684,56 @@ fn desktop_note_arm_pending_and_note_arm_are_idempotent_and_exported() {
             "operator-confirmed-delivery",
         ],
     );
+    let repeated_arm_after_close = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm",
+            "--source-thread-id",
+            "thread-desktop-writeback",
+            "--attempt-id",
+            "attempt-desktop-writeback",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-1",
+            "--bridge-arm-lease-id",
+            &lease,
+            "--json",
+            "--now",
+            "2292",
+        ],
+    );
+    assert_eq!(
+        repeated_arm_after_close["desktop_arm"]["outcome"],
+        "already_armed"
+    );
+    assert_eq!(
+        repeated_arm_after_close["desktop_arm"]["delivery_attempt_count"],
+        1
+    );
+    let repeated_pending_after_close = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-desktop-writeback",
+            "--attempt-id",
+            "attempt-desktop-writeback",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-1",
+            "--json",
+            "--now",
+            "2293",
+        ],
+    );
+    assert_eq!(
+        repeated_pending_after_close["desktop_arm_pending"]["outcome"],
+        "already_armed"
+    );
     create_desktop_batch_and_prepared_attempt(
         &home,
         "thread-desktop-writeback",
