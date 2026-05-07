@@ -13,6 +13,7 @@
 - Summary: `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md` are now short entrypoints. Durable detail lives under `docs/project_journal/2026/05/`.
 - Next Steps:
   - Continue from the active backlog in [current follow-ups](project_journal/2026/05/2026-05-05-current-follow-ups-bbe4003.md).
+  - Desktop writeback live validation is tracked in [Desktop writeback helper live validation](project_journal/2026/05/2026-05-07-desktop-writeback-live-validation-922c89c.md).
   - Keep new workstream detail in focused journal entries instead of expanding these top-level files.
 - Blockers:
   - Desktop automatic delivery is not yet live-validated end to end.
