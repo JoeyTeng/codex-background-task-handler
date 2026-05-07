@@ -855,7 +855,8 @@ fn fake_default_config_read_response() -> serde_json::Value {
             "model_provider": "openai",
             "model_reasoning_effort": "xhigh"
         },
-        "origins": {}
+        "origins": {},
+        "layers": null
     })
 }
 
@@ -875,7 +876,8 @@ fn fake_active_profile_config_read_response() -> serde_json::Value {
                 }
             }
         },
-        "origins": {}
+        "origins": {},
+        "layers": null
     })
 }
 

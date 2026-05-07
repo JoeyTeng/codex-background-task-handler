@@ -3855,6 +3855,8 @@ fn read_effective_codex_config(
         Ok(response) => response,
         Err(_) => return Ok(None),
     };
+    // ConfigReadResponse exposes the effective values in top-level `config`;
+    // `origins` and `layers` are source metadata for the same keys.
     Ok(response.get("config").and_then(Value::as_object).cloned())
 }
 
