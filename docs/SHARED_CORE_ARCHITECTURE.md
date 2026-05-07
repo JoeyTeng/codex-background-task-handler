@@ -849,17 +849,27 @@ cooldown -> superseded
 
 ### CLI managed session profile
 
-- detached auto-delivery 不只依赖 batch 自身的 delivery policy，还依赖 managed session 自身的 durable risk profile。
+- detached auto-delivery 不只依赖 batch 自身的 delivery policy，还依赖 managed session 自身的 durable effective risk profile 和 startup permission snapshot。
 - 每条 managed session 都必须 durable 记录：
   - `session_allows_approval`
   - `session_allows_network`
   - `session_allows_write_access`
-- 这些字段属于 session-scoped contract：
-  - 在 `cbth cli run --bind-thread-id ...` bootstrap / attach-or-create 时写入
-  - 对 non-retired managed session 来说是 immutable profile
-  - 不得在单次 batch 投递时临时推导
-  - 只有三者都为 `false` 时，CLI detached auto-delivery 才允许开启
-- `attach-or-create` 发现 requested profile 与 durable profile 不一致时，不得原地改写：
+  - `startup_session_allows_approval`
+  - `startup_session_allows_network`
+  - `startup_session_allows_write_access`
+  - `startup_permission_snapshot_json`
+  - `last_permission_snapshot_json`
+  - `permission_snapshot_revision`
+- `--session-allows-approval` / `--session-allows-network` / `--session-allows-write-access` 接受 `auto`、`true`、`false`，默认 `auto`：
+  - explicit `true` / `false` 是调用方给出的 bootstrap profile
+  - `auto` 必须从 `thread/resume.approvalPolicy` 与 `thread/resume.sandbox` 取可信 snapshot，无法解析时 fail-closed
+  - 第一次可信 auto snapshot pin 为 startup upper bound
+  - 每次自动 `turn/start` 前重新读取 current snapshot，并逐维计算 `effective_allows = startup_allows && current_allows`
+  - 当前收紧时按当前更紧权限投递；当前放宽时仍受 startup 限制；混合变化逐维取更紧值
+  - drift 必须写 stderr warning 与 audit record，包含 startup/current/effective、方向和 changed dimensions
+- `turn/start` request 必须显式携带 effective 权限对应的 pinned `approvalPolicy` / `sandboxPolicy`，避免 durable 记录和真实 turn 权限不一致。
+- 只有当前 effective 三者都为 `false` 时，CLI strict-safe detached auto-delivery 才允许开启；`trusted-all` 可以绕过该 gate，但 auto snapshot / drift 记录仍然适用。
+- `attach-or-create` 发现 requested bootstrap profile 与 durable effective profile 不一致时，不得原地改写：
   - 如果旧 session 仍有 active foreground client、未收口 accepted attempt、或其他未解决 delivery work，则必须 fail-closed 为 `session_profile_mismatch`
   - 只有在旧 session 已满足 retirement 条件后，daemon 才允许把它标为 `retired`，并创建一个带新 profile 的新 `managed_session_id`
 - `parked` 是 managed session 的统一非 live 停放态，不是 accepted-path 专属状态：
@@ -921,6 +931,12 @@ cooldown -> superseded
 - `session_allows_approval`
 - `session_allows_network`
 - `session_allows_write_access`
+- `startup_session_allows_approval`
+- `startup_session_allows_network`
+- `startup_session_allows_write_access`
+- `startup_permission_snapshot_json`
+- `last_permission_snapshot_json`
+- `permission_snapshot_revision`
 
 ### Delivery batch 关键字段
 

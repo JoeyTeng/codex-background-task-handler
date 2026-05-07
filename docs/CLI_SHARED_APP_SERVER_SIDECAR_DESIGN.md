@@ -59,17 +59,24 @@ codex --remote ws://127.0.0.1:<port>
      - `session_allows_approval`
      - `session_allows_network`
      - `session_allows_write_access`
+     - `startup_session_allows_approval`
+     - `startup_session_allows_network`
+     - `startup_session_allows_write_access`
+     - `startup_permission_snapshot_json`
+     - `last_permission_snapshot_json`
+     - `permission_snapshot_revision`
      - `session_state`
        - `live`
        - `detached`
        - `parked`
        - `stale`
        - `retired`
-   - 这三个 `session_allows_*` 字段属于 v1 的 session-scoped risk profile：
-     - 必须在 bootstrap / attach-or-create 时 durable 写入
-     - 对 non-retired managed session 来说是 immutable profile
-     - detached auto-delivery 只能在三者都为 `false` 时开启
-     - 任一字段为 `true` 或 `unknown` 都必须 fail-closed 到 manual/operator path
+   - 这三个 `session_allows_*` 字段表示当前可用于 gate 的 effective session risk profile：
+     - explicit `true` / `false` 在 bootstrap / attach-or-create 时直接写入
+     - default `auto` 先以 fail-closed profile 启动，随后由 sidecar 从可信 `thread/resume` permission snapshot 推导并 durable 更新
+     - `startup_session_allows_*` 与 `startup_permission_snapshot_json` 记录启动后第一次可信 auto snapshot，是后续自动投递的风险上限
+     - detached auto-delivery 的 strict-safe path 只能在当前 effective 三者都为 `false` 时开启；`trusted-all` 可以绕过该 gate，但仍必须携带或记录 auto permission snapshot
+     - 任一 auto 维度无法可信解析时都必须 fail-closed 到 manual/operator path
    - attach/reuse 时如果调用方请求的 session profile 与 durable profile 不一致：
      - 不得原地改写现有 profile
      - 如果旧 session 仍有 active foreground client、未收口 accepted attempt、或其他未解决 delivery work，则必须 fail-closed 为 `session_profile_mismatch`
@@ -169,10 +176,10 @@ codex --remote ws://127.0.0.1:<port>
       - shared `app-server` 进程被重启或重建
       - daemon 自己重启后无法证明已恢复到同一个连续 event stream
       - 任何 accepted `delivery_turn_id` 的后续观察连续性无法再证明
-- existing-thread mode（`cbth cli run --bind-thread-id <thread_id>`）的 v1 合同必须是：
+- existing-thread mode（`cbth cli run --bind-thread-id <thread_id>` 或 `cbth resume <thread_id>`）的 v1 合同必须是：
   - 先按 `bound_thread_id` 查询是否已经存在 non-retired managed session
   - 如果存在 `live` / `detached` session：
-    - 先比较 requested session profile 与 durable `session_allows_*` profile
+    - 先比较 requested bootstrap profile 与 durable `session_allows_*` effective profile
     - 只有 profile 完全一致时，才允许 attach/reuse
     - 只要存在 profile drift，且旧 session 尚未满足 retirement 条件，就必须 fail-closed 为 `session_profile_mismatch`
     - 只有旧 session 已满足 retirement 条件时，daemon 才允许 retire 它，并创建一个新 profile 的 replacement session
@@ -400,14 +407,17 @@ CLI adapter 不直接按单 job 投递，而是消费共享核心为每个 threa
   - `delivery_requires_approval=false`
   - `delivery_requires_network=false`
   - `delivery_requires_write_access=false`
-- 默认 `strict_safe` 还要求 managed session 自身满足 detached auto-continuation profile：
+- 默认 `strict_safe` 还要求 managed session 自身满足当前 effective detached auto-continuation profile：
   - `session_allows_approval=false`
   - `session_allows_network=false`
   - `session_allows_write_access=false`
+- 如果这些字段来自 default `auto`，sidecar 必须已经从 `thread/resume` 记录启动 permission snapshot；自动 `turn/start` 前还必须刷新当前 snapshot，并逐维使用 `startup && current` 得到 pinned effective 权限。
+- 当前权限收紧时使用当前更紧权限继续投递；当前权限放宽时仍以启动 snapshot 为上限；混合变化逐维取更紧值。任何 startup/current drift 都要写 stderr warning 和 audit record。
 - `trusted_all` 是显式 opt-in broad escape hatch：
-  - 由 `cbth cli run --auto-delivery-policy trusted-all` 开启
+  - 由 `cbth cli run --auto-delivery-policy trusted-all` 或 `cbth resume --auto-delivery-policy trusted-all` 开启
   - 会绕过 batch policy gates、artifact-read gate 与 session risk-profile gates
   - 仍要求 current head batch、remaining budget、matching `source_thread_id`、bound `managed_session_id`、matching `session_epoch`、fresh idle proof
+  - 如果 permission 参数为 `auto`，仍要记录 startup/current/effective snapshot，并在 `turn/start` 上携带 pinned `approvalPolicy` / `sandboxPolicy`
   - 仍不开放 `turn/steer` 或 active-turn injection
 - 不满足 `strict_safe` 条件且未显式选择 `trusted_all` 的 batch 不得自动 `turn/start`；它们保留为 operator/manual 路径。
 - 默认只在 caller thread idle 时使用：
@@ -645,10 +655,11 @@ cbth cli run
 3. 启动时对实验 RPC 做 capability probe
 4. CLI bootstrap 必须先选定显式模式：
    - existing-thread mode：`cbth cli run --bind-thread-id <thread_id>`
+   - native resume mode：`cbth resume <thread_id> [-- <codex_args>]`，前台进程为 `codex resume <thread_id> --remote <url> --cd <cwd> ...`
    - fresh-thread mode：`cbth cli run --new-thread`（仅在 `thread/start` capability 已通过 probe 时允许）
 5. attach-or-create / create-new 必须遵守：
    - existing-thread mode：
-     - 同一 `bound_thread_id` 有 `live` / `detached` session 时，先比较 requested profile 与 durable profile；只有完全一致才允许 attach/reuse
+     - 同一 `bound_thread_id` 有 `live` / `detached` session 时，先比较 requested bootstrap profile 与 durable effective profile；只有完全一致才允许 attach/reuse
      - 如果 profile drift 且旧 session 仍未满足 retirement 条件：fail-closed 为 `session_profile_mismatch`
      - 同一 `bound_thread_id` 有 `parked` session 且 unresolved manual batch 尚未终态时：fail-closed 为 `session_pending_manual_resolution`
      - 同一 `bound_thread_id` 有不可安全替换的 stale/conflicting session 时 fail-closed
@@ -692,11 +703,13 @@ v1 范围外：
   - bootstrap app-server 在 promote 前只存在于 pending registry，不触碰 managed session proof；bootstrap 失败、promote 失败、lease 过期或 daemon shutdown 时必须停止子进程并 join drain worker。
   - bootstrap 的 remote error / timeout / closed / malformed response 都在 foreground 启动前 fail closed，不创建 managed session。
 - daemon status 现在会列出 active CLI app-server，并且 daemon capability 列表包含 `cli-app-server-lifecycle` / `cli-app-server-probe`；新 CLI 不会把 lifecycle 或 doctor probe request 投递给不支持该命令的旧 daemon。
-- durable `cli_managed_sessions` schema 已落地，记录 `managed_session_id`、`bound_thread_id`、`session_epoch`、`session_state`、`activity_state`、`activity_revision`、session-scoped risk profile 和 timestamps。
-- hidden adapter-internal `cbth cli session bind` 已作为 existing-thread attach-or-create building block 落地；它要求调用方显式传入完整 risk profile，会复用同一 `bound_thread_id` 上无阻塞工作的 `live` / `detached` session，并在 attach 时递增 `session_epoch`、把 `activity_state` 重置为 `unknown`、把 epoch-local `activity_revision` 重置为 0；profile drift、`parked` 或 `stale` 旧 session 只有在满足 retirement 条件后才会先 retire 再 replacement。
+- public `cbth resume <thread_id> [-- <codex_args>]` 已作为 native resume wrapper 落地；它复用 fixed-thread managed session / daemon-owned app-server / passive sidecar 流程，前台命令为 `codex resume <thread_id> --remote <url> --cd <cwd> ...`。
+- durable `cli_managed_sessions` schema 已落地，记录 `managed_session_id`、`bound_thread_id`、`session_epoch`、`session_state`、`activity_state`、`activity_revision`、current effective session risk profile、startup permission snapshot、last permission snapshot 和 timestamps。
+- hidden adapter-internal `cbth cli session bind` 已作为 existing-thread attach-or-create building block 落地；它接收 bootstrap risk profile（explicit flags 直接给出，default `auto` 先以 fail-closed false profile 绑定），会复用同一 `bound_thread_id` 上无阻塞工作的 `live` / `detached` session，并在 attach 时递增 `session_epoch`、把 `activity_state` 重置为 `unknown`、把 epoch-local `activity_revision` 重置为 0，同时清空旧 activity/capability/permission proof；profile drift、`parked` 或 `stale` 旧 session 只有在满足 retirement 条件后才会先 retire 再 replacement。
 - operator-facing `cbth cli session list` / `inspect` / `retire` 已落地；retire 拒绝 `live` session、active delivery attempt、以及仍有 open `manual_resolution_only` head batch 的 bound thread。
 - hidden adapter-internal `cbth cli session note-activity` 已作为 current-state sync 的临时 durable 写入面落地；当前只允许同 epoch 的 `live` / `detached` session 通过严格顺序递增的 `activity_revision` 被标成 `active` 或 `idle`，同 revision 只允许完全相同状态的幂等重放。
 - hidden adapter-internal `cbth cli session note-capabilities` 已作为 epoch-local capability probe 写入面落地；每次 bind / re-attach / continuity-loss fence 都会清空旧 capability proof。
+- hidden adapter-internal `cbth cli session note-permissions` 已作为 epoch-local permission snapshot 写入面落地；auto 模式从 `thread/resume.approvalPolicy` 与 `thread/resume.sandbox` 派生 current permissions，首次可信 snapshot pin 为 startup，上游缺字段、未知 approval policy、未知 sandbox type 或不可信字段形状都会 fail-closed。
 - `begin-cli-accept` 已经要求引用一个匹配当前 batch `source_thread_id`、`session_epoch`、state、no-approval / no-network / no-write profile，且 `turn_start` 时同时具备最小 capability proof 和 `activity_state=idle` 的 managed session；不再接受任意字符串形式的 `managed_session_id`。
 - 当前最小 capability proof 要求 adapter 已证明 `turn_start`、`current_state_sync`、`turn_completed_event`、负终态 observation surface，以及 `thread_resume` 或 fresh `thread_start` 中至少一种 caller-thread attachment proof；缺任一项都会 fail-closed。
 - `cbth cli run` 已启动 wrapper-owned sidecar client：
@@ -705,6 +718,8 @@ v1 范围外：
   - 初始 `thread/resume` / `thread/read` 结果会同步成当前 epoch 的 `idle` / `active` activity proof；成功返回且 `thread.id` 匹配 `bound_thread_id` 的 `thread.status.type` authoritative snapshot 会支配该 request response 前已消费的 stale notification，缺少 status 时才 fallback 到 turns tail
   - `turn/started`、`turn/completed` 与 `thread/status/changed` notification 会继续推进 monotonic `activity_revision`；`completed` / `failed` / `interrupted` / `replaced` 都视为 terminal turn status；activity 写入失败会先 invalidate 当前 proof，再把错误交回 adapter retry loop
   - request 等待窗口内收到的 lifecycle notification 不会覆盖后续 authoritative snapshot；如果 `thread/read` 缺少 authoritative snapshot 但 `thread/resume` 已给出可信 current-state snapshot，则会按顺序 replay `thread/resume` / `thread/read` 两个 request window 的 notification，避免丢失 resume 响应前到达的 active 信号；如果 `thread/read` 超时、protocol / decode / closed / remote-error 等失败，则关闭本轮连接并 fail-closed retry，避免复用可能存在 outstanding response 或已失同步的 websocket；如果 snapshot 缺失导致 epoch invalidation，则旧 epoch 的 buffered notification 不会写回新 epoch
+  - default `auto` permission path 要求 existing-thread `thread/resume` 返回可信 permission snapshot；fresh unmaterialized `--new-thread` 在 first user message 前无法从 `thread/resume` 取到 snapshot 时不会记录 auto proof，兼容测试可以继续显式传 `--session-allows-* false`
+  - 自动 `turn/start` 前会重新执行 `thread/resume`，以 startup snapshot 为上限计算 effective permissions，并在 request params 中携带对应的 pinned `approvalPolicy` / `sandboxPolicy`；权限 drift 会同时输出 warning 并写 audit record
   - 缺失 / foreign `threadId` 的 notification 不会污染当前 bound session；snapshot path 也要求 returned `thread.id` 匹配当前 bound thread；unknown turn status、`notLoaded` 与 `systemError` 不会被折叠成 `idle`
   - websocket continuity loss、activity write failure 或 authoritative current-state snapshot 缺失时，sidecar 会通过 hidden `cli session invalidate-proof` 推进 `session_epoch` 并清空旧 activity / capability proof；daemon 短超时失败时该 invalidation 命令允许 direct-store fallback；store 对“daemon 已经推进 epoch 并清空 proof”的旧 epoch 重放返回幂等成功，避免旧 proof 只被 best-effort 清理
   - passive sidecar 的 proof 写入路径必须使用短 SQLite busy timeout，并允许 lifecycle-aware bounded retry；不能把 1s client timeout 的 passive write 交给 daemon worker 后再让 worker 按普通 30s store timeout 阻塞，否则 DB lock 下的 retry loop 会耗尽 dispatch worker；foreground 退出 / sidecar shutdown 后也不能继续重试并阻塞 cleanup。
@@ -726,7 +741,7 @@ v1 范围外：
 - accepted-turn observation loop 也受 accepted attempt 的 `delivery_observation_deadline` 约束；本地 deadline 到期会触发一次 best-effort sweep / proof refresh 后退出观察，避免前台进程长期存活时旧 attempt 阻塞后续 head batch。
 - sidecar shutdown 是 `turn/start` 前的硬门禁：passive loop 在每次 auto-delivery poll 前重新检查 stop flag；如果 `begin-cli-accept` 后、真正发送 `turn/start` 前进入 shutdown，会写入 pre-accept rejection 并保留 batch 可重试，而不是在关闭窗口里继续发 side-effectful RPC。
 - 同一 pre-start cleanup 也覆盖 `begin-cli-accept` 后、`turn/start` 前的 prompt 构造 / attempt-start audit / response parsing 失败：这些失败都必须先 best-effort `reject-cli-before-accept`，避免从未发出 RPC 的 attempt 之后被 stale sweep 当作 unknown manualize。
-- daemon capability 列表已包含 `cli-app-server-lifecycle`、`cli-app-server-probe`、`cli-session-capability-dispatch`、`cli-session-proof-invalidation-dispatch`、`cli-turn-observation-dispatch`、`cli-turn-observation-expiry-dispatch` 与 `cli-auto-delivery-dispatch`，避免新 CLI 把 app-server lifecycle / doctor probe / capability / proof invalidation / terminal-event / observation-expiry / auto-delivery audit or rejection 写入路由给不支持对应 subcommand 的旧 daemon。
+- daemon capability 列表已包含 `cli-app-server-lifecycle`、`cli-app-server-probe`、`cli-session-capability-dispatch`、`cli-session-permission-dispatch`、`cli-session-proof-invalidation-dispatch`、`cli-turn-observation-dispatch`、`cli-turn-observation-expiry-dispatch` 与 `cli-auto-delivery-dispatch`，避免新 CLI 把 app-server lifecycle / doctor probe / capability / permission / proof invalidation / terminal-event / observation-expiry / auto-delivery audit or rejection 写入路由给不支持对应 subcommand 的旧 daemon。
 - `turn_steer` 当前仍 fail-closed，直到后续 phase 落地 active-turn risk proof。
 - 这些实现仍不等价于完整 CLI 自动续跑：`trusted-all` idle `turn/start` 路径与 `--new-thread` fresh bootstrap 已落地，但 `turn/steer`、active-turn injection、rollout-only automatic delivered proof、以及更细粒度 policy engine 仍待后续 phase 实现。
 

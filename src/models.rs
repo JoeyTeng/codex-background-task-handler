@@ -261,6 +261,12 @@ pub struct CliManagedSessionRecord {
     pub session_allows_approval: bool,
     pub session_allows_network: bool,
     pub session_allows_write_access: bool,
+    pub startup_session_allows_approval: Option<bool>,
+    pub startup_session_allows_network: Option<bool>,
+    pub startup_session_allows_write_access: Option<bool>,
+    pub startup_permission_snapshot_json: Option<String>,
+    pub last_permission_snapshot_json: Option<String>,
+    pub permission_snapshot_revision: i64,
     pub created_at: i64,
     pub updated_at: i64,
     pub retired_at: Option<i64>,
@@ -302,6 +308,25 @@ pub struct CliManagedSessionCapabilities {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CliManagedSessionCapabilityUpdate {
+    pub session: CliManagedSessionRecord,
+}
+
+#[derive(Clone, Debug)]
+pub struct CliManagedSessionPermissions {
+    pub session_allows_approval: bool,
+    pub session_allows_network: bool,
+    pub session_allows_write_access: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewCliManagedSessionPermissionSnapshot {
+    pub startup: Option<CliManagedSessionPermissions>,
+    pub effective: CliManagedSessionPermissions,
+    pub snapshot_json: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CliManagedSessionPermissionUpdate {
     pub session: CliManagedSessionRecord,
 }
 

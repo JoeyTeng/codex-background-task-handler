@@ -766,6 +766,7 @@ fn desktop_bridge_preflight_require_existing_daemon_does_not_forward_client_only
                     "cli-thread-start-bootstrap",
                     "cli-session-dispatch",
                     "cli-session-capability-dispatch",
+                    "cli-session-permission-dispatch",
                     "cli-session-proof-invalidation-dispatch",
                     "cli-session-recovery-dispatch",
                     "cli-turn-observation-dispatch",

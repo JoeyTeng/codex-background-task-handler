@@ -1,5 +1,6 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -7,6 +8,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -34,9 +36,10 @@ use crate::fs_layout::{
     FsLayout, atomic_write_private, create_private_file, remove_dir_all_durable,
 };
 use crate::models::{
-    CliManagedSessionCapabilities, CliManagedSessionProfile, DEFAULT_MAX_DELIVERY_ATTEMPTS,
-    DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, DesktopInstallationStateRecord,
-    NewAuditDecision, NewCliAcceptPendingAttempt, NewDesktopInstallationRepair, NewJob,
+    CliManagedSessionCapabilities, CliManagedSessionPermissions, CliManagedSessionProfile,
+    DEFAULT_MAX_DELIVERY_ATTEMPTS, DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy,
+    DesktopInstallationStateRecord, NewAuditDecision, NewCliAcceptPendingAttempt,
+    NewCliManagedSessionPermissionSnapshot, NewDesktopInstallationRepair, NewJob,
     PartialDeliveryPolicy, SubmitMetadata, SweepReport,
 };
 use crate::self_update::{SelfUpdateOptions, current_release_target_triple, run_self_update};
@@ -76,6 +79,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "cli-thread-start-bootstrap",
     "cli-session-dispatch",
     "cli-session-capability-dispatch",
+    "cli-session-permission-dispatch",
     "cli-session-proof-invalidation-dispatch",
     "cli-session-recovery-dispatch",
     "cli-turn-observation-dispatch",
@@ -136,6 +140,8 @@ enum Commands {
         #[command(subcommand)]
         command: SelfCommand,
     },
+    #[command(about = "Resume an existing Codex thread through the managed cbth CLI bridge")]
+    Resume(CliResumeArgs),
     Cli {
         #[command(subcommand)]
         command: CliCommand,
@@ -552,6 +558,8 @@ enum CliSessionCommand {
     #[command(hide = true)]
     NoteCapabilities(CliSessionNoteCapabilitiesArgs),
     #[command(hide = true)]
+    NotePermissions(CliSessionNotePermissionsArgs),
+    #[command(hide = true)]
     InvalidateProof(CliSessionInvalidateProofArgs),
     #[command(about = "Inspect one managed CLI session")]
     Inspect(CliSessionInspectArgs),
@@ -569,14 +577,68 @@ struct CliRunArgs {
     #[arg(long, conflicts_with = "bind_thread_id")]
     new_thread: bool,
 
-    #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
-    session_allows_approval: bool,
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_approval: SessionAllowsValue,
 
-    #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
-    session_allows_network: bool,
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_network: SessionAllowsValue,
 
-    #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
-    session_allows_write_access: bool,
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_write_access: SessionAllowsValue,
+
+    #[arg(long, default_value = "codex")]
+    codex_bin: OsString,
+
+    #[arg(long, value_enum, default_value_t = CliAutoDeliveryPolicy::Off)]
+    auto_delivery_policy: CliAutoDeliveryPolicy,
+
+    #[arg(last = true)]
+    codex_args: Vec<OsString>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionAllowsValue {
+    Auto,
+    Explicit(bool),
+}
+
+impl fmt::Display for SessionAllowsValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Explicit(true) => f.write_str("true"),
+            Self::Explicit(false) => f.write_str("false"),
+        }
+    }
+}
+
+impl FromStr for SessionAllowsValue {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "true" => Ok(Self::Explicit(true)),
+            "false" => Ok(Self::Explicit(false)),
+            other => Err(format!(
+                "invalid session permission value {other:?}; expected auto, true, or false"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct CliResumeArgs {
+    thread_id: String,
+
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_approval: SessionAllowsValue,
+
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_network: SessionAllowsValue,
+
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_write_access: SessionAllowsValue,
 
     #[arg(long, default_value = "codex")]
     codex_bin: OsString,
@@ -872,6 +934,123 @@ impl CliAutoDeliveryPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CliSessionPermissionInputs {
+    approval: SessionAllowsValue,
+    network: SessionAllowsValue,
+    write_access: SessionAllowsValue,
+}
+
+impl CliSessionPermissionInputs {
+    fn initial_profile(&self) -> CliManagedSessionProfile {
+        CliManagedSessionProfile {
+            session_allows_approval: self.approval.explicit_value().unwrap_or(false),
+            session_allows_network: self.network.explicit_value().unwrap_or(false),
+            session_allows_write_access: self.write_access.explicit_value().unwrap_or(false),
+        }
+    }
+
+    fn uses_auto(&self) -> bool {
+        matches!(self.approval, SessionAllowsValue::Auto)
+            || matches!(self.network, SessionAllowsValue::Auto)
+            || matches!(self.write_access, SessionAllowsValue::Auto)
+    }
+
+    fn resolve(&self, snapshot: &CliPermissionSnapshot) -> CliResolvedPermissions {
+        CliResolvedPermissions {
+            allows_approval: self
+                .approval
+                .explicit_value()
+                .unwrap_or(snapshot.allows_approval),
+            allows_network: self
+                .network
+                .explicit_value()
+                .unwrap_or(snapshot.allows_network),
+            allows_write_access: self
+                .write_access
+                .explicit_value()
+                .unwrap_or(snapshot.allows_write_access),
+        }
+    }
+}
+
+impl SessionAllowsValue {
+    fn explicit_value(&self) -> Option<bool> {
+        match self {
+            Self::Auto => None,
+            Self::Explicit(value) => Some(*value),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CliSessionTargetConfig {
+    BindThread { thread_id: String },
+    NewThread,
+}
+
+#[derive(Clone, Debug)]
+enum CliForegroundMode {
+    Remote,
+    Resume { thread_id: String },
+}
+
+#[derive(Clone, Debug)]
+struct CliSessionRunConfig {
+    target: CliSessionTargetConfig,
+    permission_inputs: CliSessionPermissionInputs,
+    codex_bin: OsString,
+    auto_delivery_policy: CliAutoDeliveryPolicy,
+    codex_args: Vec<OsString>,
+    foreground_mode: CliForegroundMode,
+}
+
+impl CliSessionRunConfig {
+    fn from_cli_run_args(args: CliRunArgs) -> Result<Self> {
+        let target = match (args.bind_thread_id, args.new_thread) {
+            (Some(thread_id), false) => CliSessionTargetConfig::BindThread { thread_id },
+            (None, true) => CliSessionTargetConfig::NewThread,
+            (None, false) => {
+                bail!("cli run requires either --bind-thread-id <thread-id> or --new-thread")
+            }
+            (Some(_), true) => {
+                bail!("cli run accepts only one of --bind-thread-id or --new-thread")
+            }
+        };
+        Ok(Self {
+            target,
+            permission_inputs: CliSessionPermissionInputs {
+                approval: args.session_allows_approval,
+                network: args.session_allows_network,
+                write_access: args.session_allows_write_access,
+            },
+            codex_bin: args.codex_bin,
+            auto_delivery_policy: args.auto_delivery_policy,
+            codex_args: args.codex_args,
+            foreground_mode: CliForegroundMode::Remote,
+        })
+    }
+
+    fn from_cli_resume_args(args: CliResumeArgs) -> Self {
+        Self {
+            target: CliSessionTargetConfig::BindThread {
+                thread_id: args.thread_id.clone(),
+            },
+            permission_inputs: CliSessionPermissionInputs {
+                approval: args.session_allows_approval,
+                network: args.session_allows_network,
+                write_access: args.session_allows_write_access,
+            },
+            codex_bin: args.codex_bin,
+            auto_delivery_policy: args.auto_delivery_policy,
+            codex_args: args.codex_args,
+            foreground_mode: CliForegroundMode::Resume {
+                thread_id: args.thread_id,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct CliSessionBindArgs {
     #[arg(long)]
@@ -961,6 +1140,39 @@ struct CliSessionNoteCapabilitiesArgs {
 
     #[arg(long, value_parser = clap::value_parser!(bool), default_value_t = false, action = clap::ArgAction::Set)]
     turn_steer: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct CliSessionNotePermissionsArgs {
+    #[arg(long)]
+    managed_session_id: String,
+
+    #[arg(long)]
+    session_epoch: i64,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    effective_allows_approval: bool,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    effective_allows_network: bool,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    effective_allows_write_access: bool,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    startup_allows_approval: Option<bool>,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    startup_allows_network: Option<bool>,
+
+    #[arg(long, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    startup_allows_write_access: Option<bool>,
+
+    #[arg(long)]
+    snapshot_json: String,
 
     #[arg(long, hide = true)]
     now: Option<i64>,
@@ -1102,8 +1314,18 @@ pub fn run() -> Result<()> {
             if cli.direct_store {
                 bail!("cli run does not support --direct-store");
             }
+            let config = CliSessionRunConfig::from_cli_run_args(args)?;
             let exit_code =
-                run_cli_session(args, &layout, cli.auto_daemon_startup_timeout_seconds)?;
+                run_cli_session(config, &layout, cli.auto_daemon_startup_timeout_seconds)?;
+            std::process::exit(exit_code);
+        }
+        Commands::Resume(args) => {
+            if cli.direct_store {
+                bail!("resume does not support --direct-store");
+            }
+            let config = CliSessionRunConfig::from_cli_resume_args(args);
+            let exit_code =
+                run_cli_session(config, &layout, cli.auto_daemon_startup_timeout_seconds)?;
             std::process::exit(exit_code);
         }
         Commands::Self_ {
@@ -1388,6 +1610,7 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
             check: args.check,
             yes: args.yes,
         }),
+        Commands::Resume(_) => bail!("resume must execute from the foreground client"),
         Commands::Cli { command } => dispatch_cli(command, layout),
         Commands::Desktop { command } => dispatch_desktop(command, layout),
         Commands::Maintenance { command } => dispatch_maintenance(command, layout),
@@ -1396,12 +1619,12 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
 }
 
 fn run_cli_session(
-    args: CliRunArgs,
+    config: CliSessionRunConfig,
     layout: &FsLayout,
     startup_timeout_seconds: u64,
 ) -> Result<i32> {
-    validate_cli_run_target_args(&args)?;
-    let codex_binary = resolve_executable(&args.codex_bin)?;
+    validate_cli_session_target(&config.target)?;
+    let codex_binary = resolve_executable(&config.codex_bin)?;
     let cwd = env::current_dir().context("read current directory")?;
     let lease_id = new_id();
 
@@ -1414,7 +1637,8 @@ fn run_cli_session(
             startup_sweep_now: Some(now_epoch_seconds()?),
         },
     )?;
-    let target = resolve_cli_run_thread_target(layout, &args, &codex_binary, &cwd, &lease_id)?;
+    let target =
+        resolve_cli_run_thread_target(layout, &config.target, &codex_binary, &cwd, &lease_id)?;
     let bound_thread_id = target.bound_thread_id.clone();
     reserve_cli_app_server_for_thread(layout, &bound_thread_id, &lease_id).inspect_err(|_| {
         abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
@@ -1425,9 +1649,18 @@ fn run_cli_session(
             command: CliCommand::Session {
                 command: CliSessionCommand::Bind(CliSessionBindArgs {
                     bound_thread_id: bound_thread_id.clone(),
-                    session_allows_approval: args.session_allows_approval,
-                    session_allows_network: args.session_allows_network,
-                    session_allows_write_access: args.session_allows_write_access,
+                    session_allows_approval: config
+                        .permission_inputs
+                        .initial_profile()
+                        .session_allows_approval,
+                    session_allows_network: config
+                        .permission_inputs
+                        .initial_profile()
+                        .session_allows_network,
+                    session_allows_write_access: config
+                        .permission_inputs
+                        .initial_profile()
+                        .session_allows_write_access,
                     now: None,
                 }),
             },
@@ -1484,16 +1717,24 @@ fn run_cli_session(
             session_epoch,
             activity_revision,
             capability_revision,
-            auto_delivery_policy: args.auto_delivery_policy,
+            auto_delivery_policy: config.auto_delivery_policy,
             fresh_thread_bootstrap: target.bootstrap_id.is_some(),
+            permission_inputs: config.permission_inputs,
         });
 
-    let foreground_status = Command::new(&codex_binary)
+    let mut foreground = Command::new(&codex_binary);
+    match &config.foreground_mode {
+        CliForegroundMode::Remote => {}
+        CliForegroundMode::Resume { thread_id } => {
+            foreground.arg("resume").arg(thread_id);
+        }
+    }
+    let foreground_status = foreground
         .arg("--remote")
         .arg(&url)
         .arg("--cd")
         .arg(&cwd)
-        .args(args.codex_args)
+        .args(config.codex_args)
         .status()
         .with_context(|| format!("spawn foreground codex via {:?}", codex_binary));
     let passive_stop_result = passive_adapter.stop();
@@ -1515,14 +1756,12 @@ fn run_cli_session(
     Ok(status.code().unwrap_or(1))
 }
 
-fn validate_cli_run_target_args(args: &CliRunArgs) -> Result<()> {
-    match (&args.bind_thread_id, args.new_thread) {
-        (Some(bound_thread_id), false) => validate_nonempty("bind_thread_id", bound_thread_id),
-        (None, true) => Ok(()),
-        (None, false) => {
-            bail!("cli run requires either --bind-thread-id <thread-id> or --new-thread")
+fn validate_cli_session_target(target: &CliSessionTargetConfig) -> Result<()> {
+    match target {
+        CliSessionTargetConfig::BindThread { thread_id } => {
+            validate_nonempty("thread_id", thread_id)
         }
-        (Some(_), true) => bail!("cli run accepts only one of --bind-thread-id or --new-thread"),
+        CliSessionTargetConfig::NewThread => Ok(()),
     }
 }
 
@@ -1533,16 +1772,19 @@ struct CliRunThreadTarget {
 
 fn resolve_cli_run_thread_target(
     layout: &FsLayout,
-    args: &CliRunArgs,
+    target: &CliSessionTargetConfig,
     codex_binary: &OsStr,
     cwd: &Path,
     lease_id: &str,
 ) -> Result<CliRunThreadTarget> {
-    if let Some(bound_thread_id) = &args.bind_thread_id {
-        return Ok(CliRunThreadTarget {
-            bound_thread_id: bound_thread_id.clone(),
-            bootstrap_id: None,
-        });
+    match target {
+        CliSessionTargetConfig::BindThread { thread_id } => {
+            return Ok(CliRunThreadTarget {
+                bound_thread_id: thread_id.clone(),
+                bootstrap_id: None,
+            });
+        }
+        CliSessionTargetConfig::NewThread => {}
     }
     let cwd = cwd
         .as_os_str()
@@ -1702,6 +1944,7 @@ struct CliAppServerPassiveAdapterConfig {
     capability_revision: i64,
     auto_delivery_policy: CliAutoDeliveryPolicy,
     fresh_thread_bootstrap: bool,
+    permission_inputs: CliSessionPermissionInputs,
 }
 
 struct CliAppServerPassiveAdapterHandle {
@@ -1726,6 +1969,143 @@ impl CliAppServerPassiveAdapterHandle {
     }
 }
 
+fn parse_thread_resume_permission_snapshot(result: &Value) -> Result<CliPermissionSnapshot> {
+    let approval_policy = result
+        .get("approvalPolicy")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("thread/resume response missing approvalPolicy"))?;
+    let sandbox_policy = result
+        .get("sandbox")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("thread/resume response missing sandbox"))?;
+    let allows_approval = parse_approval_policy_allows_approval(&approval_policy)?;
+    let (allows_network, allows_write_access) = parse_sandbox_permissions(&sandbox_policy)?;
+    Ok(CliPermissionSnapshot {
+        allows_approval,
+        allows_network,
+        allows_write_access,
+        approval_policy,
+        sandbox_policy,
+    })
+}
+
+fn parse_approval_policy_allows_approval(value: &Value) -> Result<bool> {
+    match value.as_str() {
+        Some("never") => Ok(false),
+        Some("untrusted" | "on-failure" | "on-request") => Ok(true),
+        Some(other) => bail!("thread/resume returned unknown approvalPolicy {other:?}"),
+        None => bail!("thread/resume returned unsupported approvalPolicy shape"),
+    }
+}
+
+fn parse_sandbox_permissions(value: &Value) -> Result<(bool, bool)> {
+    let sandbox_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("thread/resume sandbox missing type"))?;
+    match sandbox_type {
+        "readOnly" => Ok((sandbox_bool_field(value, "networkAccess", false)?, false)),
+        "workspaceWrite" => Ok((sandbox_bool_field(value, "networkAccess", false)?, true)),
+        "dangerFullAccess" => Ok((true, true)),
+        "externalSandbox" => {
+            let network = match value.get("networkAccess").and_then(Value::as_str) {
+                Some("enabled") => true,
+                Some("restricted") | None => false,
+                Some(other) => bail!("thread/resume sandbox has unknown networkAccess {other:?}"),
+            };
+            Ok((network, true))
+        }
+        other => bail!("thread/resume returned unknown sandbox type {other:?}"),
+    }
+}
+
+fn sandbox_bool_field(value: &Value, field: &str, default: bool) -> Result<bool> {
+    match value.get(field) {
+        Some(Value::Bool(value)) => Ok(*value),
+        None => Ok(default),
+        Some(_) => bail!("thread/resume sandbox field {field} is not a boolean"),
+    }
+}
+
+fn effective_permissions(
+    startup: CliResolvedPermissions,
+    current: CliResolvedPermissions,
+) -> CliResolvedPermissions {
+    CliResolvedPermissions {
+        allows_approval: startup.allows_approval && current.allows_approval,
+        allows_network: startup.allows_network && current.allows_network,
+        allows_write_access: startup.allows_write_access && current.allows_write_access,
+    }
+}
+
+fn turn_start_permission_overrides(
+    current_snapshot: &CliPermissionSnapshot,
+    effective: CliResolvedPermissions,
+) -> Result<Value> {
+    let approval_policy = if effective.allows_approval {
+        current_snapshot.approval_policy.clone()
+    } else {
+        Value::String("never".to_owned())
+    };
+    let sandbox_policy = pinned_sandbox_policy(&current_snapshot.sandbox_policy, effective)?;
+    Ok(json!({
+        "approvalPolicy": approval_policy,
+        "sandboxPolicy": sandbox_policy,
+    }))
+}
+
+fn pinned_sandbox_policy(
+    current_sandbox: &Value,
+    effective: CliResolvedPermissions,
+) -> Result<Value> {
+    if !effective.allows_write_access {
+        return Ok(json!({
+            "type": "readOnly",
+            "networkAccess": effective.allows_network,
+        }));
+    }
+
+    let sandbox_type = current_sandbox
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("current sandbox missing type"))?;
+    let mut sandbox = current_sandbox.clone();
+    match sandbox_type {
+        "workspaceWrite" => {
+            let object = sandbox
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("workspaceWrite sandbox is not an object"))?;
+            object.insert(
+                "networkAccess".to_owned(),
+                Value::Bool(effective.allows_network),
+            );
+            Ok(sandbox)
+        }
+        "externalSandbox" => {
+            let object = sandbox
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("externalSandbox sandbox is not an object"))?;
+            object.insert(
+                "networkAccess".to_owned(),
+                Value::String(
+                    if effective.allows_network {
+                        "enabled"
+                    } else {
+                        "restricted"
+                    }
+                    .to_owned(),
+                ),
+            );
+            Ok(sandbox)
+        }
+        "dangerFullAccess" if effective.allows_network => Ok(sandbox),
+        "dangerFullAccess" => {
+            bail!("dangerFullAccess sandbox cannot be pinned to networkAccess=false")
+        }
+        other => bail!("cannot pin unsupported sandbox type {other:?}"),
+    }
+}
+
 impl Drop for CliAppServerPassiveAdapterHandle {
     fn drop(&mut self) {
         if let Err(error) = self.stop()
@@ -1744,6 +2124,44 @@ struct CliAppServerPassiveAdapterState {
     passive_capabilities_recorded: bool,
     durable_proof_may_exist: bool,
     last_auto_delivery_poll: Option<Instant>,
+    startup_permissions: Option<CliResolvedPermissions>,
+    last_current_permissions: Option<CliResolvedPermissions>,
+    last_effective_permissions: Option<CliResolvedPermissions>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct CliResolvedPermissions {
+    allows_approval: bool,
+    allows_network: bool,
+    allows_write_access: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CliPermissionSnapshot {
+    allows_approval: bool,
+    allows_network: bool,
+    allows_write_access: bool,
+    approval_policy: Value,
+    sandbox_policy: Value,
+}
+
+impl CliPermissionSnapshot {
+    fn raw_json(&self, effective: CliResolvedPermissions) -> Value {
+        json!({
+            "approvalPolicy": self.approval_policy,
+            "sandbox": self.sandbox_policy,
+            "derived": {
+                "allows_approval": self.allows_approval,
+                "allows_network": self.allows_network,
+                "allows_write_access": self.allows_write_access,
+            },
+            "effective": {
+                "allows_approval": effective.allows_approval,
+                "allows_network": effective.allows_network,
+                "allows_write_access": effective.allows_write_access,
+            }
+        })
+    }
 }
 
 fn spawn_cli_app_server_passive_adapter(
@@ -1759,6 +2177,9 @@ fn spawn_cli_app_server_passive_adapter(
         passive_capabilities_recorded: false,
         durable_proof_may_exist: config.activity_revision != 0 || config.capability_revision != 0,
         last_auto_delivery_poll: None,
+        startup_permissions: None,
+        last_current_permissions: None,
+        last_effective_permissions: None,
     }));
     let thread_state = Arc::clone(&state);
     let thread_config = config.clone();
@@ -1849,6 +2270,17 @@ fn run_cli_app_server_passive_adapter_once(
                     bail!("app-server thread/resume returned untrusted current-state snapshot");
                 }
             }
+            if config.permission_inputs.uses_auto() {
+                let snapshot = parse_thread_resume_permission_snapshot(&resume)?;
+                sync_passive_adapter_permissions_from_snapshot(
+                    config,
+                    state,
+                    &snapshot,
+                    Some(&config.bound_thread_id),
+                    None,
+                    Some(running),
+                )?;
+            }
         }
         Err(error)
             if config.fresh_thread_bootstrap && is_unmaterialized_thread_resume_error(&error) =>
@@ -1896,6 +2328,10 @@ fn run_cli_app_server_passive_adapter_once(
     }
 
     if current_state_sync {
+        if config.permission_inputs.uses_auto() && state.startup_permissions.is_none() {
+            invalidate_passive_adapter_proof(config, state, Some(running))?;
+            bail!("app-server did not provide a trusted startup permission snapshot");
+        }
         record_passive_adapter_capabilities(
             config,
             state,
@@ -1971,6 +2407,73 @@ fn is_unmaterialized_thread_resume_error(error: &AppServerRequestError) -> bool 
         && error.message().contains("no rollout found for thread id")
 }
 
+fn refresh_cli_auto_delivery_permissions(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    client: &mut AppServerJsonRpcClient,
+    running: &AtomicBool,
+    source_thread_id: &str,
+    batch_id: &str,
+) -> Result<Option<Value>> {
+    if !config.permission_inputs.uses_auto() {
+        return Ok(None);
+    }
+    let (resume_result, resume_messages) = passive_adapter_request(
+        client,
+        "thread/resume",
+        json!({ "threadId": config.bound_thread_id }),
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+    );
+    let resume = match resume_result {
+        Ok(resume) => resume,
+        Err(error) => {
+            invalidate_passive_adapter_proof(config, state, Some(running))?;
+            return Err(error.into());
+        }
+    };
+    match thread_result_activity_snapshot(&resume, &config.bound_thread_id) {
+        ThreadActivitySnapshot::Active => {
+            record_passive_adapter_activity(
+                config,
+                state,
+                CliSessionActivityState::Active,
+                Some(running),
+            )?;
+        }
+        ThreadActivitySnapshot::Idle => {
+            record_passive_adapter_activity(
+                config,
+                state,
+                CliSessionActivityState::Idle,
+                Some(running),
+            )?;
+        }
+        ThreadActivitySnapshot::Missing => {}
+        ThreadActivitySnapshot::Untrusted => {
+            invalidate_passive_adapter_proof(config, state, Some(running))?;
+            bail!("app-server thread/resume returned untrusted current-state snapshot");
+        }
+    }
+    let snapshot = parse_thread_resume_permission_snapshot(&resume)?;
+    let effective = sync_passive_adapter_permissions_from_snapshot(
+        config,
+        state,
+        &snapshot,
+        Some(source_thread_id),
+        Some(batch_id),
+        Some(running),
+    )?;
+    for message in resume_messages {
+        if let Some(notification) = decode_notification(&message) {
+            record_passive_adapter_notification(config, state, notification, Some(running))?;
+        }
+    }
+    if state.last_activity_state != Some(CliSessionActivityState::Idle) {
+        return Ok(None);
+    }
+    Ok(Some(turn_start_permission_overrides(&snapshot, effective)?))
+}
+
 fn maybe_run_cli_auto_delivery(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
@@ -2030,6 +2533,17 @@ fn maybe_run_cli_auto_delivery(
                 details: json!({ "bound_thread_id": config.bound_thread_id }),
             },
         )?;
+        return Ok(());
+    }
+    let turn_start_permission_overrides = refresh_cli_auto_delivery_permissions(
+        config,
+        state,
+        client,
+        running,
+        &source_thread_id,
+        &batch_id,
+    )?;
+    if state.last_activity_state != Some(CliSessionActivityState::Idle) {
         return Ok(());
     }
     let attempt_id = new_id();
@@ -2178,19 +2692,28 @@ fn maybe_run_cli_auto_delivery(
         )?;
         return Ok(());
     }
+    let mut turn_start_params = json!({
+        "threadId": config.bound_thread_id,
+        "input": [
+            {
+                "type": "text",
+                "text": prompt,
+                "textElements": []
+            }
+        ]
+    });
+    if let Some(overrides) = turn_start_permission_overrides
+        && let (Some(params), Some(overrides)) =
+            (turn_start_params.as_object_mut(), overrides.as_object())
+    {
+        for (key, value) in overrides {
+            params.insert(key.clone(), value.clone());
+        }
+    }
     let (turn_start_result, turn_start_messages) = passive_adapter_request(
         client,
         "turn/start",
-        json!({
-            "threadId": config.bound_thread_id,
-            "input": [
-                {
-                    "type": "text",
-                    "text": prompt,
-                    "textElements": []
-                }
-            ]
-        }),
+        turn_start_params,
         Duration::from_secs(CLI_APP_SERVER_TURN_START_ACCEPTANCE_TIMEOUT_SECONDS),
     );
     let turn_start = match turn_start_result {
@@ -2905,6 +3428,9 @@ fn stop_passive_adapter_after_session_parked(
     state.passive_capabilities_recorded = false;
     state.durable_proof_may_exist = false;
     state.last_auto_delivery_poll = None;
+    state.startup_permissions = None;
+    state.last_current_permissions = None;
+    state.last_effective_permissions = None;
     running.store(false, Ordering::Release);
 }
 
@@ -3119,6 +3645,109 @@ fn record_cli_auto_delivery_audit_best_effort(
     let _ = record_cli_auto_delivery_audit(config, event);
 }
 
+struct CliPermissionDriftObservation<'a> {
+    source_thread_id: Option<&'a str>,
+    batch_id: Option<&'a str>,
+    startup: CliResolvedPermissions,
+    current: CliResolvedPermissions,
+    effective: CliResolvedPermissions,
+    snapshot: &'a CliPermissionSnapshot,
+}
+
+fn record_permission_drift_if_needed(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &CliAppServerPassiveAdapterState,
+    observation: CliPermissionDriftObservation<'_>,
+) -> Result<()> {
+    let changes = permission_drift_changes(observation.startup, observation.current);
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let tightened = changes
+        .iter()
+        .any(|(_, direction)| *direction == "tightened");
+    let loosened = changes
+        .iter()
+        .any(|(_, direction)| *direction == "loosened");
+    let direction = match (tightened, loosened) {
+        (true, true) => "mixed",
+        (true, false) => "tightened",
+        (false, true) => "loosened",
+        (false, false) => "unchanged",
+    };
+    let changed_dimensions = changes
+        .iter()
+        .map(|(dimension, direction)| {
+            json!({
+                "dimension": dimension,
+                "direction": direction,
+            })
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "warning: cbth CLI permission drift for thread {}: direction={direction}, changes={:?}; using tighter effective permissions {:?}",
+        config.bound_thread_id, changes, observation.effective
+    );
+    record_cli_auto_delivery_audit(
+        config,
+        CliAutoDeliveryAuditEvent {
+            source_thread_id: observation.source_thread_id,
+            batch_id: observation.batch_id,
+            attempt_id: None,
+            session_epoch: state.session_epoch,
+            decision: "warn",
+            reason: "permission_drift",
+            details: json!({
+                "direction": direction,
+                "changed_dimensions": changed_dimensions,
+                "startup": observation.startup,
+                "current": observation.current,
+                "effective": observation.effective,
+                "snapshot": observation.snapshot.raw_json(observation.effective),
+            }),
+        },
+    )
+}
+
+fn permission_drift_changes(
+    startup: CliResolvedPermissions,
+    current: CliResolvedPermissions,
+) -> Vec<(&'static str, &'static str)> {
+    let mut changes = Vec::new();
+    push_permission_drift_change(
+        &mut changes,
+        "approval",
+        startup.allows_approval,
+        current.allows_approval,
+    );
+    push_permission_drift_change(
+        &mut changes,
+        "network",
+        startup.allows_network,
+        current.allows_network,
+    );
+    push_permission_drift_change(
+        &mut changes,
+        "write_access",
+        startup.allows_write_access,
+        current.allows_write_access,
+    );
+    changes
+}
+
+fn push_permission_drift_change(
+    changes: &mut Vec<(&'static str, &'static str)>,
+    dimension: &'static str,
+    startup_allows: bool,
+    current_allows: bool,
+) {
+    match (startup_allows, current_allows) {
+        (true, false) => changes.push((dimension, "tightened")),
+        (false, true) => changes.push((dimension, "loosened")),
+        _ => {}
+    }
+}
+
 fn record_passive_adapter_notification(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
@@ -3281,6 +3910,113 @@ fn record_passive_adapter_capabilities(
     }
 }
 
+fn record_passive_adapter_permissions(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    startup: Option<CliResolvedPermissions>,
+    effective: CliResolvedPermissions,
+    snapshot: &CliPermissionSnapshot,
+    running: Option<&AtomicBool>,
+) -> Result<()> {
+    let snapshot_json = serde_json::to_string(&snapshot.raw_json(effective))?;
+    let result = dispatch_cli_adapter_command_with_retry_timeout(
+        config,
+        || Commands::Cli {
+            command: CliCommand::Session {
+                command: CliSessionCommand::NotePermissions(CliSessionNotePermissionsArgs {
+                    managed_session_id: config.managed_session_id.clone(),
+                    session_epoch: state.session_epoch,
+                    effective_allows_approval: effective.allows_approval,
+                    effective_allows_network: effective.allows_network,
+                    effective_allows_write_access: effective.allows_write_access,
+                    startup_allows_approval: startup.map(|startup| startup.allows_approval),
+                    startup_allows_network: startup.map(|startup| startup.allows_network),
+                    startup_allows_write_access: startup.map(|startup| startup.allows_write_access),
+                    snapshot_json: snapshot_json.clone(),
+                    now: None,
+                }),
+            },
+        },
+        false,
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_PROOF_WRITE_RETRY_TIMEOUT_SECONDS),
+        running,
+        "persist passive CLI permission snapshot",
+    );
+    state.durable_proof_may_exist = true;
+    match result {
+        Ok(_) => {
+            if let Some(startup) = startup {
+                state.startup_permissions = Some(startup);
+            }
+            state.last_effective_permissions = Some(effective);
+            Ok(())
+        }
+        Err(error) => {
+            invalidate_passive_adapter_proof(config, state, running).with_context(|| {
+                format!("invalidate passive adapter proof after permission write failed: {error:#}")
+            })?;
+            Err(error)
+        }
+    }
+}
+
+fn sync_passive_adapter_permissions_from_snapshot(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    snapshot: &CliPermissionSnapshot,
+    source_thread_id: Option<&str>,
+    batch_id: Option<&str>,
+    running: Option<&AtomicBool>,
+) -> Result<CliResolvedPermissions> {
+    if !config.permission_inputs.uses_auto() {
+        return Ok(CliResolvedPermissions {
+            allows_approval: config
+                .permission_inputs
+                .approval
+                .explicit_value()
+                .unwrap_or(false),
+            allows_network: config
+                .permission_inputs
+                .network
+                .explicit_value()
+                .unwrap_or(false),
+            allows_write_access: config
+                .permission_inputs
+                .write_access
+                .explicit_value()
+                .unwrap_or(false),
+        });
+    }
+    let current = config.permission_inputs.resolve(snapshot);
+    let startup = state.startup_permissions.unwrap_or(current);
+    let effective = effective_permissions(startup, current);
+    if state.startup_permissions.is_some() && state.last_current_permissions != Some(current) {
+        record_permission_drift_if_needed(
+            config,
+            state,
+            CliPermissionDriftObservation {
+                source_thread_id,
+                batch_id,
+                startup,
+                current,
+                effective,
+                snapshot,
+            },
+        )?;
+    }
+    let startup_to_record = state.startup_permissions.is_none().then_some(startup);
+    record_passive_adapter_permissions(
+        config,
+        state,
+        startup_to_record,
+        effective,
+        snapshot,
+        running,
+    )?;
+    state.last_current_permissions = Some(current);
+    Ok(effective)
+}
+
 fn invalidate_passive_adapter_proof(
     config: &CliAppServerPassiveAdapterConfig,
     state: &mut CliAppServerPassiveAdapterState,
@@ -3293,6 +4029,9 @@ fn invalidate_passive_adapter_proof(
         state.last_activity_state = None;
         state.passive_capabilities_recorded = false;
         state.last_auto_delivery_poll = None;
+        state.startup_permissions = None;
+        state.last_current_permissions = None;
+        state.last_effective_permissions = None;
         return Ok(());
     }
     let value = dispatch_cli_adapter_command_with_retry_timeout(
@@ -3345,6 +4084,9 @@ fn apply_passive_adapter_invalidated_session(
     state.passive_capabilities_recorded = false;
     state.durable_proof_may_exist = false;
     state.last_auto_delivery_poll = None;
+    state.startup_permissions = None;
+    state.last_current_permissions = None;
+    state.last_effective_permissions = None;
     Ok(())
 }
 
@@ -3677,6 +4419,55 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
         Commands::Cli {
             command:
                 CliCommand::Session {
+                    command: CliSessionCommand::NotePermissions(args),
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("cli"),
+                OsString::from("session"),
+                OsString::from("note-permissions"),
+            ];
+            push_string_arg(&mut argv, "--managed-session-id", &args.managed_session_id);
+            push_i64_arg(&mut argv, "--session-epoch", args.session_epoch);
+            push_bool_arg(
+                &mut argv,
+                "--effective-allows-approval",
+                args.effective_allows_approval,
+            );
+            push_bool_arg(
+                &mut argv,
+                "--effective-allows-network",
+                args.effective_allows_network,
+            );
+            push_bool_arg(
+                &mut argv,
+                "--effective-allows-write-access",
+                args.effective_allows_write_access,
+            );
+            push_optional_bool_arg(
+                &mut argv,
+                "--startup-allows-approval",
+                args.startup_allows_approval,
+            );
+            push_optional_bool_arg(
+                &mut argv,
+                "--startup-allows-network",
+                args.startup_allows_network,
+            );
+            push_optional_bool_arg(
+                &mut argv,
+                "--startup-allows-write-access",
+                args.startup_allows_write_access,
+            );
+            push_string_arg(&mut argv, "--snapshot-json", &args.snapshot_json);
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Cli {
+            command:
+                CliCommand::Session {
                     command: CliSessionCommand::InvalidateProof(args),
                 },
         } => {
@@ -3825,6 +4616,7 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             command: AuditCommand::List(_),
         }
         | Commands::Self_ { .. }
+        | Commands::Resume(_)
         | Commands::Cli {
             command: CliCommand::Run(_),
         }
@@ -4807,6 +5599,46 @@ fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
                 )?;
                 Ok(json!({ "cli_session": session }))
             }
+            CliSessionCommand::NotePermissions(args) => {
+                validate_positive("session_epoch", args.session_epoch)?;
+                validate_nonempty("snapshot_json", &args.snapshot_json)?;
+                let now = match args.now {
+                    Some(value) => value,
+                    None => now_epoch_seconds()?,
+                };
+                let startup = match (
+                    args.startup_allows_approval,
+                    args.startup_allows_network,
+                    args.startup_allows_write_access,
+                ) {
+                    (Some(approval), Some(network), Some(write_access)) => {
+                        Some(CliManagedSessionPermissions {
+                            session_allows_approval: approval,
+                            session_allows_network: network,
+                            session_allows_write_access: write_access,
+                        })
+                    }
+                    (None, None, None) => None,
+                    _ => bail!(
+                        "startup permission flags must either all be present or all be omitted"
+                    ),
+                };
+                let session = store.note_cli_managed_session_permissions(
+                    &args.managed_session_id,
+                    args.session_epoch,
+                    NewCliManagedSessionPermissionSnapshot {
+                        startup,
+                        effective: CliManagedSessionPermissions {
+                            session_allows_approval: args.effective_allows_approval,
+                            session_allows_network: args.effective_allows_network,
+                            session_allows_write_access: args.effective_allows_write_access,
+                        },
+                        snapshot_json: args.snapshot_json,
+                    },
+                    now,
+                )?;
+                Ok(json!({ "cli_session": session }))
+            }
             CliSessionCommand::InvalidateProof(args) => {
                 validate_positive("session_epoch", args.session_epoch)?;
                 let now = match args.now {
@@ -5094,6 +5926,7 @@ fn cli_command_uses_lifecycle_store_timeout(command: &CliCommand) -> bool {
         CliCommand::Session {
             command: CliSessionCommand::NoteActivity(_)
                 | CliSessionCommand::NoteCapabilities(_)
+                | CliSessionCommand::NotePermissions(_)
                 | CliSessionCommand::InvalidateProof(_)
                 | CliSessionCommand::Retire(_),
         }
@@ -5265,4 +6098,103 @@ fn write_json<T: Serialize>(value: &T) -> Result<()> {
     serde_json::to_writer_pretty(&mut lock, value)?;
     lock.write_all(b"\n")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_snapshot_derives_read_only_no_network_no_approval() {
+        let snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "never",
+            "sandbox": {
+                "type": "readOnly",
+                "networkAccess": false
+            }
+        }))
+        .expect("parse snapshot");
+
+        assert!(!snapshot.allows_approval);
+        assert!(!snapshot.allows_network);
+        assert!(!snapshot.allows_write_access);
+    }
+
+    #[test]
+    fn permission_snapshot_treats_workspace_write_network_as_higher_risk() {
+        let snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": true
+            }
+        }))
+        .expect("parse snapshot");
+
+        assert!(snapshot.allows_approval);
+        assert!(snapshot.allows_network);
+        assert!(snapshot.allows_write_access);
+    }
+
+    #[test]
+    fn permission_snapshot_rejects_unknown_shapes() {
+        let error = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "mystery",
+            "sandbox": {
+                "type": "readOnly",
+                "networkAccess": false
+            }
+        }))
+        .expect_err("unknown approval policy should fail closed");
+
+        assert!(error.to_string().contains("unknown approvalPolicy"));
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_keep_startup_tighter_than_current() {
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work"]
+            }
+        }))
+        .expect("parse snapshot");
+        let startup = CliResolvedPermissions {
+            allows_approval: false,
+            allows_network: false,
+            allows_write_access: false,
+        };
+        let current_permissions = CliResolvedPermissions {
+            allows_approval: true,
+            allows_network: true,
+            allows_write_access: true,
+        };
+        let effective = effective_permissions(startup, current_permissions);
+        let overrides = turn_start_permission_overrides(&current, effective).expect("pin");
+
+        assert_eq!(overrides["approvalPolicy"], json!("never"));
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("readOnly"));
+        assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(false));
+    }
+
+    #[test]
+    fn permission_drift_tracks_mixed_dimension_changes() {
+        let startup = CliResolvedPermissions {
+            allows_approval: false,
+            allows_network: true,
+            allows_write_access: false,
+        };
+        let current = CliResolvedPermissions {
+            allows_approval: false,
+            allows_network: false,
+            allows_write_access: true,
+        };
+
+        assert_eq!(
+            permission_drift_changes(startup, current),
+            vec![("network", "tightened"), ("write_access", "loosened")]
+        );
+    }
 }
