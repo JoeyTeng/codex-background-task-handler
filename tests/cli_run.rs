@@ -882,6 +882,17 @@ fn fake_active_profile_config_read_response() -> serde_json::Value {
 }
 
 #[cfg(unix)]
+fn fake_flat_config_read_response() -> serde_json::Value {
+    serde_json::json!({
+        "model": "gpt-flat",
+        "model_provider": "openai",
+        "model_reasoning_effort": "xhigh",
+        "origins": {},
+        "layers": null
+    })
+}
+
+#[cfg(unix)]
 fn accept_fake_app_server_thread_start(
     listener: &TcpListener,
     thread_id: &'static str,
@@ -2972,6 +2983,59 @@ fn cbth_new_launches_bootstrap_app_server_in_thread_cwd() {
     assert!(log.contains(&format!("app-server-cwd\t{}", expected_cwd.display())));
     assert!(log.contains("foreground\t--remote\t"));
     assert!(!log.contains("\t--cd\tproject"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_accepts_flat_config_read_response_shape() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-flat-config";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_new_thread_then_capture_with_config(
+            thread_id,
+            Duration::from_secs(1),
+            fake_flat_config_read_response(),
+        );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with flat config/read response");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let capture = wait_for_fake_thread_start_capture(fake_server_done);
+    assert!(capture.methods.iter().any(|method| method == "config/read"));
+    assert_eq!(
+        capture.thread_start_params["model"],
+        serde_json::json!("gpt-flat")
+    );
+    assert_eq!(
+        capture.thread_start_params["config"]["model_reasoning_effort"],
+        serde_json::json!("xhigh")
+    );
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
     stop_daemon(&home);
 }
 

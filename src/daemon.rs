@@ -3855,9 +3855,13 @@ fn read_effective_codex_config(
         Ok(response) => response,
         Err(_) => return Ok(None),
     };
-    // ConfigReadResponse exposes the effective values in top-level `config`;
-    // `origins` and `layers` are source metadata for the same keys.
-    Ok(response.get("config").and_then(Value::as_object).cloned())
+    // Current ConfigReadResponse exposes effective values under top-level
+    // `config`; accept a flat result as a protocol-drift fallback.
+    Ok(response
+        .get("config")
+        .and_then(Value::as_object)
+        .or_else(|| response.as_object())
+        .cloned())
 }
 
 fn merge_effective_config_into_thread_start_params(
