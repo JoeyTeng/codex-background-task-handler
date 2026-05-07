@@ -2221,14 +2221,17 @@ fn read_managed_resume_thread_cwd(
             Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
         )
         .map_err(anyhow::Error::new)?;
-    let Some(cwd) = read
-        .get("thread")
-        .and_then(|thread| thread.get("cwd"))
-        .and_then(Value::as_str)
-    else {
+    let Some(cwd) = thread_read_cwd_from_response(&read) else {
         return Ok(None);
     };
     Ok(Some(PathBuf::from(cwd)))
+}
+
+fn thread_read_cwd_from_response(read: &Value) -> Option<&str> {
+    read.get("thread")
+        .and_then(|thread| thread.get("cwd"))
+        .and_then(Value::as_str)
+        .or_else(|| read.get("cwd").and_then(Value::as_str))
 }
 
 fn select_managed_resume_cwd(caller_cwd: &Path, history_cwd: &Path) -> Result<PathBuf> {
@@ -5205,6 +5208,9 @@ fn permission_snapshot_drift_changes(
             "sandbox_policy",
             sandbox_policy_drift_direction(&startup.sandbox_policy, &current.sandbox_policy)?,
         ));
+    }
+    if startup.permission_profile != current.permission_profile {
+        changes.push(("permission_profile", "changed"));
     }
     Ok(changes)
 }
@@ -8325,6 +8331,30 @@ mod tests {
     }
 
     #[test]
+    fn thread_read_cwd_reads_nested_and_top_level_shapes() {
+        assert_eq!(
+            thread_read_cwd_from_response(&json!({
+                "thread": { "cwd": "/tmp/thread" },
+                "cwd": "/tmp/top"
+            })),
+            Some("/tmp/thread")
+        );
+        assert_eq!(
+            thread_read_cwd_from_response(&json!({
+                "thread": { "id": "thread-1" },
+                "cwd": "/tmp/top"
+            })),
+            Some("/tmp/top")
+        );
+        assert_eq!(
+            thread_read_cwd_from_response(&json!({
+                "thread": { "id": "thread-1" }
+            })),
+            None
+        );
+    }
+
+    #[test]
     fn permission_snapshot_derives_read_only_no_network_no_approval() {
         let snapshot = parse_thread_resume_permission_snapshot(&json!({
             "approvalPolicy": "never",
@@ -8994,6 +9024,73 @@ mod tests {
         assert_eq!(
             permission_snapshot_drift_changes(&startup, &current).expect("snapshot drift"),
             vec![("sandbox_policy", "loosened")]
+        );
+    }
+
+    #[test]
+    fn permission_drift_tracks_permission_profile_body_changes() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "permissionProfile": {
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/read" },
+                            "access": "read"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "permissionProfile": {
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/other-read" },
+                            "access": "read"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse current snapshot");
+
+        assert_eq!(
+            permission_drift_changes(resolved(&startup), resolved(&current)),
+            Vec::<(&'static str, &'static str)>::new()
+        );
+        assert_eq!(
+            permission_snapshot_drift_changes(&startup, &current).expect("snapshot drift"),
+            vec![("permission_profile", "changed")]
         );
     }
 
