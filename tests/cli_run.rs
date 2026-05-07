@@ -37,6 +37,9 @@ if [ "${1:-}" = "app-server" ]; then
     printf '\t%s' "$arg" >> "$log"
   done
   printf '\n' >> "$log"
+  if [ "${FAKE_CODEX_LOG_CWD:-}" = "1" ]; then
+    printf 'app-server-cwd\t%s\n' "$(pwd)" >> "$log"
+  fi
   if [ -n "${FAKE_CODEX_APP_SERVER_PREFIX_BYTES:-}" ]; then
     i=0
     while [ "$i" -lt "$FAKE_CODEX_APP_SERVER_PREFIX_BYTES" ]; do
@@ -437,6 +440,61 @@ fn spawn_fake_app_server_new_thread_then_capture_passive_methods(
 }
 
 #[cfg(unix)]
+fn spawn_fake_app_server_new_thread_then_capture(
+    thread_id: &'static str,
+    observe_duration: Duration,
+) -> (
+    String,
+    mpsc::Receiver<Result<FakeThreadStartCapture, String>>,
+) {
+    spawn_fake_app_server_new_thread_then_capture_with_config(
+        thread_id,
+        observe_duration,
+        fake_default_config_read_response(),
+    )
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_new_thread_then_capture_with_config(
+    thread_id: &'static str,
+    observe_duration: Duration,
+    config_read_response: serde_json::Value,
+) -> (
+    String,
+    mpsc::Receiver<Result<FakeThreadStartCapture, String>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = (|| {
+            let mut capture = accept_fake_app_server_thread_start_capture(
+                &listener,
+                thread_id,
+                FakeThreadStartOutcome::Success,
+                config_read_response,
+            )?;
+            let mut passive_methods = accept_fake_app_server_capture_passive_methods(
+                &listener,
+                thread_id,
+                observe_duration,
+                true,
+                true,
+            )?;
+            capture.methods.append(&mut passive_methods);
+            Ok(capture)
+        })();
+        let _ = done_tx.send(result);
+    });
+
+    (url, done_rx)
+}
+
+#[cfg(unix)]
 fn spawn_fake_app_server_new_thread_then_auto_delivery(
     thread_id: &'static str,
     outcome: FakeAutoDeliveryOutcome,
@@ -783,11 +841,79 @@ fn accept_fake_app_server(
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+struct FakeThreadStartCapture {
+    methods: Vec<String>,
+    thread_start_params: serde_json::Value,
+}
+
+#[cfg(unix)]
+fn fake_default_config_read_response() -> serde_json::Value {
+    serde_json::json!({
+        "config": {
+            "model": "gpt-5.5",
+            "model_provider": "openai",
+            "model_reasoning_effort": "xhigh"
+        },
+        "origins": {},
+        "layers": null
+    })
+}
+
+#[cfg(unix)]
+fn fake_active_profile_config_read_response() -> serde_json::Value {
+    serde_json::json!({
+        "config": {
+            "model": "gpt-default",
+            "model_provider": "openai",
+            "model_reasoning_effort": "low",
+            "profile": "work",
+            "profiles": {
+                "work": {
+                    "model": "gpt-work",
+                    "model_provider": "work-provider",
+                    "model_reasoning_effort": "xhigh"
+                }
+            }
+        },
+        "origins": {},
+        "layers": null
+    })
+}
+
+#[cfg(unix)]
+fn fake_flat_config_read_response() -> serde_json::Value {
+    serde_json::json!({
+        "model": "gpt-flat",
+        "model_provider": "openai",
+        "model_reasoning_effort": "xhigh",
+        "origins": {},
+        "layers": null
+    })
+}
+
+#[cfg(unix)]
 fn accept_fake_app_server_thread_start(
     listener: &TcpListener,
     thread_id: &'static str,
     outcome: FakeThreadStartOutcome,
 ) -> Result<Vec<String>, String> {
+    accept_fake_app_server_thread_start_capture(
+        listener,
+        thread_id,
+        outcome,
+        fake_default_config_read_response(),
+    )
+    .map(|capture| capture.methods)
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_thread_start_capture(
+    listener: &TcpListener,
+    thread_id: &'static str,
+    outcome: FakeThreadStartOutcome,
+    config_read_response: serde_json::Value,
+) -> Result<FakeThreadStartCapture, String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let (mut stream, _) = loop {
         match listener.accept() {
@@ -834,7 +960,14 @@ fn accept_fake_app_server_thread_start(
                 }),
             )?,
             "initialized" => {}
+            "config/read" => {
+                write_fake_json_response(&mut stream, &message, config_read_response.clone())?;
+            }
             "thread/start" => {
+                let thread_start_params = message
+                    .get("params")
+                    .cloned()
+                    .ok_or_else(|| format!("thread/start missing params: {message}"))?;
                 let cwd = message
                     .get("params")
                     .and_then(|params| params.get("cwd"))
@@ -855,18 +988,30 @@ fn accept_fake_app_server_thread_start(
                                 }
                             }),
                         )?;
-                        return Ok(methods);
+                        return Ok(FakeThreadStartCapture {
+                            methods,
+                            thread_start_params,
+                        });
                     }
                     FakeThreadStartOutcome::MethodNotFound => {
                         write_fake_json_error(&mut stream, &message, -32601, "method not found")?;
-                        return Ok(methods);
+                        return Ok(FakeThreadStartCapture {
+                            methods,
+                            thread_start_params,
+                        });
                     }
                     FakeThreadStartOutcome::Timeout => {
                         thread::sleep(Duration::from_secs(6));
-                        return Ok(methods);
+                        return Ok(FakeThreadStartCapture {
+                            methods,
+                            thread_start_params,
+                        });
                     }
                     FakeThreadStartOutcome::ClosedBeforeResponse => {
-                        return Ok(methods);
+                        return Ok(FakeThreadStartCapture {
+                            methods,
+                            thread_start_params,
+                        });
                     }
                     FakeThreadStartOutcome::MalformedResponse => {
                         write_fake_json_response(
@@ -874,7 +1019,10 @@ fn accept_fake_app_server_thread_start(
                             &message,
                             serde_json::json!({ "thread": {} }),
                         )?;
-                        return Ok(methods);
+                        return Ok(FakeThreadStartCapture {
+                            methods,
+                            thread_start_params,
+                        });
                     }
                 }
             }
@@ -2034,6 +2182,17 @@ fn wait_for_fake_app_server_methods(
 }
 
 #[cfg(unix)]
+fn wait_for_fake_thread_start_capture(
+    done_rx: mpsc::Receiver<Result<FakeThreadStartCapture, String>>,
+) -> FakeThreadStartCapture {
+    match done_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(capture)) => capture,
+        Ok(Err(error)) => panic!("fake app-server failed: {error}"),
+        Err(error) => panic!("timed out waiting for fake app-server: {error}"),
+    }
+}
+
+#[cfg(unix)]
 fn submit_failed_fake_e2e_batch(home: &TempDir, thread_id: &str) -> String {
     let submitted = cbth_direct_json(
         home,
@@ -2433,6 +2592,7 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
         .arg("gpt-test")
         .arg("--profile")
         .arg("work")
+        .arg("--oss")
         .arg("--sandbox")
         .arg("read-only")
         .arg("--ask-for-approval")
@@ -2468,6 +2628,7 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
     );
     assert_eq!(params["model"], serde_json::json!("gpt-test"));
     assert_eq!(params["config"]["profile"], serde_json::json!("work"));
+    assert!(params.get("modelProvider").is_none());
     assert_eq!(params["sandbox"], serde_json::json!("read-only"));
     assert_eq!(params["approvalPolicy"], serde_json::json!("never"));
     assert_eq!(params["persistExtendedHistory"], serde_json::json!(true));
@@ -2479,6 +2640,7 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
         .expect("foreground invocation log");
     assert_eq!(foreground_line.matches("\t--cd\t").count(), 1);
     assert!(log.contains(&format!("\t--cd\t{}", expected_cwd.display())));
+    assert!(log.contains("\t--oss"));
 
     stop_daemon(&home);
 }
@@ -2674,6 +2836,7 @@ fn cli_run_new_thread_bootstraps_thread_then_preserves_foreground_model() {
         vec![
             "initialize".to_owned(),
             "initialized".to_owned(),
+            "config/read".to_owned(),
             "thread/start".to_owned(),
             "initialize".to_owned(),
             "initialized".to_owned(),
@@ -2704,6 +2867,511 @@ fn cli_run_new_thread_bootstraps_thread_then_preserves_foreground_model() {
         .expect("query managed session");
     assert_eq!(session_count, 1);
     assert_eq!(session_state, "detached");
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_bootstraps_thread_with_direct_codex_args_and_reasoning_default() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_new_thread_then_capture(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--model")
+        .arg("gpt-test")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cbth: bound thread id: thread-cbth-new")
+    );
+
+    let capture = wait_for_fake_thread_start_capture(fake_server_done);
+    assert!(capture.methods.iter().any(|method| method == "config/read"));
+    let expected_cwd = fs::canonicalize(client_cwd.path()).expect("canonical client cwd");
+    assert_eq!(
+        capture.thread_start_params["cwd"],
+        serde_json::json!(expected_cwd.display().to_string())
+    );
+    assert_eq!(
+        capture.thread_start_params["model"],
+        serde_json::json!("gpt-test")
+    );
+    assert_eq!(
+        capture.thread_start_params["modelProvider"],
+        serde_json::json!("openai")
+    );
+    assert_eq!(
+        capture.thread_start_params["config"]["model_reasoning_effort"],
+        serde_json::json!("xhigh")
+    );
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains("\t--model\tgpt-test"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_launches_bootstrap_app_server_in_thread_cwd() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    fs::create_dir(client_cwd.path().join("project")).expect("create project cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-cwd";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_new_thread_then_capture(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--cd")
+        .arg("project")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_LOG_CWD", "1")
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with --cd");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let capture = wait_for_fake_thread_start_capture(fake_server_done);
+    let expected_cwd =
+        fs::canonicalize(client_cwd.path().join("project")).expect("canonical project cwd");
+    assert_eq!(
+        capture.thread_start_params["cwd"],
+        serde_json::json!(expected_cwd.display().to_string())
+    );
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains(&format!("app-server-cwd\t{}", expected_cwd.display())));
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(!log.contains("\t--cd\tproject"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_accepts_flat_config_read_response_shape() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-flat-config";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_new_thread_then_capture_with_config(
+            thread_id,
+            Duration::from_secs(1),
+            fake_flat_config_read_response(),
+        );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with flat config/read response");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let capture = wait_for_fake_thread_start_capture(fake_server_done);
+    assert!(capture.methods.iter().any(|method| method == "config/read"));
+    assert_eq!(
+        capture.thread_start_params["model"],
+        serde_json::json!("gpt-flat")
+    );
+    assert_eq!(
+        capture.thread_start_params["config"]["model_reasoning_effort"],
+        serde_json::json!("xhigh")
+    );
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_provider_override_does_not_merge_default_model_from_other_provider() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-provider";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_new_thread_then_capture(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--oss")
+        .arg("--local-provider")
+        .arg("ollama")
+        .arg("--model")
+        .arg("qwen2.5-coder")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with provider override");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let capture = wait_for_fake_thread_start_capture(fake_server_done);
+    assert!(capture.methods.iter().any(|method| method == "config/read"));
+    assert_eq!(
+        capture.thread_start_params["modelProvider"],
+        serde_json::json!("ollama")
+    );
+    assert_eq!(
+        capture.thread_start_params["model"],
+        serde_json::json!("qwen2.5-coder")
+    );
+    assert!(capture.thread_start_params.get("config").is_none());
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains("\t--oss"));
+    assert!(log.contains("\t--local-provider\tollama"));
+    assert!(log.contains("\t--model\tqwen2.5-coder"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_oss_accepts_config_provider_override() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-config-provider";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_new_thread_then_capture(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--oss")
+        .arg("-c")
+        .arg("model_provider=ollama")
+        .arg("-c")
+        .arg("model=qwen2.5-coder")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with config provider override");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let capture = wait_for_fake_thread_start_capture(fake_server_done);
+    assert_eq!(
+        capture.thread_start_params["modelProvider"],
+        serde_json::json!("ollama")
+    );
+    assert_eq!(
+        capture.thread_start_params["model"],
+        serde_json::json!("qwen2.5-coder")
+    );
+    assert!(capture.thread_start_params.get("config").is_none());
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains("\t--oss"));
+    assert!(log.contains("\t-c\tmodel_provider=ollama"));
+    assert!(log.contains("\t-c\tmodel=qwen2.5-coder"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_profile_override_does_not_merge_default_profile_model_config() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-profile";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_new_thread_then_capture(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--profile")
+        .arg("work")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with profile");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let capture = wait_for_fake_thread_start_capture(fake_server_done);
+    assert!(!capture.methods.iter().any(|method| method == "config/read"));
+    assert_eq!(
+        capture.thread_start_params["config"]["profile"],
+        serde_json::json!("work")
+    );
+    assert!(capture.thread_start_params.get("model").is_none());
+    assert!(capture.thread_start_params.get("modelProvider").is_none());
+    assert!(
+        capture.thread_start_params["config"]
+            .get("model_reasoning_effort")
+            .is_none()
+    );
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains("\t--profile\twork"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_active_config_profile_does_not_merge_top_level_model_config() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-active-profile";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_new_thread_then_capture_with_config(
+            thread_id,
+            Duration::from_secs(1),
+            fake_active_profile_config_read_response(),
+        );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with active profile config");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let capture = wait_for_fake_thread_start_capture(fake_server_done);
+    assert!(capture.methods.iter().any(|method| method == "config/read"));
+    assert!(capture.thread_start_params.get("model").is_none());
+    assert!(capture.thread_start_params.get("modelProvider").is_none());
+    assert!(capture.thread_start_params.get("config").is_none());
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_rejects_forwarded_full_auto_before_thread_start() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--full-auto")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .output()
+        .expect("run cbth new with full-auto");
+
+    assert!(
+        !output.status.success(),
+        "cbth new unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("managed CLI session does not support forwarded --full-auto")
+    );
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!log.contains("app-server\tapp-server"));
+    assert!(!log.contains("foreground"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_rejects_oss_without_local_provider_before_thread_start() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--oss")
+        .arg("--model")
+        .arg("qwen2.5-coder")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .output()
+        .expect("run cbth new with oss without local provider");
+
+    assert!(
+        !output.status.success(),
+        "cbth new unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("managed CLI session requires --local-provider when forwarding --oss")
+    );
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!log.contains("app-server\tapp-server"));
+    assert!(!log.contains("foreground"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_rejects_oss_without_model_before_thread_start() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--oss")
+        .arg("--local-provider")
+        .arg("ollama")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .output()
+        .expect("run cbth new with oss without model");
+
+    assert!(
+        !output.status.success(),
+        "cbth new unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("managed CLI session requires --model when forwarding --oss")
+    );
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!log.contains("app-server\tapp-server"));
+    assert!(!log.contains("foreground"));
     stop_daemon(&home);
 }
 
