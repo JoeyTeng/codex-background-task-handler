@@ -77,7 +77,7 @@ The install script downloads the Rust release-profile binary from GitHub Release
 Install a specific release or custom directory:
 
 ```bash
-CBTH_VERSION=v0.1.1 CBTH_INSTALL_DIR="$HOME/.local/bin" \
+CBTH_VERSION=v0.1.2 CBTH_INSTALL_DIR="$HOME/.local/bin" \
   sh scripts/install.sh
 ```
 
