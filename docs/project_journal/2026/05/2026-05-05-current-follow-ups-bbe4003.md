@@ -31,20 +31,20 @@ superseded_by:
 - Desktop heartbeat preflight attempts are recorded in [Desktop live preflight evidence](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md): direct heartbeat access to redundant chmod, `startup.lock`, Unix socket, and SQLite WAL paths failed under Desktop sandboxing even when POSIX ownership / mode looked correct.
 - The Desktop boundary is now split: a normal shell / daemon / future sidecar publishes the inbox snapshot, while the heartbeat consumes it through no-DB read helpers. Real heartbeat validation succeeded for `read-snapshot`, `list-arm-pending`, `list-pause-due`, and read/peek `claim-next-ready` without approval.
 - `read_transport_capability=validated` now covers the no-DB direct-file-read helper path against an already-published revision-consistent snapshot, including the manifest-referenced installation-state export. It does not validate heartbeat-owned `bridge-preflight`, SQLite access, artifact payload reads, or writeback helpers.
-- Separately validate no-approval execution for narrow Desktop writeback / lifecycle helpers: `note-arm-pending`, `note-arm`, and `note-boundary-crossed`.
+- `note-arm-pending` and `note-arm` now exist as local writeback primitives with fake coverage, but Desktop heartbeat no-approval execution is not validated. Separately validate no-approval execution for `note-arm-pending`, `note-arm`, and later `note-boundary-crossed` before writing `writeback_capability=validated`.
 - If large artifacts ever enter the automatic caller path, separately validate `cbth desktop read-artifact ...` in heartbeat / caller contexts and write the result back to `artifact_read_capability`.
 
 ## Desktop Bridge Implementation
 
 - Extend daemon lifecycle so Desktop binding / attempt schema can keep daemon alive for `arm_pending_deadline` and `pause_deadline`.
 - Decide whether future daemon-owned supervised child processes need to be separated from externally reported pending jobs for idle-exit decisions.
-- Complete Desktop binding schema and behavior: `armed_generation`, `armed_generation_quiesced_at`, `pause_not_before`, `pause_deadline`, read-only capability mirrors, paused-state readback validation, and no mixed `read_transport` bindings.
+- Complete Desktop binding lifecycle behavior beyond the current writeback fields: `armed_generation_quiesced_at` updates, paused-state readback validation, unbind/rebind, and no mixed `read_transport` bindings.
 - Finish installation-wide `desktop_installation_state` authority and keep capability writes constrained to `installation-state repair`.
 - Finish the read-only inbox shape beyond the no-DB helper baseline, including optional diagnostic `by-thread/<thread_id>.json`, artifact manifest export, and operator-only payload export.
 - Implement bridge fairness and budget limits: independent reconcile and fresh-arm lanes, bounded item count / wall time, and `max_new_arms_per_wake=1`.
 - Implement real ready / arm / pause materialization behind the existing no-DB read helpers.
-- Turn `bridge_arm_lease` into executable `note-arm-pending` acquire / carry-forward semantics keyed by `(source_thread_id, attempt_id, generation)` and `bridge_request_id`.
-- Implement writeback helpers `note-arm-pending` and `note-arm` with compare-and-swap, idempotency, and no duplicate `delivery_attempt_count` increments.
+- Extend `bridge_arm_lease` beyond the current `note-arm-pending` acquire / carry-forward primitive with overdue reconcile and cleanup semantics.
+- Validate writeback helpers `note-arm-pending` and `note-arm` in real Desktop heartbeat before marking installation `writeback_capability=validated`.
 - Implement `note-boundary-crossed` with prompt-token validation, binding / installation-state checks, `cooldown` and `armed_generation` preconditions, `handoff_recorded` close, and durable `boundary_recovery_envelope`.
 - Verify the continuation-boundary contract: only fresh `note-boundary-crossed` success allows inline handoff; post-boundary automatic replay and ordinary tool continuation remain out of v1.
 - Keep the v1 automatic path limited to read-only, no approval, no network, no write access batches, plus validated Desktop read and writeback capability; `requires_artifact_read=true` remains manual/operator follow-up.

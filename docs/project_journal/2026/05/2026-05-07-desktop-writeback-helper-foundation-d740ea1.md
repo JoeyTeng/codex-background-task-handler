@@ -14,18 +14,18 @@ superseded_by:
 
 ## Summary
 
-- The next Desktop bridge slice is the writeback helper foundation for arm lifecycle state.
+- This Desktop bridge slice is the writeback helper foundation for arm lifecycle state.
 - Real Desktop heartbeat has already validated no-DB inbox reads, but writeback capability is still `unknown`.
 - This work adds durable helper primitives for future heartbeat agents without enabling automatic Desktop delivery.
 
-## Planned Changes
+## Current State
 
-- Add `cbth desktop note-arm-pending --source-thread-id <thread-id> --attempt-id <attempt-id> --generation <generation> --bridge-request-id <request-id> --json`.
-- Add `cbth desktop note-arm --source-thread-id <thread-id> --attempt-id <attempt-id> --generation <generation> --bridge-request-id <request-id> --bridge-arm-lease-id <lease-id> --json`.
+- `cbth desktop note-arm-pending --source-thread-id <thread-id> --attempt-id <attempt-id> --generation <generation> --bridge-request-id <request-id> --json` is implemented.
+- `cbth desktop note-arm --source-thread-id <thread-id> --attempt-id <attempt-id> --generation <generation> --bridge-request-id <request-id> --bridge-arm-lease-id <lease-id> --json` is implemented.
 - Keep `claim-next-ready` read-only; durable state advancement begins at `note-arm-pending`.
-- Implement CAS and idempotency so stale, mismatched, or duplicate helper calls fail closed or return a stable no-op result without creating duplicate delivery attempts.
-- Export real `arm_pending_bindings` and `pause_due_bindings` data from `bridge-preflight` for later heartbeat reconciliation.
-- Add a daemon capability gate for the writeback helper foundation so new clients cannot silently use an old daemon.
+- CAS and idempotency are implemented so stale, mismatched, or duplicate helper calls fail closed or return stable idempotent success without creating duplicate delivery attempts.
+- `bridge-preflight` exports real `arm_pending_bindings` and `pause_due_bindings` data for later heartbeat reconciliation.
+- Daemon capability `desktop-writeback-helper-foundation` gates this foundation so new clients cannot silently use an old daemon.
 
 ## Out Of Scope
 

@@ -86,6 +86,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "task-supervisor",
     "desktop-bridge-foundation-dispatch",
     "desktop-inbox-revisioned-installation-state",
+    "desktop-writeback-helper-foundation",
 ];
 
 #[derive(Debug, Parser)]
@@ -214,6 +215,16 @@ enum DesktopCommand {
         about = "Peek the next ready Desktop bridge entry from the current inbox snapshot without mutating state"
     )]
     ClaimNextReady(DesktopReadSnapshotArgs),
+    #[command(
+        name = "note-arm-pending",
+        about = "Record a durable Desktop arm-pending barrier for a prepared attempt"
+    )]
+    NoteArmPending(DesktopNoteArmPendingArgs),
+    #[command(
+        name = "note-arm",
+        about = "Record that a Desktop caller heartbeat arm was accepted"
+    )]
+    NoteArm(DesktopNoteArmArgs),
 }
 
 #[derive(Debug, Args)]
@@ -361,6 +372,51 @@ struct DesktopReadSnapshotArgs {
 
     #[arg(long, help = "Emit JSON output")]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct DesktopNoteArmPendingArgs {
+    #[arg(long, help = "Desktop caller/source thread id")]
+    source_thread_id: String,
+
+    #[arg(long, help = "Prepared Desktop delivery attempt id")]
+    attempt_id: String,
+
+    #[arg(long, help = "Expected Desktop delivery attempt generation")]
+    generation: i64,
+
+    #[arg(long, help = "Unique bridge request id for this arm pipeline")]
+    bridge_request_id: String,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopNoteArmArgs {
+    #[arg(long, help = "Desktop caller/source thread id")]
+    source_thread_id: String,
+
+    #[arg(long, help = "Arm-pending Desktop delivery attempt id")]
+    attempt_id: String,
+
+    #[arg(long, help = "Expected Desktop delivery attempt generation")]
+    generation: i64,
+
+    #[arg(long, help = "Unique bridge request id returned by note-arm-pending")]
+    bridge_request_id: String,
+
+    #[arg(long, help = "Bridge arm lease id returned by note-arm-pending")]
+    bridge_arm_lease_id: String,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -3828,6 +3884,46 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             }
             argv
         }
+        Commands::Desktop {
+            command: DesktopCommand::NoteArmPending(args),
+        } => {
+            let mut argv = vec![
+                OsString::from("desktop"),
+                OsString::from("note-arm-pending"),
+            ];
+            push_string_arg(&mut argv, "--source-thread-id", &args.source_thread_id);
+            push_string_arg(&mut argv, "--attempt-id", &args.attempt_id);
+            push_i64_arg(&mut argv, "--generation", args.generation);
+            push_string_arg(&mut argv, "--bridge-request-id", &args.bridge_request_id);
+            if args.json {
+                argv.push(OsString::from("--json"));
+            }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Desktop {
+            command: DesktopCommand::NoteArm(args),
+        } => {
+            let mut argv = vec![OsString::from("desktop"), OsString::from("note-arm")];
+            push_string_arg(&mut argv, "--source-thread-id", &args.source_thread_id);
+            push_string_arg(&mut argv, "--attempt-id", &args.attempt_id);
+            push_i64_arg(&mut argv, "--generation", args.generation);
+            push_string_arg(&mut argv, "--bridge-request-id", &args.bridge_request_id);
+            push_string_arg(
+                &mut argv,
+                "--bridge-arm-lease-id",
+                &args.bridge_arm_lease_id,
+            );
+            if args.json {
+                argv.push(OsString::from("--json"));
+            }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
         Commands::Maintenance {
             command: MaintenanceCommand::Sweep(args),
         } => {
@@ -4914,6 +5010,31 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
             let snapshot = read_desktop_inbox_snapshot(layout, &args.bridge_thread_id)?;
             Ok(json!({ "desktop_ready_claim": snapshot.claim_next_ready()? }))
         }
+        DesktopCommand::NoteArmPending(args) => {
+            let mut store = Store::open(layout)?;
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            let record = store.note_desktop_arm_pending(
+                &args.source_thread_id,
+                &args.attempt_id,
+                args.generation,
+                &args.bridge_request_id,
+                now,
+            )?;
+            Ok(json!({ "desktop_arm_pending": record }))
+        }
+        DesktopCommand::NoteArm(args) => {
+            let mut store = Store::open(layout)?;
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            let record = store.note_desktop_arm(
+                &args.source_thread_id,
+                &args.attempt_id,
+                args.generation,
+                &args.bridge_request_id,
+                &args.bridge_arm_lease_id,
+                now,
+            )?;
+            Ok(json!({ "desktop_arm": record }))
+        }
         DesktopCommand::InstallationState(args) => {
             let mut store = Store::open(layout)?;
             match args.command {
@@ -4978,10 +5099,14 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
             let fingerprint =
                 desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
             let state = store.desktop_installation_state(&fingerprint)?;
+            let arm_pending_bindings = store.list_desktop_arm_pending_bindings(now)?;
+            let pause_due_bindings = store.list_desktop_pause_due_bindings(now)?;
             let preflight = publish_desktop_bridge_preflight(
                 layout,
                 &args.bridge_thread_id,
                 &state,
+                arm_pending_bindings,
+                pause_due_bindings,
                 sweep,
                 now,
             )?;
@@ -5355,6 +5480,8 @@ fn publish_desktop_bridge_preflight(
     layout: &FsLayout,
     bridge_thread_id: &str,
     installation_state: &DesktopInstallationStateRecord,
+    arm_pending_bindings: Vec<Value>,
+    pause_due_bindings: Vec<Value>,
     sweep: SweepReport,
     now: i64,
 ) -> Result<Value> {
@@ -5366,6 +5493,10 @@ fn publish_desktop_bridge_preflight(
     let latest_installation_state_path = layout.desktop_installation_state_path();
     let installation_state_path =
         layout.desktop_snapshot_installation_state_path(&snapshot_revision);
+    let arm_pending_count =
+        i64::try_from(arm_pending_bindings.len()).context("arm_pending_bindings count overflow")?;
+    let pause_due_count =
+        i64::try_from(pause_due_bindings.len()).context("pause_due_bindings count overflow")?;
 
     let base = json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
@@ -5412,8 +5543,8 @@ fn publish_desktop_bridge_preflight(
             "created_at": now,
             "bridge_thread_id": bridge_thread_id,
             "arm_pending_bindings": {
-                "entries": [],
-                "count": 0,
+                "entries": arm_pending_bindings,
+                "count": arm_pending_count,
             },
             "base": base.clone(),
         }),
@@ -5426,8 +5557,8 @@ fn publish_desktop_bridge_preflight(
             "created_at": now,
             "bridge_thread_id": bridge_thread_id,
             "pause_due_bindings": {
-                "entries": [],
-                "count": 0,
+                "entries": pause_due_bindings,
+                "count": pause_due_count,
             },
             "base": base,
         }),
@@ -5446,11 +5577,11 @@ fn publish_desktop_bridge_preflight(
             },
             "arm_pending_bindings": {
                 "path": arm_pending_path.display().to_string(),
-                "count": 0,
+                "count": arm_pending_count,
             },
             "pause_due_bindings": {
                 "path": pause_due_path.display().to_string(),
-                "count": 0,
+                "count": pause_due_count,
             },
         },
         "installation_state": installation_state,

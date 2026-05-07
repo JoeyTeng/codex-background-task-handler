@@ -236,6 +236,12 @@ pub struct DeliveryAttemptRecord {
     pub delivery_observation_deadline: Option<i64>,
     pub last_observed_turn_event: Option<String>,
     pub last_observed_turn_event_at: Option<i64>,
+    pub bridge_request_id: Option<String>,
+    pub bridge_arm_lease_id: Option<String>,
+    pub bridge_arm_lease_deadline: Option<i64>,
+    pub arm_pending_since: Option<i64>,
+    pub arm_pending_deadline: Option<i64>,
+    pub desktop_armed_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
     pub abandoned_at: Option<i64>,
@@ -374,6 +380,10 @@ pub struct DesktopBindingRecord {
     pub source_thread_id: String,
     pub caller_automation_id: String,
     pub binding_state: String,
+    pub armed_generation: Option<i64>,
+    pub armed_generation_quiesced_at: Option<i64>,
+    pub pause_not_before: Option<i64>,
+    pub pause_deadline: Option<i64>,
     pub read_transport: String,
     pub read_transport_generation: i64,
     pub validation_fingerprint: String,
@@ -386,6 +396,26 @@ pub struct DesktopBindingRecord {
 pub struct DesktopBindingRepairRecord {
     pub binding: DesktopBindingRecord,
     pub installation_state: DesktopInstallationStateRecord,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopArmPendingRecord {
+    pub outcome: String,
+    pub attempt: DeliveryAttemptRecord,
+    pub binding: DesktopBindingRecord,
+    pub bridge_arm_lease_id: Option<String>,
+    pub bridge_arm_lease_deadline: Option<i64>,
+    pub arm_pending_deadline: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopArmRecord {
+    pub outcome: String,
+    pub attempt: DeliveryAttemptRecord,
+    pub binding: DesktopBindingRecord,
+    pub delivery_attempt_count: i64,
+    pub pause_not_before: Option<i64>,
+    pub pause_deadline: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]

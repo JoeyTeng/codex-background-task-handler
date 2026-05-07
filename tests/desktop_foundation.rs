@@ -7,6 +7,7 @@ use std::process::{Command, Output};
 #[cfg(unix)]
 use std::thread;
 
+use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -93,6 +94,82 @@ fn read_json_file(path: &str) -> Value {
 fn write_json_file(path: &str, value: &Value) {
     let bytes = serde_json::to_vec_pretty(value).expect("serialize json");
     fs::write(path, bytes).unwrap_or_else(|error| panic!("write {path}: {error}"));
+}
+
+fn create_desktop_batch_and_prepared_attempt(
+    home: &TempDir,
+    source_thread_id: &str,
+    attempt_id: &str,
+    generation: i64,
+    now: i64,
+) -> String {
+    let submitted = cbth(
+        home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            source_thread_id,
+            "--summary",
+            "desktop writeback fixture",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready for Desktop writeback",
+            "--max-delivery-attempts",
+            "3",
+            "--redelivery-window-seconds",
+            "3600",
+        ],
+    );
+    let batch_id = failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id")
+        .to_owned();
+    insert_desktop_prepared_attempt(
+        home,
+        source_thread_id,
+        &batch_id,
+        attempt_id,
+        generation,
+        now,
+    );
+    batch_id
+}
+
+fn insert_desktop_prepared_attempt(
+    home: &TempDir,
+    source_thread_id: &str,
+    batch_id: &str,
+    attempt_id: &str,
+    generation: i64,
+    now: i64,
+) {
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "INSERT INTO delivery_attempts (
+            attempt_id, batch_id, source_thread_id, adapter_kind,
+            authorization_mode, state, generation, created_at, updated_at
+        ) VALUES (?, ?, ?, 'desktop', 'strict_safe', 'prepared', ?, ?, ?)",
+        params![attempt_id, batch_id, source_thread_id, generation, now, now],
+    )
+    .expect("insert prepared Desktop attempt");
 }
 
 #[test]
@@ -316,6 +393,554 @@ fn desktop_commands_fail_closed_for_invalid_inputs() {
         ],
     );
     assert!(empty_binding.contains("source_thread_id must not be empty"));
+}
+
+#[test]
+fn desktop_note_arm_pending_and_note_arm_are_idempotent_and_exported() {
+    let home = temp_home();
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-desktop-writeback",
+            "--caller-automation-id",
+            "automation-writeback",
+            "--json",
+            "--now",
+            "2000",
+        ],
+    );
+    let batch_id = create_desktop_batch_and_prepared_attempt(
+        &home,
+        "thread-desktop-writeback",
+        "attempt-desktop-writeback",
+        1,
+        2001,
+    );
+
+    let pending = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-desktop-writeback",
+            "--attempt-id",
+            "attempt-desktop-writeback",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-1",
+            "--json",
+            "--now",
+            "2100",
+        ],
+    );
+    let pending = &pending["desktop_arm_pending"];
+    assert_eq!(pending["outcome"], "arm_pending");
+    assert_eq!(pending["attempt"]["state"], "arm_pending");
+    assert_eq!(pending["attempt"]["bridge_request_id"], "bridge-request-1");
+    let lease = pending["bridge_arm_lease_id"]
+        .as_str()
+        .expect("bridge arm lease")
+        .to_owned();
+    assert_eq!(pending["bridge_arm_lease_deadline"], 2400);
+    assert_eq!(pending["arm_pending_deadline"], 2400);
+
+    let repeated_pending = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-desktop-writeback",
+            "--attempt-id",
+            "attempt-desktop-writeback",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-1",
+            "--json",
+            "--now",
+            "2101",
+        ],
+    );
+    assert_eq!(
+        repeated_pending["desktop_arm_pending"]["outcome"],
+        "already_pending"
+    );
+    assert_eq!(
+        repeated_pending["desktop_arm_pending"]["bridge_arm_lease_id"],
+        lease
+    );
+
+    let busy = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-desktop-writeback",
+            "--attempt-id",
+            "attempt-desktop-writeback",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-2",
+            "--json",
+            "--now",
+            "2102",
+        ],
+    );
+    assert!(busy.contains("already arm_pending for another bridge request"));
+
+    let preflight = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--json",
+            "--now",
+            "2103",
+        ],
+    );
+    assert_eq!(
+        preflight["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["count"],
+        1
+    );
+    let arm_pending = cbth(
+        &home,
+        &[
+            "desktop",
+            "list-arm-pending",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--json",
+        ],
+    );
+    let pending_entries = arm_pending["desktop_arm_pending_bindings"]["entries"]
+        .as_array()
+        .expect("arm pending entries");
+    assert_eq!(pending_entries.len(), 1);
+    assert_eq!(pending_entries[0]["batch_id"], batch_id);
+    assert_eq!(
+        pending_entries[0]["attempt_id"],
+        "attempt-desktop-writeback"
+    );
+    assert_eq!(pending_entries[0]["bridge_request_id"], "bridge-request-1");
+    assert!(pending_entries[0].get("bridge_arm_lease_id").is_none());
+
+    let wrong_lease = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm",
+            "--source-thread-id",
+            "thread-desktop-writeback",
+            "--attempt-id",
+            "attempt-desktop-writeback",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-1",
+            "--bridge-arm-lease-id",
+            "wrong-lease",
+            "--json",
+            "--now",
+            "2110",
+        ],
+    );
+    assert!(wrong_lease.contains("bridge_arm_lease_id does not match"));
+
+    let armed = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm",
+            "--source-thread-id",
+            "thread-desktop-writeback",
+            "--attempt-id",
+            "attempt-desktop-writeback",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-1",
+            "--bridge-arm-lease-id",
+            &lease,
+            "--json",
+            "--now",
+            "2110",
+        ],
+    );
+    let armed = &armed["desktop_arm"];
+    assert_eq!(armed["outcome"], "armed");
+    assert_eq!(armed["attempt"]["state"], "cooldown");
+    assert_eq!(armed["delivery_attempt_count"], 1);
+    assert_eq!(armed["binding"]["armed_generation"], 1);
+    assert_eq!(armed["pause_not_before"], 2200);
+    assert_eq!(armed["pause_deadline"], 2290);
+
+    let repeated_arm = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm",
+            "--source-thread-id",
+            "thread-desktop-writeback",
+            "--attempt-id",
+            "attempt-desktop-writeback",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-1",
+            "--bridge-arm-lease-id",
+            &lease,
+            "--json",
+            "--now",
+            "2111",
+        ],
+    );
+    assert_eq!(repeated_arm["desktop_arm"]["outcome"], "already_armed");
+    assert_eq!(repeated_arm["desktop_arm"]["delivery_attempt_count"], 1);
+    let inspected = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["delivery_attempt_count"], 1);
+
+    let due_preflight = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--json",
+            "--now",
+            "2291",
+        ],
+    );
+    assert_eq!(
+        due_preflight["desktop_bridge_preflight"]["snapshots"]["pause_due_bindings"]["count"],
+        1
+    );
+    let pause_due = cbth(
+        &home,
+        &[
+            "desktop",
+            "list-pause-due",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--json",
+        ],
+    );
+    let pause_entries = pause_due["desktop_pause_due_bindings"]["entries"]
+        .as_array()
+        .expect("pause due entries");
+    assert_eq!(pause_entries.len(), 1);
+    assert_eq!(
+        pause_entries[0]["source_thread_id"],
+        "thread-desktop-writeback"
+    );
+    assert_eq!(pause_entries[0]["armed_generation"], 1);
+}
+
+#[test]
+fn desktop_writeback_helpers_fail_closed_for_stale_or_unsafe_inputs() {
+    let home = temp_home();
+    let missing_binding_batch = create_desktop_batch_and_prepared_attempt(
+        &home,
+        "thread-missing-binding",
+        "attempt-missing-binding",
+        1,
+        3000,
+    );
+    let missing_binding = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-missing-binding",
+            "--attempt-id",
+            "attempt-missing-binding",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-missing-binding",
+            "--json",
+        ],
+    );
+    assert!(missing_binding.contains("desktop binding not found"));
+
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-mismatch",
+            "--caller-automation-id",
+            "automation-mismatch",
+            "--json",
+            "--now",
+            "3001",
+        ],
+    );
+    create_desktop_batch_and_prepared_attempt(
+        &home,
+        "thread-mismatch",
+        "attempt-mismatch",
+        2,
+        3002,
+    );
+    let wrong_generation = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-mismatch",
+            "--attempt-id",
+            "attempt-mismatch",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-wrong-generation",
+            "--json",
+        ],
+    );
+    assert!(wrong_generation.contains("is generation 2, not 1"));
+
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-expired-lease",
+            "--caller-automation-id",
+            "automation-expired-lease",
+            "--json",
+            "--now",
+            "3003",
+        ],
+    );
+    let expired_batch = create_desktop_batch_and_prepared_attempt(
+        &home,
+        "thread-expired-lease",
+        "attempt-expired-lease",
+        1,
+        3004,
+    );
+    let expired_pending = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-expired-lease",
+            "--attempt-id",
+            "attempt-expired-lease",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-expired-lease",
+            "--json",
+            "--now",
+            "3005",
+        ],
+    );
+    let expired_lease = expired_pending["desktop_arm_pending"]["bridge_arm_lease_id"]
+        .as_str()
+        .expect("expired lease id");
+    let expired_arm = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm",
+            "--source-thread-id",
+            "thread-expired-lease",
+            "--attempt-id",
+            "attempt-expired-lease",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-expired-lease",
+            "--bridge-arm-lease-id",
+            expired_lease,
+            "--json",
+            "--now",
+            "3306",
+        ],
+    );
+    assert!(expired_arm.contains("bridge arm lease expired at 3305"));
+    let expired = cbth(&home, &["batch", "inspect", "--batch-id", &expired_batch]);
+    assert_eq!(expired["batch"]["batch"]["delivery_attempt_count"], 0);
+
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-non-head",
+            "--caller-automation-id",
+            "automation-non-head",
+            "--json",
+            "--now",
+            "3003",
+        ],
+    );
+    let first_batch = create_desktop_batch_and_prepared_attempt(
+        &home,
+        "thread-non-head",
+        "attempt-non-head-first",
+        1,
+        3004,
+    );
+    let second_submit = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-non-head",
+            "--summary",
+            "second batch",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let second_job_id = second_submit["job"]["job_id"].as_str().expect("job id");
+    let second_failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            second_job_id,
+            "--reason",
+            "second ready",
+        ],
+    );
+    let second_batch = second_failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("second batch id")
+        .to_owned();
+    insert_desktop_prepared_attempt(
+        &home,
+        "thread-non-head",
+        &second_batch,
+        "attempt-non-head-second",
+        1,
+        3005,
+    );
+    let non_head = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-non-head",
+            "--attempt-id",
+            "attempt-non-head-second",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-non-head",
+            "--json",
+        ],
+    );
+    assert!(non_head.contains(&format!("batch {second_batch} is not the head batch")));
+    assert!(non_head.contains("thread-non-head"));
+    let first = cbth(&home, &["batch", "inspect", "--batch-id", &first_batch]);
+    assert_eq!(first["batch"]["batch"]["delivery_attempt_count"], 0);
+
+    let unsafe_submit = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-unsafe",
+            "--summary",
+            "unsafe batch",
+        ],
+    );
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-unsafe",
+            "--caller-automation-id",
+            "automation-unsafe",
+            "--json",
+        ],
+    );
+    let unsafe_job_id = unsafe_submit["job"]["job_id"].as_str().expect("job id");
+    let unsafe_failed = cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            unsafe_job_id,
+            "--reason",
+            "unsafe ready",
+        ],
+    );
+    let unsafe_batch = unsafe_failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("unsafe batch")
+        .to_owned();
+    insert_desktop_prepared_attempt(
+        &home,
+        "thread-unsafe",
+        &unsafe_batch,
+        "attempt-unsafe",
+        1,
+        3006,
+    );
+    let unsafe_result = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-unsafe",
+            "--attempt-id",
+            "attempt-unsafe",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-unsafe",
+            "--json",
+        ],
+    );
+    assert!(unsafe_result.contains("is not eligible for Desktop delivery"));
+
+    let missing_batch = cbth(
+        &home,
+        &["batch", "inspect", "--batch-id", &missing_binding_batch],
+    );
+    assert_eq!(missing_batch["batch"]["batch"]["delivery_attempt_count"], 0);
 }
 
 #[cfg(unix)]
@@ -1138,7 +1763,8 @@ fn desktop_bridge_preflight_require_existing_daemon_does_not_forward_client_only
                     "cli-auto-delivery-dispatch",
                     "task-supervisor",
                     "desktop-bridge-foundation-dispatch",
-                    "desktop-inbox-revisioned-installation-state"
+                    "desktop-inbox-revisioned-installation-state",
+                    "desktop-writeback-helper-foundation"
                 ],
                 "message": "pong"
             }
