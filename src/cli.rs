@@ -1858,9 +1858,17 @@ fn run_cli_session(
         }
     };
     let url = json_string(&app_server["cli_app_server"], "url")?;
+    let refresh_running = Arc::new(AtomicBool::new(true));
+    spawn_cli_app_server_lease_refresher(
+        layout.clone(),
+        managed_session_id.clone(),
+        lease_id.clone(),
+        Arc::clone(&refresh_running),
+    );
     if let Err(error) =
         resolve_managed_resume_foreground_cwd(&config.foreground_mode, &mut foreground, &url, &cwd)
     {
+        refresh_running.store(false, Ordering::Release);
         release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
         let _ = daemon_request_payload_timeout(
             layout,
@@ -1871,6 +1879,7 @@ fn run_cli_session(
             }),
             Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
         );
+        abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
         return Err(error);
     }
     let initial_thread_resume_params = match initial_passive_thread_resume_params(
@@ -1882,6 +1891,7 @@ fn run_cli_session(
     ) {
         Ok(params) => params,
         Err(error) => {
+            refresh_running.store(false, Ordering::Release);
             release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
             let _ = daemon_request_payload_timeout(
                 layout,
@@ -1892,16 +1902,10 @@ fn run_cli_session(
                 }),
                 Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
             );
+            abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
             return Err(error);
         }
     };
-    let refresh_running = Arc::new(AtomicBool::new(true));
-    spawn_cli_app_server_lease_refresher(
-        layout.clone(),
-        managed_session_id.clone(),
-        lease_id.clone(),
-        Arc::clone(&refresh_running),
-    );
     let mut passive_adapter =
         spawn_cli_app_server_passive_adapter(CliAppServerPassiveAdapterConfig {
             layout: layout.clone(),

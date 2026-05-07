@@ -2374,12 +2374,14 @@ fn cbth_resume_without_explicit_cd_preserves_native_resume_cwd_choice() {
     let script_dir = tempfile::tempdir().expect("script dir");
     let fake_codex = fake_codex_script(&script_dir);
     let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cli-resume";
+    let (app_server_url, captured_resume) = spawn_fake_app_server_capture_initial_resume(thread_id);
 
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("--home")
         .arg(home.path())
         .arg("resume")
-        .arg("thread-cli-resume")
+        .arg(thread_id)
         .arg("--codex-bin")
         .arg(&fake_codex)
         .arg("--")
@@ -2387,6 +2389,8 @@ fn cbth_resume_without_explicit_cd_preserves_native_resume_cwd_choice() {
         .arg("gpt-test")
         .current_dir(client_cwd.path())
         .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "1")
         .output()
         .expect("run cbth resume");
 
@@ -2400,9 +2404,23 @@ fn cbth_resume_without_explicit_cd_preserves_native_resume_cwd_choice() {
 
     let log = fs::read_to_string(&log_path).expect("read fake codex log");
     assert!(log.contains("app-server\tapp-server\t--listen\tws://127.0.0.1:0"));
-    assert!(log.contains("foreground\tresume\tthread-cli-resume\t--remote\tws://127.0.0.1:45678"));
+    assert!(log.contains(&format!(
+        "foreground\tresume\tthread-cli-resume\t--remote\t{app_server_url}"
+    )));
     assert!(!log.contains("\t--cd\t"));
     assert!(log.contains("\t--model\tgpt-test"));
+    let params = match captured_resume.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(params)) => params,
+        Ok(Err(error)) => panic!("fake app-server failed: {error}"),
+        Err(error) => panic!("timed out waiting for fake app-server: {error}"),
+    };
+    assert_eq!(params["threadId"], serde_json::json!(thread_id));
+    assert!(
+        params.get("cwd").is_none(),
+        "unexpected cwd in params: {params}"
+    );
+    assert_eq!(params["model"], serde_json::json!("gpt-test"));
+    assert_eq!(params["persistExtendedHistory"], serde_json::json!(true));
 
     stop_daemon(&home);
 }
