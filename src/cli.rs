@@ -2197,6 +2197,10 @@ fn foreground_codex_args(
         } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
             reject_managed_resume_add_dir_override(flag)?;
         } else if policy == ManagedForegroundArgPolicy::Resume
+            && let Some(flag) = managed_resume_thread_selector_flag(&arg)
+        {
+            reject_managed_resume_thread_selector(flag)?;
+        } else if policy == ManagedForegroundArgPolicy::Resume
             && let Some(flag) = managed_resume_permission_override_flag(&arg)
         {
             reject_managed_resume_permission_override(flag)?;
@@ -2269,6 +2273,11 @@ fn foreground_codex_args(
                 "--add-dir" => {
                     reject_managed_resume_add_dir_override(arg.as_str())?;
                 }
+                "--last" | "--all" | "--include-non-interactive"
+                    if policy == ManagedForegroundArgPolicy::Resume =>
+                {
+                    reject_managed_resume_thread_selector(arg.as_str())?;
+                }
                 "--remote" | "--remote-auth-token-env" => {
                     reject_managed_resume_remote_override(arg.as_str())?;
                 }
@@ -2328,6 +2337,24 @@ fn managed_resume_add_dir_override_flag(arg: &str) -> Option<&'static str> {
 fn reject_managed_resume_add_dir_override(flag: &str) -> Result<()> {
     bail!(
         "managed resume does not allow forwarded {flag}; Codex thread/resume cannot faithfully carry additional writable roots"
+    )
+}
+
+fn managed_resume_thread_selector_flag(arg: &str) -> Option<&'static str> {
+    if arg == "--last" || arg.starts_with("--last=") {
+        Some("--last")
+    } else if arg == "--all" || arg.starts_with("--all=") {
+        Some("--all")
+    } else if arg == "--include-non-interactive" || arg.starts_with("--include-non-interactive=") {
+        Some("--include-non-interactive")
+    } else {
+        None
+    }
+}
+
+fn reject_managed_resume_thread_selector(flag: &str) -> Result<()> {
+    bail!(
+        "managed resume does not allow forwarded {flag}; native resume selectors can change the foreground thread independently of the managed bound thread id"
     )
 }
 
@@ -2615,6 +2642,8 @@ fn apply_codex_resume_foreground_args(
             reject_managed_resume_remote_override(flag)?;
         } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
             reject_managed_resume_add_dir_override(flag)?;
+        } else if let Some(flag) = managed_resume_thread_selector_flag(&arg) {
+            reject_managed_resume_thread_selector(flag)?;
         } else if let Some(flag) = managed_resume_permission_override_flag(&arg) {
             reject_managed_resume_permission_override(flag)?;
         } else if let Some(flag) = managed_resume_search_override_flag(&arg) {
@@ -2686,6 +2715,9 @@ fn apply_codex_resume_foreground_args(
                 "--add-dir" => {
                     reject_managed_resume_add_dir_override(arg.as_str())?;
                 }
+                "--last" | "--all" | "--include-non-interactive" => {
+                    reject_managed_resume_thread_selector(arg.as_str())?;
+                }
                 "--remote" | "--remote-auth-token-env" => {
                     reject_managed_resume_remote_override(arg.as_str())?;
                 }
@@ -2695,7 +2727,7 @@ fn apply_codex_resume_foreground_args(
                 "--image" | "-i" => {
                     skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), false)?;
                 }
-                "--no-alt-screen" | "--last" | "--all" | "--include-non-interactive" => {}
+                "--no-alt-screen" => {}
                 _ => {}
             }
         }
