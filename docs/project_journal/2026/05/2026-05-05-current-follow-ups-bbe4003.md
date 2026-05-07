@@ -3,7 +3,7 @@ id: 20260505-bbe4003-active
 title: Current Follow-ups
 status: active
 created: 2026-05-05
-updated: 2026-05-06
+updated: 2026-05-07
 branch: master
 pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/37
 supersedes: []
@@ -64,6 +64,7 @@ superseded_by:
 
 ## CLI And Daemon Follow-ups
 
+- Follow up PR #43 `cbth resume` hardening in order: native resume cwd UX parity, exact `permissionProfile` snapshot parsing with legacy fallback, then soft Codex CLI validated-version warnings.
 - Finish CLI attach / recovery `activity_state=unknown -> current-state sync -> active/idle`; no auto-idle before authoritative sync and fail closed on continuity loss.
 - Finish daemon overdue sweep / next-start reconcile so every entrypoint first closes, reconciles, or GC's due work, while `delivery_observation_deadline` remains the live-observation exception.
 - Fix caller heartbeat long-term lifecycle: pre-bound `caller_automation_id`, normal `pause` / `update` / `reuse`, no normal-path delete, and operator-only unbind / destroy.

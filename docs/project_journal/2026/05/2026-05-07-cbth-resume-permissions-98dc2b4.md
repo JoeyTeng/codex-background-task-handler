@@ -5,7 +5,7 @@ status: completed
 created: 2026-05-07
 updated: 2026-05-07
 branch: wip/cbth-resume-permissions
-pr:
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/43
 supersedes: []
 superseded_by:
 ---
@@ -43,9 +43,11 @@ superseded_by:
 
 ## Next Steps
 
-- Implement the CLI surface and permission snapshot model.
-- Add store/schema support for startup permission snapshots and drift audit evidence.
-- Update fake app-server tests and run the relevant Rust test suites before review.
+These follow-ups are intentionally deferred out of PR #43 and should happen in this order:
+
+1. **Native resume cwd parity**: make `cbth resume` match Codex's default resume UX instead of silently treating the caller cwd as the only working-directory choice. Explicit forwarded `--cd` / `-C` should keep bypassing the prompt, but the no-override path should let the operator choose between the current directory and the thread's prior directory before the sidecar materializes startup state.
+2. **Exact permission profile migration**: prefer `thread/resume.permissionProfile` as the canonical read-side permission snapshot when Codex provides it, keep legacy `approvalPolicy` / `sandbox` fallback for older or unrepresentable app-server responses, and continue emitting legacy pinned `approvalPolicy` / `sandboxPolicy` on `turn/start` until Codex adds a request-side permission-profile override.
+3. **Codex CLI compatibility pinning**: add a soft validated-version range and capability-shape warning around managed startup and `cbth doctor cli`. The warning should tell users when the local Codex CLI is outside the cbth-tested range and should write diagnostics/audit evidence, but actual execution should fail only when required protocol fields are missing or cannot be parsed safely.
 
 ## Evidence
 
