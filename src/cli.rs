@@ -2997,8 +2997,8 @@ fn apply_codex_config_override(
     };
     let value = strip_cli_value_quotes(raw_value.trim());
     let key = key.trim();
-    reject_permission_affecting_codex_config_override(key)?;
-    let normalized_key = key.replace('-', "_");
+    let normalized_key = normalize_codex_config_key_for_match(key)?;
+    reject_permission_affecting_codex_config_override(key, &normalized_key)?;
     match normalized_key.as_str() {
         "model" => {
             params.insert("model".to_owned(), Value::String(value.to_owned()));
@@ -3022,18 +3022,93 @@ fn apply_codex_config_override(
     Ok(())
 }
 
-fn reject_permission_affecting_codex_config_override(key: &str) -> Result<()> {
-    if managed_resume_config_override_affects_sandbox_scope(key) {
+fn reject_permission_affecting_codex_config_override(
+    original_key: &str,
+    normalized_key: &str,
+) -> Result<()> {
+    if managed_resume_config_override_affects_sandbox_scope(normalized_key) {
         bail!(
-            "managed resume does not allow forwarded --config sandbox/permission override {key:?}; cbth cannot faithfully carry it into initial thread/resume"
+            "managed resume does not allow forwarded --config sandbox/permission override {original_key:?}; cbth cannot faithfully carry it into initial thread/resume"
         );
     }
     Ok(())
 }
 
+fn normalize_codex_config_key_for_match(key: &str) -> Result<String> {
+    let mut remaining = key.trim();
+    let mut segments = Vec::new();
+    while !remaining.is_empty() {
+        let (segment, rest) = if remaining.starts_with('"') {
+            parse_basic_config_key_segment(remaining)?
+        } else if remaining.starts_with('\'') {
+            parse_literal_config_key_segment(remaining)?
+        } else {
+            let split_at = remaining.find('.').unwrap_or(remaining.len());
+            (
+                remaining[..split_at].trim().to_owned(),
+                &remaining[split_at..],
+            )
+        };
+        if segment.is_empty() {
+            bail!(
+                "managed resume does not allow forwarded --config override {key:?}; empty config key segment"
+            )
+        }
+        segments.push(segment.replace('-', "_"));
+        remaining = rest.trim_start();
+        if remaining.is_empty() {
+            break;
+        }
+        let Some(next) = remaining.strip_prefix('.') else {
+            bail!(
+                "managed resume does not allow forwarded --config override {key:?}; malformed quoted config key"
+            )
+        };
+        remaining = next.trim_start();
+        if remaining.is_empty() {
+            bail!(
+                "managed resume does not allow forwarded --config override {key:?}; trailing dotted config key"
+            )
+        }
+    }
+    if segments.is_empty() {
+        bail!("managed resume does not allow forwarded --config override {key:?}; empty config key")
+    }
+    Ok(segments.join("."))
+}
+
+fn parse_basic_config_key_segment(input: &str) -> Result<(String, &str)> {
+    let mut output = String::new();
+    let mut escaped = false;
+    for (offset, ch) in input[1..].char_indices() {
+        let absolute = 1 + offset;
+        if escaped {
+            output.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Ok((output, &input[absolute + ch.len_utf8()..])),
+            _ => output.push(ch),
+        }
+    }
+    bail!(
+        "managed resume does not allow forwarded --config override {input:?}; unterminated quoted config key"
+    )
+}
+
+fn parse_literal_config_key_segment(input: &str) -> Result<(String, &str)> {
+    let Some(offset) = input[1..].find('\'') else {
+        bail!(
+            "managed resume does not allow forwarded --config override {input:?}; unterminated quoted config key"
+        )
+    };
+    let end = 1 + offset;
+    Ok((input[1..end].to_owned(), &input[end + 1..]))
+}
+
 fn managed_resume_config_override_affects_sandbox_scope(key: &str) -> bool {
-    let normalized = key.replace('-', "_");
-    let key = normalized.as_str();
     key == "sandbox_workspace_write"
         || key
             .strip_prefix("sandbox_workspace_write.")

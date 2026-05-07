@@ -2712,6 +2712,7 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
         vec!["-c", "sandbox_read_only.readable_roots=[\"/tmp/read\"]"],
         vec!["-csandbox-workspace-write.exclude-slash-tmp=false"],
         vec!["--config=approval_policy=\"never\""],
+        vec!["--config=\"sandbox_mode\"=\"workspace-write\""],
         vec!["--config=sandbox_mode=\"workspace-write\""],
         vec!["--config", "sandbox_permissions.mode=\"workspace-write\""],
         vec!["--config=permissions.network.enabled=true"],
@@ -2740,6 +2741,8 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
         vec!["--config=features.experimental=true"],
         vec!["--config", "features={web_search=true}"],
         vec!["--config=web_search=\"live\""],
+        vec!["--config=tools.\"web_search\".context_size=\"high\""],
+        vec!["--config=\"tools\".\"web_search\".context_size=\"high\""],
         vec!["--config=tools.web_search.context_size=\"high\""],
         vec!["--config", "tools={web_search={context_size=\"high\"}}"],
     ];
