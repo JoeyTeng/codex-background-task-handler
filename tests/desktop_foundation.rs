@@ -1071,6 +1071,60 @@ fn desktop_writeback_helpers_fail_closed_for_stale_or_unsafe_inputs() {
             "binding",
             "repair",
             "--source-thread-id",
+            "thread-active-conflict",
+            "--caller-automation-id",
+            "automation-active-conflict",
+            "--json",
+            "--now",
+            "3002",
+        ],
+    );
+    let active_conflict_batch = create_desktop_batch_and_prepared_attempt(
+        &home,
+        "thread-active-conflict",
+        "attempt-active-conflict-old",
+        1,
+        3003,
+    );
+    force_desktop_attempt_arm_pending(&home, "attempt-active-conflict-old", 3004);
+    insert_desktop_prepared_attempt(
+        &home,
+        "thread-active-conflict",
+        &active_conflict_batch,
+        "attempt-active-conflict-new",
+        2,
+        3005,
+    );
+    let active_conflict = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-active-conflict",
+            "--attempt-id",
+            "attempt-active-conflict-new",
+            "--generation",
+            "2",
+            "--bridge-request-id",
+            "bridge-request-active-conflict",
+            "--json",
+            "--now",
+            "3006",
+        ],
+    );
+    assert!(
+        active_conflict
+            .contains("thread thread-active-conflict already has active delivery attempt")
+    );
+
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
             "thread-expired-lease",
             "--caller-automation-id",
             "automation-expired-lease",

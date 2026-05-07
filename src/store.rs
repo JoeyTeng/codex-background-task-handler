@@ -1886,6 +1886,7 @@ impl Store {
         match attempt.state.as_str() {
             "prepared" => {
                 ensure_desktop_binding_quiesced_for_fresh_arm(&binding)?;
+                ensure_no_other_active_attempt_for_thread_tx(&tx, source_thread_id, attempt_id)?;
                 ensure_attempt_budget_remaining(&batch)?;
                 let bridge_arm_lease_id = new_id();
                 let bridge_arm_lease_deadline = checked_timestamp_add(
@@ -4149,6 +4150,32 @@ fn ensure_no_active_attempt_for_thread_tx(
         .optional()?;
     if let Some(attempt_id) = active {
         bail!("thread {source_thread_id} already has active delivery attempt {attempt_id}");
+    }
+    Ok(())
+}
+
+fn ensure_no_other_active_attempt_for_thread_tx(
+    tx: &Transaction<'_>,
+    source_thread_id: &str,
+    attempt_id: &str,
+) -> Result<()> {
+    let active: Option<String> = tx
+        .query_row(
+            "SELECT delivery_attempts.attempt_id
+             FROM delivery_attempts
+             JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+             WHERE delivery_attempts.source_thread_id = ?
+               AND delivery_attempts.attempt_id != ?
+               AND delivery_attempts.state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown')
+               AND batches.state = 'open'
+             ORDER BY delivery_attempts.generation DESC, delivery_attempts.attempt_id DESC
+             LIMIT 1",
+            params![source_thread_id, attempt_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(active_attempt_id) = active {
+        bail!("thread {source_thread_id} already has active delivery attempt {active_attempt_id}");
     }
     Ok(())
 }
