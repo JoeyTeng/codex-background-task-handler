@@ -2572,7 +2572,13 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
             "projects={\"/tmp/project\"={trust_level=\"trusted\"}}",
         ],
         vec!["--config=trust_level=\"trusted\""],
+        vec!["--config=use_legacy_landlock=true"],
+        vec!["-cuse-legacy-landlock=true"],
+        vec!["--config=request_permissions=true"],
         vec!["--config=features.web_search=true"],
+        vec!["--config=features.use_legacy_landlock=true"],
+        vec!["--config=features.request_permissions=true"],
+        vec!["--config=features.experimental=true"],
         vec!["--config", "features={web_search=true}"],
         vec!["--config=web_search=\"live\""],
         vec!["--config=tools.web_search.context_size=\"high\""],
@@ -2740,6 +2746,10 @@ fn cbth_resume_rejects_forwarded_live_web_search() {
         vec!["--enable=web-search"],
         vec!["--enable", "web_search_request"],
         vec!["--enable=web-search-request"],
+        vec!["--enable", "use_legacy_landlock"],
+        vec!["--enable=request_permissions"],
+        vec!["--disable", "use_legacy_landlock"],
+        vec!["--disable=request_permissions"],
     ];
 
     for (index, args) in cases.into_iter().enumerate() {
@@ -2771,7 +2781,7 @@ fn cbth_resume_rejects_forwarded_live_web_search() {
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("live web search tool enablement"),
+            stderr.contains("managed resume does not allow forwarded"),
             "unexpected stderr: {stderr}"
         );
         let log = fs::read_to_string(&log_path).unwrap_or_default();

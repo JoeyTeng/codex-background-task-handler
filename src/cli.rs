@@ -2113,8 +2113,9 @@ fn foreground_codex_args(
         } else if let Some(flag) = managed_resume_search_override_flag(&arg) {
             reject_managed_resume_search_override(flag)?;
         } else if let Some(feature) = arg.strip_prefix("--enable=") {
-            reject_managed_resume_live_web_search_feature("--enable", feature)?;
-            filtered.push(codex_args[index].clone());
+            reject_managed_resume_feature_override("--enable", feature)?;
+        } else if let Some(feature) = arg.strip_prefix("--disable=") {
+            reject_managed_resume_feature_override("--disable", feature)?;
         } else if let Some(value) = arg.strip_prefix("--cd=") {
             foreground_cwd = Some(resolve_codex_cwd_arg(caller_cwd, OsStr::new(value)));
         } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
@@ -2138,17 +2139,18 @@ fn foreground_codex_args(
                         resolve_codex_cwd_arg(caller_cwd, value)
                     });
                 }
-                "--model" | "-m" | "--profile" | "-p" | "--config" | "-c" | "--local-provider"
-                | "--disable" => {
+                "--model" | "-m" | "--profile" | "-p" | "--config" | "-c" | "--local-provider" => {
                     let start = index;
                     skip_codex_arg_value(codex_args, &mut index, arg.as_str())?;
                     filtered.extend(codex_args[start..=index].iter().cloned());
                 }
                 "--enable" => {
-                    let start = index;
                     let feature = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
-                    reject_managed_resume_live_web_search_feature(arg.as_str(), &feature)?;
-                    filtered.extend(codex_args[start..=index].iter().cloned());
+                    reject_managed_resume_feature_override(arg.as_str(), &feature)?;
+                }
+                "--disable" => {
+                    let feature = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    reject_managed_resume_feature_override(arg.as_str(), &feature)?;
                 }
                 "--add-dir" => {
                     reject_managed_resume_add_dir_override(arg.as_str())?;
@@ -2246,19 +2248,9 @@ fn reject_managed_resume_search_override(flag: &str) -> Result<()> {
     )
 }
 
-fn reject_managed_resume_live_web_search_feature(flag: &str, feature: &str) -> Result<()> {
-    if codex_feature_enables_live_web_search(feature) {
-        bail!(
-            "managed resume does not allow forwarded {flag} {feature:?}; Codex thread/resume cannot faithfully carry live web search tool enablement"
-        );
-    }
-    Ok(())
-}
-
-fn codex_feature_enables_live_web_search(feature: &str) -> bool {
-    matches!(
-        feature.trim().replace('-', "_").as_str(),
-        "web_search" | "web_search_request" | "search"
+fn reject_managed_resume_feature_override(flag: &str, feature: &str) -> Result<()> {
+    bail!(
+        "managed resume does not allow forwarded {flag} {feature:?}; Codex thread/resume cannot faithfully carry feature overrides"
     )
 }
 
@@ -2465,7 +2457,9 @@ fn apply_codex_resume_foreground_args(
         } else if let Some(flag) = managed_resume_search_override_flag(&arg) {
             reject_managed_resume_search_override(flag)?;
         } else if let Some(feature) = arg.strip_prefix("--enable=") {
-            reject_managed_resume_live_web_search_feature("--enable", feature)?;
+            reject_managed_resume_feature_override("--enable", feature)?;
+        } else if let Some(feature) = arg.strip_prefix("--disable=") {
+            reject_managed_resume_feature_override("--disable", feature)?;
         } else if let Some(value) = arg.strip_prefix("--model=") {
             params.insert("model".to_owned(), Value::String(value.to_owned()));
         } else if let Some(value) = arg.strip_prefix("--profile=") {
@@ -2524,10 +2518,11 @@ fn apply_codex_resume_foreground_args(
                 }
                 "--enable" => {
                     let feature = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
-                    reject_managed_resume_live_web_search_feature(arg.as_str(), &feature)?;
+                    reject_managed_resume_feature_override(arg.as_str(), &feature)?;
                 }
                 "--disable" => {
-                    let _ = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    let feature = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    reject_managed_resume_feature_override(arg.as_str(), &feature)?;
                 }
                 "--add-dir" => {
                     reject_managed_resume_add_dir_override(arg.as_str())?;
@@ -2684,6 +2679,10 @@ fn managed_resume_config_override_affects_sandbox_scope(key: &str) -> bool {
         || key.starts_with("projects.")
         || key == "trust_level"
         || key.ends_with(".trust_level")
+        || key == "use_legacy_landlock"
+        || key.starts_with("use_legacy_landlock.")
+        || key == "request_permissions"
+        || key.starts_with("request_permissions.")
         || key == "writable_roots"
         || key.ends_with(".writable_roots")
         || key == "readable_roots"
@@ -2691,12 +2690,7 @@ fn managed_resume_config_override_affects_sandbox_scope(key: &str) -> bool {
         || key == "network_access"
         || key.ends_with(".network_access")
         || key == "features"
-        || key == "features.web_search"
-        || key.starts_with("features.web_search.")
-        || key == "features.web_search_request"
-        || key.starts_with("features.web_search_request.")
-        || key == "features.search"
-        || key.starts_with("features.search.")
+        || key.starts_with("features.")
         || key == "web_search"
         || key.starts_with("web_search.")
         || key == "web_search_request"
