@@ -3108,7 +3108,10 @@ fn run_cli_app_server_passive_adapter_once(
     }
 
     if current_state_sync {
-        if config.permission_inputs.uses_auto() && state.startup_permissions.is_none() {
+        if config.auto_delivery_policy.enabled()
+            && config.permission_inputs.uses_auto()
+            && state.startup_permissions.is_none()
+        {
             invalidate_passive_adapter_proof(config, state, Some(running))?;
             bail!("app-server did not provide a trusted startup permission snapshot");
         }
