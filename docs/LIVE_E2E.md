@@ -115,14 +115,15 @@ cbth doctor cli
 Then start a native Codex foreground session through `cbth`:
 
 ```bash
-cbth cli run \
-  --new-thread \
+cbth new \
   --session-allows-approval false \
   --session-allows-network false \
   --session-allows-write-access false \
   --auto-delivery-policy trusted-all \
-  -- --model gpt-5.5
+  --model gpt-5.5
 ```
+
+`cbth new` is equivalent to the fresh-thread `cbth cli run --new-thread` path, but it accepts Codex foreground args directly. The bootstrap carries parsed model/config overrides into `thread/start` and fills missing `model_reasoning_effort` from the app-server's effective config so direct `codex` and managed fresh-thread starts use the same default thinking level.
 
 For an already materialized thread, `cbth resume <thread-id> [-- <codex_args>]` is the preferred native-resume wrapper. The three `--session-allows-*` flags default to `auto` there: the sidecar reads `approvalPolicy` / `sandbox` from `thread/resume`, pins the startup permission snapshot, refreshes current permissions before automatic `turn/start`, and warns/audits if permissions drift. This fresh-thread smoke keeps explicit `false` flags because the unmaterialized `--new-thread` bootstrap may not have a trusted `thread/resume` permission snapshot before the first user message.
 

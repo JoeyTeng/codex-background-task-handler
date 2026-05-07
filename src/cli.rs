@@ -58,7 +58,7 @@ const CLI_APP_SERVER_LEASE_TTL_SECONDS: u64 = 60;
 const CLI_APP_SERVER_LEASE_REFRESH_SECONDS: u64 = 20;
 const CLI_APP_SERVER_ENSURE_TIMEOUT_SECONDS: u64 = 15;
 const CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS: u64 = 5;
-const CLI_THREAD_START_BOOTSTRAP_TIMEOUT_SECONDS: u64 = 20;
+const CLI_THREAD_START_BOOTSTRAP_TIMEOUT_SECONDS: u64 = 30;
 const CLI_APP_SERVER_PASSIVE_CONNECT_TIMEOUT_MS: u64 = 250;
 const CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS: u64 = 3;
 const CLI_APP_SERVER_PASSIVE_RECV_TIMEOUT_MS: u64 = 500;
@@ -85,6 +85,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "cli-app-server-lifecycle",
     "cli-app-server-probe",
     "cli-thread-start-bootstrap",
+    "cli-thread-start-params",
     "cli-session-dispatch",
     "cli-session-capability-dispatch",
     "cli-session-permission-dispatch",
@@ -153,6 +154,8 @@ enum Commands {
     },
     #[command(about = "Resume an existing Codex thread through the managed cbth CLI bridge")]
     Resume(CliResumeArgs),
+    #[command(about = "Start a new Codex thread through the managed cbth CLI bridge")]
+    New(CliNewArgs),
     Cli {
         #[command(subcommand)]
         command: CliCommand,
@@ -723,6 +726,27 @@ struct CliRunArgs {
     codex_args: Vec<OsString>,
 }
 
+#[derive(Debug, Args)]
+struct CliNewArgs {
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_approval: SessionAllowsValue,
+
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_network: SessionAllowsValue,
+
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_write_access: SessionAllowsValue,
+
+    #[arg(long, default_value = "codex")]
+    codex_bin: OsString,
+
+    #[arg(long, value_enum, default_value_t = CliAutoDeliveryPolicy::Off)]
+    auto_delivery_policy: CliAutoDeliveryPolicy,
+
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    codex_args: Vec<OsString>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionAllowsValue {
     Auto,
@@ -1185,6 +1209,21 @@ impl CliSessionRunConfig {
         })
     }
 
+    fn from_cli_new_args(args: CliNewArgs) -> Self {
+        Self {
+            target: CliSessionTargetConfig::NewThread,
+            permission_inputs: CliSessionPermissionInputs {
+                approval: args.session_allows_approval,
+                network: args.session_allows_network,
+                write_access: args.session_allows_write_access,
+            },
+            codex_bin: args.codex_bin,
+            auto_delivery_policy: args.auto_delivery_policy,
+            codex_args: args.codex_args,
+            foreground_mode: CliForegroundMode::Remote,
+        }
+    }
+
     fn from_cli_resume_args(args: CliResumeArgs) -> Self {
         Self {
             target: CliSessionTargetConfig::BindThread {
@@ -1485,6 +1524,15 @@ pub fn run() -> Result<()> {
                 run_cli_session(config, &layout, cli.auto_daemon_startup_timeout_seconds)?;
             std::process::exit(exit_code);
         }
+        Commands::New(args) => {
+            if cli.direct_store {
+                bail!("new does not support --direct-store");
+            }
+            let config = CliSessionRunConfig::from_cli_new_args(args);
+            let exit_code =
+                run_cli_session(config, &layout, cli.auto_daemon_startup_timeout_seconds)?;
+            std::process::exit(exit_code);
+        }
         Commands::Resume(args) => {
             if cli.direct_store {
                 bail!("resume does not support --direct-store");
@@ -1776,6 +1824,7 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
             check: args.check,
             yes: args.yes,
         }),
+        Commands::New(_) => bail!("new must execute from the foreground client"),
         Commands::Resume(_) => bail!("resume must execute from the foreground client"),
         Commands::Cli { command } => dispatch_cli(command, layout),
         Commands::Desktop { command } => dispatch_desktop(command, layout),
@@ -1795,8 +1844,22 @@ fn run_cli_session(
     let lease_id = new_id();
     layout.ensure_run_dir()?;
     warn_if_codex_cli_version_unvalidated(&codex_binary, layout);
-    let mut foreground = foreground_codex_args(&config.foreground_mode, &cwd, &config.codex_args)?;
+    let mut foreground = foreground_codex_args(
+        &config.target,
+        &config.foreground_mode,
+        &cwd,
+        &config.codex_args,
+    )?;
     validate_codex_resume_foreground_args(&config.foreground_mode, &cwd, &foreground.codex_args)?;
+
+    let foreground_cwd = foreground.cwd_arg.as_deref().unwrap_or(&cwd);
+    let thread_start_params = match &config.target {
+        CliSessionTargetConfig::NewThread => Some(initial_thread_start_params(
+            foreground_cwd,
+            &foreground.codex_args,
+        )?),
+        CliSessionTargetConfig::BindThread { .. } => None,
+    };
 
     validate_daemon_autostart_endpoint(layout)?;
     daemon_ensure(
@@ -1807,8 +1870,14 @@ fn run_cli_session(
             startup_sweep_now: Some(now_epoch_seconds()?),
         },
     )?;
-    let target =
-        resolve_cli_run_thread_target(layout, &config.target, &codex_binary, &cwd, &lease_id)?;
+    let target = resolve_cli_run_thread_target(
+        layout,
+        &config.target,
+        &codex_binary,
+        foreground_cwd,
+        &lease_id,
+        thread_start_params,
+    )?;
     let bound_thread_id = target.bound_thread_id.clone();
     reserve_cli_app_server_for_thread(layout, &bound_thread_id, &lease_id).inspect_err(|_| {
         abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
@@ -1995,6 +2064,7 @@ fn resolve_cli_run_thread_target(
     codex_binary: &OsStr,
     cwd: &Path,
     lease_id: &str,
+    thread_start_params: Option<Value>,
 ) -> Result<CliRunThreadTarget> {
     match target {
         CliSessionTargetConfig::BindThread { thread_id } => {
@@ -2017,6 +2087,7 @@ fn resolve_cli_run_thread_target(
             "cwd": cwd,
             "lease_id": lease_id,
             "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
+            "thread_start_params": thread_start_params.unwrap_or_else(|| json!({ "cwd": cwd })),
         }),
         Duration::from_secs(CLI_THREAD_START_BOOTSTRAP_TIMEOUT_SECONDS),
     )?;
@@ -2079,18 +2150,33 @@ struct ForegroundCodexArgs {
     codex_args: Vec<OsString>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedForegroundArgPolicy {
+    Resume,
+    FreshThread,
+}
+
 fn foreground_codex_args(
+    target: &CliSessionTargetConfig,
     foreground_mode: &CliForegroundMode,
     caller_cwd: &Path,
     codex_args: &[OsString],
 ) -> Result<ForegroundCodexArgs> {
-    if !matches!(foreground_mode, CliForegroundMode::Resume { .. }) {
+    let policy = match (target, foreground_mode) {
+        (_, CliForegroundMode::Resume { .. }) => Some(ManagedForegroundArgPolicy::Resume),
+        (CliSessionTargetConfig::NewThread, _) => Some(ManagedForegroundArgPolicy::FreshThread),
+        _ => None,
+    };
+    let Some(policy) = policy else {
         return Ok(ForegroundCodexArgs {
             cwd_arg: Some(caller_cwd.to_path_buf()),
             codex_args: codex_args.to_vec(),
         });
-    }
-    let mut foreground_cwd = None;
+    };
+    let mut foreground_cwd = match policy {
+        ManagedForegroundArgPolicy::Resume => None,
+        ManagedForegroundArgPolicy::FreshThread => Some(caller_cwd.to_path_buf()),
+    };
     let mut filtered = Vec::with_capacity(codex_args.len());
     let mut index = 0;
     while index < codex_args.len() {
@@ -2100,7 +2186,9 @@ fn foreground_codex_args(
             break;
         }
         if arg == "-" || !arg.starts_with('-') {
-            reject_managed_resume_post_prompt_options(codex_args, index + 1)?;
+            if policy == ManagedForegroundArgPolicy::Resume {
+                reject_managed_resume_post_prompt_options(codex_args, index + 1)?;
+            }
             filtered.extend(codex_args[index..].iter().cloned());
             break;
         }
@@ -2108,16 +2196,28 @@ fn foreground_codex_args(
             reject_managed_resume_remote_override(flag)?;
         } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
             reject_managed_resume_add_dir_override(flag)?;
-        } else if let Some(flag) = managed_resume_permission_override_flag(&arg) {
+        } else if policy == ManagedForegroundArgPolicy::Resume
+            && let Some(flag) = managed_resume_permission_override_flag(&arg)
+        {
             reject_managed_resume_permission_override(flag)?;
-        } else if let Some(flag) = managed_resume_search_override_flag(&arg) {
+        } else if policy == ManagedForegroundArgPolicy::Resume
+            && let Some(flag) = managed_resume_search_override_flag(&arg)
+        {
             reject_managed_resume_search_override(flag)?;
-        } else if let Some(flag) = managed_resume_provider_override_flag(&arg) {
+        } else if policy == ManagedForegroundArgPolicy::Resume
+            && let Some(flag) = managed_resume_provider_override_flag(&arg)
+        {
             reject_managed_resume_provider_override(flag)?;
-        } else if let Some(feature) = arg.strip_prefix("--enable=") {
+        } else if policy == ManagedForegroundArgPolicy::Resume
+            && let Some(feature) = arg.strip_prefix("--enable=")
+        {
             reject_managed_resume_feature_override("--enable", feature)?;
-        } else if let Some(feature) = arg.strip_prefix("--disable=") {
+        } else if policy == ManagedForegroundArgPolicy::Resume
+            && let Some(feature) = arg.strip_prefix("--disable=")
+        {
             reject_managed_resume_feature_override("--disable", feature)?;
+        } else if let Some(flag) = managed_cli_unsupported_foreground_flag(&arg) {
+            reject_managed_cli_unsupported_foreground_flag(flag)?;
         } else if let Some(value) = arg.strip_prefix("--cd=") {
             foreground_cwd = Some(resolve_codex_cwd_arg(caller_cwd, OsStr::new(value)));
         } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
@@ -2146,13 +2246,25 @@ fn foreground_codex_args(
                     skip_codex_arg_value(codex_args, &mut index, arg.as_str())?;
                     filtered.extend(codex_args[start..=index].iter().cloned());
                 }
-                "--enable" => {
+                "--sandbox" | "-s" | "--ask-for-approval" | "-a" | "--local-provider"
+                    if policy == ManagedForegroundArgPolicy::FreshThread =>
+                {
+                    let start = index;
+                    skip_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    filtered.extend(codex_args[start..=index].iter().cloned());
+                }
+                "--enable" if policy == ManagedForegroundArgPolicy::Resume => {
                     let feature = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
                     reject_managed_resume_feature_override(arg.as_str(), &feature)?;
                 }
-                "--disable" => {
+                "--disable" if policy == ManagedForegroundArgPolicy::Resume => {
                     let feature = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
                     reject_managed_resume_feature_override(arg.as_str(), &feature)?;
+                }
+                "--enable" | "--disable" => {
+                    let start = index;
+                    skip_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    filtered.extend(codex_args[start..=index].iter().cloned());
                 }
                 "--add-dir" => {
                     reject_managed_resume_add_dir_override(arg.as_str())?;
@@ -2160,8 +2272,16 @@ fn foreground_codex_args(
                 "--remote" | "--remote-auth-token-env" => {
                     reject_managed_resume_remote_override(arg.as_str())?;
                 }
-                "--oss" | "--local-provider" => {
+                "--sandbox" | "-s" | "--ask-for-approval" | "-a"
+                    if policy == ManagedForegroundArgPolicy::Resume =>
+                {
+                    reject_managed_resume_permission_override(arg.as_str())?;
+                }
+                "--oss" | "--local-provider" if policy == ManagedForegroundArgPolicy::Resume => {
                     reject_managed_resume_provider_override(arg.as_str())?;
+                }
+                "--full-auto" => {
+                    reject_managed_cli_unsupported_foreground_flag(arg.as_str())?;
                 }
                 "--image" | "-i" => {
                     let start = index;
@@ -2233,9 +2353,23 @@ fn managed_resume_permission_override_flag(arg: &str) -> Option<&'static str> {
     }
 }
 
+fn managed_cli_unsupported_foreground_flag(arg: &str) -> Option<&'static str> {
+    if arg == "--full-auto" || arg.starts_with("--full-auto=") {
+        Some("--full-auto")
+    } else {
+        None
+    }
+}
+
 fn reject_managed_resume_permission_override(flag: &str) -> Result<()> {
     bail!(
         "managed resume does not allow forwarded {flag}; Codex thread/resume permission scope must come from the managed resume snapshot"
+    )
+}
+
+fn reject_managed_cli_unsupported_foreground_flag(flag: &str) -> Result<()> {
+    bail!(
+        "managed CLI session does not support forwarded {flag}; current interactive Codex does not accept it"
     )
 }
 
@@ -2451,6 +2585,16 @@ fn validate_codex_resume_foreground_args(
     apply_codex_resume_foreground_args(&mut params, caller_cwd, codex_args)
 }
 
+fn initial_thread_start_params(cwd: &Path, codex_args: &[OsString]) -> Result<Value> {
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "cwd".to_owned(),
+        Value::String(path_to_utf8(cwd, "current directory")?),
+    );
+    apply_codex_thread_start_foreground_args(&mut params, cwd, codex_args)?;
+    Ok(Value::Object(params))
+}
+
 fn apply_codex_resume_foreground_args(
     params: &mut serde_json::Map<String, Value>,
     caller_cwd: &Path,
@@ -2560,6 +2704,234 @@ fn apply_codex_resume_foreground_args(
 
     if !config_overrides.is_empty() {
         params.insert("config".to_owned(), Value::Object(config_overrides));
+    }
+    Ok(())
+}
+
+fn apply_codex_thread_start_foreground_args(
+    params: &mut serde_json::Map<String, Value>,
+    caller_cwd: &Path,
+    codex_args: &[OsString],
+) -> Result<()> {
+    let mut config_overrides = serde_json::Map::new();
+    let mut oss = false;
+    let mut local_provider: Option<String> = None;
+    let mut index = 0;
+    while index < codex_args.len() {
+        let arg = os_arg_to_utf8(&codex_args[index], "codex argument")?;
+        if arg == "--" || arg == "-" || !arg.starts_with('-') {
+            break;
+        }
+
+        if let Some(flag) = managed_resume_remote_override_flag(&arg) {
+            reject_managed_resume_remote_override(flag)?;
+        } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
+            reject_managed_resume_add_dir_override(flag)?;
+        } else if let Some(flag) = managed_cli_unsupported_foreground_flag(&arg) {
+            reject_managed_cli_unsupported_foreground_flag(flag)?;
+        } else if let Some(value) = arg.strip_prefix("--model=") {
+            params.insert("model".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("--profile=") {
+            config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("--sandbox=") {
+            params.insert(
+                "sandbox".to_owned(),
+                Value::String(normalize_codex_sandbox_mode(value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("--ask-for-approval=") {
+            params.insert(
+                "approvalPolicy".to_owned(),
+                Value::String(normalize_codex_approval_policy(value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("--cd=") {
+            params.insert(
+                "cwd".to_owned(),
+                Value::String(codex_cwd_arg_to_resume_cwd(caller_cwd, value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            apply_codex_thread_start_config_override(params, &mut config_overrides, value)?;
+        } else if let Some(value) = arg.strip_prefix("--local-provider=") {
+            local_provider = Some(value.to_owned());
+        } else if arg.strip_prefix("--image=").is_some() {
+            skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), true)?;
+        } else if let Some(value) = arg.strip_prefix("-m").filter(|value| !value.is_empty()) {
+            params.insert("model".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("-p").filter(|value| !value.is_empty()) {
+            config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("-s").filter(|value| !value.is_empty()) {
+            params.insert(
+                "sandbox".to_owned(),
+                Value::String(normalize_codex_sandbox_mode(value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("-a").filter(|value| !value.is_empty()) {
+            params.insert(
+                "approvalPolicy".to_owned(),
+                Value::String(normalize_codex_approval_policy(value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
+            params.insert(
+                "cwd".to_owned(),
+                Value::String(codex_cwd_arg_to_resume_cwd(caller_cwd, value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("-c").filter(|value| !value.is_empty()) {
+            apply_codex_thread_start_config_override(params, &mut config_overrides, value)?;
+        } else if arg
+            .strip_prefix("-i")
+            .is_some_and(|value| !value.is_empty())
+        {
+            skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), true)?;
+        } else {
+            match arg.as_str() {
+                "--model" | "-m" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    params.insert("model".to_owned(), Value::String(value));
+                }
+                "--profile" | "-p" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    config_overrides.insert("profile".to_owned(), Value::String(value));
+                }
+                "--sandbox" | "-s" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    params.insert(
+                        "sandbox".to_owned(),
+                        Value::String(normalize_codex_sandbox_mode(&value)?),
+                    );
+                }
+                "--ask-for-approval" | "-a" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    params.insert(
+                        "approvalPolicy".to_owned(),
+                        Value::String(normalize_codex_approval_policy(&value)?),
+                    );
+                }
+                "--cd" | "-C" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    params.insert(
+                        "cwd".to_owned(),
+                        Value::String(codex_cwd_arg_to_resume_cwd(caller_cwd, &value)?),
+                    );
+                }
+                "--config" | "-c" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    apply_codex_thread_start_config_override(
+                        params,
+                        &mut config_overrides,
+                        &value,
+                    )?;
+                }
+                "--local-provider" => {
+                    local_provider =
+                        Some(next_codex_arg_value(codex_args, &mut index, arg.as_str())?);
+                }
+                "--enable" | "--disable" => {
+                    let _ = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                }
+                "--add-dir" => {
+                    reject_managed_resume_add_dir_override(arg.as_str())?;
+                }
+                "--remote" | "--remote-auth-token-env" => {
+                    reject_managed_resume_remote_override(arg.as_str())?;
+                }
+                "--image" | "-i" => {
+                    skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), false)?;
+                }
+                "--oss" => {
+                    oss = true;
+                }
+                "--dangerously-bypass-approvals-and-sandbox" => {
+                    params.insert(
+                        "approvalPolicy".to_owned(),
+                        Value::String("never".to_owned()),
+                    );
+                    params.insert(
+                        "sandbox".to_owned(),
+                        Value::String("danger-full-access".to_owned()),
+                    );
+                }
+                "--full-auto" => {
+                    reject_managed_cli_unsupported_foreground_flag(arg.as_str())?;
+                }
+                "--search"
+                | "--no-alt-screen"
+                | "--last"
+                | "--all"
+                | "--include-non-interactive" => {}
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+
+    if oss {
+        if let Some(provider) = local_provider {
+            params.insert("modelProvider".to_owned(), Value::String(provider));
+        } else if !params.contains_key("modelProvider") {
+            bail!(
+                "managed CLI session requires --local-provider when forwarding --oss; fresh thread/start cannot infer the foreground OSS provider"
+            );
+        }
+        if !params.contains_key("model") {
+            bail!(
+                "managed CLI session requires --model when forwarding --oss; fresh thread/start cannot infer the foreground OSS model"
+            );
+        }
+    }
+    if !config_overrides.is_empty() {
+        params.insert("config".to_owned(), Value::Object(config_overrides));
+    }
+    Ok(())
+}
+
+fn apply_codex_thread_start_config_override(
+    params: &mut serde_json::Map<String, Value>,
+    config_overrides: &mut serde_json::Map<String, Value>,
+    override_arg: &str,
+) -> Result<()> {
+    let Some((key, raw_value)) = override_arg.split_once('=') else {
+        return Ok(());
+    };
+    let value = strip_cli_value_quotes(raw_value.trim());
+    match key.trim() {
+        "model" => {
+            params.insert("model".to_owned(), Value::String(value.to_owned()));
+        }
+        "model_provider" | "model_provider_id" => {
+            params.insert("modelProvider".to_owned(), Value::String(value.to_owned()));
+        }
+        "approval_policy" => {
+            params.insert(
+                "approvalPolicy".to_owned(),
+                Value::String(normalize_codex_approval_policy(value)?),
+            );
+        }
+        "sandbox_mode" => {
+            params.insert(
+                "sandbox".to_owned(),
+                Value::String(normalize_codex_sandbox_mode(value)?),
+            );
+        }
+        "profile" | "config_profile" => {
+            config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
+        }
+        "model_reasoning_effort" => {
+            config_overrides.insert(
+                "model_reasoning_effort".to_owned(),
+                Value::String(value.to_owned()),
+            );
+        }
+        "model_reasoning_summary" => {
+            config_overrides.insert(
+                "model_reasoning_summary".to_owned(),
+                Value::String(value.to_owned()),
+            );
+        }
+        "approvals_reviewer" => {
+            params.insert(
+                "approvalsReviewer".to_owned(),
+                Value::String(normalize_codex_approvals_reviewer(value)?),
+            );
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -2739,6 +3111,25 @@ fn next_codex_arg_value(args: &[OsString], index: &mut usize, flag: &str) -> Res
         bail!("codex argument {flag} requires a value");
     };
     os_arg_to_utf8(value, flag)
+}
+
+fn normalize_codex_approval_policy(value: &str) -> Result<String> {
+    match value {
+        "untrusted" | "unless-trusted" | "unless_trusted" => Ok("untrusted".to_owned()),
+        "on-failure" | "on_failure" => Ok("on-failure".to_owned()),
+        "on-request" | "on_request" => Ok("on-request".to_owned()),
+        "never" => Ok("never".to_owned()),
+        other => bail!("unsupported codex approval policy override {other:?}"),
+    }
+}
+
+fn normalize_codex_sandbox_mode(value: &str) -> Result<String> {
+    match value {
+        "read-only" | "read_only" => Ok("read-only".to_owned()),
+        "workspace-write" | "workspace_write" => Ok("workspace-write".to_owned()),
+        "danger-full-access" | "danger_full_access" => Ok("danger-full-access".to_owned()),
+        other => bail!("unsupported codex sandbox override {other:?}"),
+    }
 }
 
 fn normalize_codex_approvals_reviewer(value: &str) -> Result<String> {
@@ -6670,6 +7061,7 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             command: AuditCommand::List(_),
         }
         | Commands::Self_ { .. }
+        | Commands::New(_)
         | Commands::Resume(_)
         | Commands::Cli {
             command: CliCommand::Run(_),
