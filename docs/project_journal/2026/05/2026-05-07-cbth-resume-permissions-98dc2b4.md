@@ -56,6 +56,7 @@ superseded_by:
 - Drift warning/audit now also compares raw `approvalPolicy` / `sandbox` details, so root or read-only access changes are visible even when the derived boolean permissions are unchanged.
 - Proof invalidation and post-turn resync preserve the original startup permission cap for the same foreground managed session; only epoch-local current proof is cleared, and strict-safe delivery requires a refreshed current permission snapshot before reusing recorded risk booleans.
 - Workspace-write pinning preserves safe nested writable-root intersections, such as a current root narrowed to a startup root's subdirectory.
+- Default `auto` reattach no longer treats the fail-closed initial false profile as fixed, avoiding profile-drift replacement after a prior auto-derived effective profile was wider.
 - Explicit no-write effective permissions now downgrade `workspaceWrite` snapshots to a protocol-valid legacy `readOnly` sandboxPolicy instead of emitting rejected read-access fields.
 - Validation:
   - `cargo fmt --check`

@@ -1066,6 +1066,9 @@ struct CliSessionBindArgs {
     #[arg(long, required = true, value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
     session_allows_write_access: bool,
 
+    #[arg(long, hide = true, default_value_t = false)]
+    auto_profile: bool,
+
     #[arg(long, hide = true)]
     now: Option<i64>,
 }
@@ -1645,23 +1648,16 @@ fn run_cli_session(
         abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
     })?;
 
+    let initial_profile = config.permission_inputs.initial_profile();
     let bind = match dispatch(
         Commands::Cli {
             command: CliCommand::Session {
                 command: CliSessionCommand::Bind(CliSessionBindArgs {
                     bound_thread_id: bound_thread_id.clone(),
-                    session_allows_approval: config
-                        .permission_inputs
-                        .initial_profile()
-                        .session_allows_approval,
-                    session_allows_network: config
-                        .permission_inputs
-                        .initial_profile()
-                        .session_allows_network,
-                    session_allows_write_access: config
-                        .permission_inputs
-                        .initial_profile()
-                        .session_allows_write_access,
+                    session_allows_approval: initial_profile.session_allows_approval,
+                    session_allows_network: initial_profile.session_allows_network,
+                    session_allows_write_access: initial_profile.session_allows_write_access,
+                    auto_profile: config.permission_inputs.uses_auto(),
                     now: None,
                 }),
             },
@@ -4883,6 +4879,9 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
                 "--session-allows-write-access",
                 args.session_allows_write_access,
             );
+            if args.auto_profile {
+                argv.push(OsString::from("--auto-profile"));
+            }
             if let Some(now) = args.now {
                 push_i64_arg(&mut argv, "--now", now);
             }
@@ -6085,6 +6084,7 @@ fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
                         session_allows_network: args.session_allows_network,
                         session_allows_write_access: args.session_allows_write_access,
                     },
+                    args.auto_profile,
                     now,
                 )?;
                 Ok(json!({ "cli_session": session }))

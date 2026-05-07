@@ -5097,6 +5097,7 @@ mod tests {
                     session_allows_network: false,
                     session_allows_write_access: false,
                 },
+                false,
                 100,
             )
             .expect("attach CLI managed session");

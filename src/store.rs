@@ -914,6 +914,7 @@ impl Store {
         &mut self,
         bound_thread_id: &str,
         profile: CliManagedSessionProfile,
+        auto_profile: bool,
         now: i64,
     ) -> Result<CliManagedSessionAttach> {
         let tx = self
@@ -922,7 +923,7 @@ impl Store {
         if let Some(existing) =
             query_non_retired_cli_managed_session_by_thread_tx(&tx, bound_thread_id)?
         {
-            if ensure_cli_session_profile_matches(&existing, &profile).is_ok()
+            if (auto_profile || ensure_cli_session_profile_matches(&existing, &profile).is_ok())
                 && ensure_cli_session_attachable(&existing).is_ok()
             {
                 ensure_cli_session_has_no_recovery_blockers_tx(&tx, &existing, "reattaching")?;
@@ -5596,6 +5597,7 @@ mod tests {
                     session_allows_network: false,
                     session_allows_write_access: false,
                 },
+                false,
                 0,
             )
             .expect("bind CLI session");

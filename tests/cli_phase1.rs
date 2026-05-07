@@ -865,6 +865,71 @@ fn cli_session_bind_replaces_retire_eligible_detached_profile_drift() {
 }
 
 #[test]
+fn cli_session_bind_auto_profile_reattaches_existing_effective_profile() {
+    let home = tempfile::tempdir().expect("temp home");
+    let managed_session_id = bind_cli_session(&home, "thread-cli-auto-profile");
+    let snapshot = json!({
+        "approvalPolicy": "on-request",
+        "sandbox": {
+            "type": "workspaceWrite",
+            "networkAccess": true,
+            "writableRoots": ["/tmp/work"],
+            "readOnlyAccess": {
+                "type": "all"
+            }
+        },
+        "derived": {
+            "allows_approval": true,
+            "allows_network": true,
+            "allows_write_access": true
+        },
+        "effective": {
+            "allows_approval": true,
+            "allows_network": true,
+            "allows_write_access": true
+        }
+    })
+    .to_string();
+    note_cli_session_permissions(
+        &home,
+        &managed_session_id,
+        Some((true, true, true)),
+        (true, true, true),
+        &snapshot,
+    );
+    set_cli_session_state(&home, &managed_session_id, "detached");
+
+    let attached = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-auto-profile",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "false",
+            "--auto-profile",
+            "--now",
+            "800",
+        ],
+    );
+    assert_eq!(attached["cli_session"]["outcome"], "attached");
+    assert_eq!(
+        attached["cli_session"]["session"]["managed_session_id"],
+        managed_session_id
+    );
+    assert_eq!(
+        attached["cli_session"]["session"]["session_allows_write_access"],
+        true
+    );
+}
+
+#[test]
 fn cli_session_bind_replaces_parked_after_manual_batch_closes() {
     let home = tempfile::tempdir().expect("temp home");
     let (_batch_id, attempt_id, old_session) =
