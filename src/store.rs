@@ -1838,7 +1838,6 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let binding = query_desktop_binding_tx(&tx, source_thread_id)?;
         ensure_desktop_binding_bound_for_arm(&binding)?;
-        ensure_desktop_binding_quiesced_for_fresh_arm(&binding, generation)?;
         let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
         ensure_desktop_attempt_tokens(&attempt, source_thread_id, generation)?;
         let batch = query_batch_tx(&tx, &attempt.batch_id)?;
@@ -1846,6 +1845,7 @@ impl Store {
 
         match attempt.state.as_str() {
             "prepared" => {
+                ensure_desktop_binding_quiesced_for_fresh_arm(&binding)?;
                 ensure_attempt_budget_remaining(&batch)?;
                 let bridge_arm_lease_id = new_id();
                 let bridge_arm_lease_deadline = checked_timestamp_add(
@@ -2086,6 +2086,26 @@ impl Store {
              WHERE delivery_attempts.adapter_kind = 'desktop'
                AND delivery_attempts.state = 'arm_pending'
                AND batches.state = 'open'
+               AND batches.batch_id = (
+                 SELECT head.batch_id
+                 FROM batches AS head
+                 WHERE head.source_thread_id = batches.source_thread_id
+                   AND head.state = 'open'
+                 ORDER BY head.created_at ASC, head.batch_id ASC
+                 LIMIT 1
+               )
+               AND batches.replay_policy = 'automatic'
+               AND batches.delivery_read_only = 1
+               AND batches.delivery_requires_approval = 0
+               AND batches.delivery_requires_network = 0
+               AND batches.delivery_requires_write_access = 0
+               AND batches.requires_artifact_read = 0
+               AND delivery_attempts.generation = (
+                 SELECT MAX(current_attempt.generation)
+                 FROM delivery_attempts AS current_attempt
+                 WHERE current_attempt.batch_id = delivery_attempts.batch_id
+               )
+               AND desktop_bindings.binding_state = 'bound'
              ORDER BY delivery_attempts.arm_pending_deadline ASC,
                       delivery_attempts.updated_at ASC,
                       delivery_attempts.attempt_id ASC",
@@ -4705,13 +4725,9 @@ fn ensure_desktop_binding_bound_for_arm(binding: &DesktopBindingRecord) -> Resul
     }
 }
 
-fn ensure_desktop_binding_quiesced_for_fresh_arm(
-    binding: &DesktopBindingRecord,
-    generation: i64,
-) -> Result<()> {
+fn ensure_desktop_binding_quiesced_for_fresh_arm(binding: &DesktopBindingRecord) -> Result<()> {
     if let Some(armed_generation) = binding.armed_generation
         && binding.armed_generation_quiesced_at.is_none()
-        && armed_generation != generation
     {
         bail!(
             "Desktop binding {} still has unquiesced armed_generation {}",

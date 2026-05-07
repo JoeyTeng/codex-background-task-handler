@@ -172,6 +172,31 @@ fn insert_desktop_prepared_attempt(
     .expect("insert prepared Desktop attempt");
 }
 
+fn force_desktop_attempt_arm_pending(home: &TempDir, attempt_id: &str, now: i64) {
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE delivery_attempts
+         SET state = 'arm_pending',
+             bridge_request_id = ?,
+             bridge_arm_lease_id = ?,
+             bridge_arm_lease_deadline = ?,
+             arm_pending_since = ?,
+             arm_pending_deadline = ?,
+             updated_at = ?
+         WHERE attempt_id = ?",
+        params![
+            format!("bridge-request-{attempt_id}"),
+            format!("lease-{attempt_id}"),
+            now + 300,
+            now,
+            now + 300,
+            now,
+            attempt_id,
+        ],
+    )
+    .expect("force Desktop arm_pending attempt");
+}
+
 #[test]
 fn desktop_installation_state_defaults_and_repairs_without_extra_writes() {
     let home = temp_home();
@@ -647,6 +672,259 @@ fn desktop_note_arm_pending_and_note_arm_are_idempotent_and_exported() {
         "thread-desktop-writeback"
     );
     assert_eq!(pause_entries[0]["armed_generation"], 1);
+
+    cbth(
+        &home,
+        &[
+            "batch",
+            "close-head",
+            "--source-thread-id",
+            "thread-desktop-writeback",
+            "--reason",
+            "operator-confirmed-delivery",
+        ],
+    );
+    create_desktop_batch_and_prepared_attempt(
+        &home,
+        "thread-desktop-writeback",
+        "attempt-desktop-writeback-next",
+        1,
+        2300,
+    );
+    let unquiesced_retry = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-desktop-writeback",
+            "--attempt-id",
+            "attempt-desktop-writeback-next",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-next",
+            "--json",
+            "--now",
+            "2301",
+        ],
+    );
+    assert!(unquiesced_retry.contains("still has unquiesced armed_generation 1"));
+}
+
+#[test]
+fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
+    let degraded_home = temp_home();
+    cbth(
+        &degraded_home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-degraded-export",
+            "--caller-automation-id",
+            "automation-degraded-export",
+            "--json",
+            "--now",
+            "2400",
+        ],
+    );
+    create_desktop_batch_and_prepared_attempt(
+        &degraded_home,
+        "thread-degraded-export",
+        "attempt-degraded-export",
+        1,
+        2401,
+    );
+    force_desktop_attempt_arm_pending(&degraded_home, "attempt-degraded-export", 2402);
+    let current = cbth(
+        &degraded_home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--json",
+            "--now",
+            "2403",
+        ],
+    );
+    assert_eq!(
+        current["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["count"],
+        1
+    );
+    cbth(
+        &degraded_home,
+        &[
+            "desktop",
+            "installation-state",
+            "repair",
+            "--read-transport",
+            "direct-file-read",
+            "--validation-fingerprint",
+            "drifted-fingerprint",
+            "--json",
+            "--now",
+            "2404",
+        ],
+    );
+    let degraded = cbth(
+        &degraded_home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--json",
+            "--now",
+            "2405",
+        ],
+    );
+    assert_eq!(
+        degraded["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["count"],
+        0
+    );
+
+    let non_head_home = temp_home();
+    cbth(
+        &non_head_home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-non-head-export",
+            "--caller-automation-id",
+            "automation-non-head-export",
+            "--json",
+            "--now",
+            "2500",
+        ],
+    );
+    create_desktop_batch_and_prepared_attempt(
+        &non_head_home,
+        "thread-non-head-export",
+        "attempt-head-export",
+        1,
+        2501,
+    );
+    let later_submit = cbth(
+        &non_head_home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-non-head-export",
+            "--summary",
+            "later export batch",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let later_job_id = later_submit["job"]["job_id"].as_str().expect("job id");
+    let later_failed = cbth(
+        &non_head_home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            later_job_id,
+            "--reason",
+            "later ready",
+        ],
+    );
+    let later_batch = later_failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("later batch");
+    insert_desktop_prepared_attempt(
+        &non_head_home,
+        "thread-non-head-export",
+        later_batch,
+        "attempt-non-head-export",
+        1,
+        2502,
+    );
+    force_desktop_attempt_arm_pending(&non_head_home, "attempt-non-head-export", 2503);
+    let non_head = cbth(
+        &non_head_home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--json",
+            "--now",
+            "2504",
+        ],
+    );
+    assert_eq!(
+        non_head["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["count"],
+        0
+    );
+
+    let stale_generation_home = temp_home();
+    cbth(
+        &stale_generation_home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-stale-generation-export",
+            "--caller-automation-id",
+            "automation-stale-generation-export",
+            "--json",
+            "--now",
+            "2600",
+        ],
+    );
+    let stale_generation_batch = create_desktop_batch_and_prepared_attempt(
+        &stale_generation_home,
+        "thread-stale-generation-export",
+        "attempt-stale-generation-export",
+        1,
+        2601,
+    );
+    force_desktop_attempt_arm_pending(
+        &stale_generation_home,
+        "attempt-stale-generation-export",
+        2602,
+    );
+    insert_desktop_prepared_attempt(
+        &stale_generation_home,
+        "thread-stale-generation-export",
+        &stale_generation_batch,
+        "attempt-current-generation-export",
+        2,
+        2603,
+    );
+    let stale_generation = cbth(
+        &stale_generation_home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--json",
+            "--now",
+            "2604",
+        ],
+    );
+    assert_eq!(
+        stale_generation["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["count"],
+        0
+    );
 }
 
 #[test]
