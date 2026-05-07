@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use rusqlite::ErrorCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::artifact::{ingest_result_file, remove_ingest_marker_best_effort};
 use crate::cli_app_server_client::AppServerJsonRpcClient;
@@ -256,6 +256,8 @@ struct CliThreadStartPayload {
     cwd: String,
     lease_id: String,
     lease_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    thread_start_params: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3753,10 +3755,11 @@ fn start_cli_thread(
         client
             .notify_initialized()
             .context("notify bootstrap cli app-server initialized")?;
+        let thread_start_params = cli_thread_start_params(&mut client, &payload)?;
         let started = client
             .request(
                 "thread/start",
-                json!({ "cwd": payload.cwd }),
+                thread_start_params,
                 CLI_THREAD_START_BOOTSTRAP_REQUEST_TIMEOUT,
             )
             .context("bootstrap cli thread/start")?;
@@ -3790,6 +3793,102 @@ fn start_cli_thread(
         }
     }
     result
+}
+
+fn cli_thread_start_params(
+    client: &mut AppServerJsonRpcClient,
+    payload: &CliThreadStartPayload,
+) -> Result<Value> {
+    let mut params = match payload
+        .thread_start_params
+        .clone()
+        .unwrap_or_else(|| json!({ "cwd": payload.cwd.clone() }))
+    {
+        Value::Object(params) => params,
+        _ => bail!("thread_start_params must be an object"),
+    };
+    let cwd = match params.get("cwd").and_then(Value::as_str) {
+        Some(cwd) if !cwd.is_empty() => cwd.to_owned(),
+        _ => {
+            params.insert("cwd".to_owned(), Value::String(payload.cwd.clone()));
+            payload.cwd.clone()
+        }
+    };
+
+    // The app-server's fresh thread defaults can lag behind the foreground CLI
+    // defaults. Echo only the stable effective config values that affect the
+    // model picker display, unless the caller supplied an explicit override.
+    if let Some(config) = read_effective_codex_config(client, &cwd)? {
+        merge_effective_config_into_thread_start_params(&mut params, &config)?;
+    }
+
+    Ok(Value::Object(params))
+}
+
+fn read_effective_codex_config(
+    client: &mut AppServerJsonRpcClient,
+    cwd: &str,
+) -> Result<Option<Map<String, Value>>> {
+    let response = match client.request(
+        "config/read",
+        json!({
+            "cwd": cwd,
+            "includeLayers": false,
+        }),
+        CLI_THREAD_START_BOOTSTRAP_REQUEST_TIMEOUT,
+    ) {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    Ok(response.get("config").and_then(Value::as_object).cloned())
+}
+
+fn merge_effective_config_into_thread_start_params(
+    params: &mut Map<String, Value>,
+    config: &Map<String, Value>,
+) -> Result<()> {
+    if !params.contains_key("model")
+        && let Some(model) = config.get("model").filter(|value| !value.is_null())
+    {
+        params.insert("model".to_owned(), model.clone());
+    }
+    if !params.contains_key("modelProvider")
+        && let Some(provider) = config
+            .get("model_provider")
+            .filter(|value| !value.is_null())
+    {
+        params.insert("modelProvider".to_owned(), provider.clone());
+    }
+
+    let mut config_overrides = Map::new();
+    for key in ["model_reasoning_effort", "model_reasoning_summary"] {
+        if !thread_start_config_contains(params, key)?
+            && let Some(value) = config.get(key).filter(|value| !value.is_null())
+        {
+            config_overrides.insert(key.to_owned(), value.clone());
+        }
+    }
+    if !config_overrides.is_empty() {
+        let thread_config = params
+            .entry("config".to_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(thread_config) = thread_config.as_object_mut() else {
+            bail!("thread_start_params config must be an object");
+        };
+        thread_config.extend(config_overrides);
+    }
+
+    Ok(())
+}
+
+fn thread_start_config_contains(params: &Map<String, Value>, key: &str) -> Result<bool> {
+    let Some(config) = params.get("config") else {
+        return Ok(false);
+    };
+    let Some(config) = config.as_object() else {
+        bail!("thread_start_params config must be an object");
+    };
+    Ok(config.contains_key(key))
 }
 
 fn promote_cli_thread_start_app_server(
@@ -5570,6 +5669,7 @@ mod tests {
                 cwd: "/tmp".to_owned(),
                 lease_id: "lease-stopped-thread-start".to_owned(),
                 lease_ttl_seconds: None,
+                thread_start_params: None,
             },
         )
         .expect_err("stopped daemon should reject thread/start bootstrap");
@@ -5608,6 +5708,7 @@ mod tests {
                     cwd: home.path().display().to_string(),
                     lease_id: "lease-stopped-thread-start-registration".to_owned(),
                     lease_ttl_seconds: None,
+                    thread_start_params: None,
                 },
             )
         });

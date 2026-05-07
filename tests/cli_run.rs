@@ -437,6 +437,44 @@ fn spawn_fake_app_server_new_thread_then_capture_passive_methods(
 }
 
 #[cfg(unix)]
+fn spawn_fake_app_server_new_thread_then_capture(
+    thread_id: &'static str,
+    observe_duration: Duration,
+) -> (
+    String,
+    mpsc::Receiver<Result<FakeThreadStartCapture, String>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = (|| {
+            let mut capture = accept_fake_app_server_thread_start_capture(
+                &listener,
+                thread_id,
+                FakeThreadStartOutcome::Success,
+            )?;
+            let mut passive_methods = accept_fake_app_server_capture_passive_methods(
+                &listener,
+                thread_id,
+                observe_duration,
+                true,
+                true,
+            )?;
+            capture.methods.append(&mut passive_methods);
+            Ok(capture)
+        })();
+        let _ = done_tx.send(result);
+    });
+
+    (url, done_rx)
+}
+
+#[cfg(unix)]
 fn spawn_fake_app_server_new_thread_then_auto_delivery(
     thread_id: &'static str,
     outcome: FakeAutoDeliveryOutcome,
@@ -783,11 +821,28 @@ fn accept_fake_app_server(
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+struct FakeThreadStartCapture {
+    methods: Vec<String>,
+    thread_start_params: serde_json::Value,
+}
+
+#[cfg(unix)]
 fn accept_fake_app_server_thread_start(
     listener: &TcpListener,
     thread_id: &'static str,
     outcome: FakeThreadStartOutcome,
 ) -> Result<Vec<String>, String> {
+    accept_fake_app_server_thread_start_capture(listener, thread_id, outcome)
+        .map(|capture| capture.methods)
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_thread_start_capture(
+    listener: &TcpListener,
+    thread_id: &'static str,
+    outcome: FakeThreadStartOutcome,
+) -> Result<FakeThreadStartCapture, String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let (mut stream, _) = loop {
         match listener.accept() {
@@ -834,7 +889,25 @@ fn accept_fake_app_server_thread_start(
                 }),
             )?,
             "initialized" => {}
+            "config/read" => {
+                write_fake_json_response(
+                    &mut stream,
+                    &message,
+                    serde_json::json!({
+                        "config": {
+                            "model": "gpt-5.5",
+                            "model_provider": "openai",
+                            "model_reasoning_effort": "xhigh"
+                        },
+                        "origins": {}
+                    }),
+                )?;
+            }
             "thread/start" => {
+                let thread_start_params = message
+                    .get("params")
+                    .cloned()
+                    .ok_or_else(|| format!("thread/start missing params: {message}"))?;
                 let cwd = message
                     .get("params")
                     .and_then(|params| params.get("cwd"))
@@ -855,18 +928,30 @@ fn accept_fake_app_server_thread_start(
                                 }
                             }),
                         )?;
-                        return Ok(methods);
+                        return Ok(FakeThreadStartCapture {
+                            methods,
+                            thread_start_params,
+                        });
                     }
                     FakeThreadStartOutcome::MethodNotFound => {
                         write_fake_json_error(&mut stream, &message, -32601, "method not found")?;
-                        return Ok(methods);
+                        return Ok(FakeThreadStartCapture {
+                            methods,
+                            thread_start_params,
+                        });
                     }
                     FakeThreadStartOutcome::Timeout => {
                         thread::sleep(Duration::from_secs(6));
-                        return Ok(methods);
+                        return Ok(FakeThreadStartCapture {
+                            methods,
+                            thread_start_params,
+                        });
                     }
                     FakeThreadStartOutcome::ClosedBeforeResponse => {
-                        return Ok(methods);
+                        return Ok(FakeThreadStartCapture {
+                            methods,
+                            thread_start_params,
+                        });
                     }
                     FakeThreadStartOutcome::MalformedResponse => {
                         write_fake_json_response(
@@ -874,7 +959,10 @@ fn accept_fake_app_server_thread_start(
                             &message,
                             serde_json::json!({ "thread": {} }),
                         )?;
-                        return Ok(methods);
+                        return Ok(FakeThreadStartCapture {
+                            methods,
+                            thread_start_params,
+                        });
                     }
                 }
             }
@@ -2034,6 +2122,17 @@ fn wait_for_fake_app_server_methods(
 }
 
 #[cfg(unix)]
+fn wait_for_fake_thread_start_capture(
+    done_rx: mpsc::Receiver<Result<FakeThreadStartCapture, String>>,
+) -> FakeThreadStartCapture {
+    match done_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(capture)) => capture,
+        Ok(Err(error)) => panic!("fake app-server failed: {error}"),
+        Err(error) => panic!("timed out waiting for fake app-server: {error}"),
+    }
+}
+
+#[cfg(unix)]
 fn submit_failed_fake_e2e_batch(home: &TempDir, thread_id: &str) -> String {
     let submitted = cbth_direct_json(
         home,
@@ -2674,6 +2773,7 @@ fn cli_run_new_thread_bootstraps_thread_then_preserves_foreground_model() {
         vec![
             "initialize".to_owned(),
             "initialized".to_owned(),
+            "config/read".to_owned(),
             "thread/start".to_owned(),
             "initialize".to_owned(),
             "initialized".to_owned(),
@@ -2704,6 +2804,70 @@ fn cli_run_new_thread_bootstraps_thread_then_preserves_foreground_model() {
         .expect("query managed session");
     assert_eq!(session_count, 1);
     assert_eq!(session_state, "detached");
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_bootstraps_thread_with_direct_codex_args_and_reasoning_default() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_new_thread_then_capture(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--model")
+        .arg("gpt-test")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cbth: bound thread id: thread-cbth-new")
+    );
+
+    let capture = wait_for_fake_thread_start_capture(fake_server_done);
+    assert!(capture.methods.iter().any(|method| method == "config/read"));
+    let expected_cwd = fs::canonicalize(client_cwd.path()).expect("canonical client cwd");
+    assert_eq!(
+        capture.thread_start_params["cwd"],
+        serde_json::json!(expected_cwd.display().to_string())
+    );
+    assert_eq!(
+        capture.thread_start_params["model"],
+        serde_json::json!("gpt-test")
+    );
+    assert_eq!(
+        capture.thread_start_params["modelProvider"],
+        serde_json::json!("openai")
+    );
+    assert_eq!(
+        capture.thread_start_params["config"]["model_reasoning_effort"],
+        serde_json::json!("xhigh")
+    );
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains("\t--model\tgpt-test"));
     stop_daemon(&home);
 }
 

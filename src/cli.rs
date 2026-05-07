@@ -147,6 +147,8 @@ enum Commands {
     },
     #[command(about = "Resume an existing Codex thread through the managed cbth CLI bridge")]
     Resume(CliResumeArgs),
+    #[command(about = "Start a new Codex thread through the managed cbth CLI bridge")]
+    New(CliNewArgs),
     Cli {
         #[command(subcommand)]
         command: CliCommand,
@@ -685,6 +687,27 @@ struct CliRunArgs {
     codex_args: Vec<OsString>,
 }
 
+#[derive(Debug, Args)]
+struct CliNewArgs {
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_approval: SessionAllowsValue,
+
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_network: SessionAllowsValue,
+
+    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    session_allows_write_access: SessionAllowsValue,
+
+    #[arg(long, default_value = "codex")]
+    codex_bin: OsString,
+
+    #[arg(long, value_enum, default_value_t = CliAutoDeliveryPolicy::Off)]
+    auto_delivery_policy: CliAutoDeliveryPolicy,
+
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    codex_args: Vec<OsString>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionAllowsValue {
     Auto,
@@ -1147,6 +1170,21 @@ impl CliSessionRunConfig {
         })
     }
 
+    fn from_cli_new_args(args: CliNewArgs) -> Self {
+        Self {
+            target: CliSessionTargetConfig::NewThread,
+            permission_inputs: CliSessionPermissionInputs {
+                approval: args.session_allows_approval,
+                network: args.session_allows_network,
+                write_access: args.session_allows_write_access,
+            },
+            codex_bin: args.codex_bin,
+            auto_delivery_policy: args.auto_delivery_policy,
+            codex_args: args.codex_args,
+            foreground_mode: CliForegroundMode::Remote,
+        }
+    }
+
     fn from_cli_resume_args(args: CliResumeArgs) -> Self {
         Self {
             target: CliSessionTargetConfig::BindThread {
@@ -1447,6 +1485,15 @@ pub fn run() -> Result<()> {
                 run_cli_session(config, &layout, cli.auto_daemon_startup_timeout_seconds)?;
             std::process::exit(exit_code);
         }
+        Commands::New(args) => {
+            if cli.direct_store {
+                bail!("new does not support --direct-store");
+            }
+            let config = CliSessionRunConfig::from_cli_new_args(args);
+            let exit_code =
+                run_cli_session(config, &layout, cli.auto_daemon_startup_timeout_seconds)?;
+            std::process::exit(exit_code);
+        }
         Commands::Resume(args) => {
             if cli.direct_store {
                 bail!("resume does not support --direct-store");
@@ -1738,6 +1785,7 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
             check: args.check,
             yes: args.yes,
         }),
+        Commands::New(_) => bail!("new must execute from the foreground client"),
         Commands::Resume(_) => bail!("resume must execute from the foreground client"),
         Commands::Cli { command } => dispatch_cli(command, layout),
         Commands::Desktop { command } => dispatch_desktop(command, layout),
@@ -1765,21 +1813,31 @@ fn run_cli_session(
             startup_sweep_now: Some(now_epoch_seconds()?),
         },
     )?;
-    let target =
-        resolve_cli_run_thread_target(layout, &config.target, &codex_binary, &cwd, &lease_id)?;
+    let (foreground_cwd, foreground_codex_args) = match foreground_codex_args(
+        &config.target,
+        &config.foreground_mode,
+        &cwd,
+        &config.codex_args,
+    ) {
+        Ok(args) => args,
+        Err(error) => return Err(error),
+    };
+    let thread_start_params = match &config.target {
+        CliSessionTargetConfig::NewThread => Some(initial_thread_start_params(
+            &foreground_cwd,
+            &foreground_codex_args,
+        )?),
+        CliSessionTargetConfig::BindThread { .. } => None,
+    };
+    let target = resolve_cli_run_thread_target(
+        layout,
+        &config.target,
+        &codex_binary,
+        &foreground_cwd,
+        &lease_id,
+        thread_start_params,
+    )?;
     let bound_thread_id = target.bound_thread_id.clone();
-    let (foreground_cwd, foreground_codex_args) =
-        match foreground_codex_args(&config.foreground_mode, &cwd, &config.codex_args) {
-            Ok(args) => args,
-            Err(error) => {
-                abort_cli_thread_start_bootstrap_best_effort(
-                    layout,
-                    &target.bootstrap_id,
-                    &lease_id,
-                );
-                return Err(error);
-            }
-        };
     let initial_thread_resume_params = match initial_passive_thread_resume_params(
         &config.foreground_mode,
         &bound_thread_id,
@@ -1934,6 +1992,7 @@ fn resolve_cli_run_thread_target(
     codex_binary: &OsStr,
     cwd: &Path,
     lease_id: &str,
+    thread_start_params: Option<Value>,
 ) -> Result<CliRunThreadTarget> {
     match target {
         CliSessionTargetConfig::BindThread { thread_id } => {
@@ -1956,6 +2015,7 @@ fn resolve_cli_run_thread_target(
             "cwd": cwd,
             "lease_id": lease_id,
             "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
+            "thread_start_params": thread_start_params.unwrap_or_else(|| json!({ "cwd": cwd })),
         }),
         Duration::from_secs(CLI_THREAD_START_BOOTSTRAP_TIMEOUT_SECONDS),
     )?;
@@ -2014,11 +2074,14 @@ fn ensure_cli_run_app_server(
 }
 
 fn foreground_codex_args(
+    target: &CliSessionTargetConfig,
     foreground_mode: &CliForegroundMode,
     caller_cwd: &Path,
     codex_args: &[OsString],
 ) -> Result<(PathBuf, Vec<OsString>)> {
-    if !matches!(foreground_mode, CliForegroundMode::Resume { .. }) {
+    if !matches!(foreground_mode, CliForegroundMode::Resume { .. })
+        && !matches!(target, CliSessionTargetConfig::NewThread)
+    {
         return Ok((caller_cwd.to_path_buf(), codex_args.to_vec()));
     }
     let mut foreground_cwd = caller_cwd.to_path_buf();
@@ -2134,6 +2197,16 @@ fn initial_passive_thread_resume_params(
         params.insert("persistExtendedHistory".to_owned(), Value::Bool(true));
         apply_codex_resume_foreground_args(&mut params, cwd, codex_args)?;
     }
+    Ok(Value::Object(params))
+}
+
+fn initial_thread_start_params(cwd: &Path, codex_args: &[OsString]) -> Result<Value> {
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "cwd".to_owned(),
+        Value::String(path_to_utf8(cwd, "current directory")?),
+    );
+    apply_codex_resume_foreground_args(&mut params, cwd, codex_args)?;
     Ok(Value::Object(params))
 }
 
@@ -2355,6 +2428,18 @@ fn apply_codex_config_override(
         }
         "profile" | "config_profile" => {
             config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
+        }
+        "model_reasoning_effort" => {
+            config_overrides.insert(
+                "model_reasoning_effort".to_owned(),
+                Value::String(value.to_owned()),
+            );
+        }
+        "model_reasoning_summary" => {
+            config_overrides.insert(
+                "model_reasoning_summary".to_owned(),
+                Value::String(value.to_owned()),
+            );
         }
         "approvals_reviewer" => {
             params.insert(
@@ -5844,6 +5929,7 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             command: AuditCommand::List(_),
         }
         | Commands::Self_ { .. }
+        | Commands::New(_)
         | Commands::Resume(_)
         | Commands::Cli {
             command: CliCommand::Run(_),
