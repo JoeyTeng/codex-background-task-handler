@@ -1698,6 +1698,12 @@ fn run_cli_session(
         }
     };
     let url = json_string(&app_server["cli_app_server"], "url")?;
+    let initial_thread_resume_params = initial_passive_thread_resume_params(
+        &config.foreground_mode,
+        &bound_thread_id,
+        &cwd,
+        &config.codex_args,
+    )?;
     let refresh_running = Arc::new(AtomicBool::new(true));
     spawn_cli_app_server_lease_refresher(
         layout.clone(),
@@ -1717,6 +1723,7 @@ fn run_cli_session(
             auto_delivery_policy: config.auto_delivery_policy,
             fresh_thread_bootstrap: target.bootstrap_id.is_some(),
             permission_inputs: config.permission_inputs,
+            initial_thread_resume_params,
         });
 
     let mut foreground = Command::new(&codex_binary);
@@ -1852,6 +1859,260 @@ fn ensure_cli_run_app_server(
     )
 }
 
+fn initial_passive_thread_resume_params(
+    foreground_mode: &CliForegroundMode,
+    bound_thread_id: &str,
+    cwd: &Path,
+    codex_args: &[OsString],
+) -> Result<Value> {
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "threadId".to_owned(),
+        Value::String(bound_thread_id.to_owned()),
+    );
+    if matches!(foreground_mode, CliForegroundMode::Resume { .. }) {
+        params.insert(
+            "cwd".to_owned(),
+            Value::String(path_to_utf8(cwd, "current directory")?),
+        );
+        params.insert("persistExtendedHistory".to_owned(), Value::Bool(true));
+        apply_codex_resume_foreground_args(&mut params, codex_args)?;
+    }
+    Ok(Value::Object(params))
+}
+
+fn apply_codex_resume_foreground_args(
+    params: &mut serde_json::Map<String, Value>,
+    codex_args: &[OsString],
+) -> Result<()> {
+    let mut config_overrides = serde_json::Map::new();
+    let mut oss = false;
+    let mut local_provider: Option<String> = None;
+    let mut index = 0;
+    while index < codex_args.len() {
+        let arg = os_arg_to_utf8(&codex_args[index], "codex argument")?;
+        if arg == "--" || arg == "-" || !arg.starts_with('-') {
+            break;
+        }
+
+        if let Some(value) = arg.strip_prefix("--model=") {
+            params.insert("model".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("--profile=") {
+            config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("--sandbox=") {
+            params.insert(
+                "sandbox".to_owned(),
+                Value::String(normalize_codex_sandbox_mode(value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("--ask-for-approval=") {
+            params.insert(
+                "approvalPolicy".to_owned(),
+                Value::String(normalize_codex_approval_policy(value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("--cd=") {
+            params.insert("cwd".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            apply_codex_config_override(params, &mut config_overrides, value)?;
+        } else if let Some(value) = arg.strip_prefix("--local-provider=") {
+            local_provider = Some(value.to_owned());
+        } else if let Some(value) = arg.strip_prefix("-m").filter(|value| !value.is_empty()) {
+            params.insert("model".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("-p").filter(|value| !value.is_empty()) {
+            config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("-s").filter(|value| !value.is_empty()) {
+            params.insert(
+                "sandbox".to_owned(),
+                Value::String(normalize_codex_sandbox_mode(value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("-a").filter(|value| !value.is_empty()) {
+            params.insert(
+                "approvalPolicy".to_owned(),
+                Value::String(normalize_codex_approval_policy(value)?),
+            );
+        } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
+            params.insert("cwd".to_owned(), Value::String(value.to_owned()));
+        } else if let Some(value) = arg.strip_prefix("-c").filter(|value| !value.is_empty()) {
+            apply_codex_config_override(params, &mut config_overrides, value)?;
+        } else {
+            match arg.as_str() {
+                "--model" | "-m" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    params.insert("model".to_owned(), Value::String(value));
+                }
+                "--profile" | "-p" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    config_overrides.insert("profile".to_owned(), Value::String(value));
+                }
+                "--sandbox" | "-s" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    params.insert(
+                        "sandbox".to_owned(),
+                        Value::String(normalize_codex_sandbox_mode(&value)?),
+                    );
+                }
+                "--ask-for-approval" | "-a" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    params.insert(
+                        "approvalPolicy".to_owned(),
+                        Value::String(normalize_codex_approval_policy(&value)?),
+                    );
+                }
+                "--cd" | "-C" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    params.insert("cwd".to_owned(), Value::String(value));
+                }
+                "--config" | "-c" => {
+                    let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                    apply_codex_config_override(params, &mut config_overrides, &value)?;
+                }
+                "--local-provider" => {
+                    local_provider =
+                        Some(next_codex_arg_value(codex_args, &mut index, arg.as_str())?);
+                }
+                "--enable"
+                | "--disable"
+                | "--remote"
+                | "--remote-auth-token-env"
+                | "--image"
+                | "-i" => {
+                    let _ = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                }
+                "--oss" => {
+                    oss = true;
+                }
+                "--dangerously-bypass-approvals-and-sandbox" => {
+                    params.insert(
+                        "approvalPolicy".to_owned(),
+                        Value::String("never".to_owned()),
+                    );
+                    params.insert(
+                        "sandbox".to_owned(),
+                        Value::String("danger-full-access".to_owned()),
+                    );
+                }
+                "--search"
+                | "--no-alt-screen"
+                | "--last"
+                | "--all"
+                | "--include-non-interactive" => {}
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+
+    if oss && let Some(provider) = local_provider {
+        params.insert("modelProvider".to_owned(), Value::String(provider));
+    }
+    if !config_overrides.is_empty() {
+        params.insert("config".to_owned(), Value::Object(config_overrides));
+    }
+    Ok(())
+}
+
+fn apply_codex_config_override(
+    params: &mut serde_json::Map<String, Value>,
+    config_overrides: &mut serde_json::Map<String, Value>,
+    override_arg: &str,
+) -> Result<()> {
+    let Some((key, raw_value)) = override_arg.split_once('=') else {
+        return Ok(());
+    };
+    let value = strip_cli_value_quotes(raw_value.trim());
+    match key.trim() {
+        "model" => {
+            params.insert("model".to_owned(), Value::String(value.to_owned()));
+        }
+        "model_provider" | "model_provider_id" => {
+            params.insert("modelProvider".to_owned(), Value::String(value.to_owned()));
+        }
+        "approval_policy" => {
+            params.insert(
+                "approvalPolicy".to_owned(),
+                Value::String(normalize_codex_approval_policy(value)?),
+            );
+        }
+        "sandbox_mode" => {
+            params.insert(
+                "sandbox".to_owned(),
+                Value::String(normalize_codex_sandbox_mode(value)?),
+            );
+        }
+        "profile" | "config_profile" => {
+            config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
+        }
+        "approvals_reviewer" => {
+            params.insert(
+                "approvalsReviewer".to_owned(),
+                Value::String(normalize_codex_approvals_reviewer(value)?),
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn next_codex_arg_value(args: &[OsString], index: &mut usize, flag: &str) -> Result<String> {
+    *index += 1;
+    let Some(value) = args.get(*index) else {
+        bail!("codex argument {flag} requires a value");
+    };
+    os_arg_to_utf8(value, flag)
+}
+
+fn normalize_codex_approval_policy(value: &str) -> Result<String> {
+    match value {
+        "untrusted" | "unless-trusted" | "unless_trusted" => Ok("untrusted".to_owned()),
+        "on-failure" | "on_failure" => Ok("on-failure".to_owned()),
+        "on-request" | "on_request" => Ok("on-request".to_owned()),
+        "never" => Ok("never".to_owned()),
+        other => bail!("unsupported codex approval policy override {other:?}"),
+    }
+}
+
+fn normalize_codex_sandbox_mode(value: &str) -> Result<String> {
+    match value {
+        "read-only" | "read_only" => Ok("read-only".to_owned()),
+        "workspace-write" | "workspace_write" => Ok("workspace-write".to_owned()),
+        "danger-full-access" | "danger_full_access" => Ok("danger-full-access".to_owned()),
+        other => bail!("unsupported codex sandbox override {other:?}"),
+    }
+}
+
+fn normalize_codex_approvals_reviewer(value: &str) -> Result<String> {
+    match value {
+        "user" => Ok("user".to_owned()),
+        "guardian_subagent" | "guardian-subagent" => Ok("guardian_subagent".to_owned()),
+        other => bail!("unsupported codex approvals reviewer override {other:?}"),
+    }
+}
+
+fn strip_cli_value_quotes(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(value)
+}
+
+fn path_to_utf8(path: &Path, field: &str) -> Result<String> {
+    path.as_os_str()
+        .to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{field} path is not valid UTF-8"))
+}
+
+fn os_arg_to_utf8(value: &OsStr, field: &str) -> Result<String> {
+    value
+        .to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{field} is not valid UTF-8"))
+}
+
 fn abort_cli_thread_start_bootstrap_best_effort(
     layout: &FsLayout,
     bootstrap_id: &Option<String>,
@@ -1942,6 +2203,7 @@ struct CliAppServerPassiveAdapterConfig {
     auto_delivery_policy: CliAutoDeliveryPolicy,
     fresh_thread_bootstrap: bool,
     permission_inputs: CliSessionPermissionInputs,
+    initial_thread_resume_params: Value,
 }
 
 struct CliAppServerPassiveAdapterHandle {
@@ -2470,6 +2732,7 @@ struct CliAppServerPassiveAdapterState {
     last_current_permissions: Option<CliResolvedPermissions>,
     last_current_permission_snapshot: Option<CliPermissionSnapshot>,
     last_effective_permissions: Option<CliResolvedPermissions>,
+    initial_thread_resume_params_sent: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -2525,6 +2788,7 @@ fn spawn_cli_app_server_passive_adapter(
         last_current_permissions: None,
         last_current_permission_snapshot: None,
         last_effective_permissions: None,
+        initial_thread_resume_params_sent: false,
     }));
     let thread_state = Arc::clone(&state);
     let thread_config = config.clone();
@@ -2588,10 +2852,15 @@ fn run_cli_app_server_passive_adapter_once(
     )?;
     client.notify_initialized()?;
 
+    let resume_params = if state.initial_thread_resume_params_sent {
+        json!({ "threadId": config.bound_thread_id })
+    } else {
+        config.initial_thread_resume_params.clone()
+    };
     let (resume_result, resume_messages) = passive_adapter_request(
         &mut client,
         "thread/resume",
-        json!({ "threadId": config.bound_thread_id }),
+        resume_params,
         Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
     );
     let mut thread_resume_capability = false;
@@ -2600,6 +2869,7 @@ fn run_cli_app_server_passive_adapter_once(
     let mut active = false;
     match resume_result {
         Ok(resume) => {
+            state.initial_thread_resume_params_sent = true;
             thread_resume_capability = true;
             match thread_result_activity_snapshot(&resume, &config.bound_thread_id) {
                 ThreadActivitySnapshot::Active => {

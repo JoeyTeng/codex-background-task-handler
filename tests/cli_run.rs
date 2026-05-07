@@ -170,6 +170,25 @@ fn spawn_fake_app_server(thread_id: &'static str) -> (String, mpsc::Receiver<Res
 }
 
 #[cfg(unix)]
+fn spawn_fake_app_server_capture_initial_resume(
+    thread_id: &'static str,
+) -> (String, mpsc::Receiver<Result<serde_json::Value, String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = accept_fake_app_server_capture_initial_resume(&listener, thread_id);
+        let _ = done_tx.send(result);
+    });
+
+    (url, done_rx)
+}
+
+#[cfg(unix)]
 fn spawn_fake_app_server_without_turn_snapshot(
     thread_id: &'static str,
 ) -> (String, mpsc::Receiver<Result<(), String>>) {
@@ -496,6 +515,76 @@ fn spawn_fake_app_server_with_options(
     });
 
     (url, done_rx)
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_capture_initial_resume(
+    listener: &TcpListener,
+    thread_id: &str,
+) -> Result<serde_json::Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(format!("accept fake app-server websocket: {error}")),
+        }
+    };
+
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set fake app-server stream blocking: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("set fake app-server read timeout: {error}"))?;
+    let websocket_accept = read_fake_http_upgrade(&mut stream)?;
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("write fake app-server handshake: {error}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut captured_resume_params = None;
+    let mut saw_thread_read = false;
+    while !saw_thread_read && Instant::now() < deadline {
+        let message = read_fake_client_text_frame(&mut stream)?;
+        let method = message
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match method {
+            "initialize" => write_fake_json_response(
+                &mut stream,
+                &message,
+                serde_json::json!({
+                    "userAgent": "fake-codex",
+                    "codexHome": "/tmp/fake-codex-home",
+                    "platformFamily": "unix",
+                    "platformOs": "macos"
+                }),
+            )?,
+            "initialized" => {}
+            "thread/resume" => {
+                captured_resume_params = message.get("params").cloned();
+                write_fake_thread_response(&mut stream, &message, thread_id, true)?;
+            }
+            "thread/read" => {
+                write_fake_thread_response(&mut stream, &message, thread_id, true)?;
+                saw_thread_read = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_thread_read {
+        return Err("fake app-server did not receive thread/read".to_owned());
+    }
+    captured_resume_params.ok_or_else(|| "fake app-server did not receive thread/resume".to_owned())
 }
 
 #[cfg(unix)]
@@ -2253,6 +2342,68 @@ fn cbth_resume_launches_codex_resume_with_remote_and_cwd() {
     );
     assert!(log.contains(&client_cwd.path().display().to_string()));
     assert!(log.contains("\t--model\tgpt-test"));
+
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cli-resume-overrides";
+    let (app_server_url, captured_resume) = spawn_fake_app_server_capture_initial_resume(thread_id);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("resume")
+        .arg(thread_id)
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--")
+        .arg("--model")
+        .arg("gpt-test")
+        .arg("--profile")
+        .arg("work")
+        .arg("--sandbox")
+        .arg("read-only")
+        .arg("--ask-for-approval")
+        .arg("never")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "1")
+        .output()
+        .expect("run cbth resume");
+
+    assert!(
+        output.status.success(),
+        "cbth resume failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let params = match captured_resume.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(params)) => params,
+        Ok(Err(error)) => panic!("fake app-server failed: {error}"),
+        Err(error) => panic!("timed out waiting for fake app-server: {error}"),
+    };
+    assert_eq!(params["threadId"], serde_json::json!(thread_id));
+    let expected_cwd = fs::canonicalize(client_cwd.path()).expect("canonical client cwd");
+    assert_eq!(
+        params["cwd"],
+        serde_json::json!(expected_cwd.display().to_string())
+    );
+    assert_eq!(params["model"], serde_json::json!("gpt-test"));
+    assert_eq!(params["config"]["profile"], serde_json::json!("work"));
+    assert_eq!(params["sandbox"], serde_json::json!("read-only"));
+    assert_eq!(params["approvalPolicy"], serde_json::json!("never"));
+    assert_eq!(params["persistExtendedHistory"], serde_json::json!(true));
 
     stop_daemon(&home);
 }
