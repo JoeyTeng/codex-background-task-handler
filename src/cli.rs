@@ -2255,17 +2255,38 @@ fn read_managed_resume_thread_cwd(
             Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
         )
         .map_err(anyhow::Error::new)?;
-    let Some(cwd) = thread_read_cwd_from_response(&read) else {
+    let Some(cwd) = thread_read_cwd_from_response(&read, thread_id) else {
         return Ok(None);
     };
     Ok(Some(PathBuf::from(cwd)))
 }
 
-fn thread_read_cwd_from_response(read: &Value) -> Option<&str> {
+fn thread_read_cwd_from_response<'a>(read: &'a Value, thread_id: &str) -> Option<&'a str> {
+    if !thread_read_response_matches_thread(read, thread_id) {
+        return None;
+    }
     read.get("thread")
         .and_then(|thread| thread.get("cwd"))
         .and_then(Value::as_str)
         .or_else(|| read.get("cwd").and_then(Value::as_str))
+}
+
+fn thread_read_response_matches_thread(read: &Value, thread_id: &str) -> bool {
+    let mut matched = false;
+    for candidate in [
+        read.get("thread").and_then(|thread| thread.get("id")),
+        read.get("id"),
+        read.get("threadId"),
+    ] {
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        if candidate.as_str() != Some(thread_id) {
+            return false;
+        }
+        matched = true;
+    }
+    matched
 }
 
 fn select_managed_resume_cwd(caller_cwd: &Path, history_cwd: &Path) -> Result<PathBuf> {
@@ -8422,23 +8443,85 @@ mod tests {
     #[test]
     fn thread_read_cwd_reads_nested_and_top_level_shapes() {
         assert_eq!(
-            thread_read_cwd_from_response(&json!({
-                "thread": { "cwd": "/tmp/thread" },
-                "cwd": "/tmp/top"
-            })),
+            thread_read_cwd_from_response(
+                &json!({
+                    "thread": { "id": "thread-1", "cwd": "/tmp/thread" },
+                    "cwd": "/tmp/top"
+                }),
+                "thread-1"
+            ),
             Some("/tmp/thread")
         );
         assert_eq!(
-            thread_read_cwd_from_response(&json!({
-                "thread": { "id": "thread-1" },
-                "cwd": "/tmp/top"
-            })),
+            thread_read_cwd_from_response(
+                &json!({
+                    "thread": { "id": "thread-1" },
+                    "cwd": "/tmp/top"
+                }),
+                "thread-1"
+            ),
             Some("/tmp/top")
         );
         assert_eq!(
-            thread_read_cwd_from_response(&json!({
-                "thread": { "id": "thread-1" }
-            })),
+            thread_read_cwd_from_response(
+                &json!({
+                    "id": "thread-1",
+                    "cwd": "/tmp/top"
+                }),
+                "thread-1"
+            ),
+            Some("/tmp/top")
+        );
+        assert_eq!(
+            thread_read_cwd_from_response(
+                &json!({
+                    "thread": { "id": "thread-1" }
+                }),
+                "thread-1"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn thread_read_cwd_rejects_missing_or_foreign_thread_id() {
+        assert_eq!(
+            thread_read_cwd_from_response(
+                &json!({
+                    "cwd": "/tmp/top"
+                }),
+                "thread-1"
+            ),
+            None
+        );
+        assert_eq!(
+            thread_read_cwd_from_response(
+                &json!({
+                    "thread": { "cwd": "/tmp/thread" }
+                }),
+                "thread-1"
+            ),
+            None
+        );
+        assert_eq!(
+            thread_read_cwd_from_response(
+                &json!({
+                    "thread": { "id": "thread-other", "cwd": "/tmp/thread" },
+                    "cwd": "/tmp/top"
+                }),
+                "thread-1"
+            ),
+            None
+        );
+        assert_eq!(
+            thread_read_cwd_from_response(
+                &json!({
+                    "thread": { "id": "thread-1" },
+                    "id": "thread-other",
+                    "cwd": "/tmp/top"
+                }),
+                "thread-1"
+            ),
             None
         );
     }

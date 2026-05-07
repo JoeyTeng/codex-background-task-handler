@@ -42,11 +42,13 @@ superseded_by:
   - Internal review then found a permission-profile/legacy write-scope mismatch hole; the fix now rejects canonical profiles whose write entries do not cover legacy writable roots, tmp access, or external sandbox shape.
   - Internal `codex-readonly` fallback found that `thread/read` cwd parsing only handled nested `thread.cwd`, and that permission drift did not report `permissionProfile` body changes. The final fix accepts both nested and top-level cwd response shapes and records `permission_profile` drift when the canonical body changes.
   - Final internal `codex-readonly` review on `origin/master..HEAD` returned `LGTM`.
+  - Clean-context reviewer on PR #45 found that interactive resume cwd probing accepted `thread/read` cwd without proving the response belonged to the requested thread. The fix now requires nested `thread.id`, top-level `id`, or top-level `threadId` to explicitly match before using cwd, and treats missing/foreign ids as no history cwd so native no-`--cd` fallback remains intact.
 - Validation:
   - `cargo fmt --all -- --check`
   - `cargo clippy --locked --all-targets -- -D warnings`
   - `cargo test --locked`
   - `cargo test --locked thread_read_cwd_reads_nested_and_top_level_shapes --lib`
+  - `cargo test --locked thread_read_cwd --lib`
   - `cargo test --locked permission_drift_tracks_permission_profile_body_changes --lib`
   - `CARGO_TARGET_DIR=.codex-tmp/cargo-target-precommit git commit -S ...` pre-commit hook passed `cargo fmt --all`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked` in an isolated target directory after the shared target produced a cross-worktree binary mismatch.
   - `uv run python /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/hoteng/.codex/worktrees/aef0/codex-background-task-handler`
