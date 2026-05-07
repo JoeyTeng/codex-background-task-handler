@@ -773,7 +773,8 @@ fn desktop_bridge_preflight_require_existing_daemon_does_not_forward_client_only
                     "cli-turn-observation-expiry-dispatch",
                     "cli-auto-delivery-dispatch",
                     "task-supervisor",
-                    "desktop-bridge-foundation-dispatch"
+                    "desktop-bridge-foundation-dispatch",
+                    "desktop-inbox-revisioned-installation-state"
                 ],
                 "message": "pong"
             }
