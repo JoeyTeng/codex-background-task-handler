@@ -2755,15 +2755,16 @@ fn parse_thread_resume_permission_snapshot(result: &Value) -> Result<CliPermissi
         permission_profile.as_ref()
     {
         let profile_permissions = parse_permission_profile_permissions(permission_profile)?;
-        if profile_permissions != legacy_permissions {
+        if profile_permissions.derived_permissions() != legacy_permissions {
             bail!(
                 "thread/resume permissionProfile and legacy sandbox disagree on derived permissions"
             );
         }
+        ensure_permission_profile_legacy_write_equivalence(&profile_permissions, &sandbox_policy)?;
         (
             CliPermissionSnapshotSource::PermissionProfile,
-            profile_permissions.0,
-            profile_permissions.1,
+            profile_permissions.allows_network,
+            profile_permissions.allows_write_access,
         )
     } else {
         (
@@ -2823,7 +2824,54 @@ fn parse_sandbox_permissions(value: &Value) -> Result<(bool, bool)> {
     }
 }
 
-fn parse_permission_profile_permissions(value: &Value) -> Result<(bool, bool)> {
+#[derive(Debug)]
+struct PermissionProfilePermissions {
+    allows_network: bool,
+    allows_write_access: bool,
+    write_paths: Vec<PathBuf>,
+    write_special_kinds: HashSet<String>,
+    has_unrepresentable_write_scope: bool,
+    has_write_denials: bool,
+}
+
+impl PermissionProfilePermissions {
+    fn new(allows_network: bool) -> Self {
+        Self {
+            allows_network,
+            allows_write_access: false,
+            write_paths: Vec::new(),
+            write_special_kinds: HashSet::new(),
+            has_unrepresentable_write_scope: false,
+            has_write_denials: false,
+        }
+    }
+
+    fn derived_permissions(&self) -> (bool, bool) {
+        (self.allows_network, self.allows_write_access)
+    }
+
+    fn write_covers_path(&self, path: &Path) -> bool {
+        self.write_special_kinds.contains("root")
+            || (self.write_special_kinds.contains("slash_tmp")
+                && path.starts_with(Path::new("/tmp")))
+            || self
+                .write_paths
+                .iter()
+                .any(|write_path| path.starts_with(write_path))
+    }
+
+    fn write_covers_special(&self, kind: &str) -> bool {
+        self.write_special_kinds.contains("root") || self.write_special_kinds.contains(kind)
+    }
+}
+
+enum PermissionProfilePathScope {
+    Absolute(PathBuf),
+    GlobPattern,
+    Special(String),
+}
+
+fn parse_permission_profile_permissions(value: &Value) -> Result<PermissionProfilePermissions> {
     let allows_network = match value.get("network") {
         Some(Value::Null) | None => false,
         Some(network) => network
@@ -2831,8 +2879,9 @@ fn parse_permission_profile_permissions(value: &Value) -> Result<(bool, bool)> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     };
+    let mut permissions = PermissionProfilePermissions::new(allows_network);
     let Some(file_system) = value.get("fileSystem").filter(|value| !value.is_null()) else {
-        return Ok((allows_network, false));
+        return Ok(permissions);
     };
     let entries = file_system
         .get("entries")
@@ -2845,29 +2894,45 @@ fn parse_permission_profile_permissions(value: &Value) -> Result<(bool, bool)> {
     {
         bail!("thread/resume permissionProfile globScanMaxDepth is not a positive integer");
     }
-    let mut allows_write_access = false;
     for entry in entries {
-        validate_permission_profile_entry(entry)?;
-        if entry.get("access").and_then(Value::as_str) == Some("write") {
-            allows_write_access = true;
+        let path_scope = parse_permission_profile_entry_path(entry)?;
+        match entry.get("access").and_then(Value::as_str) {
+            Some("read") => {}
+            Some("none") => permissions.has_write_denials = true,
+            Some("write") => {
+                permissions.allows_write_access = true;
+                match path_scope {
+                    PermissionProfilePathScope::Absolute(path) => {
+                        permissions.write_paths.push(path)
+                    }
+                    PermissionProfilePathScope::Special(kind)
+                        if matches!(kind.as_str(), "root" | "tmpdir" | "slash_tmp") =>
+                    {
+                        permissions.write_special_kinds.insert(kind);
+                    }
+                    PermissionProfilePathScope::Special(_)
+                    | PermissionProfilePathScope::GlobPattern => {
+                        permissions.has_unrepresentable_write_scope = true;
+                    }
+                }
+            }
+            Some(other) => {
+                bail!("thread/resume permissionProfile entry has unknown access {other:?}")
+            }
+            None => bail!("thread/resume permissionProfile entry missing access"),
         }
     }
-    Ok((allows_network, allows_write_access))
+    Ok(permissions)
 }
 
-fn validate_permission_profile_entry(entry: &Value) -> Result<()> {
+fn parse_permission_profile_entry_path(entry: &Value) -> Result<PermissionProfilePathScope> {
     let path = entry
         .get("path")
         .ok_or_else(|| anyhow::anyhow!("thread/resume permissionProfile entry missing path"))?;
-    validate_permission_profile_path(path)?;
-    match entry.get("access").and_then(Value::as_str) {
-        Some("read" | "write" | "none") => Ok(()),
-        Some(other) => bail!("thread/resume permissionProfile entry has unknown access {other:?}"),
-        None => bail!("thread/resume permissionProfile entry missing access"),
-    }
+    parse_permission_profile_path(path)
 }
 
-fn validate_permission_profile_path(path: &Value) -> Result<()> {
+fn parse_permission_profile_path(path: &Value) -> Result<PermissionProfilePathScope> {
     match path.get("type").and_then(Value::as_str) {
         Some("path") => {
             let Some(path) = path.get("path").and_then(Value::as_str) else {
@@ -2876,38 +2941,120 @@ fn validate_permission_profile_path(path: &Value) -> Result<()> {
             if !Path::new(path).is_absolute() {
                 bail!("thread/resume permissionProfile path entry is not absolute: {path:?}");
             }
-            Ok(())
+            Ok(PermissionProfilePathScope::Absolute(
+                normalize_absolute_permission_profile_path(path)?,
+            ))
         }
         Some("glob_pattern") => {
             if path.get("pattern").and_then(Value::as_str).is_none() {
                 bail!("thread/resume permissionProfile glob_pattern entry missing pattern");
             }
-            Ok(())
+            Ok(PermissionProfilePathScope::GlobPattern)
         }
         Some("special") => {
             let value = path.get("value").ok_or_else(|| {
                 anyhow::anyhow!("thread/resume permissionProfile special path missing value")
             })?;
-            match value.get("kind").and_then(Value::as_str) {
-                Some("root" | "minimal" | "current_working_directory" | "tmpdir" | "slash_tmp") => {
-                    Ok(())
+            let kind = match value.get("kind").and_then(Value::as_str) {
+                Some(
+                    kind @ ("root"
+                    | "minimal"
+                    | "current_working_directory"
+                    | "tmpdir"
+                    | "slash_tmp"),
+                ) => kind,
+                Some(kind @ "project_roots") => {
+                    validate_optional_string_field(value, "subpath")?;
+                    kind
                 }
-                Some("project_roots") => validate_optional_string_field(value, "subpath"),
                 Some("unknown") => {
                     if value.get("path").and_then(Value::as_str).is_none() {
                         bail!("thread/resume permissionProfile unknown special path missing path");
                     }
-                    validate_optional_string_field(value, "subpath")
+                    validate_optional_string_field(value, "subpath")?;
+                    "unknown"
                 }
                 Some(other) => {
                     bail!("thread/resume permissionProfile special path has unknown kind {other:?}")
                 }
                 None => bail!("thread/resume permissionProfile special path missing kind"),
-            }
+            };
+            Ok(PermissionProfilePathScope::Special(kind.to_owned()))
         }
         Some(other) => bail!("thread/resume permissionProfile path has unknown type {other:?}"),
         None => bail!("thread/resume permissionProfile path missing type"),
     }
+}
+
+fn normalize_absolute_permission_profile_path(path: &str) -> Result<PathBuf> {
+    let path = Path::new(path);
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                bail!("thread/resume permissionProfile path contains parent directory component")
+            }
+            Component::Prefix(_) => {
+                bail!("thread/resume permissionProfile path contains unsupported prefix")
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn ensure_permission_profile_legacy_write_equivalence(
+    profile: &PermissionProfilePermissions,
+    sandbox: &Value,
+) -> Result<()> {
+    if !profile.allows_write_access {
+        return Ok(());
+    }
+    if profile.has_write_denials || profile.has_unrepresentable_write_scope {
+        bail!(
+            "thread/resume permissionProfile write scope cannot be safely represented by legacy sandbox"
+        );
+    }
+    match sandbox_policy_type(sandbox)? {
+        "workspaceWrite" => ensure_permission_profile_covers_workspace_write(profile, sandbox),
+        "dangerFullAccess" if profile.write_covers_special("root") => Ok(()),
+        "dangerFullAccess" => {
+            bail!("thread/resume permissionProfile does not cover legacy dangerFullAccess sandbox")
+        }
+        "externalSandbox" => {
+            bail!("thread/resume permissionProfile cannot be compared to externalSandbox")
+        }
+        "readOnly" => bail!("readOnly sandbox cannot match a writable permissionProfile"),
+        other => bail!("thread/resume returned unknown sandbox type {other:?}"),
+    }
+}
+
+fn ensure_permission_profile_covers_workspace_write(
+    profile: &PermissionProfilePermissions,
+    sandbox: &Value,
+) -> Result<()> {
+    for root in workspace_writable_roots(sandbox)? {
+        let root = normalize_workspace_writable_root(&root)?;
+        if !profile.write_covers_path(&root) {
+            bail!(
+                "thread/resume permissionProfile does not cover legacy workspace writableRoot {}",
+                root.display()
+            );
+        }
+    }
+    if !sandbox_required_bool_field(sandbox, "excludeTmpdirEnvVar")?
+        && !profile.write_covers_special("tmpdir")
+    {
+        bail!("thread/resume permissionProfile does not cover legacy tmpdir write access");
+    }
+    if !sandbox_required_bool_field(sandbox, "excludeSlashTmp")?
+        && !profile.write_covers_path(Path::new("/tmp"))
+    {
+        bail!("thread/resume permissionProfile does not cover legacy /tmp write access");
+    }
+    Ok(())
 }
 
 fn validate_optional_string_field(value: &Value, field: &str) -> Result<()> {
@@ -8224,8 +8371,8 @@ mod tests {
                 "readOnlyAccess": restricted_access(&["/tmp/read"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/work"],
-                "excludeTmpdirEnvVar": false,
-                "excludeSlashTmp": false
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
             },
             "permissionProfile": {
                 "network": { "enabled": true },
@@ -8283,6 +8430,72 @@ mod tests {
         .expect_err("mismatched permission profile should fail closed");
 
         assert!(error.to_string().contains("disagree"));
+    }
+
+    #[test]
+    fn permission_snapshot_rejects_permission_profile_narrower_than_legacy_writable_root() {
+        let error = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "permissionProfile": {
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": { "type": "path", "path": "/tmp/work/narrow" },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect_err("narrower profile should not pin broader legacy sandbox");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not cover legacy workspace writableRoot")
+        );
+    }
+
+    #[test]
+    fn permission_snapshot_rejects_permission_profile_denials_for_legacy_write() {
+        let error = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "permissionProfile": {
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work/secret" },
+                            "access": "none"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect_err("profile denials should not pin legacy sandbox");
+
+        assert!(error.to_string().contains("cannot be safely represented"));
     }
 
     #[test]
