@@ -2208,8 +2208,14 @@ fn managed_resume_permission_override_flag(arg: &str) -> Option<&'static str> {
         || arg.starts_with("-a")
     {
         Some("--ask-for-approval")
-    } else if arg == "--dangerously-bypass-approvals-and-sandbox" {
+    } else if arg == "--dangerously-bypass-approvals-and-sandbox"
+        || arg.starts_with("--dangerously-bypass-approvals-and-sandbox=")
+    {
         Some("--dangerously-bypass-approvals-and-sandbox")
+    } else if arg == "--full-auto" || arg.starts_with("--full-auto=") {
+        Some("--full-auto")
+    } else if arg == "--yolo" || arg.starts_with("--yolo=") {
+        Some("--yolo")
     } else {
         None
     }
@@ -2649,6 +2655,12 @@ fn managed_resume_config_override_affects_sandbox_scope(key: &str) -> bool {
         || key.starts_with("default_permissions.")
         || key == "defaultPermissions"
         || key.starts_with("defaultPermissions.")
+        || key == "profiles"
+        || key.starts_with("profiles.")
+        || key == "projects"
+        || key.starts_with("projects.")
+        || key == "trust_level"
+        || key.ends_with(".trust_level")
         || key == "writable_roots"
         || key.ends_with(".writable_roots")
         || key == "readable_roots"

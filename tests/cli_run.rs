@@ -2561,6 +2561,17 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
         vec!["--config=default_permissions=\"read-only\""],
         vec!["-cdefault-permissions=\"workspace-write\""],
         vec!["--config=defaultPermissions=\"trusted-all\""],
+        vec!["--config=profiles.temp.sandbox_mode=\"danger-full-access\""],
+        vec![
+            "--config",
+            "profiles={temp={sandbox_mode=\"danger-full-access\"}}",
+        ],
+        vec!["--config=projects.\"/tmp/project\".trust_level=\"trusted\""],
+        vec![
+            "--config",
+            "projects={\"/tmp/project\"={trust_level=\"trusted\"}}",
+        ],
+        vec!["--config=trust_level=\"trusted\""],
         vec!["--config=features.web_search=true"],
         vec!["--config", "features={web_search=true}"],
         vec!["--config=web_search=\"live\""],
@@ -2621,6 +2632,11 @@ fn cbth_resume_rejects_forwarded_permission_policy_overrides() {
         vec!["-a", "never"],
         vec!["-anever"],
         vec!["--dangerously-bypass-approvals-and-sandbox"],
+        vec!["--dangerously-bypass-approvals-and-sandbox=true"],
+        vec!["--full-auto"],
+        vec!["--full-auto=true"],
+        vec!["--yolo"],
+        vec!["--yolo=true"],
     ];
 
     for (index, args) in cases.into_iter().enumerate() {
