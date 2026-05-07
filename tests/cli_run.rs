@@ -30,8 +30,13 @@ fn write_fake_codex_script(path: &Path) -> PathBuf {
     fs::write(
         path,
         r#"#!/bin/sh
-log="${FAKE_CODEX_LOG:?}"
-if [ "${1:-}" = "app-server" ]; then
+	log="${FAKE_CODEX_LOG:?}"
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' "${FAKE_CODEX_VERSION:-codex-cli 0.128.0}"
+  exit 0
+fi
+
+	if [ "${1:-}" = "app-server" ]; then
   printf 'app-server' >> "$log"
   for arg in "$@"; do
     printf '\t%s' "$arg" >> "$log"
@@ -2363,7 +2368,7 @@ fn cli_run_binds_session_starts_foreground_codex_and_stops_app_server() {
 
 #[cfg(unix)]
 #[test]
-fn cbth_resume_launches_codex_resume_with_remote_and_cwd() {
+fn cbth_resume_without_explicit_cd_preserves_native_resume_cwd_choice() {
     let home = temp_home();
     let client_cwd = tempfile::tempdir().expect("client cwd");
     let script_dir = tempfile::tempdir().expect("script dir");
@@ -2395,12 +2400,8 @@ fn cbth_resume_launches_codex_resume_with_remote_and_cwd() {
 
     let log = fs::read_to_string(&log_path).expect("read fake codex log");
     assert!(log.contains("app-server\tapp-server\t--listen\tws://127.0.0.1:0"));
-    assert!(
-        log.contains(
-            "foreground\tresume\tthread-cli-resume\t--remote\tws://127.0.0.1:45678\t--cd\t"
-        )
-    );
-    assert!(log.contains(&client_cwd.path().display().to_string()));
+    assert!(log.contains("foreground\tresume\tthread-cli-resume\t--remote\tws://127.0.0.1:45678"));
+    assert!(!log.contains("\t--cd\t"));
     assert!(log.contains("\t--model\tgpt-test"));
 
     stop_daemon(&home);

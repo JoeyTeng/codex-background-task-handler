@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use semver::Version;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -71,6 +72,9 @@ const CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS: i64 = MAX_CLI_OBSERVAT
 const CLI_APP_SERVER_RECONCILE_INTERVAL_MS: u64 = 2_000;
 const DOCTOR_CODEX_VERSION_TIMEOUT_SECONDS: u64 = 5;
 const DOCTOR_APP_SERVER_PROBE_TIMEOUT_SECONDS: u64 = 15;
+const VALIDATED_CODEX_CLI_VERSION_REQUIREMENT: &str = "0.128.x";
+const VALIDATED_CODEX_CLI_MAJOR: u64 = 0;
+const VALIDATED_CODEX_CLI_MINOR: u64 = 128;
 const DESKTOP_INBOX_SCHEMA_VERSION: i64 = 1;
 const DESKTOP_INBOX_MAX_JSON_BYTES: u64 = 1024 * 1024;
 const DESKTOP_SNAPSHOT_REVISION_RETENTION: usize = 128;
@@ -1755,6 +1759,8 @@ fn run_cli_session(
     let codex_binary = resolve_executable(&config.codex_bin)?;
     let cwd = env::current_dir().context("read current directory")?;
     let lease_id = new_id();
+    layout.ensure_run_dir()?;
+    warn_if_codex_cli_version_unvalidated(&codex_binary, layout);
 
     validate_daemon_autostart_endpoint(layout)?;
     daemon_ensure(
@@ -1768,7 +1774,7 @@ fn run_cli_session(
     let target =
         resolve_cli_run_thread_target(layout, &config.target, &codex_binary, &cwd, &lease_id)?;
     let bound_thread_id = target.bound_thread_id.clone();
-    let (foreground_cwd, foreground_codex_args) =
+    let mut foreground =
         match foreground_codex_args(&config.foreground_mode, &cwd, &config.codex_args) {
             Ok(args) => args,
             Err(error) => {
@@ -1780,18 +1786,12 @@ fn run_cli_session(
                 return Err(error);
             }
         };
-    let initial_thread_resume_params = match initial_passive_thread_resume_params(
-        &config.foreground_mode,
-        &bound_thread_id,
-        &foreground_cwd,
-        &foreground_codex_args,
-    ) {
-        Ok(params) => params,
-        Err(error) => {
-            abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
-            return Err(error);
-        }
-    };
+    if let Err(error) =
+        validate_codex_resume_foreground_args(&config.foreground_mode, &cwd, &foreground.codex_args)
+    {
+        abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
+        return Err(error);
+    }
     reserve_cli_app_server_for_thread(layout, &bound_thread_id, &lease_id).inspect_err(|_| {
         abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
     })?;
@@ -1858,6 +1858,43 @@ fn run_cli_session(
         }
     };
     let url = json_string(&app_server["cli_app_server"], "url")?;
+    if let Err(error) =
+        resolve_managed_resume_foreground_cwd(&config.foreground_mode, &mut foreground, &url, &cwd)
+    {
+        release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
+        let _ = daemon_request_payload_timeout(
+            layout,
+            "cli_app_server_stop",
+            json!({
+                "managed_session_id": managed_session_id,
+                "lease_id": lease_id,
+            }),
+            Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+        );
+        return Err(error);
+    }
+    let initial_thread_resume_params = match initial_passive_thread_resume_params(
+        &config.foreground_mode,
+        &bound_thread_id,
+        &cwd,
+        foreground.cwd_arg.as_deref(),
+        &foreground.codex_args,
+    ) {
+        Ok(params) => params,
+        Err(error) => {
+            release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
+            let _ = daemon_request_payload_timeout(
+                layout,
+                "cli_app_server_stop",
+                json!({
+                    "managed_session_id": managed_session_id,
+                    "lease_id": lease_id,
+                }),
+                Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+            );
+            return Err(error);
+        }
+    };
     let refresh_running = Arc::new(AtomicBool::new(true));
     spawn_cli_app_server_lease_refresher(
         layout.clone(),
@@ -1880,18 +1917,20 @@ fn run_cli_session(
             initial_thread_resume_params,
         });
 
-    let mut foreground = Command::new(&codex_binary);
+    let foreground_cwd_arg = foreground.cwd_arg.take();
+    let foreground_codex_args = std::mem::take(&mut foreground.codex_args);
+    let mut foreground_command = Command::new(&codex_binary);
     match &config.foreground_mode {
         CliForegroundMode::Remote => {}
         CliForegroundMode::Resume { thread_id } => {
-            foreground.arg("resume").arg(thread_id);
+            foreground_command.arg("resume").arg(thread_id);
         }
     }
-    let foreground_status = foreground
-        .arg("--remote")
-        .arg(&url)
-        .arg("--cd")
-        .arg(&foreground_cwd)
+    foreground_command.arg("--remote").arg(&url);
+    if let Some(cwd_arg) = foreground_cwd_arg.as_ref() {
+        foreground_command.arg("--cd").arg(cwd_arg);
+    }
+    let foreground_status = foreground_command
         .args(foreground_codex_args)
         .status()
         .with_context(|| format!("spawn foreground codex via {:?}", codex_binary));
@@ -2013,15 +2052,23 @@ fn ensure_cli_run_app_server(
     )
 }
 
+struct ForegroundCodexArgs {
+    cwd_arg: Option<PathBuf>,
+    codex_args: Vec<OsString>,
+}
+
 fn foreground_codex_args(
     foreground_mode: &CliForegroundMode,
     caller_cwd: &Path,
     codex_args: &[OsString],
-) -> Result<(PathBuf, Vec<OsString>)> {
+) -> Result<ForegroundCodexArgs> {
     if !matches!(foreground_mode, CliForegroundMode::Resume { .. }) {
-        return Ok((caller_cwd.to_path_buf(), codex_args.to_vec()));
+        return Ok(ForegroundCodexArgs {
+            cwd_arg: Some(caller_cwd.to_path_buf()),
+            codex_args: codex_args.to_vec(),
+        });
     }
-    let mut foreground_cwd = caller_cwd.to_path_buf();
+    let mut foreground_cwd = None;
     let mut filtered = Vec::with_capacity(codex_args.len());
     let mut index = 0;
     while index < codex_args.len() {
@@ -2035,9 +2082,9 @@ fn foreground_codex_args(
         } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
             reject_managed_resume_add_dir_override(flag)?;
         } else if let Some(value) = arg.strip_prefix("--cd=") {
-            foreground_cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
+            foreground_cwd = Some(resolve_codex_cwd_arg(caller_cwd, OsStr::new(value)));
         } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
-            foreground_cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
+            foreground_cwd = Some(resolve_codex_cwd_arg(caller_cwd, OsStr::new(value)));
         } else if arg.strip_prefix("--image=").is_some()
             || arg
                 .strip_prefix("-i")
@@ -2050,12 +2097,12 @@ fn foreground_codex_args(
             match arg.as_str() {
                 "--cd" | "-C" => {
                     index += 1;
-                    foreground_cwd = {
+                    foreground_cwd = Some({
                         let Some(value) = codex_args.get(index) else {
                             bail!("codex argument {arg} requires a value");
                         };
                         resolve_codex_cwd_arg(caller_cwd, value)
-                    };
+                    });
                 }
                 "--model" | "-m" | "--profile" | "-p" | "--sandbox" | "-s"
                 | "--ask-for-approval" | "-a" | "--config" | "-c" | "--local-provider"
@@ -2082,7 +2129,10 @@ fn foreground_codex_args(
         }
         index += 1;
     }
-    Ok((foreground_cwd, filtered))
+    Ok(ForegroundCodexArgs {
+        cwd_arg: foreground_cwd,
+        codex_args: filtered,
+    })
 }
 
 fn managed_resume_remote_override_flag(arg: &str) -> Option<&'static str> {
@@ -2115,10 +2165,119 @@ fn reject_managed_resume_add_dir_override(flag: &str) -> Result<()> {
     )
 }
 
+fn resolve_managed_resume_foreground_cwd(
+    foreground_mode: &CliForegroundMode,
+    foreground: &mut ForegroundCodexArgs,
+    app_server_url: &str,
+    caller_cwd: &Path,
+) -> Result<()> {
+    let CliForegroundMode::Resume { thread_id } = foreground_mode else {
+        return Ok(());
+    };
+    if foreground.cwd_arg.is_some() {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Ok(());
+    }
+    let history_cwd = match read_managed_resume_thread_cwd(app_server_url, thread_id) {
+        Ok(history_cwd) => history_cwd,
+        Err(error) => {
+            eprintln!("warning: failed to read previous Codex thread cwd before resume: {error:#}");
+            None
+        }
+    };
+    let Some(history_cwd) = history_cwd else {
+        return Ok(());
+    };
+    foreground.cwd_arg = Some(select_managed_resume_cwd(caller_cwd, &history_cwd)?);
+    Ok(())
+}
+
+fn read_managed_resume_thread_cwd(
+    app_server_url: &str,
+    thread_id: &str,
+) -> Result<Option<PathBuf>> {
+    let mut client = AppServerJsonRpcClient::connect(
+        app_server_url,
+        Duration::from_millis(CLI_APP_SERVER_PASSIVE_CONNECT_TIMEOUT_MS),
+    )?;
+    client.initialize(
+        env!("CARGO_PKG_VERSION"),
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+    )?;
+    client.notify_initialized()?;
+    let read = client
+        .request(
+            "thread/read",
+            json!({
+                "threadId": thread_id,
+                "includeTurns": false,
+            }),
+            Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+        )
+        .map_err(anyhow::Error::new)?;
+    let Some(cwd) = read
+        .get("thread")
+        .and_then(|thread| thread.get("cwd"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PathBuf::from(cwd)))
+}
+
+fn select_managed_resume_cwd(caller_cwd: &Path, history_cwd: &Path) -> Result<PathBuf> {
+    if !resume_cwds_differ(caller_cwd, history_cwd) {
+        return Ok(history_cwd.to_path_buf());
+    }
+    eprintln!("cbth resume: choose working directory for the resumed Codex thread");
+    eprintln!("  1) Session: {}", history_cwd.display());
+    eprintln!("  2) Current: {}", caller_cwd.display());
+    eprint!("Select [1/2] (default 1): ");
+    io::stderr().flush()?;
+    let mut input = String::new();
+    let bytes = io::stdin().read_line(&mut input)?;
+    if bytes == 0 {
+        eprintln!();
+        return Ok(history_cwd.to_path_buf());
+    }
+    match input.trim() {
+        "" | "1" | "s" | "S" | "session" | "Session" => Ok(history_cwd.to_path_buf()),
+        "2" | "c" | "C" | "current" | "Current" => Ok(caller_cwd.to_path_buf()),
+        other => bail!("invalid working-directory selection {other:?}; expected 1 or 2"),
+    }
+}
+
+fn resume_cwds_differ(left: &Path, right: &Path) -> bool {
+    normalize_resume_cwd_for_compare(left) != normalize_resume_cwd_for_compare(right)
+}
+
+fn normalize_resume_cwd_for_compare(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| normalize_path_lexically(path))
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
 fn initial_passive_thread_resume_params(
     foreground_mode: &CliForegroundMode,
     bound_thread_id: &str,
-    cwd: &Path,
+    caller_cwd: &Path,
+    cwd: Option<&Path>,
     codex_args: &[OsString],
 ) -> Result<Value> {
     let mut params = serde_json::Map::new();
@@ -2127,14 +2286,28 @@ fn initial_passive_thread_resume_params(
         Value::String(bound_thread_id.to_owned()),
     );
     if matches!(foreground_mode, CliForegroundMode::Resume { .. }) {
-        params.insert(
-            "cwd".to_owned(),
-            Value::String(path_to_utf8(cwd, "current directory")?),
-        );
+        if let Some(cwd) = cwd {
+            params.insert(
+                "cwd".to_owned(),
+                Value::String(path_to_utf8(cwd, "current directory")?),
+            );
+        }
         params.insert("persistExtendedHistory".to_owned(), Value::Bool(true));
-        apply_codex_resume_foreground_args(&mut params, cwd, codex_args)?;
+        apply_codex_resume_foreground_args(&mut params, caller_cwd, codex_args)?;
     }
     Ok(Value::Object(params))
+}
+
+fn validate_codex_resume_foreground_args(
+    foreground_mode: &CliForegroundMode,
+    caller_cwd: &Path,
+    codex_args: &[OsString],
+) -> Result<()> {
+    if !matches!(foreground_mode, CliForegroundMode::Resume { .. }) {
+        return Ok(());
+    }
+    let mut params = serde_json::Map::new();
+    apply_codex_resume_foreground_args(&mut params, caller_cwd, codex_args)
 }
 
 fn apply_codex_resume_foreground_args(
@@ -2569,13 +2742,40 @@ fn parse_thread_resume_permission_snapshot(result: &Value) -> Result<CliPermissi
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("thread/resume response missing sandbox"))?;
     let allows_approval = parse_approval_policy_allows_approval(&approval_policy)?;
-    let (allows_network, allows_write_access) = parse_sandbox_permissions(&sandbox_policy)?;
+    let legacy_permissions = parse_sandbox_permissions(&sandbox_policy)?;
+    let permission_profile = result
+        .get("permissionProfile")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let (source, allows_network, allows_write_access) = if let Some(permission_profile) =
+        permission_profile.as_ref()
+    {
+        let profile_permissions = parse_permission_profile_permissions(permission_profile)?;
+        if profile_permissions != legacy_permissions {
+            bail!(
+                "thread/resume permissionProfile and legacy sandbox disagree on derived permissions"
+            );
+        }
+        (
+            CliPermissionSnapshotSource::PermissionProfile,
+            profile_permissions.0,
+            profile_permissions.1,
+        )
+    } else {
+        (
+            CliPermissionSnapshotSource::LegacySandbox,
+            legacy_permissions.0,
+            legacy_permissions.1,
+        )
+    };
     Ok(CliPermissionSnapshot {
+        source,
         allows_approval,
         allows_network,
         allows_write_access,
         approval_policy,
         sandbox_policy,
+        permission_profile,
     })
 }
 
@@ -2616,6 +2816,100 @@ fn parse_sandbox_permissions(value: &Value) -> Result<(bool, bool)> {
             Ok((network, true))
         }
         other => bail!("thread/resume returned unknown sandbox type {other:?}"),
+    }
+}
+
+fn parse_permission_profile_permissions(value: &Value) -> Result<(bool, bool)> {
+    let allows_network = match value.get("network") {
+        Some(Value::Null) | None => false,
+        Some(network) => network
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
+    let Some(file_system) = value.get("fileSystem").filter(|value| !value.is_null()) else {
+        return Ok((allows_network, false));
+    };
+    let entries = file_system
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("thread/resume permissionProfile fileSystem missing entries")
+        })?;
+    if let Some(glob_scan_max_depth) = file_system.get("globScanMaxDepth")
+        && glob_scan_max_depth.as_u64().is_none_or(|value| value == 0)
+    {
+        bail!("thread/resume permissionProfile globScanMaxDepth is not a positive integer");
+    }
+    let mut allows_write_access = false;
+    for entry in entries {
+        validate_permission_profile_entry(entry)?;
+        if entry.get("access").and_then(Value::as_str) == Some("write") {
+            allows_write_access = true;
+        }
+    }
+    Ok((allows_network, allows_write_access))
+}
+
+fn validate_permission_profile_entry(entry: &Value) -> Result<()> {
+    let path = entry
+        .get("path")
+        .ok_or_else(|| anyhow::anyhow!("thread/resume permissionProfile entry missing path"))?;
+    validate_permission_profile_path(path)?;
+    match entry.get("access").and_then(Value::as_str) {
+        Some("read" | "write" | "none") => Ok(()),
+        Some(other) => bail!("thread/resume permissionProfile entry has unknown access {other:?}"),
+        None => bail!("thread/resume permissionProfile entry missing access"),
+    }
+}
+
+fn validate_permission_profile_path(path: &Value) -> Result<()> {
+    match path.get("type").and_then(Value::as_str) {
+        Some("path") => {
+            let Some(path) = path.get("path").and_then(Value::as_str) else {
+                bail!("thread/resume permissionProfile path entry missing path");
+            };
+            if !Path::new(path).is_absolute() {
+                bail!("thread/resume permissionProfile path entry is not absolute: {path:?}");
+            }
+            Ok(())
+        }
+        Some("glob_pattern") => {
+            if path.get("pattern").and_then(Value::as_str).is_none() {
+                bail!("thread/resume permissionProfile glob_pattern entry missing pattern");
+            }
+            Ok(())
+        }
+        Some("special") => {
+            let value = path.get("value").ok_or_else(|| {
+                anyhow::anyhow!("thread/resume permissionProfile special path missing value")
+            })?;
+            match value.get("kind").and_then(Value::as_str) {
+                Some("root" | "minimal" | "current_working_directory" | "tmpdir" | "slash_tmp") => {
+                    Ok(())
+                }
+                Some("project_roots") => validate_optional_string_field(value, "subpath"),
+                Some("unknown") => {
+                    if value.get("path").and_then(Value::as_str).is_none() {
+                        bail!("thread/resume permissionProfile unknown special path missing path");
+                    }
+                    validate_optional_string_field(value, "subpath")
+                }
+                Some(other) => {
+                    bail!("thread/resume permissionProfile special path has unknown kind {other:?}")
+                }
+                None => bail!("thread/resume permissionProfile special path missing kind"),
+            }
+        }
+        Some(other) => bail!("thread/resume permissionProfile path has unknown type {other:?}"),
+        None => bail!("thread/resume permissionProfile path missing type"),
+    }
+}
+
+fn validate_optional_string_field(value: &Value, field: &str) -> Result<()> {
+    match value.get(field) {
+        Some(Value::String(_)) | Some(Value::Null) | None => Ok(()),
+        Some(_) => bail!("thread/resume permissionProfile special path {field} is not a string"),
     }
 }
 
@@ -3082,18 +3376,37 @@ struct CliResolvedPermissions {
 
 #[derive(Clone, Debug, PartialEq)]
 struct CliPermissionSnapshot {
+    source: CliPermissionSnapshotSource,
     allows_approval: bool,
     allows_network: bool,
     allows_write_access: bool,
     approval_policy: Value,
     sandbox_policy: Value,
+    permission_profile: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CliPermissionSnapshotSource {
+    PermissionProfile,
+    LegacySandbox,
+}
+
+impl CliPermissionSnapshotSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PermissionProfile => "permissionProfile",
+            Self::LegacySandbox => "legacySandbox",
+        }
+    }
 }
 
 impl CliPermissionSnapshot {
     fn raw_json(&self, effective: CliResolvedPermissions) -> Value {
         json!({
+            "source": self.source.as_str(),
             "approvalPolicy": self.approval_policy,
             "sandbox": self.sandbox_policy,
+            "permissionProfile": self.permission_profile,
             "derived": {
                 "allows_approval": self.allows_approval,
                 "allows_network": self.allows_network,
@@ -6031,6 +6344,10 @@ impl DoctorReportBuilder {
         self.push(name, required, "ok", message.into(), details);
     }
 
+    fn warn(&mut self, name: &str, required: bool, message: impl Into<String>, details: Value) {
+        self.push(name, required, "warn", message.into(), details);
+    }
+
     fn fail(
         &mut self,
         name: &str,
@@ -6122,12 +6439,21 @@ fn dispatch_doctor_cli(
 
     let codex_binary = match doctor_check_codex_binary(&args.codex_bin, layout) {
         Ok((binary, details)) => {
-            report.ok(
-                "codex-binary",
-                true,
-                "Codex CLI executable is available",
-                details,
-            );
+            if details["compatibility"]["warning"].is_string() {
+                report.warn(
+                    "codex-binary",
+                    true,
+                    "Codex CLI executable is available but outside cbth's validated range",
+                    details,
+                );
+            } else {
+                report.ok(
+                    "codex-binary",
+                    true,
+                    "Codex CLI executable is available",
+                    details,
+                );
+            }
             Some(binary)
         }
         Err(error) => {
@@ -6292,14 +6618,27 @@ fn doctor_check_codex_binary(binary: &OsStr, layout: &FsLayout) -> Result<(OsStr
             resolved_path.display()
         );
     }
-    let mut command = Command::new(&resolved);
+    let version = run_codex_version_command(&resolved, layout)?;
+    let compatibility = codex_cli_version_compatibility(version.as_deref());
+    Ok((
+        resolved.clone(),
+        json!({
+            "path": resolved_path.display().to_string(),
+            "version": version,
+            "compatibility": compatibility,
+        }),
+    ))
+}
+
+fn run_codex_version_command(binary: &OsStr, layout: &FsLayout) -> Result<Option<String>> {
+    let mut command = Command::new(binary);
     command.arg("--version").stdin(Stdio::null());
     let output = command_output_timeout(
         command,
         Duration::from_secs(DOCTOR_CODEX_VERSION_TIMEOUT_SECONDS),
         &layout.run_dir(),
     )
-    .with_context(|| format!("run {:?} --version", resolved))?;
+    .with_context(|| format!("run {:?} --version", binary))?;
     if !output.status.success() {
         bail!(
             "Codex binary --version failed with status {}; stdout: {}; stderr: {}",
@@ -6308,14 +6647,54 @@ fn doctor_check_codex_binary(binary: &OsStr, layout: &FsLayout) -> Result<(OsStr
             doctor_output_preview(&output.stderr).unwrap_or_default()
         );
     }
-    Ok((
-        resolved.clone(),
-        json!({
-            "path": resolved_path.display().to_string(),
-            "version": doctor_output_preview(&output.stdout)
-                .or_else(|| doctor_output_preview(&output.stderr)),
-        }),
+    Ok(doctor_output_preview(&output.stdout).or_else(|| doctor_output_preview(&output.stderr)))
+}
+
+fn warn_if_codex_cli_version_unvalidated(binary: &OsStr, layout: &FsLayout) {
+    let warning = match run_codex_version_command(binary, layout) {
+        Ok(version) => codex_cli_version_warning(version.as_deref()),
+        Err(error) => Some(format!(
+            "cbth could not verify Codex CLI version before managed startup: {error:#}"
+        )),
+    };
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning}");
+    }
+}
+
+fn codex_cli_version_compatibility(raw_version: Option<&str>) -> Value {
+    let parsed = raw_version.and_then(parse_codex_cli_version);
+    let warning = codex_cli_version_warning(raw_version);
+    json!({
+        "validated_range": VALIDATED_CODEX_CLI_VERSION_REQUIREMENT,
+        "parsed_version": parsed.as_ref().map(ToString::to_string),
+        "warning": warning,
+    })
+}
+
+fn codex_cli_version_warning(raw_version: Option<&str>) -> Option<String> {
+    let Some(raw_version) = raw_version else {
+        return Some(format!(
+            "cbth could not read Codex CLI version; validated range is codex-cli {VALIDATED_CODEX_CLI_VERSION_REQUIREMENT}"
+        ));
+    };
+    let Some(version) = parse_codex_cli_version(raw_version) else {
+        return Some(format!(
+            "cbth could not parse Codex CLI version {raw_version:?}; validated range is codex-cli {VALIDATED_CODEX_CLI_VERSION_REQUIREMENT}"
+        ));
+    };
+    if version.major == VALIDATED_CODEX_CLI_MAJOR && version.minor == VALIDATED_CODEX_CLI_MINOR {
+        return None;
+    }
+    Some(format!(
+        "cbth was validated against codex-cli {VALIDATED_CODEX_CLI_VERSION_REQUIREMENT}, but the current Codex CLI reports {raw_version:?}; run `cbth doctor cli` after Codex upgrades and update cbth if protocol warnings appear"
     ))
+}
+
+fn parse_codex_cli_version(raw_version: &str) -> Option<Version> {
+    raw_version
+        .split_whitespace()
+        .find_map(|part| Version::parse(part.trim_start_matches('v')).ok())
 }
 
 fn doctor_check_daemon(layout: &FsLayout, startup_timeout_seconds: u64) -> Result<Value> {
@@ -7806,6 +8185,7 @@ mod tests {
         }))
         .expect("parse snapshot");
 
+        assert_eq!(snapshot.source, CliPermissionSnapshotSource::LegacySandbox);
         assert!(!snapshot.allows_approval);
         assert!(!snapshot.allows_network);
         assert!(!snapshot.allows_write_access);
@@ -7829,6 +8209,101 @@ mod tests {
         assert!(snapshot.allows_approval);
         assert!(snapshot.allows_network);
         assert!(snapshot.allows_write_access);
+    }
+
+    #[test]
+    fn permission_snapshot_prefers_permission_profile_when_present() {
+        let snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            },
+            "permissionProfile": {
+                "network": { "enabled": true },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": { "type": "path", "path": "/tmp/read" },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse snapshot");
+
+        assert_eq!(
+            snapshot.source,
+            CliPermissionSnapshotSource::PermissionProfile
+        );
+        assert!(snapshot.allows_approval);
+        assert!(snapshot.allows_network);
+        assert!(snapshot.allows_write_access);
+        assert!(snapshot.permission_profile.is_some());
+        assert_eq!(
+            snapshot.raw_json(resolved(&snapshot))["source"],
+            serde_json::json!("permissionProfile")
+        );
+    }
+
+    #[test]
+    fn permission_snapshot_rejects_permission_profile_legacy_disagreement() {
+        let error = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "never",
+            "sandbox": {
+                "type": "readOnly",
+                "access": restricted_access(&["/tmp/read"]),
+                "networkAccess": false
+            },
+            "permissionProfile": {
+                "network": { "enabled": true },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": { "type": "path", "path": "/tmp/read" },
+                            "access": "read"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect_err("mismatched permission profile should fail closed");
+
+        assert!(error.to_string().contains("disagree"));
+    }
+
+    #[test]
+    fn permission_snapshot_handles_restricted_empty_permission_profile() {
+        let snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "never",
+            "sandbox": {
+                "type": "readOnly",
+                "access": restricted_access(&[]),
+                "networkAccess": false
+            },
+            "permissionProfile": {
+                "network": null,
+                "fileSystem": null
+            }
+        }))
+        .expect("parse snapshot");
+
+        assert_eq!(
+            snapshot.source,
+            CliPermissionSnapshotSource::PermissionProfile
+        );
+        assert!(!snapshot.allows_approval);
+        assert!(!snapshot.allows_network);
+        assert!(!snapshot.allows_write_access);
     }
 
     #[test]
