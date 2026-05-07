@@ -90,6 +90,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-bridge-foundation-dispatch",
     "desktop-inbox-revisioned-installation-state",
     "desktop-writeback-helper-foundation",
+    "desktop-writeback-live-validation-fixture",
 ];
 const MAX_DISPATCH_WORKERS: usize = 32;
 const RESERVED_CONTROL_WORKERS: usize = 8;

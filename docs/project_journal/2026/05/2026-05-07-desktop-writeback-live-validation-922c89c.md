@@ -37,6 +37,9 @@ superseded_by:
 ## Current State
 
 - `read_transport_capability=validated` covers the no-DB Desktop inbox read helper path.
+- The validation harness adds hidden `cbth desktop validation prepare-writeback-fixture ... --json` so operator shell can create a safe prepared Desktop attempt without manual SQLite edits.
+- Fake coverage proves the fixture creates a safe batch / prepared attempt / bound binding, rejects empty or incompatible inputs, and drives `note-arm-pending` plus `note-arm` through idempotent retries without duplicate delivery-attempt count increments.
+- `docs/DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md` records the operator setup, heartbeat prompt, post-run verification, capability repair, and cleanup flow.
 - `writeback_capability` remains `unknown` until real Desktop heartbeat successfully executes the writeback helpers.
 - Base PR #42 merge commit: `922c89cfbdfe6a92b4bf42f748ed0b71018a8239`.
 - Implementation branch started from latest `master` at `bcc86b7a5d5d` after the `v0.1.1` release follow-up.
