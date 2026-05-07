@@ -446,6 +446,27 @@ fn spawn_fake_app_server_auto_delivery(
 }
 
 #[cfg(unix)]
+fn spawn_fake_app_server_auto_delivery_expect_pinned_permissions(
+    thread_id: &'static str,
+    outcome: FakeAutoDeliveryOutcome,
+) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result =
+            accept_fake_app_server_auto_delivery_with_options(&listener, thread_id, outcome, true);
+        let _ = done_tx.send(result);
+    });
+
+    (url, done_rx)
+}
+
+#[cfg(unix)]
 fn spawn_fake_app_server_with_options(
     thread_id: &'static str,
     include_turns: bool,
@@ -819,6 +840,16 @@ fn accept_fake_app_server_auto_delivery(
     thread_id: &'static str,
     outcome: FakeAutoDeliveryOutcome,
 ) -> Result<Vec<String>, String> {
+    accept_fake_app_server_auto_delivery_with_options(listener, thread_id, outcome, false)
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_auto_delivery_with_options(
+    listener: &TcpListener,
+    thread_id: &'static str,
+    outcome: FakeAutoDeliveryOutcome,
+    expect_pinned_permissions: bool,
+) -> Result<Vec<String>, String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let (mut stream, _) = loop {
         match listener.accept() {
@@ -940,6 +971,41 @@ fn accept_fake_app_server_auto_delivery(
                 let params = message.get("params").unwrap_or(&serde_json::Value::Null);
                 if params.get("threadId").and_then(serde_json::Value::as_str) != Some(thread_id) {
                     return Err(format!("turn/start targeted wrong thread: {params}"));
+                }
+                if let Some(sandbox_policy) = params.get("sandboxPolicy")
+                    && (sandbox_policy.get("access").is_some()
+                        || sandbox_policy.get("readOnlyAccess").is_some())
+                {
+                    return Err(format!(
+                        "turn/start sandboxPolicy carried legacy read access field: {sandbox_policy}"
+                    ));
+                }
+                if expect_pinned_permissions {
+                    if params
+                        .get("approvalPolicy")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("never")
+                    {
+                        return Err(format!(
+                            "turn/start missing pinned approvalPolicy=never: {params}"
+                        ));
+                    }
+                    let Some(sandbox_policy) = params.get("sandboxPolicy") else {
+                        return Err(format!("turn/start missing pinned sandboxPolicy: {params}"));
+                    };
+                    if sandbox_policy
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("readOnly")
+                        || sandbox_policy
+                            .get("networkAccess")
+                            .and_then(serde_json::Value::as_bool)
+                            != Some(false)
+                    {
+                        return Err(format!(
+                            "turn/start pinned unexpected sandboxPolicy: {sandbox_policy}"
+                        ));
+                    }
                 }
                 let input = params
                     .get("input")
@@ -1912,6 +1978,34 @@ fn run_cli_trusted_all_fake_e2e_with_sleep(
 }
 
 #[cfg(unix)]
+fn run_cli_trusted_all_fake_e2e_auto_permissions(
+    home: &TempDir,
+    thread_id: &str,
+    app_server_url: &str,
+) -> Output {
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+
+    Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg(thread_id)
+        .arg("--auto-delivery-policy")
+        .arg("trusted-all")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "12")
+        .output()
+        .expect("run cbth cli run trusted-all with auto permissions")
+}
+
+#[cfg(unix)]
 fn wait_for_batch_close_reason(home: &TempDir, batch_id: &str, close_reason: &str) {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
@@ -2672,6 +2766,35 @@ fn cli_run_trusted_all_auto_delivery_notification_closes_delivered() {
             .iter()
             .any(|decision| decision["decision"] == "observed")
     );
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_auto_delivery_auto_permissions_pin_protocol_sandbox() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-permission-pin";
+    let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_auto_delivery_expect_pinned_permissions(
+            thread_id,
+            FakeAutoDeliveryOutcome::CompletedNotification,
+        );
+
+    let output = run_cli_trusted_all_fake_e2e_auto_permissions(&home, thread_id, &app_server_url);
+    assert!(
+        output.status.success(),
+        "cbth cli run trusted-all auto permissions failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(methods.iter().any(|method| method == "turn/start"));
+
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "closed");
+    assert_eq!(inspected["batch"]["batch"]["close_reason"], "delivered");
     stop_daemon(&home);
 }
 

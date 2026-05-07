@@ -2149,36 +2149,49 @@ fn pinned_read_only_sandbox(
 ) -> Result<Value> {
     let startup_type = sandbox_policy_type(startup_sandbox)?;
     let current_type = sandbox_policy_type(current_sandbox)?;
-    let access = match (startup_type, current_type) {
-        ("readOnly", "readOnly") => pinned_read_only_access(
-            sandbox_access(startup_sandbox, "access")?,
-            sandbox_access(current_sandbox, "access")?,
-        )?,
-        ("readOnly", "workspaceWrite") => pinned_read_only_access(
-            sandbox_access(startup_sandbox, "access")?,
-            sandbox_access(current_sandbox, "readOnlyAccess")?,
-        )?,
-        ("workspaceWrite", "readOnly") => pinned_read_only_access(
-            sandbox_access(startup_sandbox, "readOnlyAccess")?,
-            sandbox_access(current_sandbox, "access")?,
-        )?,
-        ("workspaceWrite", "workspaceWrite") => pinned_read_only_access(
-            sandbox_access(startup_sandbox, "readOnlyAccess")?,
-            sandbox_access(current_sandbox, "readOnlyAccess")?,
-        )?,
-        ("readOnly", _) => sandbox_access(startup_sandbox, "access")?.clone(),
-        (_, "readOnly") => sandbox_access(current_sandbox, "access")?.clone(),
+    match (startup_type, current_type) {
+        ("readOnly", "readOnly") => {
+            pinned_read_only_access(
+                sandbox_access(startup_sandbox, "access")?,
+                sandbox_access(current_sandbox, "access")?,
+            )?;
+        }
+        ("readOnly", "workspaceWrite") => {
+            pinned_read_only_access(
+                sandbox_access(startup_sandbox, "access")?,
+                sandbox_access(current_sandbox, "readOnlyAccess")?,
+            )?;
+        }
+        ("workspaceWrite", "readOnly") => {
+            pinned_read_only_access(
+                sandbox_access(startup_sandbox, "readOnlyAccess")?,
+                sandbox_access(current_sandbox, "access")?,
+            )?;
+        }
+        ("workspaceWrite", "workspaceWrite") => {
+            pinned_read_only_access(
+                sandbox_access(startup_sandbox, "readOnlyAccess")?,
+                sandbox_access(current_sandbox, "readOnlyAccess")?,
+            )?;
+        }
+        ("readOnly", _) => {
+            sandbox_access(startup_sandbox, "access")?;
+        }
+        (_, "readOnly") => {
+            sandbox_access(current_sandbox, "access")?;
+        }
         ("workspaceWrite", "dangerFullAccess") => {
-            sandbox_access(startup_sandbox, "readOnlyAccess")?.clone()
+            sandbox_access(startup_sandbox, "readOnlyAccess")?;
         }
         ("dangerFullAccess", "workspaceWrite") => {
-            sandbox_access(current_sandbox, "readOnlyAccess")?.clone()
+            sandbox_access(current_sandbox, "readOnlyAccess")?;
         }
-        _ => strict_read_only_access(),
+        _ => {
+            strict_read_only_access();
+        }
     };
     Ok(json!({
         "type": "readOnly",
-        "access": access,
         "networkAccess": effective.allows_network,
     }))
 }
@@ -2213,19 +2226,24 @@ fn pinned_workspace_write_sandbox(
     let exclude_slash_tmp =
         workspace_bool_if_workspace(startup_sandbox, startup_workspace, "excludeSlashTmp")?
             || workspace_bool_if_workspace(current_sandbox, current_workspace, "excludeSlashTmp")?;
-    let read_only_access = match (startup_workspace, current_workspace) {
-        (true, true) => pinned_read_only_access(
-            sandbox_access(startup_sandbox, "readOnlyAccess")?,
-            sandbox_access(current_sandbox, "readOnlyAccess")?,
-        )?,
-        (true, false) => sandbox_access(startup_sandbox, "readOnlyAccess")?.clone(),
-        (false, true) => sandbox_access(current_sandbox, "readOnlyAccess")?.clone(),
+    match (startup_workspace, current_workspace) {
+        (true, true) => {
+            pinned_read_only_access(
+                sandbox_access(startup_sandbox, "readOnlyAccess")?,
+                sandbox_access(current_sandbox, "readOnlyAccess")?,
+            )?;
+        }
+        (true, false) => {
+            sandbox_access(startup_sandbox, "readOnlyAccess")?;
+        }
+        (false, true) => {
+            sandbox_access(current_sandbox, "readOnlyAccess")?;
+        }
         (false, false) => bail!("workspaceWrite pin requested without workspace sandbox"),
-    };
+    }
     Ok(json!({
         "type": "workspaceWrite",
         "writableRoots": writable_roots,
-        "readOnlyAccess": read_only_access,
         "networkAccess": effective.allows_network,
         "excludeTmpdirEnvVar": exclude_tmpdir_env_var,
         "excludeSlashTmp": exclude_slash_tmp,
@@ -4148,8 +4166,8 @@ fn read_only_access_drift_direction(
             push_optional_direction(
                 &mut directions,
                 permissive_bool_drift_direction(
-                    sandbox_required_bool_field(startup, "includePlatformDefaults")?,
-                    sandbox_required_bool_field(current, "includePlatformDefaults")?,
+                    sandbox_bool_field(startup, "includePlatformDefaults", false)?,
+                    sandbox_bool_field(current, "includePlatformDefaults", false)?,
                 ),
             );
             Ok(Some(
@@ -6703,10 +6721,7 @@ mod tests {
         assert_eq!(overrides["approvalPolicy"], json!("never"));
         assert_eq!(overrides["sandboxPolicy"]["type"], json!("readOnly"));
         assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(false));
-        assert_eq!(
-            overrides["sandboxPolicy"]["access"],
-            restricted_access(&["/tmp/start-read"])
-        );
+        assert!(overrides["sandboxPolicy"].get("access").is_none());
     }
 
     #[test]
@@ -6746,15 +6761,12 @@ mod tests {
             overrides["sandboxPolicy"]["writableRoots"],
             json!(["/tmp/a"])
         );
-        assert_eq!(
-            overrides["sandboxPolicy"]["readOnlyAccess"],
-            restricted_access(&["/tmp/read-a"])
-        );
+        assert!(overrides["sandboxPolicy"].get("readOnlyAccess").is_none());
         assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(true));
     }
 
     #[test]
-    fn pinned_turn_start_overrides_explicit_no_write_preserves_workspace_read_access() {
+    fn pinned_turn_start_overrides_explicit_no_write_uses_legacy_read_only_shape() {
         let startup = parse_thread_resume_permission_snapshot(&json!({
             "approvalPolicy": "on-request",
             "sandbox": {
@@ -6790,10 +6802,7 @@ mod tests {
 
         assert_eq!(overrides["sandboxPolicy"]["type"], json!("readOnly"));
         assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(true));
-        assert_eq!(
-            overrides["sandboxPolicy"]["access"],
-            restricted_access_without_platform_defaults(&["/tmp/read-b"])
-        );
+        assert!(overrides["sandboxPolicy"].get("access").is_none());
     }
 
     #[test]
@@ -6833,10 +6842,7 @@ mod tests {
             overrides["sandboxPolicy"]["writableRoots"],
             json!(["/tmp/b"])
         );
-        assert_eq!(
-            overrides["sandboxPolicy"]["readOnlyAccess"],
-            restricted_access_without_platform_defaults(&["/tmp/read-b"])
-        );
+        assert!(overrides["sandboxPolicy"].get("readOnlyAccess").is_none());
         assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(false));
         assert_eq!(overrides["sandboxPolicy"]["excludeSlashTmp"], json!(true));
     }
@@ -6876,10 +6882,7 @@ mod tests {
             overrides["sandboxPolicy"]["excludeTmpdirEnvVar"],
             json!(true)
         );
-        assert_eq!(
-            overrides["sandboxPolicy"]["readOnlyAccess"],
-            restricted_access(&["/tmp/read"])
-        );
+        assert!(overrides["sandboxPolicy"].get("readOnlyAccess").is_none());
     }
 
     #[test]
@@ -6967,6 +6970,39 @@ mod tests {
             permission_drift_changes(resolved(&startup), resolved(&current)),
             Vec::<(&'static str, &'static str)>::new()
         );
+        assert_eq!(
+            permission_snapshot_drift_changes(&startup, &current).expect("snapshot drift"),
+            vec![("sandbox_policy", "loosened")]
+        );
+    }
+
+    #[test]
+    fn permission_drift_defaults_missing_include_platform_defaults() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "readOnly",
+                "access": {
+                    "type": "restricted",
+                    "readableRoots": ["/tmp/read"]
+                },
+                "networkAccess": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "readOnly",
+                "access": {
+                    "type": "restricted",
+                    "readableRoots": ["/tmp/read", "/tmp/extra-read"]
+                },
+                "networkAccess": false
+            }
+        }))
+        .expect("parse current snapshot");
+
         assert_eq!(
             permission_snapshot_drift_changes(&startup, &current).expect("snapshot drift"),
             vec![("sandbox_policy", "loosened")]

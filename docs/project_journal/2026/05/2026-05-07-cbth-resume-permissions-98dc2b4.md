@@ -52,10 +52,10 @@ superseded_by:
 - Starting point: `98dc2b4 Add Desktop direct-helper preflight`
 - Branch: `wip/cbth-resume-permissions`
 - Implemented `cbth resume <thread-id> [-- <codex_args>]`, auto permission snapshots, effective permission pinning, drift warning/audit records, schema support, and documentation updates.
-- Pinned `sandboxPolicy` now preserves or tightens protocol-required read-only access fields (`access` / `readOnlyAccess`) along with write roots and network access.
+- Pinned `turn/start` legacy `sandboxPolicy` now omits Codex 0.128-rejected restricted-read fields (`access` / `readOnlyAccess`) while still using those fields for parsing, tightening, and drift/audit.
 - Drift warning/audit now also compares raw `approvalPolicy` / `sandbox` details, so root or read-only access changes are visible even when the derived boolean permissions are unchanged.
 - Proof invalidation and post-turn resync preserve the original startup permission cap for the same foreground managed session; only epoch-local current proof is cleared.
-- Explicit no-write effective permissions now downgrade `workspaceWrite` snapshots to `readOnly` using the intersected `readOnlyAccess` shape instead of losing readable workspace context.
+- Explicit no-write effective permissions now downgrade `workspaceWrite` snapshots to a protocol-valid legacy `readOnly` sandboxPolicy instead of emitting rejected read-access fields.
 - Validation:
   - `cargo fmt --check`
   - `cargo clippy --locked --all-targets -- -D warnings`
