@@ -53,6 +53,7 @@ superseded_by:
 - Branch: `wip/cbth-resume-permissions`
 - Implemented `cbth resume <thread-id> [-- <codex_args>]`, auto permission snapshots, effective permission pinning, drift warning/audit records, schema support, and documentation updates.
 - Pinned `sandboxPolicy` now preserves or tightens protocol-required read-only access fields (`access` / `readOnlyAccess`) along with write roots and network access.
+- Drift warning/audit now also compares raw `approvalPolicy` / `sandbox` details, so root or read-only access changes are visible even when the derived boolean permissions are unchanged.
 - Validation:
   - `cargo fmt --check`
   - `cargo clippy --locked --all-targets -- -D warnings`

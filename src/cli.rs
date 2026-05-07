@@ -2389,6 +2389,7 @@ struct CliAppServerPassiveAdapterState {
     startup_permissions: Option<CliResolvedPermissions>,
     startup_permission_snapshot: Option<CliPermissionSnapshot>,
     last_current_permissions: Option<CliResolvedPermissions>,
+    last_current_permission_snapshot: Option<CliPermissionSnapshot>,
     last_effective_permissions: Option<CliResolvedPermissions>,
 }
 
@@ -2399,7 +2400,7 @@ struct CliResolvedPermissions {
     allows_write_access: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct CliPermissionSnapshot {
     allows_approval: bool,
     allows_network: bool,
@@ -2443,6 +2444,7 @@ fn spawn_cli_app_server_passive_adapter(
         startup_permissions: None,
         startup_permission_snapshot: None,
         last_current_permissions: None,
+        last_current_permission_snapshot: None,
         last_effective_permissions: None,
     }));
     let thread_state = Arc::clone(&state);
@@ -3706,6 +3708,7 @@ fn stop_passive_adapter_after_session_parked(
     state.startup_permissions = None;
     state.startup_permission_snapshot = None;
     state.last_current_permissions = None;
+    state.last_current_permission_snapshot = None;
     state.last_effective_permissions = None;
     running.store(false, Ordering::Release);
 }
@@ -3927,6 +3930,7 @@ struct CliPermissionDriftObservation<'a> {
     startup: CliResolvedPermissions,
     current: CliResolvedPermissions,
     effective: CliResolvedPermissions,
+    startup_snapshot: &'a CliPermissionSnapshot,
     snapshot: &'a CliPermissionSnapshot,
 }
 
@@ -3935,7 +3939,11 @@ fn record_permission_drift_if_needed(
     state: &CliAppServerPassiveAdapterState,
     observation: CliPermissionDriftObservation<'_>,
 ) -> Result<()> {
-    let changes = permission_drift_changes(observation.startup, observation.current);
+    let mut changes = permission_drift_changes(observation.startup, observation.current);
+    changes.extend(permission_snapshot_drift_changes(
+        observation.startup_snapshot,
+        observation.snapshot,
+    )?);
     if changes.is_empty() {
         return Ok(());
     }
@@ -3945,11 +3953,14 @@ fn record_permission_drift_if_needed(
     let loosened = changes
         .iter()
         .any(|(_, direction)| *direction == "loosened");
-    let direction = match (tightened, loosened) {
-        (true, true) => "mixed",
-        (true, false) => "tightened",
-        (false, true) => "loosened",
-        (false, false) => "unchanged",
+    let mixed = changes.iter().any(|(_, direction)| *direction == "mixed");
+    let changed = changes.iter().any(|(_, direction)| *direction == "changed");
+    let direction = match (tightened, loosened, mixed, changed) {
+        (_, _, true, _) | (true, true, _, _) | (true, _, _, true) | (_, true, _, true) => "mixed",
+        (true, false, false, false) => "tightened",
+        (false, true, false, false) => "loosened",
+        (false, false, false, true) => "changed",
+        (false, false, false, false) => "unchanged",
     };
     let changed_dimensions = changes
         .iter()
@@ -3979,6 +3990,8 @@ fn record_permission_drift_if_needed(
                 "startup": observation.startup,
                 "current": observation.current,
                 "effective": observation.effective,
+                "startup_snapshot": observation.startup_snapshot.raw_json(observation.startup),
+                "current_snapshot": observation.snapshot.raw_json(observation.current),
                 "snapshot": observation.snapshot.raw_json(observation.effective),
             }),
         },
@@ -4009,6 +4022,181 @@ fn permission_drift_changes(
         current.allows_write_access,
     );
     changes
+}
+
+fn permission_snapshot_drift_changes(
+    startup: &CliPermissionSnapshot,
+    current: &CliPermissionSnapshot,
+) -> Result<Vec<(&'static str, &'static str)>> {
+    let mut changes = Vec::new();
+    if startup.approval_policy != current.approval_policy {
+        changes.push((
+            "approval_policy",
+            approval_policy_drift_direction(&startup.approval_policy, &current.approval_policy)?,
+        ));
+    }
+    if startup.sandbox_policy != current.sandbox_policy {
+        changes.push((
+            "sandbox_policy",
+            sandbox_policy_drift_direction(&startup.sandbox_policy, &current.sandbox_policy)?,
+        ));
+    }
+    Ok(changes)
+}
+
+fn approval_policy_drift_direction(startup: &Value, current: &Value) -> Result<&'static str> {
+    let startup_rank = approval_policy_risk_rank(startup)?;
+    let current_rank = approval_policy_risk_rank(current)?;
+    Ok(match current_rank.cmp(&startup_rank) {
+        std::cmp::Ordering::Less => "tightened",
+        std::cmp::Ordering::Greater => "loosened",
+        std::cmp::Ordering::Equal => "changed",
+    })
+}
+
+fn sandbox_policy_drift_direction(startup: &Value, current: &Value) -> Result<&'static str> {
+    let startup_type = sandbox_policy_type(startup)?;
+    let current_type = sandbox_policy_type(current)?;
+    if startup_type != current_type {
+        return Ok("changed");
+    }
+    let mut directions = Vec::new();
+    match startup_type {
+        "readOnly" => push_optional_direction(
+            &mut directions,
+            read_only_access_drift_direction(
+                sandbox_access(startup, "access")?,
+                sandbox_access(current, "access")?,
+            )?,
+        ),
+        "workspaceWrite" => {
+            push_optional_direction(
+                &mut directions,
+                roots_drift_direction(
+                    workspace_writable_roots(startup)?,
+                    workspace_writable_roots(current)?,
+                ),
+            );
+            push_optional_direction(
+                &mut directions,
+                read_only_access_drift_direction(
+                    sandbox_access(startup, "readOnlyAccess")?,
+                    sandbox_access(current, "readOnlyAccess")?,
+                )?,
+            );
+            push_optional_direction(
+                &mut directions,
+                restrictive_bool_drift_direction(
+                    sandbox_required_bool_field(startup, "excludeTmpdirEnvVar")?,
+                    sandbox_required_bool_field(current, "excludeTmpdirEnvVar")?,
+                ),
+            );
+            push_optional_direction(
+                &mut directions,
+                restrictive_bool_drift_direction(
+                    sandbox_required_bool_field(startup, "excludeSlashTmp")?,
+                    sandbox_required_bool_field(current, "excludeSlashTmp")?,
+                ),
+            );
+        }
+        "dangerFullAccess" | "externalSandbox" => {}
+        _ => return Ok("changed"),
+    }
+    Ok(combine_drift_directions(&directions).unwrap_or("changed"))
+}
+
+fn read_only_access_drift_direction(
+    startup: &Value,
+    current: &Value,
+) -> Result<Option<&'static str>> {
+    if startup == current {
+        return Ok(None);
+    }
+    let startup_type = read_only_access_type(startup)?;
+    let current_type = read_only_access_type(current)?;
+    match (startup_type, current_type) {
+        ("fullAccess", "restricted") => Ok(Some("tightened")),
+        ("restricted", "fullAccess") => Ok(Some("loosened")),
+        ("fullAccess", "fullAccess") => Ok(Some("changed")),
+        ("restricted", "restricted") => {
+            let mut directions = Vec::new();
+            push_optional_direction(
+                &mut directions,
+                roots_drift_direction(
+                    read_only_readable_roots(startup)?,
+                    read_only_readable_roots(current)?,
+                ),
+            );
+            push_optional_direction(
+                &mut directions,
+                permissive_bool_drift_direction(
+                    sandbox_required_bool_field(startup, "includePlatformDefaults")?,
+                    sandbox_required_bool_field(current, "includePlatformDefaults")?,
+                ),
+            );
+            Ok(Some(
+                combine_drift_directions(&directions).unwrap_or("changed"),
+            ))
+        }
+        _ => Ok(Some("changed")),
+    }
+}
+
+fn roots_drift_direction(
+    startup_roots: Vec<String>,
+    current_roots: Vec<String>,
+) -> Option<&'static str> {
+    let startup = startup_roots.into_iter().collect::<HashSet<_>>();
+    let current = current_roots.into_iter().collect::<HashSet<_>>();
+    if startup == current {
+        return None;
+    }
+    let current_is_subset = current.is_subset(&startup);
+    let startup_is_subset = startup.is_subset(&current);
+    Some(match (current_is_subset, startup_is_subset) {
+        (true, false) => "tightened",
+        (false, true) => "loosened",
+        _ => "mixed",
+    })
+}
+
+fn permissive_bool_drift_direction(startup: bool, current: bool) -> Option<&'static str> {
+    match (startup, current) {
+        (true, false) => Some("tightened"),
+        (false, true) => Some("loosened"),
+        _ => None,
+    }
+}
+
+fn restrictive_bool_drift_direction(startup: bool, current: bool) -> Option<&'static str> {
+    match (startup, current) {
+        (false, true) => Some("tightened"),
+        (true, false) => Some("loosened"),
+        _ => None,
+    }
+}
+
+fn push_optional_direction(directions: &mut Vec<&'static str>, direction: Option<&'static str>) {
+    if let Some(direction) = direction {
+        directions.push(direction);
+    }
+}
+
+fn combine_drift_directions(directions: &[&'static str]) -> Option<&'static str> {
+    if directions.is_empty() {
+        return None;
+    }
+    let tightened = directions.contains(&"tightened");
+    let loosened = directions.contains(&"loosened");
+    let mixed = directions.contains(&"mixed");
+    let changed = directions.contains(&"changed");
+    Some(match (tightened, loosened, mixed, changed) {
+        (_, _, true, _) | (true, true, _, _) | (true, _, _, true) | (_, true, _, true) => "mixed",
+        (true, false, false, false) => "tightened",
+        (false, true, false, false) => "loosened",
+        (false, false, false, true) => "changed",
+        (false, false, false, false) => return None,
+    })
 }
 
 fn push_permission_drift_change(
@@ -4267,7 +4455,15 @@ fn sync_passive_adapter_permissions_from_snapshot(
     let current = config.permission_inputs.resolve(snapshot);
     let startup = state.startup_permissions.unwrap_or(current);
     let effective = effective_permissions(startup, current);
-    if state.startup_permissions.is_some() && state.last_current_permissions != Some(current) {
+    let current_snapshot_changed =
+        state.last_current_permission_snapshot.as_ref() != Some(snapshot);
+    if state.startup_permissions.is_some()
+        && (state.last_current_permissions != Some(current) || current_snapshot_changed)
+    {
+        let startup_snapshot = state
+            .startup_permission_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing startup permission snapshot"))?;
         record_permission_drift_if_needed(
             config,
             state,
@@ -4277,6 +4473,7 @@ fn sync_passive_adapter_permissions_from_snapshot(
                 startup,
                 current,
                 effective,
+                startup_snapshot,
                 snapshot,
             },
         )?;
@@ -4291,6 +4488,7 @@ fn sync_passive_adapter_permissions_from_snapshot(
         running,
     )?;
     state.last_current_permissions = Some(current);
+    state.last_current_permission_snapshot = Some(snapshot.clone());
     Ok(effective)
 }
 
@@ -4309,6 +4507,7 @@ fn invalidate_passive_adapter_proof(
         state.startup_permissions = None;
         state.startup_permission_snapshot = None;
         state.last_current_permissions = None;
+        state.last_current_permission_snapshot = None;
         state.last_effective_permissions = None;
         return Ok(());
     }
@@ -4365,6 +4564,7 @@ fn apply_passive_adapter_invalidated_session(
     state.startup_permissions = None;
     state.startup_permission_snapshot = None;
     state.last_current_permissions = None;
+    state.last_current_permission_snapshot = None;
     state.last_effective_permissions = None;
     Ok(())
 }
@@ -6676,6 +6876,43 @@ mod tests {
         assert_eq!(
             permission_drift_changes(startup, current),
             vec![("network", "tightened"), ("write_access", "loosened")]
+        );
+    }
+
+    #[test]
+    fn permission_drift_tracks_raw_sandbox_policy_changes() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/a"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read", "/tmp/extra-read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/a", "/tmp/b"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+            }
+        }))
+        .expect("parse current snapshot");
+
+        assert_eq!(
+            permission_drift_changes(resolved(&startup), resolved(&current)),
+            Vec::<(&'static str, &'static str)>::new()
+        );
+        assert_eq!(
+            permission_snapshot_drift_changes(&startup, &current).expect("snapshot drift"),
+            vec![("sandbox_policy", "loosened")]
         );
     }
 }
