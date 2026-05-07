@@ -1125,6 +1125,125 @@ fn desktop_writeback_helpers_fail_closed_for_stale_or_unsafe_inputs() {
             "binding",
             "repair",
             "--source-thread-id",
+            "thread-degraded-armed",
+            "--caller-automation-id",
+            "automation-degraded-armed",
+            "--json",
+            "--now",
+            "3007",
+        ],
+    );
+    create_desktop_batch_and_prepared_attempt(
+        &home,
+        "thread-degraded-armed",
+        "attempt-degraded-armed",
+        1,
+        3008,
+    );
+    let degraded_armed_pending = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-degraded-armed",
+            "--attempt-id",
+            "attempt-degraded-armed",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-degraded-armed",
+            "--json",
+            "--now",
+            "3009",
+        ],
+    );
+    let degraded_armed_lease = degraded_armed_pending["desktop_arm_pending"]["bridge_arm_lease_id"]
+        .as_str()
+        .expect("degraded armed lease");
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm",
+            "--source-thread-id",
+            "thread-degraded-armed",
+            "--attempt-id",
+            "attempt-degraded-armed",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-degraded-armed",
+            "--bridge-arm-lease-id",
+            degraded_armed_lease,
+            "--json",
+            "--now",
+            "3010",
+        ],
+    );
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "installation-state",
+            "repair",
+            "--read-transport",
+            "direct-file-read",
+            "--validation-fingerprint",
+            "drifted-after-arm",
+            "--json",
+            "--now",
+            "3011",
+        ],
+    );
+    let degraded_arm_retry = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm",
+            "--source-thread-id",
+            "thread-degraded-armed",
+            "--attempt-id",
+            "attempt-degraded-armed",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-degraded-armed",
+            "--bridge-arm-lease-id",
+            degraded_armed_lease,
+            "--json",
+            "--now",
+            "3012",
+        ],
+    );
+    assert!(degraded_arm_retry.contains("Desktop binding thread-degraded-armed is degraded"));
+    let degraded_pending_retry = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-degraded-armed",
+            "--attempt-id",
+            "attempt-degraded-armed",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-degraded-armed",
+            "--json",
+            "--now",
+            "3013",
+        ],
+    );
+    assert!(degraded_pending_retry.contains("Desktop binding thread-degraded-armed is degraded"));
+
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
             "thread-expired-lease",
             "--caller-automation-id",
             "automation-expired-lease",

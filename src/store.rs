@@ -1880,6 +1880,7 @@ impl Store {
             && attempt.bridge_request_id.as_deref() == Some(bridge_request_id)
             && binding.armed_generation == Some(generation)
         {
+            ensure_desktop_binding_bound_for_arm(&binding)?;
             tx.commit()?;
             return Ok(DesktopArmPendingRecord {
                 outcome: "already_armed".to_owned(),
@@ -1980,6 +1981,7 @@ impl Store {
             && attempt.bridge_arm_lease_id.as_deref() == Some(bridge_arm_lease_id)
             && binding.armed_generation == Some(generation)
         {
+            ensure_desktop_binding_bound_for_arm(&binding)?;
             tx.commit()?;
             return Ok(DesktopArmRecord {
                 outcome: "already_armed".to_owned(),
