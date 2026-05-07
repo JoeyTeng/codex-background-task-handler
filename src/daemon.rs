@@ -3529,15 +3529,16 @@ fn ensure_cli_app_server(
     ensure_cli_app_server_reservation_matches(state, &payload.bound_thread_id, &payload.lease_id)?;
     ensure_daemon_not_stopping(state)?;
 
-    let server = spawn_cli_app_server(
-        &payload.managed_session_id,
-        &payload.bound_thread_id,
-        payload.session_epoch,
-        &payload.codex_binary,
-        &payload.lease_id,
+    let server = spawn_cli_app_server(SpawnCliAppServerOptions {
+        managed_session_id: &payload.managed_session_id,
+        bound_thread_id: &payload.bound_thread_id,
+        session_epoch: payload.session_epoch,
+        codex_binary: &payload.codex_binary,
+        cwd: None,
+        lease_id: &payload.lease_id,
         lease_ttl,
-        &state.stop_requested,
-    )?;
+        stop_requested: &state.stop_requested,
+    })?;
     let mut server = Some(server);
     loop {
         let mut servers = state
@@ -3640,15 +3641,19 @@ fn probe_cli_app_server(
     validate_daemon_nonempty_bytes("codex_binary", &payload.codex_binary)?;
     ensure_daemon_not_stopping(state)?;
     let probe_id = new_id();
-    let server = spawn_cli_app_server(
-        &format!("doctor-probe-session-{probe_id}"),
-        &format!("doctor-probe-thread-{probe_id}"),
-        1,
-        &payload.codex_binary,
-        &format!("doctor-probe-lease-{probe_id}"),
-        Duration::from_secs(DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS),
-        &state.stop_requested,
-    )?;
+    let managed_session_id = format!("doctor-probe-session-{probe_id}");
+    let bound_thread_id = format!("doctor-probe-thread-{probe_id}");
+    let lease_id = format!("doctor-probe-lease-{probe_id}");
+    let server = spawn_cli_app_server(SpawnCliAppServerOptions {
+        managed_session_id: &managed_session_id,
+        bound_thread_id: &bound_thread_id,
+        session_epoch: 1,
+        codex_binary: &payload.codex_binary,
+        cwd: None,
+        lease_id: &lease_id,
+        lease_ttl: Duration::from_secs(DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS),
+        stop_requested: &state.stop_requested,
+    })?;
     let info = cli_app_server_info(&server);
     stop_managed_cli_app_server_process(server);
     Ok(info)
@@ -3711,15 +3716,16 @@ fn start_cli_thread(
     let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
     ensure_daemon_not_stopping(state)?;
     let bootstrap_id = new_id();
-    let server = spawn_cli_app_server(
-        &bootstrap_id,
-        "__cbth_thread_start_bootstrap__",
-        1,
-        &payload.codex_binary,
-        &payload.lease_id,
+    let server = spawn_cli_app_server(SpawnCliAppServerOptions {
+        managed_session_id: &bootstrap_id,
+        bound_thread_id: "__cbth_thread_start_bootstrap__",
+        session_epoch: 1,
+        codex_binary: &payload.codex_binary,
+        cwd: Some(&payload.cwd),
+        lease_id: &payload.lease_id,
         lease_ttl,
-        &state.stop_requested,
-    )?;
+        stop_requested: &state.stop_requested,
+    })?;
     let mut server = Some(server);
     let result = (|| {
         {
@@ -3820,7 +3826,9 @@ fn cli_thread_start_params(
     // model picker display, unless the caller supplied an explicit override.
     // config/read exposes the raw config shape, not the profile-resolved final
     // Config, so leave active-profile cases to thread/start's normal config
-    // resolution path.
+    // resolution path. The fresh bootstrap app-server is launched in this cwd
+    // so config/read still matches the target project if that method ignores
+    // the request cwd field.
     if !thread_start_has_profile_override(&params)?
         && let Some(config) = read_effective_codex_config(client, &cwd)?
         && !effective_config_has_active_profile(&config)
@@ -4060,16 +4068,19 @@ fn parse_cli_thread_start_id(value: &Value) -> Result<String> {
     Ok(thread_id.to_owned())
 }
 
-fn spawn_cli_app_server(
-    managed_session_id: &str,
-    bound_thread_id: &str,
+struct SpawnCliAppServerOptions<'a> {
+    managed_session_id: &'a str,
+    bound_thread_id: &'a str,
     session_epoch: i64,
-    codex_binary: &[u8],
-    lease_id: &str,
+    codex_binary: &'a [u8],
+    cwd: Option<&'a str>,
+    lease_id: &'a str,
     lease_ttl: Duration,
-    stop_requested: &AtomicBool,
-) -> Result<ManagedCliAppServer> {
-    let codex_binary = OsString::from_vec(codex_binary.to_vec());
+    stop_requested: &'a AtomicBool,
+}
+
+fn spawn_cli_app_server(options: SpawnCliAppServerOptions<'_>) -> Result<ManagedCliAppServer> {
+    let codex_binary = OsString::from_vec(options.codex_binary.to_vec());
     let mut command = Command::new(&codex_binary);
     command
         .arg("app-server")
@@ -4079,6 +4090,9 @@ fn spawn_cli_app_server(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    if let Some(cwd) = options.cwd {
+        command.current_dir(cwd);
+    }
     let mut child = spawn_command_locked(&mut command)
         .with_context(|| format!("spawn codex app-server via {:?}", codex_binary))?;
     let stdout = child.stdout.take().context("capture app-server stdout")?;
@@ -4104,7 +4118,7 @@ fn spawn_cli_app_server(
     });
     let startup_deadline = Instant::now() + CLI_APP_SERVER_STARTUP_TIMEOUT;
     let url = loop {
-        if stop_requested.load(Ordering::Acquire) {
+        if options.stop_requested.load(Ordering::Acquire) {
             drain_running.store(false, Ordering::Release);
             stop_cli_app_server_process(&mut child);
             join_worker(stdout_worker);
@@ -4141,14 +4155,14 @@ fn spawn_cli_app_server(
     }
     let started_at = current_epoch_seconds()?;
     Ok(ManagedCliAppServer {
-        managed_session_id: managed_session_id.to_owned(),
-        bound_thread_id: bound_thread_id.to_owned(),
-        session_epoch,
+        managed_session_id: options.managed_session_id.to_owned(),
+        bound_thread_id: options.bound_thread_id.to_owned(),
+        session_epoch: options.session_epoch,
         url,
         child,
         started_at,
-        lease_id: lease_id.to_owned(),
-        lease_expires_at: Instant::now() + lease_ttl,
+        lease_id: options.lease_id.to_owned(),
+        lease_expires_at: Instant::now() + options.lease_ttl,
         drain_running,
         stdout_worker: Some(stdout_worker),
         stderr_worker: Some(stderr_worker),
