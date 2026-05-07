@@ -30,7 +30,7 @@ cbth desktop list-pause-due --bridge-thread-id <thread-id> --json
 cbth desktop claim-next-ready --bridge-thread-id <thread-id> --json
 ```
 
-所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch` capability 时会按现有 capability gate fail closed 或重启。`read-snapshot` / `list-*` / `claim-next-ready` 是 no-DB read helpers：它们只读取已经发布的 inbox JSON，不打开 SQLite、不连接 daemon、不写文件。
+所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch` 或 `desktop-inbox-revisioned-installation-state` capability 时会按现有 capability gate fail closed 或重启。`read-snapshot` / `list-*` / `claim-next-ready` 是 no-DB read helpers：它们只读取已经发布的 inbox JSON，不打开 SQLite、不连接 daemon、不写文件。
 
 ## Installation State
 

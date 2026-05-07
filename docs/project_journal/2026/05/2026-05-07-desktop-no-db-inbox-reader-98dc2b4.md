@@ -42,6 +42,7 @@ superseded_by:
 
 - `cbth desktop read-snapshot`, `list-arm-pending`, `list-pause-due`, and read/peek `claim-next-ready` are implemented as no-DB, no-daemon, no-write inbox readers.
 - The shared reader validates the current manifest, revision-specific snapshots, revision-specific installation-state export, schema version, bridge thread id, snapshot revision, manifest paths, regular-file type, JSON size limit, and entry counts before returning data. The latest-only `~/.cbth/inbox/desktop-installation-state.json` remains an operator convenience export and is not used for revision-consistent reads.
+- Daemon compatibility now includes `desktop-inbox-revisioned-installation-state` so default daemon-routed preflight cannot silently use an older daemon that still publishes the latest-only installation-state manifest format.
 - Fake integration coverage proves the helpers can consume published snapshots even when SQLite is no longer openable and that they fail closed on missing, malformed, oversized, mismatched, or path-escaped snapshot inputs.
 - Real Desktop heartbeat validation succeeded with the no-DB helper path on 2026-05-07. The V5 evidence used a revision-specific installation-state export at `~/.cbth/inbox/snapshots/<snapshot_revision>/desktop-installation-state.json`, and the local installation remains `read_transport_capability=validated`; `artifact_read_capability` and `writeback_capability` remain `unknown`.
 

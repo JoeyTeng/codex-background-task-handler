@@ -85,6 +85,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "cli-auto-delivery-dispatch",
     "task-supervisor",
     "desktop-bridge-foundation-dispatch",
+    "desktop-inbox-revisioned-installation-state",
 ];
 
 #[derive(Debug, Parser)]
