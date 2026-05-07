@@ -56,7 +56,7 @@ const CLI_APP_SERVER_LEASE_TTL_SECONDS: u64 = 60;
 const CLI_APP_SERVER_LEASE_REFRESH_SECONDS: u64 = 20;
 const CLI_APP_SERVER_ENSURE_TIMEOUT_SECONDS: u64 = 15;
 const CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS: u64 = 5;
-const CLI_THREAD_START_BOOTSTRAP_TIMEOUT_SECONDS: u64 = 20;
+const CLI_THREAD_START_BOOTSTRAP_TIMEOUT_SECONDS: u64 = 30;
 const CLI_APP_SERVER_PASSIVE_CONNECT_TIMEOUT_MS: u64 = 250;
 const CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS: u64 = 3;
 const CLI_APP_SERVER_PASSIVE_RECV_TIMEOUT_MS: u64 = 500;
@@ -2377,7 +2377,12 @@ fn apply_codex_resume_foreground_args(
         index += 1;
     }
 
-    if oss && let Some(provider) = local_provider {
+    if oss {
+        let Some(provider) = local_provider else {
+            bail!(
+                "managed CLI session requires --local-provider when forwarding --oss; fresh thread/start cannot infer the foreground OSS provider"
+            );
+        };
         params.insert("modelProvider".to_owned(), Value::String(provider));
     }
     if !config_overrides.is_empty() {

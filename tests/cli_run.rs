@@ -3165,6 +3165,44 @@ fn cbth_new_rejects_forwarded_full_auto_before_thread_start() {
 
 #[cfg(unix)]
 #[test]
+fn cbth_new_rejects_oss_without_local_provider_before_thread_start() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--oss")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .output()
+        .expect("run cbth new with oss without local provider");
+
+    assert!(
+        !output.status.success(),
+        "cbth new unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("managed CLI session requires --local-provider when forwarding --oss")
+    );
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!log.contains("app-server\tapp-server"));
+    assert!(!log.contains("foreground"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
 fn cli_run_new_thread_requires_exclusive_target_mode() {
     let home = temp_home();
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
