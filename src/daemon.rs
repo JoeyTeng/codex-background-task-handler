@@ -78,6 +78,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "cli-app-server-lifecycle",
     "cli-app-server-probe",
     "cli-thread-start-bootstrap",
+    "cli-thread-start-params",
     "cli-session-dispatch",
     "cli-session-capability-dispatch",
     "cli-session-permission-dispatch",
@@ -3861,7 +3862,9 @@ fn merge_effective_config_into_thread_start_params(
     params: &mut Map<String, Value>,
     config: &Map<String, Value>,
 ) -> Result<()> {
-    if !params.contains_key("model")
+    let provider_matches_config = thread_start_provider_matches_config(params, config);
+    if provider_matches_config
+        && !params.contains_key("model")
         && let Some(model) = config.get("model").filter(|value| !value.is_null())
     {
         params.insert("model".to_owned(), model.clone());
@@ -3876,7 +3879,8 @@ fn merge_effective_config_into_thread_start_params(
 
     let mut config_overrides = Map::new();
     for key in ["model_reasoning_effort", "model_reasoning_summary"] {
-        if !thread_start_config_contains(params, key)?
+        if provider_matches_config
+            && !thread_start_config_contains(params, key)?
             && let Some(value) = config.get(key).filter(|value| !value.is_null())
         {
             config_overrides.insert(key.to_owned(), value.clone());
@@ -3893,6 +3897,19 @@ fn merge_effective_config_into_thread_start_params(
     }
 
     Ok(())
+}
+
+fn thread_start_provider_matches_config(
+    params: &Map<String, Value>,
+    config: &Map<String, Value>,
+) -> bool {
+    let Some(provider) = params.get("modelProvider").filter(|value| !value.is_null()) else {
+        return true;
+    };
+    config
+        .get("model_provider")
+        .filter(|value| !value.is_null())
+        .is_some_and(|config_provider| config_provider == provider)
 }
 
 fn thread_start_config_contains(params: &Map<String, Value>, key: &str) -> Result<bool> {

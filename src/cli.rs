@@ -80,6 +80,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "cli-app-server-lifecycle",
     "cli-app-server-probe",
     "cli-thread-start-bootstrap",
+    "cli-thread-start-params",
     "cli-session-dispatch",
     "cli-session-capability-dispatch",
     "cli-session-permission-dispatch",
