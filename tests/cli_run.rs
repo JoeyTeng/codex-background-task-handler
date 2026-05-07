@@ -2399,8 +2399,6 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
         .arg("--image")
         .arg("one.png")
         .arg("two.png")
-        .arg("--add-dir")
-        .arg("extra")
         .arg("--model")
         .arg("gpt-test")
         .arg("--profile")
@@ -2453,6 +2451,51 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
     assert!(log.contains(&format!("\t--cd\t{}", expected_cwd.display())));
 
     stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_forwarded_add_dir() {
+    let cases = [vec!["--add-dir", "extra"], vec!["--add-dir=extra"]];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-add-dir-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("managed resume does not allow forwarded --add-dir"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
 }
 
 #[cfg(unix)]

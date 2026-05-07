@@ -1944,6 +1944,8 @@ fn foreground_codex_args(
         }
         if let Some(flag) = managed_resume_remote_override_flag(&arg) {
             reject_managed_resume_remote_override(flag)?;
+        } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
+            reject_managed_resume_add_dir_override(flag)?;
         } else if let Some(value) = arg.strip_prefix("--cd=") {
             foreground_cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
         } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
@@ -1969,10 +1971,13 @@ fn foreground_codex_args(
                 }
                 "--model" | "-m" | "--profile" | "-p" | "--sandbox" | "-s"
                 | "--ask-for-approval" | "-a" | "--config" | "-c" | "--local-provider"
-                | "--enable" | "--disable" | "--add-dir" => {
+                | "--enable" | "--disable" => {
                     let start = index;
                     skip_codex_arg_value(codex_args, &mut index, arg.as_str())?;
                     filtered.extend(codex_args[start..=index].iter().cloned());
+                }
+                "--add-dir" => {
+                    reject_managed_resume_add_dir_override(arg.as_str())?;
                 }
                 "--remote" | "--remote-auth-token-env" => {
                     reject_managed_resume_remote_override(arg.as_str())?;
@@ -2005,6 +2010,20 @@ fn managed_resume_remote_override_flag(arg: &str) -> Option<&'static str> {
 fn reject_managed_resume_remote_override(flag: &str) -> Result<()> {
     bail!(
         "managed resume does not allow forwarded {flag}; cbth owns the remote app-server connection"
+    )
+}
+
+fn managed_resume_add_dir_override_flag(arg: &str) -> Option<&'static str> {
+    if arg == "--add-dir" || arg.starts_with("--add-dir=") {
+        Some("--add-dir")
+    } else {
+        None
+    }
+}
+
+fn reject_managed_resume_add_dir_override(flag: &str) -> Result<()> {
+    bail!(
+        "managed resume does not allow forwarded {flag}; Codex thread/resume cannot faithfully carry additional writable roots"
     )
 }
 
@@ -2047,6 +2066,8 @@ fn apply_codex_resume_foreground_args(
 
         if let Some(flag) = managed_resume_remote_override_flag(&arg) {
             reject_managed_resume_remote_override(flag)?;
+        } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
+            reject_managed_resume_add_dir_override(flag)?;
         } else if let Some(value) = arg.strip_prefix("--model=") {
             params.insert("model".to_owned(), Value::String(value.to_owned()));
         } else if let Some(value) = arg.strip_prefix("--profile=") {
@@ -2137,8 +2158,11 @@ fn apply_codex_resume_foreground_args(
                     local_provider =
                         Some(next_codex_arg_value(codex_args, &mut index, arg.as_str())?);
                 }
-                "--enable" | "--disable" | "--add-dir" => {
+                "--enable" | "--disable" => {
                     let _ = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                }
+                "--add-dir" => {
+                    reject_managed_resume_add_dir_override(arg.as_str())?;
                 }
                 "--remote" | "--remote-auth-token-env" => {
                     reject_managed_resume_remote_override(arg.as_str())?;
