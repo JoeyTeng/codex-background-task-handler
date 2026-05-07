@@ -2465,6 +2465,64 @@ fn cbth_resume_invalid_forwarded_args_do_not_start_app_server() {
 
 #[cfg(unix)]
 #[test]
+fn cbth_resume_rejects_forwarded_remote_override() {
+    let cases = [
+        (vec!["--remote", "ws://127.0.0.1:9999"], "--remote"),
+        (vec!["--remote=ws://127.0.0.1:9999"], "--remote"),
+        (
+            vec!["--remote-auth-token-env", "CODEX_TOKEN"],
+            "--remote-auth-token-env",
+        ),
+        (
+            vec!["--remote-auth-token-env=CODEX_TOKEN"],
+            "--remote-auth-token-env",
+        ),
+    ];
+
+    for (index, (args, rejected_flag)) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-remote-override-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "managed resume does not allow forwarded {rejected_flag}"
+            )),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn cli_run_new_thread_bootstraps_thread_then_preserves_foreground_model() {
     let home = temp_home();
     let client_cwd = tempfile::tempdir().expect("client cwd");

@@ -59,6 +59,7 @@ superseded_by:
 - Review follow-up keeps forwarded native resume option scanning aligned with Codex single-value and variadic options, so `--add-dir` or `--image <FILE>...` cannot hide later `--cd` / sandbox overrides from the initial sidecar `thread/resume`.
 - Single-source workspace-write pins now normalize and validate writable roots before emission, matching the intersection path and failing closed on relative or parent-directory roots.
 - Native resume consumes forwarded `--cd` / `-C` into the single pinned foreground cwd instead of passing duplicate cwd flags to Codex.
+- Native resume rejects forwarded `--remote` / `--remote-auth-token-env` overrides so the foreground Codex process cannot bypass the daemon-owned managed app-server.
 - Startup permission idempotency now compares the raw startup snapshot JSON as well as derived booleans, so a lost response cannot repin a different raw sandbox under the same risk booleans.
 - Fresh unmaterialized `--new-thread` keeps default passive proof with auto permissions even before a startup permission snapshot exists; automatic delivery still requires a trusted snapshot.
 - Default `auto` reattach no longer treats the fail-closed initial false profile as fixed, avoiding profile-drift replacement after a prior auto-derived effective profile was wider.
@@ -73,5 +74,7 @@ superseded_by:
   - `cargo test --locked cli_session_invalidate_proof_preserves_startup_permission_cap`
   - `cargo test --locked cli_run_new_thread_bootstraps_thread_then_preserves_foreground_model`
   - `cargo test --locked cli_run_trusted_all_auto_delivery_resyncs_after_terminal_for_next_head`
+  - `cargo test --locked cbth_resume_rejects_forwarded_remote_override`
+  - `cargo test --locked cbth_resume_invalid_forwarded_args_do_not_start_app_server`
   - `cargo test --test cli_run`
   - `uv run python /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/hoteng/.codex/worktrees/aef0/codex-background-task-handler`

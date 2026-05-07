@@ -1894,7 +1894,9 @@ fn foreground_codex_args(
             filtered.extend(codex_args[index..].iter().cloned());
             break;
         }
-        if let Some(value) = arg.strip_prefix("--cd=") {
+        if let Some(flag) = managed_resume_remote_override_flag(&arg) {
+            reject_managed_resume_remote_override(flag)?;
+        } else if let Some(value) = arg.strip_prefix("--cd=") {
             foreground_cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
         } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
             foreground_cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
@@ -1917,25 +1919,15 @@ fn foreground_codex_args(
                         resolve_codex_cwd_arg(caller_cwd, value)
                     };
                 }
-                "--model"
-                | "-m"
-                | "--profile"
-                | "-p"
-                | "--sandbox"
-                | "-s"
-                | "--ask-for-approval"
-                | "-a"
-                | "--config"
-                | "-c"
-                | "--local-provider"
-                | "--enable"
-                | "--disable"
-                | "--remote"
-                | "--remote-auth-token-env"
-                | "--add-dir" => {
+                "--model" | "-m" | "--profile" | "-p" | "--sandbox" | "-s"
+                | "--ask-for-approval" | "-a" | "--config" | "-c" | "--local-provider"
+                | "--enable" | "--disable" | "--add-dir" => {
                     let start = index;
                     skip_codex_arg_value(codex_args, &mut index, arg.as_str())?;
                     filtered.extend(codex_args[start..=index].iter().cloned());
+                }
+                "--remote" | "--remote-auth-token-env" => {
+                    reject_managed_resume_remote_override(arg.as_str())?;
                 }
                 "--image" | "-i" => {
                     let start = index;
@@ -1950,6 +1942,22 @@ fn foreground_codex_args(
         index += 1;
     }
     Ok((foreground_cwd, filtered))
+}
+
+fn managed_resume_remote_override_flag(arg: &str) -> Option<&'static str> {
+    if arg == "--remote" || arg.starts_with("--remote=") {
+        Some("--remote")
+    } else if arg == "--remote-auth-token-env" || arg.starts_with("--remote-auth-token-env=") {
+        Some("--remote-auth-token-env")
+    } else {
+        None
+    }
+}
+
+fn reject_managed_resume_remote_override(flag: &str) -> Result<()> {
+    bail!(
+        "managed resume does not allow forwarded {flag}; cbth owns the remote app-server connection"
+    )
 }
 
 fn initial_passive_thread_resume_params(
@@ -1989,7 +1997,9 @@ fn apply_codex_resume_foreground_args(
             break;
         }
 
-        if let Some(value) = arg.strip_prefix("--model=") {
+        if let Some(flag) = managed_resume_remote_override_flag(&arg) {
+            reject_managed_resume_remote_override(flag)?;
+        } else if let Some(value) = arg.strip_prefix("--model=") {
             params.insert("model".to_owned(), Value::String(value.to_owned()));
         } else if let Some(value) = arg.strip_prefix("--profile=") {
             config_overrides.insert("profile".to_owned(), Value::String(value.to_owned()));
@@ -2079,8 +2089,11 @@ fn apply_codex_resume_foreground_args(
                     local_provider =
                         Some(next_codex_arg_value(codex_args, &mut index, arg.as_str())?);
                 }
-                "--enable" | "--disable" | "--remote" | "--remote-auth-token-env" | "--add-dir" => {
+                "--enable" | "--disable" | "--add-dir" => {
                     let _ = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
+                }
+                "--remote" | "--remote-auth-token-env" => {
+                    reject_managed_resume_remote_override(arg.as_str())?;
                 }
                 "--image" | "-i" => {
                     skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), false)?;
