@@ -440,6 +440,26 @@ pub struct DesktopBindingRepairRecord {
     pub installation_state: DesktopInstallationStateRecord,
 }
 
+#[derive(Clone, Debug)]
+pub struct NewDesktopWritebackFixture {
+    pub source_thread_id: String,
+    pub caller_automation_id: String,
+    pub bridge_request_id: String,
+    pub default_validation_fingerprint: String,
+    pub now: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopWritebackFixtureRecord {
+    pub source_thread_id: String,
+    pub caller_automation_id: String,
+    pub bridge_request_id: String,
+    pub job: JobRecord,
+    pub batch: BatchRecord,
+    pub attempt: DeliveryAttemptRecord,
+    pub binding: DesktopBindingRecord,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DesktopArmPendingRecord {
     pub outcome: String,

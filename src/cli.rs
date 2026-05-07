@@ -42,7 +42,8 @@ use crate::models::{
     CliManagedSessionProfileRequirement, DEFAULT_MAX_DELIVERY_ATTEMPTS,
     DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, DesktopInstallationStateRecord,
     NewAuditDecision, NewCliAcceptPendingAttempt, NewCliManagedSessionPermissionSnapshot,
-    NewDesktopInstallationRepair, NewJob, PartialDeliveryPolicy, SubmitMetadata, SweepReport,
+    NewDesktopInstallationRepair, NewDesktopWritebackFixture, NewJob, PartialDeliveryPolicy,
+    SubmitMetadata, SweepReport,
 };
 use crate::self_update::{SelfUpdateOptions, current_release_target_triple, run_self_update};
 use crate::store::{Store, new_id};
@@ -93,6 +94,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-bridge-foundation-dispatch",
     "desktop-inbox-revisioned-installation-state",
     "desktop-writeback-helper-foundation",
+    "desktop-writeback-live-validation-fixture",
 ];
 
 #[derive(Debug, Parser)]
@@ -235,6 +237,11 @@ enum DesktopCommand {
         about = "Record that a Desktop caller heartbeat arm was accepted"
     )]
     NoteArm(DesktopNoteArmArgs),
+    #[command(name = "validation", hide = true)]
+    Validation {
+        #[command(subcommand)]
+        command: DesktopValidationCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -343,6 +350,33 @@ struct DesktopBindingRepairArgs {
 
     #[arg(long, help = "Caller heartbeat automation id owned by this binding")]
     caller_automation_id: String,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Subcommand)]
+enum DesktopValidationCommand {
+    #[command(
+        name = "prepare-writeback-fixture",
+        about = "Create a validation-only Desktop writeback fixture"
+    )]
+    PrepareWritebackFixture(DesktopPrepareWritebackFixtureArgs),
+}
+
+#[derive(Debug, Args)]
+struct DesktopPrepareWritebackFixtureArgs {
+    #[arg(long)]
+    source_thread_id: String,
+
+    #[arg(long)]
+    caller_automation_id: String,
+
+    #[arg(long)]
+    bridge_request_id: Option<String>,
 
     #[arg(long, help = "Emit JSON output")]
     json: bool,
@@ -5934,6 +5968,36 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             }
             argv
         }
+        Commands::Desktop {
+            command:
+                DesktopCommand::Validation {
+                    command: DesktopValidationCommand::PrepareWritebackFixture(args),
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("desktop"),
+                OsString::from("validation"),
+                OsString::from("prepare-writeback-fixture"),
+            ];
+            push_string_arg(&mut argv, "--source-thread-id", &args.source_thread_id);
+            push_string_arg(
+                &mut argv,
+                "--caller-automation-id",
+                &args.caller_automation_id,
+            );
+            push_optional_string_arg(
+                &mut argv,
+                "--bridge-request-id",
+                args.bridge_request_id.as_deref(),
+            );
+            if args.json {
+                argv.push(OsString::from("--json"));
+            }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
         Commands::Maintenance {
             command: MaintenanceCommand::Sweep(args),
         } => {
@@ -7103,6 +7167,31 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
                 now,
             )?;
             Ok(json!({ "desktop_arm": record }))
+        }
+        DesktopCommand::Validation {
+            command: DesktopValidationCommand::PrepareWritebackFixture(args),
+        } => {
+            let mut store = Store::open(layout)?;
+            validate_nonempty("source_thread_id", &args.source_thread_id)?;
+            validate_nonempty("caller_automation_id", &args.caller_automation_id)?;
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            let bridge_request_id = match args.bridge_request_id {
+                Some(value) => {
+                    validate_nonempty("bridge_request_id", &value)?;
+                    value
+                }
+                None => new_id(),
+            };
+            let fingerprint =
+                desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
+            let fixture = store.prepare_desktop_writeback_fixture(NewDesktopWritebackFixture {
+                source_thread_id: args.source_thread_id,
+                caller_automation_id: args.caller_automation_id,
+                bridge_request_id,
+                default_validation_fingerprint: fingerprint,
+                now,
+            })?;
+            Ok(json!({ "desktop_writeback_fixture": fixture }))
         }
         DesktopCommand::InstallationState(args) => {
             let mut store = Store::open(layout)?;
