@@ -712,6 +712,7 @@ v1 范围外：
 - hidden adapter-internal `cbth cli session note-activity` 已作为 current-state sync 的临时 durable 写入面落地；当前只允许同 epoch 的 `live` / `detached` session 通过严格顺序递增的 `activity_revision` 被标成 `active` 或 `idle`，同 revision 只允许完全相同状态的幂等重放。
 - hidden adapter-internal `cbth cli session note-capabilities` 已作为 epoch-local capability probe 写入面落地；每次 bind / re-attach / continuity-loss fence 都会清空旧 capability proof。
 - hidden adapter-internal `cbth cli session note-permissions` 已作为 epoch-local permission snapshot 写入面落地；auto 模式从 `thread/resume.approvalPolicy` 与 `thread/resume.sandbox` 派生 current permissions，首次可信 snapshot pin 为 startup，上游缺字段、未知 approval policy、未知 sandbox type 或不可信字段形状都会 fail-closed。
+- default passive auto session 在 `thread/resume` 缺少权限字段时仍可继续记录 activity/capability current-state proof；缺失 snapshot 只阻止自动投递，直到后续 refresh 获得可信权限快照。混合 explicit/auto bind 只放宽 auto 维度，显式 `true` / `false` 维度仍参与 profile drift 检查。
 - `begin-cli-accept` 已经要求引用一个匹配当前 batch `source_thread_id`、`session_epoch`、state、no-approval / no-network / no-write profile，且 `turn_start` 时同时具备最小 capability proof 和 `activity_state=idle` 的 managed session；不再接受任意字符串形式的 `managed_session_id`。
 - 当前最小 capability proof 要求 adapter 已证明 `turn_start`、`current_state_sync`、`turn_completed_event`、负终态 observation surface，以及 `thread_resume` 或 fresh `thread_start` 中至少一种 caller-thread attachment proof；缺任一项都会 fail-closed。
 - `cbth cli run` 已启动 wrapper-owned sidecar client：

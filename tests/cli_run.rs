@@ -310,13 +310,21 @@ fn spawn_fake_app_server_reconnect_without_turn_snapshot(
 fn spawn_fake_app_server_capture_passive_methods(
     thread_id: &'static str,
 ) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
-    spawn_fake_app_server_capture_passive_methods_for(thread_id, Duration::from_secs(2))
+    spawn_fake_app_server_capture_passive_methods_for(thread_id, Duration::from_secs(2), true)
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_capture_passive_methods_without_permissions(
+    thread_id: &'static str,
+) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
+    spawn_fake_app_server_capture_passive_methods_for(thread_id, Duration::from_secs(2), false)
 }
 
 #[cfg(unix)]
 fn spawn_fake_app_server_capture_passive_methods_for(
     thread_id: &'static str,
     observe_duration: Duration,
+    include_permissions: bool,
 ) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
     listener
@@ -326,8 +334,12 @@ fn spawn_fake_app_server_capture_passive_methods_for(
     let (done_tx, done_rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let result =
-            accept_fake_app_server_capture_passive_methods(&listener, thread_id, observe_duration);
+        let result = accept_fake_app_server_capture_passive_methods(
+            &listener,
+            thread_id,
+            observe_duration,
+            include_permissions,
+        );
         let _ = done_tx.send(result);
     });
 
@@ -384,6 +396,7 @@ fn spawn_fake_app_server_new_thread_then_capture_passive_methods(
                 &listener,
                 thread_id,
                 observe_duration,
+                true,
             )?;
             methods.append(&mut passive_methods);
             Ok(methods)
@@ -849,6 +862,7 @@ fn accept_fake_app_server_capture_passive_methods(
     listener: &TcpListener,
     thread_id: &'static str,
     observe_duration: Duration,
+    include_permissions: bool,
 ) -> Result<Vec<String>, String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let (mut stream, _) = loop {
@@ -893,7 +907,13 @@ fn accept_fake_app_server_capture_passive_methods(
                 }),
             )?,
             "initialized" => {}
-            "thread/resume" => write_fake_thread_response(&mut stream, &message, thread_id, true)?,
+            "thread/resume" => write_fake_thread_response_with_permissions(
+                &mut stream,
+                &message,
+                thread_id,
+                true,
+                include_permissions,
+            )?,
             "thread/read" => {
                 write_fake_thread_response(&mut stream, &message, thread_id, true)?;
                 saw_thread_read = true;
@@ -1781,6 +1801,17 @@ fn write_fake_thread_response(
     thread_id: &str,
     include_turns: bool,
 ) -> Result<(), String> {
+    write_fake_thread_response_with_permissions(stream, request, thread_id, include_turns, true)
+}
+
+#[cfg(unix)]
+fn write_fake_thread_response_with_permissions(
+    stream: &mut TcpStream,
+    request: &serde_json::Value,
+    thread_id: &str,
+    include_turns: bool,
+    include_permissions: bool,
+) -> Result<(), String> {
     let thread = if include_turns {
         serde_json::json!({
             "id": thread_id,
@@ -1792,27 +1823,26 @@ fn write_fake_thread_response(
             "id": thread_id
         })
     };
-    write_fake_json_response(
-        stream,
-        request,
-        serde_json::json!({
-            "thread": thread,
-            "approvalPolicy": "never",
-            "approvalsReviewer": "user",
-            "cwd": "/tmp/fake-cwd",
-            "model": "fake-model",
-            "modelProvider": "openai",
-            "sandbox": {
-                "type": "readOnly",
-                "access": {
-                    "type": "restricted",
-                    "includePlatformDefaults": true,
-                    "readableRoots": ["/tmp/fake-cwd"]
-                },
-                "networkAccess": false
-            }
-        }),
-    )
+    let mut response = serde_json::json!({
+        "thread": thread,
+        "cwd": "/tmp/fake-cwd",
+        "model": "fake-model",
+        "modelProvider": "openai",
+    });
+    if include_permissions {
+        response["approvalPolicy"] = serde_json::json!("never");
+        response["approvalsReviewer"] = serde_json::json!("user");
+        response["sandbox"] = serde_json::json!({
+            "type": "readOnly",
+            "access": {
+                "type": "restricted",
+                "includePlatformDefaults": true,
+                "readableRoots": ["/tmp/fake-cwd"]
+            },
+            "networkAccess": false
+        });
+    }
+    write_fake_json_response(stream, request, response)
 }
 
 #[cfg(unix)]
@@ -2984,6 +3014,75 @@ fn cli_run_fake_e2e_passive_sync_does_not_send_delivery_rpc() {
 
 #[cfg(unix)]
 #[test]
+fn cli_run_passive_auto_missing_permission_snapshot_keeps_current_state_sync() {
+    let home = temp_home();
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cli-run-passive-missing-permissions";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_capture_passive_methods_without_permissions(thread_id);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg(thread_id)
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "1")
+        .output()
+        .expect("run cbth cli run");
+
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let methods = match fake_server_done.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(methods)) => methods,
+        Ok(Err(error)) => panic!("fake app-server failed: {error}"),
+        Err(error) => panic!("timed out waiting for fake app-server: {error}"),
+    };
+    assert_eq!(
+        methods,
+        vec![
+            "initialize".to_owned(),
+            "initialized".to_owned(),
+            "thread/resume".to_owned(),
+            "thread/read".to_owned(),
+        ]
+    );
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (session_state, permission_snapshot_revision, last_permission_snapshot_json): (
+        String,
+        i64,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT session_state, permission_snapshot_revision, last_permission_snapshot_json
+             FROM cli_managed_sessions
+             WHERE bound_thread_id = ?",
+            [thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query managed session");
+    assert_eq!(session_state, "detached");
+    assert_eq!(permission_snapshot_revision, 0);
+    assert!(last_permission_snapshot_json.is_none());
+
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
 fn cli_run_trusted_all_auto_delivery_notification_closes_delivered() {
     let home = temp_home();
     let thread_id = "thread-cli-auto-notification";
@@ -3255,7 +3354,7 @@ fn cli_run_trusted_all_auto_delivery_skips_manual_resolution_head_without_audit(
     drop(conn);
 
     let (app_server_url, fake_server_done) =
-        spawn_fake_app_server_capture_passive_methods_for(thread_id, Duration::from_secs(5));
+        spawn_fake_app_server_capture_passive_methods_for(thread_id, Duration::from_secs(5), true);
 
     run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
     let methods = wait_for_fake_app_server_methods(fake_server_done);

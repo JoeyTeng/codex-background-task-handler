@@ -63,6 +63,8 @@ superseded_by:
 - Startup permission idempotency now compares the raw startup snapshot JSON as well as derived booleans, so a lost response cannot repin a different raw sandbox under the same risk booleans.
 - Fresh unmaterialized `--new-thread` keeps default passive proof with auto permissions even before a startup permission snapshot exists; automatic delivery still requires a trusted snapshot.
 - Default `auto` reattach no longer treats the fail-closed initial false profile as fixed, avoiding profile-drift replacement after a prior auto-derived effective profile was wider.
+- Passive auto sessions continue current-state activity/capability sync when `thread/resume` lacks permission fields; automatic delivery remains disabled until a trusted snapshot appears.
+- Mixed explicit/auto binds enforce explicit dimensions during profile drift checks while allowing only auto dimensions to float.
 - Explicit no-write effective permissions now downgrade `workspaceWrite` snapshots to a protocol-valid legacy `readOnly` sandboxPolicy instead of emitting rejected read-access fields.
 - Validation:
   - `cargo fmt --check`
@@ -76,5 +78,7 @@ superseded_by:
   - `cargo test --locked cli_run_trusted_all_auto_delivery_resyncs_after_terminal_for_next_head`
   - `cargo test --locked cbth_resume_rejects_forwarded_remote_override`
   - `cargo test --locked cbth_resume_invalid_forwarded_args_do_not_start_app_server`
+  - `cargo test --locked cli_run_passive_auto_missing_permission_snapshot_keeps_current_state_sync`
+  - `cargo test --locked cli_session_bind_auto_profile_enforces_explicit_dimensions`
   - `cargo test --test cli_run`
   - `uv run python /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/hoteng/.codex/worktrees/aef0/codex-background-task-handler`

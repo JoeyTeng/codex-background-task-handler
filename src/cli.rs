@@ -38,10 +38,10 @@ use crate::fs_layout::{
 };
 use crate::models::{
     CliManagedSessionCapabilities, CliManagedSessionPermissions, CliManagedSessionProfile,
-    DEFAULT_MAX_DELIVERY_ATTEMPTS, DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy,
-    DesktopInstallationStateRecord, NewAuditDecision, NewCliAcceptPendingAttempt,
-    NewCliManagedSessionPermissionSnapshot, NewDesktopInstallationRepair, NewJob,
-    PartialDeliveryPolicy, SubmitMetadata, SweepReport,
+    CliManagedSessionProfileRequirement, DEFAULT_MAX_DELIVERY_ATTEMPTS,
+    DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, DesktopInstallationStateRecord,
+    NewAuditDecision, NewCliAcceptPendingAttempt, NewCliManagedSessionPermissionSnapshot,
+    NewDesktopInstallationRepair, NewJob, PartialDeliveryPolicy, SubmitMetadata, SweepReport,
 };
 use crate::self_update::{SelfUpdateOptions, current_release_target_triple, run_self_update};
 use crate::store::{Store, new_id};
@@ -951,6 +951,29 @@ impl CliSessionPermissionInputs {
         }
     }
 
+    fn profile_requirement(
+        &self,
+        profile: &CliManagedSessionProfile,
+    ) -> CliManagedSessionProfileRequirement {
+        if !self.uses_auto() {
+            return CliManagedSessionProfileRequirement::all(profile);
+        }
+        CliManagedSessionProfileRequirement {
+            session_allows_approval: self
+                .approval
+                .is_explicit()
+                .then_some(profile.session_allows_approval),
+            session_allows_network: self
+                .network
+                .is_explicit()
+                .then_some(profile.session_allows_network),
+            session_allows_write_access: self
+                .write_access
+                .is_explicit()
+                .then_some(profile.session_allows_write_access),
+        }
+    }
+
     fn uses_auto(&self) -> bool {
         matches!(self.approval, SessionAllowsValue::Auto)
             || matches!(self.network, SessionAllowsValue::Auto)
@@ -981,6 +1004,10 @@ impl SessionAllowsValue {
             Self::Auto => None,
             Self::Explicit(value) => Some(*value),
         }
+    }
+
+    fn is_explicit(&self) -> bool {
+        matches!(self, Self::Explicit(_))
     }
 }
 
@@ -1068,6 +1095,15 @@ struct CliSessionBindArgs {
 
     #[arg(long, hide = true, default_value_t = false)]
     auto_profile: bool,
+
+    #[arg(long, hide = true, default_value_t = false)]
+    session_allows_approval_explicit: bool,
+
+    #[arg(long, hide = true, default_value_t = false)]
+    session_allows_network_explicit: bool,
+
+    #[arg(long, hide = true, default_value_t = false)]
+    session_allows_write_access_explicit: bool,
 
     #[arg(long, hide = true)]
     now: Option<i64>,
@@ -1673,6 +1709,9 @@ fn run_cli_session(
     })?;
 
     let initial_profile = config.permission_inputs.initial_profile();
+    let profile_requirement = config
+        .permission_inputs
+        .profile_requirement(&initial_profile);
     let bind = match dispatch(
         Commands::Cli {
             command: CliCommand::Session {
@@ -1682,6 +1721,15 @@ fn run_cli_session(
                     session_allows_network: initial_profile.session_allows_network,
                     session_allows_write_access: initial_profile.session_allows_write_access,
                     auto_profile: config.permission_inputs.uses_auto(),
+                    session_allows_approval_explicit: profile_requirement
+                        .session_allows_approval
+                        .is_some(),
+                    session_allows_network_explicit: profile_requirement
+                        .session_allows_network
+                        .is_some(),
+                    session_allows_write_access_explicit: profile_requirement
+                        .session_allows_write_access
+                        .is_some(),
                     now: None,
                 }),
             },
@@ -3064,15 +3112,23 @@ fn run_cli_app_server_passive_adapter_once(
                 }
             }
             if config.permission_inputs.uses_auto() {
-                let snapshot = parse_thread_resume_permission_snapshot(&resume)?;
-                sync_passive_adapter_permissions_from_snapshot(
-                    config,
-                    state,
-                    &snapshot,
-                    Some(&config.bound_thread_id),
-                    None,
-                    Some(running),
-                )?;
+                match parse_thread_resume_permission_snapshot(&resume) {
+                    Ok(snapshot) => {
+                        sync_passive_adapter_permissions_from_snapshot(
+                            config,
+                            state,
+                            &snapshot,
+                            Some(&config.bound_thread_id),
+                            None,
+                            Some(running),
+                        )?;
+                    }
+                    Err(_error) => {
+                        state.last_current_permissions = None;
+                        state.last_current_permission_snapshot = None;
+                        state.last_effective_permissions = None;
+                    }
+                }
             }
         }
         Err(error)
@@ -5361,6 +5417,15 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             if args.auto_profile {
                 argv.push(OsString::from("--auto-profile"));
             }
+            if args.session_allows_approval_explicit {
+                argv.push(OsString::from("--session-allows-approval-explicit"));
+            }
+            if args.session_allows_network_explicit {
+                argv.push(OsString::from("--session-allows-network-explicit"));
+            }
+            if args.session_allows_write_access_explicit {
+                argv.push(OsString::from("--session-allows-write-access-explicit"));
+            }
             if let Some(now) = args.now {
                 push_i64_arg(&mut argv, "--now", now);
             }
@@ -6556,14 +6621,30 @@ fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
                     Some(value) => value,
                     None => now_epoch_seconds()?,
                 };
+                let profile = CliManagedSessionProfile {
+                    session_allows_approval: args.session_allows_approval,
+                    session_allows_network: args.session_allows_network,
+                    session_allows_write_access: args.session_allows_write_access,
+                };
+                let profile_requirement = if args.auto_profile {
+                    CliManagedSessionProfileRequirement {
+                        session_allows_approval: args
+                            .session_allows_approval_explicit
+                            .then_some(args.session_allows_approval),
+                        session_allows_network: args
+                            .session_allows_network_explicit
+                            .then_some(args.session_allows_network),
+                        session_allows_write_access: args
+                            .session_allows_write_access_explicit
+                            .then_some(args.session_allows_write_access),
+                    }
+                } else {
+                    CliManagedSessionProfileRequirement::all(&profile)
+                };
                 let session = store.attach_or_create_cli_managed_session(
                     &args.bound_thread_id,
-                    CliManagedSessionProfile {
-                        session_allows_approval: args.session_allows_approval,
-                        session_allows_network: args.session_allows_network,
-                        session_allows_write_access: args.session_allows_write_access,
-                    },
-                    args.auto_profile,
+                    profile,
+                    profile_requirement,
                     now,
                 )?;
                 Ok(json!({ "cli_session": session }))

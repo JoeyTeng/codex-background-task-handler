@@ -17,14 +17,14 @@ use crate::models::{
     ArtifactRecord, AuditDecisionRecord, BatchInspect, BatchJobRecord, BatchRecord,
     CliManagedSessionActivityUpdate, CliManagedSessionAttach, CliManagedSessionCapabilities,
     CliManagedSessionCapabilityUpdate, CliManagedSessionPermissionUpdate,
-    CliManagedSessionPermissions, CliManagedSessionProfile, CliManagedSessionProofInvalidation,
-    CliManagedSessionRecord, CliManagedSessionRetirement, DEFAULT_REDELIVERY_WINDOW_SECONDS,
-    DaemonLifecycleStatus, DeliveryAttemptRecord, DeliveryPolicy, DesktopBindingRecord,
-    DesktopBindingRepairRecord, DesktopInstallationRepairRecord, DesktopInstallationStateRecord,
-    JobRecord, LostPendingTaskProcess, NewArtifact, NewAuditDecision, NewBatch,
-    NewCliAcceptPendingAttempt, NewCliManagedSessionPermissionSnapshot,
-    NewDesktopInstallationRepair, NewJob, NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS,
-    POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport, TaskRecord,
+    CliManagedSessionPermissions, CliManagedSessionProfile, CliManagedSessionProfileRequirement,
+    CliManagedSessionProofInvalidation, CliManagedSessionRecord, CliManagedSessionRetirement,
+    DEFAULT_REDELIVERY_WINDOW_SECONDS, DaemonLifecycleStatus, DeliveryAttemptRecord,
+    DeliveryPolicy, DesktopBindingRecord, DesktopBindingRepairRecord,
+    DesktopInstallationRepairRecord, DesktopInstallationStateRecord, JobRecord,
+    LostPendingTaskProcess, NewArtifact, NewAuditDecision, NewBatch, NewCliAcceptPendingAttempt,
+    NewCliManagedSessionPermissionSnapshot, NewDesktopInstallationRepair, NewJob, NewTask,
+    ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport, TaskRecord,
 };
 
 const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
@@ -914,7 +914,7 @@ impl Store {
         &mut self,
         bound_thread_id: &str,
         profile: CliManagedSessionProfile,
-        auto_profile: bool,
+        profile_requirement: CliManagedSessionProfileRequirement,
         now: i64,
     ) -> Result<CliManagedSessionAttach> {
         let tx = self
@@ -923,7 +923,8 @@ impl Store {
         if let Some(existing) =
             query_non_retired_cli_managed_session_by_thread_tx(&tx, bound_thread_id)?
         {
-            if (auto_profile || ensure_cli_session_profile_matches(&existing, &profile).is_ok())
+            if ensure_cli_session_profile_matches_requirement(&existing, &profile_requirement)
+                .is_ok()
                 && ensure_cli_session_attachable(&existing).is_ok()
             {
                 ensure_cli_session_has_no_recovery_blockers_tx(&tx, &existing, "reattaching")?;
@@ -4411,14 +4412,20 @@ fn ensure_batch_allows_cli_delivery_for_authorization(
     }
 }
 
-fn ensure_cli_session_profile_matches(
+fn ensure_cli_session_profile_matches_requirement(
     session: &CliManagedSessionRecord,
-    profile: &CliManagedSessionProfile,
+    requirement: &CliManagedSessionProfileRequirement,
 ) -> Result<()> {
-    if session.session_allows_approval == profile.session_allows_approval
-        && session.session_allows_network == profile.session_allows_network
-        && session.session_allows_write_access == profile.session_allows_write_access
-    {
+    let approval_matches = requirement
+        .session_allows_approval
+        .is_none_or(|required| session.session_allows_approval == required);
+    let network_matches = requirement
+        .session_allows_network
+        .is_none_or(|required| session.session_allows_network == required);
+    let write_matches = requirement
+        .session_allows_write_access
+        .is_none_or(|required| session.session_allows_write_access == required);
+    if approval_matches && network_matches && write_matches {
         Ok(())
     } else {
         bail!(
@@ -5603,7 +5610,11 @@ mod tests {
                     session_allows_network: false,
                     session_allows_write_access: false,
                 },
-                false,
+                CliManagedSessionProfileRequirement {
+                    session_allows_approval: Some(false),
+                    session_allows_network: Some(false),
+                    session_allows_write_access: Some(false),
+                },
                 0,
             )
             .expect("bind CLI session");

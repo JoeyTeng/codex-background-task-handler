@@ -930,6 +930,55 @@ fn cli_session_bind_auto_profile_reattaches_existing_effective_profile() {
 }
 
 #[test]
+fn cli_session_bind_auto_profile_enforces_explicit_dimensions() {
+    let home = tempfile::tempdir().expect("temp home");
+    let old_session = bind_cli_session(&home, "thread-cli-auto-explicit-drift");
+    set_cli_session_state(&home, &old_session, "detached");
+
+    let replaced = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "bind",
+            "--bound-thread-id",
+            "thread-cli-auto-explicit-drift",
+            "--session-allows-approval",
+            "false",
+            "--session-allows-network",
+            "false",
+            "--session-allows-write-access",
+            "true",
+            "--auto-profile",
+            "--session-allows-write-access-explicit",
+            "--now",
+            "900",
+        ],
+    );
+    assert_eq!(replaced["cli_session"]["outcome"], "replaced");
+    let new_session = replaced["cli_session"]["session"]["managed_session_id"]
+        .as_str()
+        .expect("new managed session id");
+    assert_ne!(new_session, old_session);
+    assert_eq!(
+        replaced["cli_session"]["session"]["session_allows_write_access"],
+        true
+    );
+
+    let old = cbth(
+        &home,
+        &[
+            "cli",
+            "session",
+            "inspect",
+            "--managed-session-id",
+            &old_session,
+        ],
+    );
+    assert_eq!(old["cli_session"]["session_state"], "retired");
+}
+
+#[test]
 fn cli_session_bind_replaces_parked_after_manual_batch_closes() {
     let home = tempfile::tempdir().expect("temp home");
     let (_batch_id, attempt_id, old_session) =

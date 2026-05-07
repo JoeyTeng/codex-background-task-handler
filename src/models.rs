@@ -290,6 +290,23 @@ pub struct CliManagedSessionProfile {
     pub session_allows_write_access: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct CliManagedSessionProfileRequirement {
+    pub session_allows_approval: Option<bool>,
+    pub session_allows_network: Option<bool>,
+    pub session_allows_write_access: Option<bool>,
+}
+
+impl CliManagedSessionProfileRequirement {
+    pub fn all(profile: &CliManagedSessionProfile) -> Self {
+        Self {
+            session_allows_approval: Some(profile.session_allows_approval),
+            session_allows_network: Some(profile.session_allows_network),
+            session_allows_write_access: Some(profile.session_allows_write_access),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CliManagedSessionActivityUpdate {
     pub session: CliManagedSessionRecord,

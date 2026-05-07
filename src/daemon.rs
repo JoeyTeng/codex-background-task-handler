@@ -5097,7 +5097,11 @@ mod tests {
                     session_allows_network: false,
                     session_allows_write_access: false,
                 },
-                false,
+                crate::models::CliManagedSessionProfileRequirement {
+                    session_allows_approval: Some(false),
+                    session_allows_network: Some(false),
+                    session_allows_write_access: Some(false),
+                },
                 100,
             )
             .expect("attach CLI managed session");
