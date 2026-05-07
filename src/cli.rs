@@ -2005,18 +2005,36 @@ fn parse_sandbox_permissions(value: &Value) -> Result<(bool, bool)> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("thread/resume sandbox missing type"))?;
     match sandbox_type {
-        "readOnly" => Ok((sandbox_bool_field(value, "networkAccess", false)?, false)),
-        "workspaceWrite" => Ok((sandbox_bool_field(value, "networkAccess", false)?, true)),
+        "readOnly" => {
+            sandbox_access(value, "access")?;
+            Ok((sandbox_required_bool_field(value, "networkAccess")?, false))
+        }
+        "workspaceWrite" => {
+            sandbox_access(value, "readOnlyAccess")?;
+            workspace_writable_roots(value)?;
+            sandbox_required_bool_field(value, "excludeTmpdirEnvVar")?;
+            sandbox_required_bool_field(value, "excludeSlashTmp")?;
+            Ok((sandbox_required_bool_field(value, "networkAccess")?, true))
+        }
         "dangerFullAccess" => Ok((true, true)),
         "externalSandbox" => {
             let network = match value.get("networkAccess").and_then(Value::as_str) {
                 Some("enabled") => true,
-                Some("restricted") | None => false,
+                Some("restricted") => false,
                 Some(other) => bail!("thread/resume sandbox has unknown networkAccess {other:?}"),
+                None => bail!("thread/resume externalSandbox missing networkAccess"),
             };
             Ok((network, true))
         }
         other => bail!("thread/resume returned unknown sandbox type {other:?}"),
+    }
+}
+
+fn sandbox_required_bool_field(value: &Value, field: &str) -> Result<bool> {
+    match value.get(field) {
+        Some(Value::Bool(value)) => Ok(*value),
+        None => bail!("thread/resume sandbox missing {field}"),
+        Some(_) => bail!("thread/resume sandbox field {field} is not a boolean"),
     }
 }
 
@@ -2094,10 +2112,7 @@ fn pinned_sandbox_policy(
     effective: CliResolvedPermissions,
 ) -> Result<Value> {
     if !effective.allows_write_access {
-        return Ok(json!({
-            "type": "readOnly",
-            "networkAccess": effective.allows_network,
-        }));
+        return pinned_read_only_sandbox(startup_sandbox, current_sandbox, effective);
     }
 
     let startup_type = sandbox_policy_type(startup_sandbox)?;
@@ -2125,6 +2140,29 @@ fn pinned_sandbox_policy(
             bail!("cannot pin unsupported sandbox transition {startup:?} -> {current:?}")
         }
     }
+}
+
+fn pinned_read_only_sandbox(
+    startup_sandbox: &Value,
+    current_sandbox: &Value,
+    effective: CliResolvedPermissions,
+) -> Result<Value> {
+    let startup_type = sandbox_policy_type(startup_sandbox)?;
+    let current_type = sandbox_policy_type(current_sandbox)?;
+    let access = match (startup_type, current_type) {
+        ("readOnly", "readOnly") => pinned_read_only_access(
+            sandbox_access(startup_sandbox, "access")?,
+            sandbox_access(current_sandbox, "access")?,
+        )?,
+        ("readOnly", _) => sandbox_access(startup_sandbox, "access")?.clone(),
+        (_, "readOnly") => sandbox_access(current_sandbox, "access")?.clone(),
+        _ => strict_read_only_access(),
+    };
+    Ok(json!({
+        "type": "readOnly",
+        "access": access,
+        "networkAccess": effective.allows_network,
+    }))
 }
 
 fn sandbox_policy_type(sandbox: &Value) -> Result<&str> {
@@ -2157,9 +2195,19 @@ fn pinned_workspace_write_sandbox(
     let exclude_slash_tmp =
         workspace_bool_if_workspace(startup_sandbox, startup_workspace, "excludeSlashTmp")?
             || workspace_bool_if_workspace(current_sandbox, current_workspace, "excludeSlashTmp")?;
+    let read_only_access = match (startup_workspace, current_workspace) {
+        (true, true) => pinned_read_only_access(
+            sandbox_access(startup_sandbox, "readOnlyAccess")?,
+            sandbox_access(current_sandbox, "readOnlyAccess")?,
+        )?,
+        (true, false) => sandbox_access(startup_sandbox, "readOnlyAccess")?.clone(),
+        (false, true) => sandbox_access(current_sandbox, "readOnlyAccess")?.clone(),
+        (false, false) => bail!("workspaceWrite pin requested without workspace sandbox"),
+    };
     Ok(json!({
         "type": "workspaceWrite",
         "writableRoots": writable_roots,
+        "readOnlyAccess": read_only_access,
         "networkAccess": effective.allows_network,
         "excludeTmpdirEnvVar": exclude_tmpdir_env_var,
         "excludeSlashTmp": exclude_slash_tmp,
@@ -2201,6 +2249,95 @@ fn workspace_bool_if_workspace(sandbox: &Value, is_workspace: bool, field: &str)
     } else {
         Ok(false)
     }
+}
+
+fn sandbox_access<'a>(sandbox: &'a Value, field: &str) -> Result<&'a Value> {
+    let access = sandbox
+        .get(field)
+        .ok_or_else(|| anyhow::anyhow!("sandbox policy missing {field}"))?;
+    validate_read_only_access(access)?;
+    Ok(access)
+}
+
+fn validate_read_only_access(access: &Value) -> Result<()> {
+    match access.get("type").and_then(Value::as_str) {
+        Some("fullAccess") => Ok(()),
+        Some("restricted") => {
+            sandbox_bool_field(access, "includePlatformDefaults", false)?;
+            read_only_readable_roots(access)?;
+            Ok(())
+        }
+        Some(other) => bail!("sandbox read-only access has unknown type {other:?}"),
+        None => bail!("sandbox read-only access missing type"),
+    }
+}
+
+fn pinned_read_only_access(startup_access: &Value, current_access: &Value) -> Result<Value> {
+    let startup_type = read_only_access_type(startup_access)?;
+    let current_type = read_only_access_type(current_access)?;
+    match (startup_type, current_type) {
+        ("fullAccess", "fullAccess") => Ok(json!({ "type": "fullAccess" })),
+        ("restricted", "fullAccess") => Ok(startup_access.clone()),
+        ("fullAccess", "restricted") => Ok(current_access.clone()),
+        ("restricted", "restricted") => {
+            let include_platform_defaults =
+                sandbox_bool_field(startup_access, "includePlatformDefaults", false)?
+                    && sandbox_bool_field(current_access, "includePlatformDefaults", false)?;
+            Ok(json!({
+                "type": "restricted",
+                "includePlatformDefaults": include_platform_defaults,
+                "readableRoots": readable_roots_intersection(startup_access, current_access)?,
+            }))
+        }
+        (startup, current) => {
+            bail!("cannot pin unsupported read-only access transition {startup:?} -> {current:?}")
+        }
+    }
+}
+
+fn read_only_access_type(access: &Value) -> Result<&str> {
+    validate_read_only_access(access)?;
+    access
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("sandbox read-only access missing type"))
+}
+
+fn readable_roots_intersection(
+    startup_access: &Value,
+    current_access: &Value,
+) -> Result<Vec<String>> {
+    let startup_roots = read_only_readable_roots(startup_access)?;
+    let current_roots = read_only_readable_roots(current_access)?;
+    let current_set = current_roots.iter().cloned().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    Ok(startup_roots
+        .into_iter()
+        .filter(|root| current_set.contains(root) && seen.insert(root.clone()))
+        .collect())
+}
+
+fn read_only_readable_roots(access: &Value) -> Result<Vec<String>> {
+    let roots = access
+        .get("readableRoots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("restricted read-only access missing readableRoots"))?;
+    roots
+        .iter()
+        .map(|root| {
+            root.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("restricted readableRoots contains non-string"))
+        })
+        .collect()
+}
+
+fn strict_read_only_access() -> Value {
+    json!({
+        "type": "restricted",
+        "includePlatformDefaults": false,
+        "readableRoots": [],
+    })
 }
 
 fn pinned_external_sandbox(
@@ -6254,12 +6391,29 @@ mod tests {
         }
     }
 
+    fn restricted_access(roots: &[&str]) -> Value {
+        json!({
+            "type": "restricted",
+            "includePlatformDefaults": true,
+            "readableRoots": roots,
+        })
+    }
+
+    fn restricted_access_without_platform_defaults(roots: &[&str]) -> Value {
+        json!({
+            "type": "restricted",
+            "includePlatformDefaults": false,
+            "readableRoots": roots,
+        })
+    }
+
     #[test]
     fn permission_snapshot_derives_read_only_no_network_no_approval() {
         let snapshot = parse_thread_resume_permission_snapshot(&json!({
             "approvalPolicy": "never",
             "sandbox": {
                 "type": "readOnly",
+                "access": restricted_access(&["/tmp/read"]),
                 "networkAccess": false
             }
         }))
@@ -6276,7 +6430,11 @@ mod tests {
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
-                "networkAccess": true
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
             }
         }))
         .expect("parse snapshot");
@@ -6292,6 +6450,7 @@ mod tests {
             "approvalPolicy": "mystery",
             "sandbox": {
                 "type": "readOnly",
+                "access": restricted_access(&["/tmp/read"]),
                 "networkAccess": false
             }
         }))
@@ -6306,6 +6465,7 @@ mod tests {
             "approvalPolicy": "never",
             "sandbox": {
                 "type": "readOnly",
+                "access": restricted_access(&["/tmp/start-read"]),
                 "networkAccess": false
             }
         }))
@@ -6314,8 +6474,11 @@ mod tests {
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/start-read", "/tmp/work"]),
                 "networkAccess": true,
-                "writableRoots": ["/tmp/work"]
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
             }
         }))
         .expect("parse snapshot");
@@ -6326,6 +6489,10 @@ mod tests {
         assert_eq!(overrides["approvalPolicy"], json!("never"));
         assert_eq!(overrides["sandboxPolicy"]["type"], json!("readOnly"));
         assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(false));
+        assert_eq!(
+            overrides["sandboxPolicy"]["access"],
+            restricted_access(&["/tmp/start-read"])
+        );
     }
 
     #[test]
@@ -6334,6 +6501,7 @@ mod tests {
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read-a"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/a"],
                 "excludeTmpdirEnvVar": false,
@@ -6345,6 +6513,7 @@ mod tests {
             "approvalPolicy": "on-failure",
             "sandbox": {
                 "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read-a", "/tmp/read-b"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/a", "/tmp/b"],
                 "excludeTmpdirEnvVar": false,
@@ -6363,6 +6532,10 @@ mod tests {
             overrides["sandboxPolicy"]["writableRoots"],
             json!(["/tmp/a"])
         );
+        assert_eq!(
+            overrides["sandboxPolicy"]["readOnlyAccess"],
+            restricted_access(&["/tmp/read-a"])
+        );
         assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(true));
     }
 
@@ -6372,6 +6545,7 @@ mod tests {
             "approvalPolicy": "on-failure",
             "sandbox": {
                 "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read-a", "/tmp/read-b"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/a", "/tmp/b"],
                 "excludeTmpdirEnvVar": false,
@@ -6383,6 +6557,7 @@ mod tests {
             "approvalPolicy": "untrusted",
             "sandbox": {
                 "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access_without_platform_defaults(&["/tmp/read-b"]),
                 "networkAccess": false,
                 "writableRoots": ["/tmp/b"],
                 "excludeTmpdirEnvVar": false,
@@ -6401,6 +6576,10 @@ mod tests {
             overrides["sandboxPolicy"]["writableRoots"],
             json!(["/tmp/b"])
         );
+        assert_eq!(
+            overrides["sandboxPolicy"]["readOnlyAccess"],
+            restricted_access_without_platform_defaults(&["/tmp/read-b"])
+        );
         assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(false));
         assert_eq!(overrides["sandboxPolicy"]["excludeSlashTmp"], json!(true));
     }
@@ -6411,6 +6590,7 @@ mod tests {
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/work"],
                 "excludeTmpdirEnvVar": true,
@@ -6439,6 +6619,10 @@ mod tests {
             overrides["sandboxPolicy"]["excludeTmpdirEnvVar"],
             json!(true)
         );
+        assert_eq!(
+            overrides["sandboxPolicy"]["readOnlyAccess"],
+            restricted_access(&["/tmp/read"])
+        );
     }
 
     #[test]
@@ -6447,6 +6631,7 @@ mod tests {
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/work"],
                 "excludeTmpdirEnvVar": false,

@@ -1649,6 +1649,11 @@ fn write_fake_thread_response(
             "modelProvider": "openai",
             "sandbox": {
                 "type": "readOnly",
+                "access": {
+                    "type": "restricted",
+                    "includePlatformDefaults": true,
+                    "readableRoots": ["/tmp/fake-cwd"]
+                },
                 "networkAccess": false
             }
         }),

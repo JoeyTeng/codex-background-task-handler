@@ -52,10 +52,10 @@ superseded_by:
 - Starting point: `98dc2b4 Add Desktop direct-helper preflight`
 - Branch: `wip/cbth-resume-permissions`
 - Implemented `cbth resume <thread-id> [-- <codex_args>]`, auto permission snapshots, effective permission pinning, drift warning/audit records, schema support, and documentation updates.
+- Pinned `sandboxPolicy` now preserves or tightens protocol-required read-only access fields (`access` / `readOnlyAccess`) along with write roots and network access.
 - Validation:
   - `cargo fmt --check`
-  - `cargo check`
-  - `cargo test --lib`
+  - `cargo clippy --locked --all-targets -- -D warnings`
+  - `cargo test --locked`
   - `cargo test --test cli_run`
-  - `cargo test --test daemon_phase2`
-  - `cargo test --test desktop_foundation`
+  - `uv run python /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/hoteng/.codex/worktrees/aef0/codex-background-task-handler`
