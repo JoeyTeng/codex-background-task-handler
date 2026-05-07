@@ -1813,15 +1813,12 @@ fn run_cli_session(
             startup_sweep_now: Some(now_epoch_seconds()?),
         },
     )?;
-    let (foreground_cwd, foreground_codex_args) = match foreground_codex_args(
+    let (foreground_cwd, foreground_codex_args) = foreground_codex_args(
         &config.target,
         &config.foreground_mode,
         &cwd,
         &config.codex_args,
-    ) {
-        Ok(args) => args,
-        Err(error) => return Err(error),
-    };
+    )?;
     let thread_start_params = match &config.target {
         CliSessionTargetConfig::NewThread => Some(initial_thread_start_params(
             &foreground_cwd,
@@ -2342,6 +2339,16 @@ fn apply_codex_resume_foreground_args(
                     params.insert(
                         "sandbox".to_owned(),
                         Value::String("danger-full-access".to_owned()),
+                    );
+                }
+                "--full-auto" => {
+                    params.insert(
+                        "approvalPolicy".to_owned(),
+                        Value::String("on-request".to_owned()),
+                    );
+                    params.insert(
+                        "sandbox".to_owned(),
+                        Value::String("workspace-write".to_owned()),
                     );
                 }
                 "--search"
