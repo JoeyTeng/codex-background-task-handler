@@ -33,7 +33,7 @@ superseded_by:
 
 ## Evidence
 
-- Base: `698664c` from PR #43.
+- Base: `698664c` from PR #43; branch also merges `bcc86b7` / `v0.1.1` before review.
 - Branch: `wip/cbth-resume-followups`.
 - Validation:
   - `cargo fmt --all -- --check`
