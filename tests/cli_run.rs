@@ -321,10 +321,37 @@ fn spawn_fake_app_server_capture_passive_methods_without_permissions(
 }
 
 #[cfg(unix)]
+fn spawn_fake_app_server_capture_passive_methods_resume_missing_with_permissions(
+    thread_id: &'static str,
+) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
+    spawn_fake_app_server_capture_passive_methods_for_options(
+        thread_id,
+        Duration::from_secs(2),
+        true,
+        false,
+    )
+}
+
+#[cfg(unix)]
 fn spawn_fake_app_server_capture_passive_methods_for(
     thread_id: &'static str,
     observe_duration: Duration,
     include_permissions: bool,
+) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
+    spawn_fake_app_server_capture_passive_methods_for_options(
+        thread_id,
+        observe_duration,
+        include_permissions,
+        true,
+    )
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_capture_passive_methods_for_options(
+    thread_id: &'static str,
+    observe_duration: Duration,
+    include_permissions: bool,
+    resume_include_turns: bool,
 ) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
     listener
@@ -339,6 +366,7 @@ fn spawn_fake_app_server_capture_passive_methods_for(
             thread_id,
             observe_duration,
             include_permissions,
+            resume_include_turns,
         );
         let _ = done_tx.send(result);
     });
@@ -396,6 +424,7 @@ fn spawn_fake_app_server_new_thread_then_capture_passive_methods(
                 &listener,
                 thread_id,
                 observe_duration,
+                true,
                 true,
             )?;
             methods.append(&mut passive_methods);
@@ -863,6 +892,7 @@ fn accept_fake_app_server_capture_passive_methods(
     thread_id: &'static str,
     observe_duration: Duration,
     include_permissions: bool,
+    resume_include_turns: bool,
 ) -> Result<Vec<String>, String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let (mut stream, _) = loop {
@@ -911,7 +941,7 @@ fn accept_fake_app_server_capture_passive_methods(
                 &mut stream,
                 &message,
                 thread_id,
-                true,
+                resume_include_turns,
                 include_permissions,
             )?,
             "thread/read" => {
@@ -3120,6 +3150,80 @@ fn cli_run_passive_auto_missing_permission_snapshot_keeps_current_state_sync() {
     assert_eq!(session_state, "detached");
     assert_eq!(permission_snapshot_revision, 0);
     assert!(last_permission_snapshot_json.is_none());
+
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_passive_auto_permission_snapshot_requires_resume_current_state_proof() {
+    let home = temp_home();
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cli-run-passive-permissions-missing-proof";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_capture_passive_methods_resume_missing_with_permissions(thread_id);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg(thread_id)
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "1")
+        .output()
+        .expect("run cbth cli run");
+
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let methods = match fake_server_done.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(methods)) => methods,
+        Ok(Err(error)) => panic!("fake app-server failed: {error}"),
+        Err(error) => panic!("timed out waiting for fake app-server: {error}"),
+    };
+    assert_eq!(
+        methods,
+        vec![
+            "initialize".to_owned(),
+            "initialized".to_owned(),
+            "thread/resume".to_owned(),
+            "thread/read".to_owned(),
+        ]
+    );
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (
+        session_state,
+        permission_snapshot_revision,
+        last_permission_snapshot_json,
+        startup_permission_snapshot_json,
+    ): (String, i64, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT session_state,
+                    permission_snapshot_revision,
+                    last_permission_snapshot_json,
+                    startup_permission_snapshot_json
+             FROM cli_managed_sessions
+             WHERE bound_thread_id = ?",
+            [thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("query managed session");
+    assert_eq!(session_state, "detached");
+    assert_eq!(permission_snapshot_revision, 0);
+    assert!(last_permission_snapshot_json.is_none());
+    assert!(startup_permission_snapshot_json.is_none());
 
     stop_daemon(&home);
 }

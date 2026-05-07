@@ -3203,6 +3203,7 @@ fn run_cli_app_server_passive_adapter_once(
     );
     let mut thread_resume_capability = false;
     let mut thread_start_capability = config.fresh_thread_bootstrap;
+    let mut resume_current_state_sync = false;
     let mut current_state_sync = false;
     let mut active = false;
     match resume_result {
@@ -3211,10 +3212,12 @@ fn run_cli_app_server_passive_adapter_once(
             thread_resume_capability = true;
             match thread_result_activity_snapshot(&resume, &config.bound_thread_id) {
                 ThreadActivitySnapshot::Active => {
+                    resume_current_state_sync = true;
                     current_state_sync = true;
                     active = true;
                 }
                 ThreadActivitySnapshot::Idle => {
+                    resume_current_state_sync = true;
                     current_state_sync = true;
                 }
                 ThreadActivitySnapshot::Missing => {}
@@ -3223,7 +3226,7 @@ fn run_cli_app_server_passive_adapter_once(
                     bail!("app-server thread/resume returned untrusted current-state snapshot");
                 }
             }
-            if config.permission_inputs.uses_auto() {
+            if config.permission_inputs.uses_auto() && resume_current_state_sync {
                 match parse_thread_resume_permission_snapshot(&resume) {
                     Ok(snapshot) => {
                         sync_passive_adapter_permissions_from_snapshot(
