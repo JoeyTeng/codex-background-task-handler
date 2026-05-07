@@ -1996,7 +1996,7 @@ impl Store {
         let lease_deadline = attempt
             .bridge_arm_lease_deadline
             .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
-        if lease_deadline < now {
+        if lease_deadline <= now {
             bail!(
                 "delivery attempt {} bridge arm lease expired at {}",
                 attempt.attempt_id,

@@ -1055,7 +1055,7 @@ fn desktop_writeback_helpers_fail_closed_for_stale_or_unsafe_inputs() {
             expired_lease,
             "--json",
             "--now",
-            "3306",
+            "3305",
         ],
     );
     assert!(expired_arm.contains("bridge arm lease expired at 3305"));
