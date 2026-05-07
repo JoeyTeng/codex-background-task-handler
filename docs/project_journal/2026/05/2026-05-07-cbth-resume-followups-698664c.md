@@ -55,6 +55,7 @@ superseded_by:
   - Follow-up clean-context review found Codex permission aliases and indirect config roots could still make foreground Codex diverge from the sidecar startup snapshot. The fix now rejects forwarded `--full-auto` / `--yolo` aliases plus permission-affecting `profiles.*`, `projects.*`, and `trust_level` config overrides.
   - Follow-up clean-context review found Codex options placed after the resume prompt were not scanned, so foreground Codex could still apply permission, web-search, cwd, or profile overrides that the sidecar did not mirror. Managed resume now fail-closes any forwarded option after the prompt unless the operator uses an explicit `--` sentinel for literal prompt text.
   - Follow-up clean-context review found non-search feature toggles such as `use_legacy_landlock` / `request_permissions` could still be forwarded through `--enable` / `--disable` or equivalent config aliases without being carried in the sidecar's first `thread/resume`. Managed resume now rejects all forwarded feature overrides and all `features.*` / top-level known feature config roots until feature state can be mirrored exactly.
+  - Follow-up clean-context review found provider selection (`--oss` / `--local-provider`) and unmirrored config keys such as `model_reasoning_effort` could still let foreground Codex diverge from the sidecar's first `thread/resume`. Managed resume now rejects provider overrides and only accepts config keys that are explicitly mirrored into initial resume params.
 - Validation:
   - `cargo fmt --all -- --check`
   - `cargo clippy --locked --all-targets -- -D warnings`
@@ -82,6 +83,8 @@ superseded_by:
   - `cargo test --locked cbth_resume_rejects_post_prompt_forwarded_options --test cli_run`
   - `cargo test --locked cbth_resume_rejects_forwarded_live_web_search --test cli_run` after broadening feature override rejection to all `--enable` / `--disable` values.
   - `cargo test --locked cbth_resume_rejects_permission_affecting_config_overrides --test cli_run` after broadening config rejection to all `features.*` plus `use_legacy_landlock` / `request_permissions`.
+  - `cargo test --locked cbth_resume_rejects_forwarded_provider_overrides --test cli_run`
+  - `cargo test --locked cbth_resume_rejects_unmirrored_config_overrides --test cli_run`
   - `cargo test --locked permission_drift_tracks_permission_profile_body_changes --lib`
   - `CARGO_TARGET_DIR=.codex-tmp/cargo-target-precommit git commit -S ...` pre-commit hook passed `cargo fmt --all`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked` in an isolated target directory after the shared target produced a cross-worktree binary mismatch.
   - `uv run python /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/hoteng/.codex/worktrees/aef0/codex-background-task-handler`

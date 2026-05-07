@@ -2112,6 +2112,8 @@ fn foreground_codex_args(
             reject_managed_resume_permission_override(flag)?;
         } else if let Some(flag) = managed_resume_search_override_flag(&arg) {
             reject_managed_resume_search_override(flag)?;
+        } else if let Some(flag) = managed_resume_provider_override_flag(&arg) {
+            reject_managed_resume_provider_override(flag)?;
         } else if let Some(feature) = arg.strip_prefix("--enable=") {
             reject_managed_resume_feature_override("--enable", feature)?;
         } else if let Some(feature) = arg.strip_prefix("--disable=") {
@@ -2139,7 +2141,7 @@ fn foreground_codex_args(
                         resolve_codex_cwd_arg(caller_cwd, value)
                     });
                 }
-                "--model" | "-m" | "--profile" | "-p" | "--config" | "-c" | "--local-provider" => {
+                "--model" | "-m" | "--profile" | "-p" | "--config" | "-c" => {
                     let start = index;
                     skip_codex_arg_value(codex_args, &mut index, arg.as_str())?;
                     filtered.extend(codex_args[start..=index].iter().cloned());
@@ -2157,6 +2159,9 @@ fn foreground_codex_args(
                 }
                 "--remote" | "--remote-auth-token-env" => {
                     reject_managed_resume_remote_override(arg.as_str())?;
+                }
+                "--oss" | "--local-provider" => {
+                    reject_managed_resume_provider_override(arg.as_str())?;
                 }
                 "--image" | "-i" => {
                     let start = index;
@@ -2245,6 +2250,22 @@ fn managed_resume_search_override_flag(arg: &str) -> Option<&'static str> {
 fn reject_managed_resume_search_override(flag: &str) -> Result<()> {
     bail!(
         "managed resume does not allow forwarded {flag}; Codex thread/resume cannot faithfully carry live web search tool enablement"
+    )
+}
+
+fn managed_resume_provider_override_flag(arg: &str) -> Option<&'static str> {
+    if arg == "--oss" || arg.starts_with("--oss=") {
+        Some("--oss")
+    } else if arg == "--local-provider" || arg.starts_with("--local-provider=") {
+        Some("--local-provider")
+    } else {
+        None
+    }
+}
+
+fn reject_managed_resume_provider_override(flag: &str) -> Result<()> {
+    bail!(
+        "managed resume does not allow forwarded {flag}; Codex thread/resume cannot faithfully carry provider overrides"
     )
 }
 
@@ -2436,8 +2457,6 @@ fn apply_codex_resume_foreground_args(
     codex_args: &[OsString],
 ) -> Result<()> {
     let mut config_overrides = serde_json::Map::new();
-    let mut oss = false;
-    let mut local_provider: Option<String> = None;
     let mut index = 0;
     while index < codex_args.len() {
         let arg = os_arg_to_utf8(&codex_args[index], "codex argument")?;
@@ -2456,6 +2475,8 @@ fn apply_codex_resume_foreground_args(
             reject_managed_resume_permission_override(flag)?;
         } else if let Some(flag) = managed_resume_search_override_flag(&arg) {
             reject_managed_resume_search_override(flag)?;
+        } else if let Some(flag) = managed_resume_provider_override_flag(&arg) {
+            reject_managed_resume_provider_override(flag)?;
         } else if let Some(feature) = arg.strip_prefix("--enable=") {
             reject_managed_resume_feature_override("--enable", feature)?;
         } else if let Some(feature) = arg.strip_prefix("--disable=") {
@@ -2471,8 +2492,6 @@ fn apply_codex_resume_foreground_args(
             );
         } else if let Some(value) = arg.strip_prefix("--config=") {
             apply_codex_config_override(params, &mut config_overrides, value)?;
-        } else if let Some(value) = arg.strip_prefix("--local-provider=") {
-            local_provider = Some(value.to_owned());
         } else if arg.strip_prefix("--image=").is_some() {
             skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), true)?;
         } else if let Some(value) = arg.strip_prefix("-m").filter(|value| !value.is_empty()) {
@@ -2512,10 +2531,6 @@ fn apply_codex_resume_foreground_args(
                     let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
                     apply_codex_config_override(params, &mut config_overrides, &value)?;
                 }
-                "--local-provider" => {
-                    local_provider =
-                        Some(next_codex_arg_value(codex_args, &mut index, arg.as_str())?);
-                }
                 "--enable" => {
                     let feature = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
                     reject_managed_resume_feature_override(arg.as_str(), &feature)?;
@@ -2530,11 +2545,11 @@ fn apply_codex_resume_foreground_args(
                 "--remote" | "--remote-auth-token-env" => {
                     reject_managed_resume_remote_override(arg.as_str())?;
                 }
+                "--oss" | "--local-provider" => {
+                    reject_managed_resume_provider_override(arg.as_str())?;
+                }
                 "--image" | "-i" => {
                     skip_variadic_codex_arg_values(codex_args, &mut index, arg.as_str(), false)?;
-                }
-                "--oss" => {
-                    oss = true;
                 }
                 "--no-alt-screen" | "--last" | "--all" | "--include-non-interactive" => {}
                 _ => {}
@@ -2543,9 +2558,6 @@ fn apply_codex_resume_foreground_args(
         index += 1;
     }
 
-    if oss && let Some(provider) = local_provider {
-        params.insert("modelProvider".to_owned(), Value::String(provider));
-    }
     if !config_overrides.is_empty() {
         params.insert("config".to_owned(), Value::Object(config_overrides));
     }
@@ -2607,12 +2619,15 @@ fn apply_codex_config_override(
     override_arg: &str,
 ) -> Result<()> {
     let Some((key, raw_value)) = override_arg.split_once('=') else {
-        return Ok(());
+        bail!(
+            "managed resume does not allow forwarded --config override {override_arg:?}; expected key=value so cbth can mirror it into initial thread/resume"
+        );
     };
     let value = strip_cli_value_quotes(raw_value.trim());
     let key = key.trim();
     reject_permission_affecting_codex_config_override(key)?;
-    match key {
+    let normalized_key = key.replace('-', "_");
+    match normalized_key.as_str() {
         "model" => {
             params.insert("model".to_owned(), Value::String(value.to_owned()));
         }
@@ -2628,7 +2643,9 @@ fn apply_codex_config_override(
                 Value::String(normalize_codex_approvals_reviewer(value)?),
             );
         }
-        _ => {}
+        _ => bail!(
+            "managed resume does not allow forwarded --config override {key:?}; cbth cannot faithfully carry it into initial thread/resume"
+        ),
     }
     Ok(())
 }
