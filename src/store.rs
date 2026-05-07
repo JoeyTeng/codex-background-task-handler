@@ -24,8 +24,8 @@ use crate::models::{
     DesktopBindingRepairRecord, DesktopInstallationRepairRecord, DesktopInstallationStateRecord,
     JobRecord, LostPendingTaskProcess, NewArtifact, NewAuditDecision, NewBatch,
     NewCliAcceptPendingAttempt, NewCliManagedSessionPermissionSnapshot,
-    NewDesktopInstallationRepair, NewJob, NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS,
-    POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport, TaskRecord,
+    NewDesktopInstallationRepair, NewDesktopWritebackFixture, NewJob, NewTask,
+    ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport, TaskRecord,
 };
 
 const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
@@ -1906,6 +1906,188 @@ impl Store {
         Ok(DesktopBindingRepairRecord {
             binding,
             installation_state,
+        })
+    }
+
+    pub fn prepare_desktop_writeback_fixture(
+        &mut self,
+        fixture: NewDesktopWritebackFixture,
+    ) -> Result<crate::models::DesktopWritebackFixtureRecord> {
+        ensure_nonempty_value("source_thread_id", &fixture.source_thread_id)?;
+        ensure_nonempty_value("caller_automation_id", &fixture.caller_automation_id)?;
+        ensure_nonempty_value("bridge_request_id", &fixture.bridge_request_id)?;
+        ensure_nonempty_value(
+            "default_validation_fingerprint",
+            &fixture.default_validation_fingerprint,
+        )?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let installation_state = query_desktop_installation_state_tx(&tx)?.unwrap_or_else(|| {
+            default_desktop_installation_state(&fixture.default_validation_fingerprint)
+        });
+        let existing_owner = tx
+            .query_row(
+                "SELECT source_thread_id FROM desktop_bindings
+                 WHERE caller_automation_id = ?
+                   AND source_thread_id != ?
+                   AND binding_state IN ('bound', 'degraded')",
+                params![&fixture.caller_automation_id, &fixture.source_thread_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing_owner) = existing_owner {
+            bail!("caller_automation_id is already bound to source_thread_id {existing_owner}");
+        }
+
+        let existing_binding = tx
+            .query_row(
+                "SELECT * FROM desktop_bindings WHERE source_thread_id = ?",
+                params![&fixture.source_thread_id],
+                desktop_binding_from_row,
+            )
+            .optional()?;
+        if let Some(binding) = &existing_binding {
+            if matches!(binding.binding_state.as_str(), "bound" | "degraded")
+                && binding.caller_automation_id != fixture.caller_automation_id
+            {
+                bail!(
+                    "source_thread_id {} is already bound to caller_automation_id {}",
+                    fixture.source_thread_id,
+                    binding.caller_automation_id
+                );
+            }
+            ensure_desktop_binding_quiesced_for_fresh_arm(binding)?;
+        }
+
+        let open_batch_id = tx
+            .query_row(
+                "SELECT batch_id FROM batches
+                 WHERE source_thread_id = ? AND state = 'open'
+                 ORDER BY created_at ASC, batch_id ASC
+                 LIMIT 1",
+                params![&fixture.source_thread_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(batch_id) = open_batch_id {
+            bail!(
+                "source_thread_id {} already has open batch {}",
+                fixture.source_thread_id,
+                batch_id
+            );
+        }
+        ensure_no_active_attempt_for_thread_tx(&tx, &fixture.source_thread_id)?;
+
+        let created_at = existing_binding
+            .as_ref()
+            .map(|binding| binding.created_at)
+            .unwrap_or(fixture.now);
+        tx.execute(
+            "INSERT INTO desktop_bindings (
+                source_thread_id, caller_automation_id, binding_state,
+                read_transport, read_transport_generation, validation_fingerprint,
+                created_at, updated_at, degraded_at
+            ) VALUES (?, ?, 'bound', ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(source_thread_id) DO UPDATE SET
+                caller_automation_id = excluded.caller_automation_id,
+                binding_state = 'bound',
+                read_transport = excluded.read_transport,
+                read_transport_generation = excluded.read_transport_generation,
+                validation_fingerprint = excluded.validation_fingerprint,
+                updated_at = excluded.updated_at,
+                degraded_at = NULL",
+            params![
+                &fixture.source_thread_id,
+                &fixture.caller_automation_id,
+                &installation_state.read_transport,
+                installation_state.read_transport_generation,
+                &installation_state.validation_fingerprint,
+                created_at,
+                fixture.now,
+            ],
+        )?;
+
+        let job_id = new_id();
+        let batch_id = new_id();
+        let attempt_id = new_id();
+        let metadata_json = serde_json::json!({
+            "validation_fixture": "desktop_writeback_live"
+        })
+        .to_string();
+        let policy = DeliveryPolicy {
+            delivery_read_only: true,
+            delivery_requires_approval: false,
+            delivery_requires_network: false,
+            delivery_requires_write_access: false,
+        };
+        tx.execute(
+            "INSERT INTO jobs (
+                job_id, source_thread_id, status, summary, metadata_json,
+                created_at, updated_at, failed_at, failure_reason,
+                delivery_read_only, delivery_requires_approval,
+                delivery_requires_network, delivery_requires_write_access
+            ) VALUES (?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                &job_id,
+                &fixture.source_thread_id,
+                "Desktop writeback live validation fixture",
+                &metadata_json,
+                fixture.now,
+                fixture.now,
+                fixture.now,
+                "validation fixture",
+                bool_to_i64(policy.delivery_read_only),
+                bool_to_i64(policy.delivery_requires_approval),
+                bool_to_i64(policy.delivery_requires_network),
+                bool_to_i64(policy.delivery_requires_write_access),
+            ],
+        )?;
+        let redelivery_window_ends_at = checked_timestamp_add(
+            fixture.now,
+            DEFAULT_REDELIVERY_WINDOW_SECONDS,
+            "redelivery_window_seconds",
+        )?;
+        let batch = NewBatch {
+            batch_id,
+            source_thread_id: fixture.source_thread_id.clone(),
+            summary: "Desktop writeback live validation fixture".to_owned(),
+            created_at: fixture.now,
+            redelivery_window_ends_at,
+            max_delivery_attempts: crate::models::DEFAULT_MAX_DELIVERY_ATTEMPTS,
+            policy,
+            inline_payload_bytes: 0,
+            requires_artifact_read: false,
+        };
+        insert_batch_tx(&tx, &batch, std::slice::from_ref(&job_id))?;
+        tx.execute(
+            "INSERT INTO delivery_attempts (
+                attempt_id, batch_id, source_thread_id, adapter_kind,
+                authorization_mode, state, generation, created_at, updated_at
+            ) VALUES (?, ?, ?, 'desktop', 'strict_safe', 'prepared', 1, ?, ?)",
+            params![
+                &attempt_id,
+                &batch.batch_id,
+                &fixture.source_thread_id,
+                fixture.now,
+                fixture.now,
+            ],
+        )?;
+
+        let job = query_job_tx(&tx, &job_id)?;
+        let batch = query_batch_tx(&tx, &batch.batch_id)?;
+        let attempt = query_delivery_attempt_tx(&tx, &attempt_id)?;
+        let binding = query_desktop_binding_tx(&tx, &fixture.source_thread_id)?;
+        tx.commit()?;
+        Ok(crate::models::DesktopWritebackFixtureRecord {
+            source_thread_id: fixture.source_thread_id,
+            caller_automation_id: fixture.caller_automation_id,
+            bridge_request_id: fixture.bridge_request_id,
+            job,
+            batch,
+            attempt,
+            binding,
         })
     }
 
