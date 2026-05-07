@@ -2873,6 +2873,61 @@ fn cbth_new_bootstraps_thread_with_direct_codex_args_and_reasoning_default() {
 
 #[cfg(unix)]
 #[test]
+fn cbth_new_profile_override_does_not_merge_default_profile_model_config() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-profile";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_new_thread_then_capture(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--profile")
+        .arg("work")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with profile");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let capture = wait_for_fake_thread_start_capture(fake_server_done);
+    assert!(!capture.methods.iter().any(|method| method == "config/read"));
+    assert_eq!(
+        capture.thread_start_params["config"]["profile"],
+        serde_json::json!("work")
+    );
+    assert!(capture.thread_start_params.get("model").is_none());
+    assert!(capture.thread_start_params.get("modelProvider").is_none());
+    assert!(
+        capture.thread_start_params["config"]
+            .get("model_reasoning_effort")
+            .is_none()
+    );
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains("\t--profile\twork"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
 fn cli_run_new_thread_requires_exclusive_target_mode() {
     let home = temp_home();
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))

@@ -3818,7 +3818,11 @@ fn cli_thread_start_params(
     // The app-server's fresh thread defaults can lag behind the foreground CLI
     // defaults. Echo only the stable effective config values that affect the
     // model picker display, unless the caller supplied an explicit override.
-    if let Some(config) = read_effective_codex_config(client, &cwd)? {
+    // config/read cannot resolve a foreground profile override, so leave those
+    // cases to thread/start's normal config override path.
+    if !thread_start_has_profile_override(&params)?
+        && let Some(config) = read_effective_codex_config(client, &cwd)?
+    {
         merge_effective_config_into_thread_start_params(&mut params, &config)?;
     }
 
@@ -3889,6 +3893,19 @@ fn thread_start_config_contains(params: &Map<String, Value>, key: &str) -> Resul
         bail!("thread_start_params config must be an object");
     };
     Ok(config.contains_key(key))
+}
+
+fn thread_start_has_profile_override(params: &Map<String, Value>) -> Result<bool> {
+    let Some(config) = params.get("config") else {
+        return Ok(false);
+    };
+    let Some(config) = config.as_object() else {
+        bail!("thread_start_params config must be an object");
+    };
+    Ok(config
+        .get("profile")
+        .or_else(|| config.get("config_profile"))
+        .is_some_and(|value| !value.is_null()))
 }
 
 fn promote_cli_thread_start_app_server(
