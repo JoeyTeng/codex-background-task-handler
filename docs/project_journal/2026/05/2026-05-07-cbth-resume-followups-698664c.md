@@ -53,6 +53,7 @@ superseded_by:
   - Follow-up clean-context review found direct foreground permission overrides, unrepresentable canonical read scopes, and mixed-id activity snapshots were still accepted. The latest fix rejects forwarded `--sandbox` / `--ask-for-approval` / danger-bypass plus matching config keys, fail-closes canonical read scopes that cannot be pinned with legacy sandbox fields, and validates all present ids on activity / turn-status snapshots.
   - GitHub Codex review and clean-context follow-up found web-search aliases and inline config tables could still bypass the deny list. The fix now treats `web_search_request` as live web-search and rejects top-level `features`, top-level `web_search*`, and top-level / nested `tools.web_search*` managed-resume config overrides.
   - Follow-up clean-context review found Codex permission aliases and indirect config roots could still make foreground Codex diverge from the sidecar startup snapshot. The fix now rejects forwarded `--full-auto` / `--yolo` aliases plus permission-affecting `profiles.*`, `projects.*`, and `trust_level` config overrides.
+  - Follow-up clean-context review found Codex options placed after the resume prompt were not scanned, so foreground Codex could still apply permission, web-search, cwd, or profile overrides that the sidecar did not mirror. Managed resume now fail-closes any forwarded option after the prompt unless the operator uses an explicit `--` sentinel for literal prompt text.
 - Validation:
   - `cargo fmt --all -- --check`
   - `cargo clippy --locked --all-targets -- -D warnings`
@@ -77,6 +78,7 @@ superseded_by:
   - `cargo test --locked cbth_resume_rejects_permission_affecting_config_overrides --test cli_run` after adding `features` / `web_search` / `tools.web_search` aliases.
   - `cargo test --locked cbth_resume_rejects_forwarded_permission_policy_overrides --test cli_run` after adding `--full-auto` / `--yolo` aliases.
   - `cargo test --locked cbth_resume_rejects_permission_affecting_config_overrides --test cli_run` after adding `profiles.*` / `projects.*` / `trust_level` overrides.
+  - `cargo test --locked cbth_resume_rejects_post_prompt_forwarded_options --test cli_run`
   - `cargo test --locked permission_drift_tracks_permission_profile_body_changes --lib`
   - `CARGO_TARGET_DIR=.codex-tmp/cargo-target-precommit git commit -S ...` pre-commit hook passed `cargo fmt --all`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked` in an isolated target directory after the shared target produced a cross-worktree binary mismatch.
   - `uv run python /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/hoteng/.codex/worktrees/aef0/codex-background-task-handler`

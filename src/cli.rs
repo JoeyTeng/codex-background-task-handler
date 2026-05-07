@@ -2095,7 +2095,12 @@ fn foreground_codex_args(
     let mut index = 0;
     while index < codex_args.len() {
         let arg = os_arg_to_utf8(&codex_args[index], "codex argument")?;
-        if arg == "--" || arg == "-" || !arg.starts_with('-') {
+        if arg == "--" {
+            filtered.extend(codex_args[index..].iter().cloned());
+            break;
+        }
+        if arg == "-" || !arg.starts_with('-') {
+            reject_managed_resume_post_prompt_options(codex_args, index + 1)?;
             filtered.extend(codex_args[index..].iter().cloned());
             break;
         }
@@ -2445,6 +2450,9 @@ fn apply_codex_resume_foreground_args(
     while index < codex_args.len() {
         let arg = os_arg_to_utf8(&codex_args[index], "codex argument")?;
         if arg == "--" || arg == "-" || !arg.starts_with('-') {
+            if arg != "--" {
+                reject_managed_resume_post_prompt_options(codex_args, index + 1)?;
+            }
             break;
         }
 
@@ -2579,6 +2587,21 @@ fn skip_variadic_codex_arg_values(
             break;
         }
         *index += 1;
+    }
+    Ok(())
+}
+
+fn reject_managed_resume_post_prompt_options(args: &[OsString], start_index: usize) -> Result<()> {
+    for arg in &args[start_index..] {
+        let arg = os_arg_to_utf8(arg, "codex argument")?;
+        if arg == "--" {
+            return Ok(());
+        }
+        if arg != "-" && arg.starts_with('-') {
+            bail!(
+                "managed resume does not allow forwarded Codex option {arg:?} after the resume prompt; move options before the prompt or put literal prompt flags after --"
+            );
+        }
     }
     Ok(())
 }
