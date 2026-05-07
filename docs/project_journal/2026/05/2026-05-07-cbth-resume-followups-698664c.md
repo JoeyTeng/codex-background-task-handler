@@ -5,7 +5,7 @@ status: completed
 created: 2026-05-07
 updated: 2026-05-07
 branch: wip/cbth-resume-followups
-pr:
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/45
 supersedes: []
 superseded_by:
 ---
