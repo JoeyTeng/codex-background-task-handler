@@ -1848,6 +1848,18 @@ impl Store {
                 );
             }
             ensure_desktop_binding_bound_for_arm(&binding)?;
+            let lease_deadline = attempt
+                .bridge_arm_lease_deadline
+                .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
+            if lease_deadline <= now {
+                abandon_desktop_arm_pending_tx(&tx, &attempt.attempt_id, now)?;
+                tx.commit()?;
+                bail!(
+                    "delivery attempt {} bridge arm lease expired at {}",
+                    attempt.attempt_id,
+                    lease_deadline
+                );
+            }
             let lease_id = attempt
                 .bridge_arm_lease_id
                 .as_ref()
@@ -2004,6 +2016,8 @@ impl Store {
             .bridge_arm_lease_deadline
             .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
         if lease_deadline <= now {
+            abandon_desktop_arm_pending_tx(&tx, &attempt.attempt_id, now)?;
+            tx.commit()?;
             bail!(
                 "delivery attempt {} bridge arm lease expired at {}",
                 attempt.attempt_id,
@@ -4177,6 +4191,20 @@ fn ensure_no_other_active_attempt_for_thread_tx(
     if let Some(active_attempt_id) = active {
         bail!("thread {source_thread_id} already has active delivery attempt {active_attempt_id}");
     }
+    Ok(())
+}
+
+fn abandon_desktop_arm_pending_tx(tx: &Transaction<'_>, attempt_id: &str, now: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE delivery_attempts
+         SET state = 'abandoned',
+             updated_at = ?,
+             abandoned_at = ?
+         WHERE attempt_id = ?
+           AND adapter_kind = 'desktop'
+           AND state = 'arm_pending'",
+        params![now, now, attempt_id],
+    )?;
     Ok(())
 }
 

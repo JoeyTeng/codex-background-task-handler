@@ -1184,6 +1184,121 @@ fn desktop_writeback_helpers_fail_closed_for_stale_or_unsafe_inputs() {
     assert!(expired_arm.contains("bridge arm lease expired at 3305"));
     let expired = cbth(&home, &["batch", "inspect", "--batch-id", &expired_batch]);
     assert_eq!(expired["batch"]["batch"]["delivery_attempt_count"], 0);
+    let expired_attempt = cbth(
+        &home,
+        &[
+            "attempt",
+            "inspect",
+            "--attempt-id",
+            "attempt-expired-lease",
+        ],
+    );
+    assert_eq!(expired_attempt["attempt"]["state"], "abandoned");
+    assert_eq!(expired_attempt["attempt"]["abandoned_at"], 3305);
+
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-expired-pending-retry",
+            "--caller-automation-id",
+            "automation-expired-pending-retry",
+            "--json",
+            "--now",
+            "3306",
+        ],
+    );
+    let expired_retry_batch = create_desktop_batch_and_prepared_attempt(
+        &home,
+        "thread-expired-pending-retry",
+        "attempt-expired-pending-retry",
+        1,
+        3307,
+    );
+    let expired_retry_pending = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-expired-pending-retry",
+            "--attempt-id",
+            "attempt-expired-pending-retry",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-expired-pending-retry",
+            "--json",
+            "--now",
+            "3308",
+        ],
+    );
+    assert_eq!(
+        expired_retry_pending["desktop_arm_pending"]["bridge_arm_lease_deadline"],
+        3608
+    );
+    let expired_pending_retry = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-expired-pending-retry",
+            "--attempt-id",
+            "attempt-expired-pending-retry",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-expired-pending-retry",
+            "--json",
+            "--now",
+            "3608",
+        ],
+    );
+    assert!(expired_pending_retry.contains("bridge arm lease expired at 3608"));
+    let expired_pending_attempt = cbth(
+        &home,
+        &[
+            "attempt",
+            "inspect",
+            "--attempt-id",
+            "attempt-expired-pending-retry",
+        ],
+    );
+    assert_eq!(expired_pending_attempt["attempt"]["state"], "abandoned");
+    insert_desktop_prepared_attempt(
+        &home,
+        "thread-expired-pending-retry",
+        &expired_retry_batch,
+        "attempt-expired-pending-retry-next",
+        2,
+        3609,
+    );
+    let fresh_after_expiry = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-expired-pending-retry",
+            "--attempt-id",
+            "attempt-expired-pending-retry-next",
+            "--generation",
+            "2",
+            "--bridge-request-id",
+            "bridge-request-expired-pending-retry-next",
+            "--json",
+            "--now",
+            "3610",
+        ],
+    );
+    assert_eq!(
+        fresh_after_expiry["desktop_arm_pending"]["outcome"],
+        "arm_pending"
+    );
 
     cbth(
         &home,
