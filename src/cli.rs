@@ -2094,6 +2094,8 @@ fn foreground_codex_args(
             reject_managed_resume_remote_override(flag)?;
         } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
             reject_managed_resume_add_dir_override(flag)?;
+        } else if let Some(flag) = managed_cli_unsupported_foreground_flag(&arg) {
+            reject_managed_cli_unsupported_foreground_flag(flag)?;
         } else if let Some(value) = arg.strip_prefix("--cd=") {
             foreground_cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
         } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
@@ -2129,6 +2131,9 @@ fn foreground_codex_args(
                 }
                 "--remote" | "--remote-auth-token-env" => {
                     reject_managed_resume_remote_override(arg.as_str())?;
+                }
+                "--full-auto" => {
+                    reject_managed_cli_unsupported_foreground_flag(arg.as_str())?;
                 }
                 "--image" | "-i" => {
                     let start = index;
@@ -2172,6 +2177,20 @@ fn managed_resume_add_dir_override_flag(arg: &str) -> Option<&'static str> {
 fn reject_managed_resume_add_dir_override(flag: &str) -> Result<()> {
     bail!(
         "managed resume does not allow forwarded {flag}; Codex thread/resume cannot faithfully carry additional writable roots"
+    )
+}
+
+fn managed_cli_unsupported_foreground_flag(arg: &str) -> Option<&'static str> {
+    if arg == "--full-auto" || arg.starts_with("--full-auto=") {
+        Some("--full-auto")
+    } else {
+        None
+    }
+}
+
+fn reject_managed_cli_unsupported_foreground_flag(flag: &str) -> Result<()> {
+    bail!(
+        "managed CLI session does not support forwarded {flag}; current interactive Codex does not accept it"
     )
 }
 
@@ -2226,6 +2245,8 @@ fn apply_codex_resume_foreground_args(
             reject_managed_resume_remote_override(flag)?;
         } else if let Some(flag) = managed_resume_add_dir_override_flag(&arg) {
             reject_managed_resume_add_dir_override(flag)?;
+        } else if let Some(flag) = managed_cli_unsupported_foreground_flag(&arg) {
+            reject_managed_cli_unsupported_foreground_flag(flag)?;
         } else if let Some(value) = arg.strip_prefix("--model=") {
             params.insert("model".to_owned(), Value::String(value.to_owned()));
         } else if let Some(value) = arg.strip_prefix("--profile=") {
@@ -2342,14 +2363,7 @@ fn apply_codex_resume_foreground_args(
                     );
                 }
                 "--full-auto" => {
-                    params.insert(
-                        "approvalPolicy".to_owned(),
-                        Value::String("on-request".to_owned()),
-                    );
-                    params.insert(
-                        "sandbox".to_owned(),
-                        Value::String("workspace-write".to_owned()),
-                    );
+                    reject_managed_cli_unsupported_foreground_flag(arg.as_str())?;
                 }
                 "--search"
                 | "--no-alt-screen"

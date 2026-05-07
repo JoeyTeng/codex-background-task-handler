@@ -3020,15 +3020,12 @@ fn cbth_new_active_config_profile_does_not_merge_top_level_model_config() {
 
 #[cfg(unix)]
 #[test]
-fn cbth_new_full_auto_bootstrap_matches_codex_alias() {
+fn cbth_new_rejects_forwarded_full_auto_before_thread_start() {
     let home = temp_home();
     let client_cwd = tempfile::tempdir().expect("client cwd");
     let script_dir = tempfile::tempdir().expect("script dir");
     let fake_codex = fake_codex_script(&script_dir);
     let log_path = script_dir.path().join("fake-codex.log");
-    let thread_id = "thread-cbth-new-full-auto";
-    let (app_server_url, fake_server_done) =
-        spawn_fake_app_server_new_thread_then_capture(thread_id, Duration::from_secs(1));
 
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("--home")
@@ -3039,32 +3036,23 @@ fn cbth_new_full_auto_bootstrap_matches_codex_alias() {
         .arg("--full-auto")
         .current_dir(client_cwd.path())
         .env("FAKE_CODEX_LOG", &log_path)
-        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
-        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
         .output()
         .expect("run cbth new with full-auto");
 
     assert!(
-        output.status.success(),
-        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
-        output.status,
+        !output.status.success(),
+        "cbth new unexpectedly succeeded\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-
-    let capture = wait_for_fake_thread_start_capture(fake_server_done);
-    assert_eq!(
-        capture.thread_start_params["approvalPolicy"],
-        serde_json::json!("on-request")
-    );
-    assert_eq!(
-        capture.thread_start_params["sandbox"],
-        serde_json::json!("workspace-write")
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("managed CLI session does not support forwarded --full-auto")
     );
 
-    let log = fs::read_to_string(&log_path).expect("read fake codex log");
-    assert!(log.contains("foreground\t--remote\t"));
-    assert!(log.contains("\t--full-auto"));
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!log.contains("app-server\tapp-server"));
+    assert!(!log.contains("foreground"));
     stop_daemon(&home);
 }
 
