@@ -24,9 +24,13 @@ cbth desktop bridge-preflight \
   --bridge-thread-id <thread-id> \
   --helper-direct-store \
   --json
+cbth desktop read-snapshot --bridge-thread-id <thread-id> --json
+cbth desktop list-arm-pending --bridge-thread-id <thread-id> --json
+cbth desktop list-pause-due --bridge-thread-id <thread-id> --json
+cbth desktop claim-next-ready --bridge-thread-id <thread-id> --json
 ```
 
-所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch` capability 时会按现有 capability gate fail closed 或重启。
+所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch` 或 `desktop-inbox-revisioned-installation-state` capability 时会按现有 capability gate fail closed 或重启。`read-snapshot` / `list-*` / `claim-next-ready` 是 no-DB read helpers：它们只读取已经发布的 inbox JSON，不打开 SQLite、不连接 daemon、不写文件。
 
 ## Installation State
 
@@ -75,26 +79,26 @@ cbth desktop bridge-preflight \
 
 ## Bridge Preflight Snapshots
 
-`cbth desktop bridge-preflight --bridge-thread-id ... --json` 是每轮 Desktop bridge wake 的 mandatory helper。即使 bridge 最终使用 `direct_file_read`，也必须先调用 preflight，以便：
+`cbth desktop bridge-preflight --bridge-thread-id ... --json` 是 snapshot publisher helper。即使 bridge 最终使用 `direct_file_read`，也必须先有一个非 Desktop-sandbox publisher 调用 preflight，以便：
 
 - 按需启动 same-user daemon。
 - 执行现有 maintenance sweep / GC。
 - 原子发布同一 `snapshot_revision` 的 inbox snapshot set。
 - 避免 bridge 读取旧 snapshot 后继续推进 delivery。
 
-默认 preflight 仍通过 same-user daemon 路由。`--require-existing-daemon` 只连接已经存在且兼容的 daemon，不 autostart，也不触碰 `startup.lock`。`--helper-direct-store` 是 Desktop heartbeat 专用的窄 helper 路径：它不使用 daemon autostart、`startup.lock` 或 Unix socket，而是在当前 `cbth` 进程内打开 store、执行 sweep 并发布同样的 snapshot set。`--helper-direct-store` 与 `--require-existing-daemon` 互斥；direct-helper 失败时必须 fail closed，不 fallback 到 daemon 或旧 snapshot。
+默认 preflight 仍通过 same-user daemon 路由。`--require-existing-daemon` 只连接已经存在且兼容的 daemon，不 autostart，也不触碰 `startup.lock`。`--helper-direct-store` 不使用 daemon autostart、`startup.lock` 或 Unix socket，而是在当前 `cbth` 进程内打开 store、执行 sweep 并发布同样的 snapshot set。`--helper-direct-store` 与 `--require-existing-daemon` 互斥；direct-helper 失败时必须 fail closed，不 fallback 到 daemon 或旧 snapshot。
 
-当前 preflight 发布一个稳定 manifest、一个稳定 installation-state export，和三份 revision-specific data snapshot：
+当前 preflight 发布一个稳定 manifest、一个 latest-only installation-state export，以及四份 revision-specific snapshot 文件：
 
 - `~/.cbth/inbox/current-snapshot.json`
-- `~/.cbth/inbox/desktop-installation-state.json`
 - `~/.cbth/inbox/snapshots/<snapshot_revision>/ready-threads.json`
 - `~/.cbth/inbox/snapshots/<snapshot_revision>/arm-pending-bindings.json`
 - `~/.cbth/inbox/snapshots/<snapshot_revision>/pause-due-bindings.json`
+- `~/.cbth/inbox/snapshots/<snapshot_revision>/desktop-installation-state.json`
 
-`current-snapshot.json` 必须最后写入，并且只引用 immutable revision-specific data files。这样即使新的 preflight 正在发布或中途失败，旧 manifest 引用的旧 data files 仍保持一致，不会因为固定文件名被覆盖而变成 revision mismatch。
+`current-snapshot.json` 必须最后写入，并且只引用 immutable revision-specific snapshot files。这样即使新的 preflight 正在发布或中途失败，旧 manifest 引用的旧 files 仍保持一致，不会因为固定文件名被覆盖而变成 revision mismatch。
 
-`desktop-installation-state.json` 是 preferred direct-file-read 路径，用于让 Desktop heartbeat 读取 installation generation、fingerprint、read transport、capability states 和 timestamps。它由 `bridge-preflight` 原子刷新；它不是 capability 写入口，capability 仍只能通过 `installation-state repair` 写入。
+`~/.cbth/inbox/desktop-installation-state.json` 仍作为 latest-only convenience export 保留，用于 operator inspection。它由 `bridge-preflight` 原子刷新，但不是 revision-consistent snapshot 的一部分；no-DB readers 必须使用 manifest 指向的 `snapshots/<snapshot_revision>/desktop-installation-state.json`。它也不是 capability 写入口，capability 仍只能通过 `installation-state repair` 写入。
 
 每个 snapshot 文件都包含：
 
@@ -104,6 +108,17 @@ cbth desktop bridge-preflight \
 - 相同的 `bridge_thread_id`
 
 本阶段三个 data snapshot 的 `entries` 都为空，`count = 0`。真实 ready selection、arm-pending reconciliation、pause-due cleanup、attempt creation 和 writeback helpers 留给后续 PR。
+
+## No-DB Inbox Read Helpers
+
+真实 Desktop heartbeat 可能无法打开 SQLite、daemon socket 或 `startup.lock`。因此 heartbeat v1 可以改用 no-DB read helpers 消费已经发布的 inbox snapshot：
+
+- `read-snapshot` 读取并校验 current manifest、三份 revision data snapshot 和 revision-specific `desktop-installation-state.json`。
+- `list-arm-pending` 读取 `arm-pending-bindings.json` 的 entries。
+- `list-pause-due` 读取 `pause-due-bindings.json` 的 entries。
+- `claim-next-ready` 读取 `ready-threads.json` 并返回第一条 ready entry 或 `null`。
+
+这些 helper 都是 pure read。`claim-next-ready` 当前只是 read/peek，不 reservation、不隐藏 head、不改变 durable state。它们会校验 `schema_version`、`snapshot_revision`、`bridge_thread_id`、manifest 引用路径和文件大小；任何不一致都 fail closed。
 
 权限合同沿用私有文件约束：
 
@@ -119,6 +134,7 @@ cbth desktop bridge-preflight \
 - `degraded` binding 不允许 automatic Desktop delivery。
 - 默认 daemon-routed preflight 缺少 daemon capability `desktop-bridge-foundation-dispatch` 时不执行 preflight / repair。
 - preflight 失败时 bridge 不得读取旧 snapshot 继续 arm。
+- no-DB read helper 发现 manifest / snapshot 不一致时不得继续 delivery。
 - `ready_threads.entries` 为空不是“没有任何未来工作”的最终语义；它只是本阶段尚未实现 ready materialization。
 
 ## Out Of Scope
@@ -128,7 +144,6 @@ cbth desktop bridge-preflight \
 - caller heartbeat wake / `automation_update` 调用。
 - ready attempt materialization。
 - `note-arm-pending`、`note-arm`、`note-boundary-crossed`。
-- `list-arm-pending`、`list-pause-due`、`claim-next-ready` fallback helpers。
 - Desktop automatic delivery live validation；preflight/read validation workflow is documented separately in [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](DESKTOP_LIVE_PREFLIGHT_VALIDATION.md).
 - 大 artifact automatic continuation。
 - 外部 Webex / GitHub / PR polling integrations。

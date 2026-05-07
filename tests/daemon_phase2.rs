@@ -416,7 +416,8 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "cli-turn-observation-expiry-dispatch",
             "cli-auto-delivery-dispatch",
             "task-supervisor",
-            "desktop-bridge-foundation-dispatch"
+            "desktop-bridge-foundation-dispatch",
+            "desktop-inbox-revisioned-installation-state"
         ])
     );
     assert_eq!(ping["daemon"]["idle_timeout_seconds"], 10);
@@ -440,7 +441,8 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "cli-turn-observation-expiry-dispatch",
             "cli-auto-delivery-dispatch",
             "task-supervisor",
-            "desktop-bridge-foundation-dispatch"
+            "desktop-bridge-foundation-dispatch",
+            "desktop-inbox-revisioned-installation-state"
         ])
     );
     assert!(status["startup_sweep"].is_object());
@@ -530,7 +532,8 @@ fn daemon_ensure_restarts_incompatible_daemon() {
             "cli-turn-observation-expiry-dispatch",
             "cli-auto-delivery-dispatch",
             "task-supervisor",
-            "desktop-bridge-foundation-dispatch"
+            "desktop-bridge-foundation-dispatch",
+            "desktop-inbox-revisioned-installation-state"
         ])
     );
 
@@ -605,7 +608,8 @@ fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
             "cli-turn-observation-expiry-dispatch",
             "cli-auto-delivery-dispatch",
             "task-supervisor",
-            "desktop-bridge-foundation-dispatch"
+            "desktop-bridge-foundation-dispatch",
+            "desktop-inbox-revisioned-installation-state"
         ])
     );
 
@@ -680,7 +684,8 @@ fn daemon_ensure_restarts_daemon_missing_auto_delivery_capability() {
             "cli-turn-observation-expiry-dispatch",
             "cli-auto-delivery-dispatch",
             "task-supervisor",
-            "desktop-bridge-foundation-dispatch"
+            "desktop-bridge-foundation-dispatch",
+            "desktop-inbox-revisioned-installation-state"
         ])
     );
 
@@ -755,7 +760,8 @@ fn daemon_ensure_restarts_daemon_missing_session_capability_dispatch() {
             "cli-turn-observation-expiry-dispatch",
             "cli-auto-delivery-dispatch",
             "task-supervisor",
-            "desktop-bridge-foundation-dispatch"
+            "desktop-bridge-foundation-dispatch",
+            "desktop-inbox-revisioned-installation-state"
         ])
     );
 
@@ -822,7 +828,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
                     let request = String::from_utf8_lossy(&request[..request_len]);
                     assert!(request.contains("\"ping\""));
                     if let Err(error) = stream.write_all(
-                        br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch"],"message":"pong"}}"#,
+                        br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state"],"message":"pong"}}"#,
                     ) {
                         if is_peer_disconnect(&error) {
                             continue;
@@ -888,7 +894,7 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
             } else if index == 1 {
                 r#"{"ok":false,"error":"daemon connection limit reached"}"#
             } else {
-                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch"],"message":"pong"}}"#
+                r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())

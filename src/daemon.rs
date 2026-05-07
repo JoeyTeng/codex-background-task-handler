@@ -87,6 +87,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "cli-auto-delivery-dispatch",
     "task-supervisor",
     "desktop-bridge-foundation-dispatch",
+    "desktop-inbox-revisioned-installation-state",
 ];
 const MAX_DISPATCH_WORKERS: usize = 32;
 const RESERVED_CONTROL_WORKERS: usize = 8;

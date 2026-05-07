@@ -3,7 +3,7 @@ id: 20260505-bbe4003-active
 title: Current Follow-ups
 status: active
 created: 2026-05-05
-updated: 2026-05-06
+updated: 2026-05-07
 branch: master
 pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/37
 supersedes: []
@@ -28,12 +28,10 @@ superseded_by:
 - If still needed, run a scheduled Desktop heartbeat test that distinguishes app-open behavior from fully-quit app behavior.
 - Build a real heartbeat automation sample and confirm target-thread fields in `automation.toml` / `codex-dev.db`.
 - Validate whether external process edits to Desktop automation schedule state, especially `next_run_at` and status transitions, are hot-observed by the caller thread heartbeat.
-- Desktop heartbeat preflight attempts are recorded in [Desktop live preflight evidence](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md): the first run failed at redundant `chmod 0700 /Users/hoteng/.cbth`; PR #38 fixed that blocker; the retry failed opening `/Users/hoteng/.cbth/run/startup.lock`; the existing-daemon path failed because Desktop heartbeat could not connect `/Users/hoteng/.cbth/run/cbth.sock`. Local inspection confirmed the cbth directories, socket, and startup lock were private and current-user owned, so the socket failure is not a POSIX mode / ownership misconfiguration.
-- The direct-helper path lets heartbeat run `bridge-preflight --helper-direct-store` without daemon autostart, `startup.lock`, or Unix socket access, but live validation still failed while enabling SQLite WAL mode under `~/.cbth`; ordinary POSIX mode / ownership drift has not explained the failure.
-- Decide the next Desktop preflight boundary after the SQLite WAL blocker: either make the heartbeat helper avoid opening SQLite entirely by consuming an already-exported installation/inbox state, or identify an app-side permission model that allows heartbeat code to open the cbth store and WAL files without approval.
-- Validate in a real Desktop heartbeat that `bridge-preflight` and direct reads of `current-snapshot.json`, `ready-threads.json`, `arm-pending-bindings.json`, `pause-due-bindings.json`, and `desktop-installation-state.json` work without approval.
-- After live validation, and only then, allow `read_transport_capability=validated` to cover mandatory `bridge-preflight`, daemon sweep / refresh success, and refreshed snapshot reads.
-- Separately validate no-approval execution for narrow Desktop helpers: `bridge-preflight`, `note-arm-pending`, `list-arm-pending`, `list-pause-due`, `claim-next-ready`, `note-arm`, and `note-boundary-crossed`.
+- Desktop heartbeat preflight attempts are recorded in [Desktop live preflight evidence](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md): direct heartbeat access to redundant chmod, `startup.lock`, Unix socket, and SQLite WAL paths failed under Desktop sandboxing even when POSIX ownership / mode looked correct.
+- The Desktop boundary is now split: a normal shell / daemon / future sidecar publishes the inbox snapshot, while the heartbeat consumes it through no-DB read helpers. Real heartbeat validation succeeded for `read-snapshot`, `list-arm-pending`, `list-pause-due`, and read/peek `claim-next-ready` without approval.
+- `read_transport_capability=validated` now covers the no-DB direct-file-read helper path against an already-published revision-consistent snapshot, including the manifest-referenced installation-state export. It does not validate heartbeat-owned `bridge-preflight`, SQLite access, artifact payload reads, or writeback helpers.
+- Separately validate no-approval execution for narrow Desktop writeback / lifecycle helpers: `note-arm-pending`, `note-arm`, and `note-boundary-crossed`.
 - If large artifacts ever enter the automatic caller path, separately validate `cbth desktop read-artifact ...` in heartbeat / caller contexts and write the result back to `artifact_read_capability`.
 
 ## Desktop Bridge Implementation
@@ -42,10 +40,9 @@ superseded_by:
 - Decide whether future daemon-owned supervised child processes need to be separated from externally reported pending jobs for idle-exit decisions.
 - Complete Desktop binding schema and behavior: `armed_generation`, `armed_generation_quiesced_at`, `pause_not_before`, `pause_deadline`, read-only capability mirrors, paused-state readback validation, and no mixed `read_transport` bindings.
 - Finish installation-wide `desktop_installation_state` authority and keep capability writes constrained to `installation-state repair`.
-- Finish the read-only inbox shape, including optional diagnostic `by-thread/<thread_id>.json`, artifact manifest export, and operator-only payload export.
+- Finish the read-only inbox shape beyond the no-DB helper baseline, including optional diagnostic `by-thread/<thread_id>.json`, artifact manifest export, and operator-only payload export.
 - Implement bridge fairness and budget limits: independent reconcile and fresh-arm lanes, bounded item count / wall time, and `max_new_arms_per_wake=1`.
-- Implement `helper_cli_read` fallback helpers: `list-arm-pending`, `list-pause-due`, and pure read/peek `claim-next-ready`.
-- Implement `claim-next-ready` with no reservation, no head hiding, and no durable state mutation.
+- Implement real ready / arm / pause materialization behind the existing no-DB read helpers.
 - Turn `bridge_arm_lease` into executable `note-arm-pending` acquire / carry-forward semantics keyed by `(source_thread_id, attempt_id, generation)` and `bridge_request_id`.
 - Implement writeback helpers `note-arm-pending` and `note-arm` with compare-and-swap, idempotency, and no duplicate `delivery_attempt_count` increments.
 - Implement `note-boundary-crossed` with prompt-token validation, binding / installation-state checks, `cooldown` and `armed_generation` preconditions, `handoff_recorded` close, and durable `boundary_recovery_envelope`.
