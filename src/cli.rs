@@ -2247,7 +2247,7 @@ fn reject_managed_resume_live_web_search_feature(flag: &str, feature: &str) -> R
 fn codex_feature_enables_live_web_search(feature: &str) -> bool {
     matches!(
         feature.trim().replace('-', "_").as_str(),
-        "web_search" | "search"
+        "web_search" | "web_search_request" | "search"
     )
 }
 
@@ -2655,10 +2655,22 @@ fn managed_resume_config_override_affects_sandbox_scope(key: &str) -> bool {
         || key.ends_with(".readable_roots")
         || key == "network_access"
         || key.ends_with(".network_access")
+        || key == "features"
         || key == "features.web_search"
         || key.starts_with("features.web_search.")
+        || key == "features.web_search_request"
+        || key.starts_with("features.web_search_request.")
         || key == "features.search"
         || key.starts_with("features.search.")
+        || key == "web_search"
+        || key.starts_with("web_search.")
+        || key == "web_search_request"
+        || key.starts_with("web_search_request.")
+        || key == "tools"
+        || key == "tools.web_search"
+        || key.starts_with("tools.web_search.")
+        || key == "tools.web_search_request"
+        || key.starts_with("tools.web_search_request.")
 }
 
 fn managed_resume_workspace_write_config_field_affects_sandbox_scope(field: &str) -> bool {

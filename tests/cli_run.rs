@@ -2562,6 +2562,10 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
         vec!["-cdefault-permissions=\"workspace-write\""],
         vec!["--config=defaultPermissions=\"trusted-all\""],
         vec!["--config=features.web_search=true"],
+        vec!["--config", "features={web_search=true}"],
+        vec!["--config=web_search=\"live\""],
+        vec!["--config=tools.web_search.context_size=\"high\""],
+        vec!["--config", "tools={web_search={context_size=\"high\"}}"],
     ];
 
     for (index, args) in cases.into_iter().enumerate() {
@@ -2667,6 +2671,8 @@ fn cbth_resume_rejects_forwarded_live_web_search() {
         vec!["--search=true"],
         vec!["--enable", "web_search"],
         vec!["--enable=web-search"],
+        vec!["--enable", "web_search_request"],
+        vec!["--enable=web-search-request"],
     ];
 
     for (index, args) in cases.into_iter().enumerate() {
