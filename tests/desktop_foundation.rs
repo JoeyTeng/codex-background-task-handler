@@ -763,6 +763,247 @@ fn desktop_note_arm_pending_and_note_arm_are_idempotent_and_exported() {
 }
 
 #[test]
+fn desktop_writeback_validation_fixture_prepares_safe_attempt() {
+    let home = temp_home();
+    let fixture = cbth(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "prepare-writeback-fixture",
+            "--source-thread-id",
+            "thread-desktop-live-writeback",
+            "--caller-automation-id",
+            "automation-desktop-live-writeback",
+            "--bridge-request-id",
+            "bridge-request-live-writeback",
+            "--now",
+            "4100",
+            "--json",
+        ],
+    );
+    let fixture = &fixture["desktop_writeback_fixture"];
+    assert_eq!(fixture["source_thread_id"], "thread-desktop-live-writeback");
+    assert_eq!(
+        fixture["caller_automation_id"],
+        "automation-desktop-live-writeback"
+    );
+    assert_eq!(
+        fixture["bridge_request_id"],
+        "bridge-request-live-writeback"
+    );
+    assert_eq!(fixture["batch"]["state"], "open");
+    assert_eq!(fixture["batch"]["replay_policy"], "automatic");
+    assert_eq!(fixture["batch"]["requires_artifact_read"], false);
+    assert_eq!(
+        fixture["batch"]["delivery_policy"]["delivery_read_only"],
+        true
+    );
+    assert_eq!(
+        fixture["batch"]["delivery_policy"]["delivery_requires_approval"],
+        false
+    );
+    assert_eq!(fixture["attempt"]["adapter_kind"], "desktop");
+    assert_eq!(fixture["attempt"]["state"], "prepared");
+    assert_eq!(fixture["attempt"]["generation"], 1);
+    assert_eq!(fixture["binding"]["binding_state"], "bound");
+
+    let attempt_id = fixture["attempt"]["attempt_id"].as_str().unwrap();
+    let pending = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-desktop-live-writeback",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-live-writeback",
+            "--now",
+            "4110",
+            "--json",
+        ],
+    );
+    assert_eq!(pending["desktop_arm_pending"]["outcome"], "arm_pending");
+    let lease_id = pending["desktop_arm_pending"]["bridge_arm_lease_id"]
+        .as_str()
+        .unwrap();
+
+    let repeated_pending = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-desktop-live-writeback",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-live-writeback",
+            "--now",
+            "4120",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        repeated_pending["desktop_arm_pending"]["outcome"],
+        "already_pending"
+    );
+    assert_eq!(
+        repeated_pending["desktop_arm_pending"]["bridge_arm_lease_id"],
+        lease_id
+    );
+
+    let armed = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm",
+            "--source-thread-id",
+            "thread-desktop-live-writeback",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-live-writeback",
+            "--bridge-arm-lease-id",
+            lease_id,
+            "--now",
+            "4130",
+            "--json",
+        ],
+    );
+    assert_eq!(armed["desktop_arm"]["outcome"], "armed");
+    assert_eq!(armed["desktop_arm"]["delivery_attempt_count"], 1);
+
+    let repeated_arm = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm",
+            "--source-thread-id",
+            "thread-desktop-live-writeback",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-live-writeback",
+            "--bridge-arm-lease-id",
+            lease_id,
+            "--now",
+            "4140",
+            "--json",
+        ],
+    );
+    assert_eq!(repeated_arm["desktop_arm"]["outcome"], "already_armed");
+    assert_eq!(repeated_arm["desktop_arm"]["delivery_attempt_count"], 1);
+}
+
+#[test]
+fn desktop_writeback_validation_fixture_fail_closed_cases_and_help_hidden() {
+    let home = temp_home();
+    let help = cbth_output(&home, &["desktop", "--help"], true);
+    assert!(help.status.success(), "desktop help should succeed");
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(!help.contains("validation"));
+    assert!(!help.contains("prepare-writeback-fixture"));
+
+    let empty_source = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "prepare-writeback-fixture",
+            "--source-thread-id",
+            "",
+            "--caller-automation-id",
+            "automation-empty-source",
+            "--json",
+        ],
+    );
+    assert!(empty_source.contains("source_thread_id must not be empty"));
+
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-bound",
+            "--caller-automation-id",
+            "automation-original",
+            "--now",
+            "4200",
+            "--json",
+        ],
+    );
+    let incompatible_binding = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "prepare-writeback-fixture",
+            "--source-thread-id",
+            "thread-bound",
+            "--caller-automation-id",
+            "automation-replacement",
+            "--bridge-request-id",
+            "bridge-request-replacement",
+            "--now",
+            "4210",
+            "--json",
+        ],
+    );
+    assert!(incompatible_binding.contains(
+        "source_thread_id thread-bound is already bound to caller_automation_id automation-original"
+    ));
+
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "prepare-writeback-fixture",
+            "--source-thread-id",
+            "thread-open-batch",
+            "--caller-automation-id",
+            "automation-open-batch",
+            "--bridge-request-id",
+            "bridge-request-open-batch",
+            "--now",
+            "4300",
+            "--json",
+        ],
+    );
+    let duplicate_fixture = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "prepare-writeback-fixture",
+            "--source-thread-id",
+            "thread-open-batch",
+            "--caller-automation-id",
+            "automation-open-batch",
+            "--bridge-request-id",
+            "bridge-request-open-batch-again",
+            "--now",
+            "4310",
+            "--json",
+        ],
+    );
+    assert!(duplicate_fixture.contains("already has open batch"));
+}
+
+#[test]
 fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
     let degraded_home = temp_home();
     cbth(
@@ -2400,7 +2641,8 @@ fn desktop_bridge_preflight_require_existing_daemon_does_not_forward_client_only
                     "task-supervisor",
                     "desktop-bridge-foundation-dispatch",
                     "desktop-inbox-revisioned-installation-state",
-                    "desktop-writeback-helper-foundation"
+                    "desktop-writeback-helper-foundation",
+                    "desktop-writeback-live-validation-fixture"
                 ],
                 "message": "pong"
             }

@@ -43,7 +43,7 @@ cbth desktop note-arm \
   --json
 ```
 
-所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state` 或 `desktop-writeback-helper-foundation` capability 时会按现有 capability gate fail closed 或重启。`read-snapshot` / `list-*` / `claim-next-ready` 是 no-DB read helpers：它们只读取已经发布的 inbox JSON，不打开 SQLite、不连接 daemon、不写文件。
+所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation` 或 validation-only `desktop-writeback-live-validation-fixture` capability 时会按现有 capability gate fail closed 或重启。`read-snapshot` / `list-*` / `claim-next-ready` 是 no-DB read helpers：它们只读取已经发布的 inbox JSON，不打开 SQLite、不连接 daemon、不写文件。
 
 ## Installation State
 
@@ -161,7 +161,7 @@ cbth desktop note-arm \
 
 - 未 validated 的 installation state 不允许 automatic Desktop delivery。
 - `degraded` binding 不允许 automatic Desktop delivery。
-- 默认 daemon-routed preflight / writeback 缺少 daemon capability `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state` 或 `desktop-writeback-helper-foundation` 时不执行 preflight / repair / writeback。
+- 默认 daemon-routed preflight / writeback 缺少 daemon capability `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation` 或 validation-only `desktop-writeback-live-validation-fixture` 时不执行 preflight / repair / writeback / fixture setup。
 - preflight 失败时 bridge 不得读取旧 snapshot 继续 arm。
 - no-DB read helper 发现 manifest / snapshot 不一致时不得继续 delivery。
 - writeback helper 发现 CAS token、binding、batch、attempt 或 policy 不匹配时不得推进 durable state。
@@ -180,3 +180,5 @@ cbth desktop note-arm \
 - 外部 Webex / GitHub / PR polling integrations。
 
 这些能力仍由 [DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md) 和 [SHARED_CORE_ARCHITECTURE.md](SHARED_CORE_ARCHITECTURE.md) 定义未来合同。
+
+Writeback helper live validation is tracked separately in [DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md](DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md).
