@@ -1644,6 +1644,30 @@ fn run_cli_session(
     let target =
         resolve_cli_run_thread_target(layout, &config.target, &codex_binary, &cwd, &lease_id)?;
     let bound_thread_id = target.bound_thread_id.clone();
+    let foreground_codex_args =
+        match foreground_codex_args(&config.foreground_mode, &cwd, &config.codex_args) {
+            Ok(args) => args,
+            Err(error) => {
+                abort_cli_thread_start_bootstrap_best_effort(
+                    layout,
+                    &target.bootstrap_id,
+                    &lease_id,
+                );
+                return Err(error);
+            }
+        };
+    let initial_thread_resume_params = match initial_passive_thread_resume_params(
+        &config.foreground_mode,
+        &bound_thread_id,
+        &cwd,
+        &foreground_codex_args,
+    ) {
+        Ok(params) => params,
+        Err(error) => {
+            abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
+            return Err(error);
+        }
+    };
     reserve_cli_app_server_for_thread(layout, &bound_thread_id, &lease_id).inspect_err(|_| {
         abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
     })?;
@@ -1698,12 +1722,6 @@ fn run_cli_session(
         }
     };
     let url = json_string(&app_server["cli_app_server"], "url")?;
-    let initial_thread_resume_params = initial_passive_thread_resume_params(
-        &config.foreground_mode,
-        &bound_thread_id,
-        &cwd,
-        &config.codex_args,
-    )?;
     let refresh_running = Arc::new(AtomicBool::new(true));
     spawn_cli_app_server_lease_refresher(
         layout.clone(),
@@ -1738,7 +1756,7 @@ fn run_cli_session(
         .arg(&url)
         .arg("--cd")
         .arg(&cwd)
-        .args(config.codex_args)
+        .args(foreground_codex_args)
         .status()
         .with_context(|| format!("spawn foreground codex via {:?}", codex_binary));
     let passive_stop_result = passive_adapter.stop();
@@ -1859,6 +1877,69 @@ fn ensure_cli_run_app_server(
     )
 }
 
+fn foreground_codex_args(
+    foreground_mode: &CliForegroundMode,
+    caller_cwd: &Path,
+    codex_args: &[OsString],
+) -> Result<Vec<OsString>> {
+    if !matches!(foreground_mode, CliForegroundMode::Resume { .. }) {
+        return Ok(codex_args.to_vec());
+    }
+    let mut normalized = codex_args.to_vec();
+    let mut index = 0;
+    while index < normalized.len() {
+        let arg = os_arg_to_utf8(&normalized[index], "codex argument")?;
+        if arg == "--" || arg == "-" || !arg.starts_with('-') {
+            break;
+        }
+        if let Some(value) = arg.strip_prefix("--cd=") {
+            let cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
+            normalized[index] = OsString::from(format!("--cd={}", cwd.to_string_lossy()));
+        } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
+            let cwd = resolve_codex_cwd_arg(caller_cwd, OsStr::new(value));
+            normalized[index] = OsString::from(format!("-C{}", cwd.to_string_lossy()));
+        } else {
+            match arg.as_str() {
+                "--cd" | "-C" => {
+                    index += 1;
+                    let cwd = {
+                        let Some(value) = normalized.get(index) else {
+                            bail!("codex argument {arg} requires a value");
+                        };
+                        resolve_codex_cwd_arg(caller_cwd, value).into_os_string()
+                    };
+                    normalized[index] = cwd;
+                }
+                "--model"
+                | "-m"
+                | "--profile"
+                | "-p"
+                | "--sandbox"
+                | "-s"
+                | "--ask-for-approval"
+                | "-a"
+                | "--config"
+                | "-c"
+                | "--local-provider"
+                | "--enable"
+                | "--disable"
+                | "--remote"
+                | "--remote-auth-token-env"
+                | "--image"
+                | "-i" => {
+                    index += 1;
+                    if index >= normalized.len() {
+                        bail!("codex argument {arg} requires a value");
+                    }
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    Ok(normalized)
+}
+
 fn initial_passive_thread_resume_params(
     foreground_mode: &CliForegroundMode,
     bound_thread_id: &str,
@@ -1876,13 +1957,14 @@ fn initial_passive_thread_resume_params(
             Value::String(path_to_utf8(cwd, "current directory")?),
         );
         params.insert("persistExtendedHistory".to_owned(), Value::Bool(true));
-        apply_codex_resume_foreground_args(&mut params, codex_args)?;
+        apply_codex_resume_foreground_args(&mut params, cwd, codex_args)?;
     }
     Ok(Value::Object(params))
 }
 
 fn apply_codex_resume_foreground_args(
     params: &mut serde_json::Map<String, Value>,
+    caller_cwd: &Path,
     codex_args: &[OsString],
 ) -> Result<()> {
     let mut config_overrides = serde_json::Map::new();
@@ -1910,7 +1992,10 @@ fn apply_codex_resume_foreground_args(
                 Value::String(normalize_codex_approval_policy(value)?),
             );
         } else if let Some(value) = arg.strip_prefix("--cd=") {
-            params.insert("cwd".to_owned(), Value::String(value.to_owned()));
+            params.insert(
+                "cwd".to_owned(),
+                Value::String(codex_cwd_arg_to_resume_cwd(caller_cwd, value)?),
+            );
         } else if let Some(value) = arg.strip_prefix("--config=") {
             apply_codex_config_override(params, &mut config_overrides, value)?;
         } else if let Some(value) = arg.strip_prefix("--local-provider=") {
@@ -1930,7 +2015,10 @@ fn apply_codex_resume_foreground_args(
                 Value::String(normalize_codex_approval_policy(value)?),
             );
         } else if let Some(value) = arg.strip_prefix("-C").filter(|value| !value.is_empty()) {
-            params.insert("cwd".to_owned(), Value::String(value.to_owned()));
+            params.insert(
+                "cwd".to_owned(),
+                Value::String(codex_cwd_arg_to_resume_cwd(caller_cwd, value)?),
+            );
         } else if let Some(value) = arg.strip_prefix("-c").filter(|value| !value.is_empty()) {
             apply_codex_config_override(params, &mut config_overrides, value)?;
         } else {
@@ -1959,7 +2047,10 @@ fn apply_codex_resume_foreground_args(
                 }
                 "--cd" | "-C" => {
                     let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
-                    params.insert("cwd".to_owned(), Value::String(value));
+                    params.insert(
+                        "cwd".to_owned(),
+                        Value::String(codex_cwd_arg_to_resume_cwd(caller_cwd, &value)?),
+                    );
                 }
                 "--config" | "-c" => {
                     let value = next_codex_arg_value(codex_args, &mut index, arg.as_str())?;
@@ -2097,6 +2188,22 @@ fn strip_cli_value_quotes(value: &str) -> &str {
                 .and_then(|value| value.strip_suffix('\''))
         })
         .unwrap_or(value)
+}
+
+fn codex_cwd_arg_to_resume_cwd(caller_cwd: &Path, value: &str) -> Result<String> {
+    path_to_utf8(
+        &resolve_codex_cwd_arg(caller_cwd, OsStr::new(value)),
+        "codex --cd",
+    )
+}
+
+fn resolve_codex_cwd_arg(caller_cwd: &Path, value: &OsStr) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        caller_cwd.join(path)
+    }
 }
 
 fn path_to_utf8(path: &Path, field: &str) -> Result<String> {
