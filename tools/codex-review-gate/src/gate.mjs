@@ -4,6 +4,7 @@ import {
   DEFAULT_CODEX_BOT_LOGINS,
   DEFAULT_TRUSTED_COMMENT_LOGINS,
   GateFailure,
+  NonJsonResponseError,
   STATUS_CONTEXT,
   activeMarkerIsObsolete,
   buildMarkerCommentBody,
@@ -22,6 +23,7 @@ import {
   markerFromComment,
   normalizeState,
   parseLoginSet,
+  parseJsonResponseText,
   parseStateCommentBody,
   parseTimestamp,
   reconcileStateWithMarkerComment,
@@ -717,7 +719,25 @@ async function request(method, path, bodyOrQuery) {
     }
 
     const text = await response.text();
-    const data = text ? JSON.parse(text) : null;
+    let data;
+    try {
+      data = parseJsonResponseText(text, `${method} ${url.pathname} (${response.status})`);
+    } catch (error) {
+      if (
+        error instanceof NonJsonResponseError &&
+        !response.ok &&
+        attempt < MAX_REQUEST_ATTEMPTS &&
+        restRequestRetryAllowed(method, path, response.status)
+      ) {
+        await sleepBeforeRetry(
+          `retrying ${method} ${url.pathname} after ${response.status}: ${error.preview}`,
+          attempt,
+          response.headers.get("retry-after"),
+        );
+        continue;
+      }
+      throw error;
+    }
 
     if (!response.ok) {
       const message = data?.message || response.statusText;
@@ -765,7 +785,23 @@ async function graphqlRequest(query, variables) {
     }
 
     const text = await response.text();
-    const payload = text ? JSON.parse(text) : null;
+    let payload;
+    try {
+      payload = parseJsonResponseText(
+        text,
+        `POST ${new URL(config.graphqlUrl).pathname} (${response.status})`,
+      );
+    } catch (error) {
+      if (error instanceof NonJsonResponseError && !response.ok && attempt < MAX_REQUEST_ATTEMPTS) {
+        await sleepBeforeRetry(
+          `retrying GraphQL request after ${response.status}: ${error.preview}`,
+          attempt,
+          response.headers.get("retry-after"),
+        );
+        continue;
+      }
+      throw error;
+    }
 
     if (!response.ok) {
       const message = payload?.message || response.statusText;

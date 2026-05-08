@@ -18,6 +18,8 @@ import {
   isRetryableHttpStatus,
   issueCommentIdentity,
   markerFromComment,
+  NonJsonResponseError,
+  parseJsonResponseText,
   parseStateCommentBody,
   reconcileStateWithMarkerComment,
   reactionIdentity,
@@ -185,6 +187,24 @@ test("does not retry marker comment creation requests", () => {
 test("honors Retry-After response delays", () => {
   assert.equal(retryAfterDelayMs("2", 100), 2000);
   assert.equal(retryAfterDelayMs("invalid", 100), 100);
+});
+
+test("parses JSON response text and accepts empty response bodies", () => {
+  assert.deepEqual(parseJsonResponseText("{\"ok\":true}", "GET /repos/o/r"), { ok: true });
+  assert.equal(parseJsonResponseText("", "GET /repos/o/r"), null);
+});
+
+test("reports non-JSON response previews without raw SyntaxError text", () => {
+  assert.throws(
+    () => parseJsonResponseText("<!DOCTYPE html><title>Bad Gateway</title>", "GET /repos/o/r (502)"),
+    (error) => {
+      assert.equal(error instanceof NonJsonResponseError, true);
+      assert.equal(error.name, "NonJsonResponseError");
+      assert.match(error.message, /GET \/repos\/o\/r \(502\) returned a non-JSON response/);
+      assert.match(error.preview, /<!DOCTYPE html>/);
+      return true;
+    },
+  );
 });
 
 test("round-trips hidden state metadata", () => {
