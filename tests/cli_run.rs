@@ -32,7 +32,7 @@ fn write_fake_codex_script(path: &Path) -> PathBuf {
         r#"#!/bin/sh
 	log="${FAKE_CODEX_LOG:?}"
 if [ "${1:-}" = "--version" ]; then
-  printf '%s\n' "${FAKE_CODEX_VERSION:-codex-cli 0.128.0}"
+  printf '%s\n' "${FAKE_CODEX_VERSION:-codex-cli 0.129.0}"
   exit 0
 fi
 
@@ -2017,12 +2017,23 @@ fn write_fake_thread_response_with_permissions(
         response["approvalsReviewer"] = serde_json::json!("user");
         response["sandbox"] = serde_json::json!({
             "type": "readOnly",
-            "access": {
-                "type": "restricted",
-                "includePlatformDefaults": true,
-                "readableRoots": ["/tmp/fake-cwd"]
-            },
             "networkAccess": false
+        });
+        response["permissionProfile"] = serde_json::json!({
+            "type": "managed",
+            "network": { "enabled": false },
+            "fileSystem": {
+                "type": "restricted",
+                "entries": [
+                    {
+                        "path": {
+                            "type": "special",
+                            "value": { "kind": "root" }
+                        },
+                        "access": "read"
+                    }
+                ]
+            }
         });
     }
     write_fake_json_response(stream, request, response)
@@ -2718,6 +2729,7 @@ fn cbth_resume_rejects_permission_affecting_config_overrides() {
         vec!["--config=permissions.network.enabled=true"],
         vec!["-cpermissions.file_system.entries=[]"],
         vec!["--config=permission_profile.network.enabled=true"],
+        vec!["--config=activePermissionProfile.id=\":workspace\""],
         vec!["--config=default_permissions=\"read-only\""],
         vec!["-cdefault-permissions=\"workspace-write\""],
         vec!["--config=defaultPermissions=\"trusted-all\""],

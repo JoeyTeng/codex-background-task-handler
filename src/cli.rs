@@ -73,9 +73,9 @@ const CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS: i64 = MAX_CLI_OBSERVAT
 const CLI_APP_SERVER_RECONCILE_INTERVAL_MS: u64 = 2_000;
 const DOCTOR_CODEX_VERSION_TIMEOUT_SECONDS: u64 = 5;
 const DOCTOR_APP_SERVER_PROBE_TIMEOUT_SECONDS: u64 = 15;
-const VALIDATED_CODEX_CLI_VERSION_REQUIREMENT: &str = "0.128.x";
+const VALIDATED_CODEX_CLI_VERSION_REQUIREMENT: &str = "0.129.x";
 const VALIDATED_CODEX_CLI_MAJOR: u64 = 0;
-const VALIDATED_CODEX_CLI_MINOR: u64 = 128;
+const VALIDATED_CODEX_CLI_MINOR: u64 = 129;
 const DESKTOP_INBOX_SCHEMA_VERSION: i64 = 1;
 const DESKTOP_INBOX_MAX_JSON_BYTES: u64 = 1024 * 1024;
 const DESKTOP_SNAPSHOT_REVISION_RETENTION: usize = 128;
@@ -3165,6 +3165,10 @@ fn managed_resume_config_override_affects_sandbox_scope(key: &str) -> bool {
         || key.starts_with("permission_profile.")
         || key == "permissionProfile"
         || key.starts_with("permissionProfile.")
+        || key == "active_permission_profile"
+        || key.starts_with("active_permission_profile.")
+        || key == "activePermissionProfile"
+        || key.starts_with("activePermissionProfile.")
         || key == "default_permissions"
         || key.starts_with("default_permissions.")
         || key == "defaultPermissions"
@@ -3419,6 +3423,18 @@ fn parse_thread_resume_permission_snapshot(result: &Value) -> Result<CliPermissi
         .get("permissionProfile")
         .filter(|value| !value.is_null())
         .cloned();
+    let active_permission_profile = result
+        .get("activePermissionProfile")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let active_permission_profile_selection = active_permission_profile
+        .as_ref()
+        .map(parse_active_permission_profile_selection)
+        .transpose()?;
+    let can_use_current_profile_selection = active_permission_profile_selection
+        .as_ref()
+        .is_some_and(|selection| active_permission_profile_id_is_stable_builtin(&selection.id));
+    let mut permission_profile_legacy_compatible = true;
     let (source, allows_network, allows_write_access) = if let Some(permission_profile) =
         permission_profile.as_ref()
     {
@@ -3428,7 +3444,16 @@ fn parse_thread_resume_permission_snapshot(result: &Value) -> Result<CliPermissi
                 "thread/resume permissionProfile and legacy sandbox disagree on derived permissions"
             );
         }
-        ensure_permission_profile_legacy_write_equivalence(&profile_permissions, &sandbox_policy)?;
+        if let Err(error) = ensure_permission_profile_legacy_write_equivalence(
+            &profile_permissions,
+            &sandbox_policy,
+        ) {
+            if can_use_current_profile_selection {
+                permission_profile_legacy_compatible = false;
+            } else {
+                return Err(error);
+            }
+        }
         (
             CliPermissionSnapshotSource::PermissionProfile,
             profile_permissions.allows_network,
@@ -3449,6 +3474,9 @@ fn parse_thread_resume_permission_snapshot(result: &Value) -> Result<CliPermissi
         approval_policy,
         sandbox_policy,
         permission_profile,
+        permission_profile_legacy_compatible,
+        active_permission_profile,
+        active_permission_profile_selection,
     })
 }
 
@@ -3468,11 +3496,11 @@ fn parse_sandbox_permissions(value: &Value) -> Result<(bool, bool)> {
         .ok_or_else(|| anyhow::anyhow!("thread/resume sandbox missing type"))?;
     match sandbox_type {
         "readOnly" => {
-            sandbox_access(value, "access")?;
+            validate_sandbox_access_if_present(value, "access")?;
             Ok((sandbox_required_bool_field(value, "networkAccess")?, false))
         }
         "workspaceWrite" => {
-            sandbox_access(value, "readOnlyAccess")?;
+            validate_sandbox_access_if_present(value, "readOnlyAccess")?;
             workspace_writable_roots(value)?;
             sandbox_required_bool_field(value, "excludeTmpdirEnvVar")?;
             sandbox_required_bool_field(value, "excludeSlashTmp")?;
@@ -3484,7 +3512,7 @@ fn parse_sandbox_permissions(value: &Value) -> Result<(bool, bool)> {
                 Some("enabled") => true,
                 Some("restricted") => false,
                 Some(other) => bail!("thread/resume sandbox has unknown networkAccess {other:?}"),
-                None => bail!("thread/resume externalSandbox missing networkAccess"),
+                None => false,
             };
             Ok((network, true))
         }
@@ -3492,8 +3520,76 @@ fn parse_sandbox_permissions(value: &Value) -> Result<(bool, bool)> {
     }
 }
 
+fn parse_active_permission_profile_selection(
+    value: &Value,
+) -> Result<CliPermissionProfileSelection> {
+    let value = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("thread/resume activePermissionProfile is not an object"))?;
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("thread/resume activePermissionProfile missing id"))?;
+    if id.is_empty() {
+        bail!("thread/resume activePermissionProfile id is empty");
+    }
+    let mut additional_writable_roots = Vec::new();
+    match value.get("modifications") {
+        Some(Value::Null) | None => {}
+        Some(Value::Array(modifications)) => {
+            for modification in modifications {
+                let modification = modification.as_object().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "thread/resume activePermissionProfile modification is not an object"
+                    )
+                })?;
+                match modification.get("type").and_then(Value::as_str) {
+                    Some("additionalWritableRoot" | "additional_writable_root") => {
+                        let path = modification
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "thread/resume activePermissionProfile additionalWritableRoot missing path"
+                                )
+                            })?;
+                        if !Path::new(path).is_absolute() {
+                            bail!(
+                                "thread/resume activePermissionProfile additionalWritableRoot path is not absolute: {path:?}"
+                            );
+                        }
+                        additional_writable_roots
+                            .push(normalize_absolute_permission_profile_path(path)?);
+                    }
+                    Some(other) => bail!(
+                        "thread/resume activePermissionProfile has unknown modification {other:?}"
+                    ),
+                    None => {
+                        bail!("thread/resume activePermissionProfile modification missing type")
+                    }
+                }
+            }
+        }
+        Some(_) => bail!("thread/resume activePermissionProfile modifications is not an array"),
+    }
+    additional_writable_roots.sort();
+    additional_writable_roots.dedup();
+    Ok(CliPermissionProfileSelection {
+        id: id.to_owned(),
+        additional_writable_roots,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PermissionProfileRuntimeKind {
+    Managed,
+    Disabled,
+    External,
+}
+
 #[derive(Debug)]
 struct PermissionProfilePermissions {
+    kind: PermissionProfileRuntimeKind,
     allows_network: bool,
     allows_write_access: bool,
     read_paths: Vec<PathBuf>,
@@ -3502,12 +3598,16 @@ struct PermissionProfilePermissions {
     write_paths: Vec<PathBuf>,
     write_special_kinds: HashSet<String>,
     has_unrepresentable_write_scope: bool,
+    deny_paths: Vec<PathBuf>,
+    deny_special_kinds: HashSet<String>,
+    has_unrepresentable_deny_scope: bool,
     has_access_denials: bool,
 }
 
 impl PermissionProfilePermissions {
-    fn new(allows_network: bool) -> Self {
+    fn new(kind: PermissionProfileRuntimeKind, allows_network: bool) -> Self {
         Self {
+            kind,
             allows_network,
             allows_write_access: false,
             read_paths: Vec::new(),
@@ -3516,12 +3616,33 @@ impl PermissionProfilePermissions {
             write_paths: Vec::new(),
             write_special_kinds: HashSet::new(),
             has_unrepresentable_write_scope: false,
+            deny_paths: Vec::new(),
+            deny_special_kinds: HashSet::new(),
+            has_unrepresentable_deny_scope: false,
             has_access_denials: false,
         }
     }
 
+    fn full_access(kind: PermissionProfileRuntimeKind, allows_network: bool) -> Self {
+        let mut permissions = Self::new(kind, allows_network);
+        permissions.record_full_file_system_access();
+        permissions
+    }
+
+    fn external(allows_network: bool) -> Self {
+        let mut permissions = Self::new(PermissionProfileRuntimeKind::External, allows_network);
+        permissions.allows_write_access = true;
+        permissions
+    }
+
     fn derived_permissions(&self) -> (bool, bool) {
         (self.allows_network, self.allows_write_access)
+    }
+
+    fn record_full_file_system_access(&mut self) {
+        self.allows_write_access = true;
+        self.read_special_kinds.insert("root".to_owned());
+        self.write_special_kinds.insert("root".to_owned());
     }
 
     fn write_covers_path(&self, path: &Path) -> bool {
@@ -3566,6 +3687,37 @@ impl PermissionProfilePermissions {
                 .iter()
                 .any(|read_path| path.starts_with(read_path))
     }
+
+    fn read_covers_special(&self, kind: &str) -> bool {
+        match kind {
+            "root" => self.read_covers_path(Path::new("/")),
+            "slash_tmp" => self.read_covers_path(Path::new("/tmp")),
+            _ => self.read_special_kinds.contains("root") || self.read_special_kinds.contains(kind),
+        }
+    }
+
+    fn write_covers_scope_kind(&self, kind: &str) -> bool {
+        match kind {
+            "root" => self.write_covers_path(Path::new("/")),
+            "slash_tmp" => self.write_covers_path(Path::new("/tmp")),
+            "tmpdir" => self.write_covers_special("tmpdir"),
+            "project_roots" => self.write_covers_special("project_roots"),
+            _ => self.write_covers_special(kind),
+        }
+    }
+
+    fn record_deny_scope(&mut self, path_scope: &PermissionProfilePathScope) {
+        self.has_access_denials = true;
+        match path_scope {
+            PermissionProfilePathScope::Absolute(path) => self.deny_paths.push(path.clone()),
+            PermissionProfilePathScope::Special(kind) => {
+                self.deny_special_kinds.insert(kind.clone());
+            }
+            PermissionProfilePathScope::GlobPattern => {
+                self.has_unrepresentable_deny_scope = true;
+            }
+        }
+    }
 }
 
 enum PermissionProfilePathScope {
@@ -3578,25 +3730,89 @@ fn parse_permission_profile_permissions(value: &Value) -> Result<PermissionProfi
     let value = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("thread/resume permissionProfile is not an object"))?;
-    let allows_network = match value.get("network") {
-        Some(Value::Null) | None => false,
-        Some(Value::Object(network)) => network
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "thread/resume permissionProfile network.enabled missing or not a boolean"
-                )
-            })?,
+    match value.get("type").and_then(Value::as_str) {
+        Some("managed") => {
+            let allows_network = parse_permission_profile_network(value.get("network"), true)?;
+            let mut permissions = PermissionProfilePermissions::new(
+                PermissionProfileRuntimeKind::Managed,
+                allows_network,
+            );
+            parse_permission_profile_file_system(value.get("fileSystem"), true, &mut permissions)?;
+            Ok(permissions)
+        }
+        Some("disabled") => Ok(PermissionProfilePermissions::full_access(
+            PermissionProfileRuntimeKind::Disabled,
+            true,
+        )),
+        Some("external") => {
+            let allows_network = parse_permission_profile_network(value.get("network"), true)?;
+            Ok(PermissionProfilePermissions::external(allows_network))
+        }
+        Some(other) => bail!("thread/resume permissionProfile has unknown type {other:?}"),
+        None => {
+            let allows_network = parse_permission_profile_network(value.get("network"), false)?;
+            let mut permissions = PermissionProfilePermissions::new(
+                PermissionProfileRuntimeKind::Managed,
+                allows_network,
+            );
+            parse_permission_profile_file_system(value.get("fileSystem"), false, &mut permissions)?;
+            Ok(permissions)
+        }
+    }
+}
+
+fn parse_permission_profile_network(value: Option<&Value>, required: bool) -> Result<bool> {
+    match value {
+        Some(Value::Null) | None if !required => Ok(false),
+        None => bail!("thread/resume permissionProfile missing network"),
+        Some(Value::Null) => bail!("thread/resume permissionProfile network is null"),
+        Some(Value::Object(network)) => {
+            network
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "thread/resume permissionProfile network.enabled missing or not a boolean"
+                    )
+                })
+        }
         Some(_) => bail!("thread/resume permissionProfile network is not an object"),
-    };
-    let mut permissions = PermissionProfilePermissions::new(allows_network);
-    let Some(file_system) = value.get("fileSystem").filter(|value| !value.is_null()) else {
-        return Ok(permissions);
+    }
+}
+
+fn parse_permission_profile_file_system(
+    value: Option<&Value>,
+    required: bool,
+    permissions: &mut PermissionProfilePermissions,
+) -> Result<()> {
+    let Some(file_system) = value.filter(|value| !value.is_null()) else {
+        if required {
+            bail!("thread/resume permissionProfile missing fileSystem");
+        }
+        return Ok(());
     };
     let file_system = file_system.as_object().ok_or_else(|| {
         anyhow::anyhow!("thread/resume permissionProfile fileSystem is not an object")
     })?;
+    match file_system.get("type").and_then(Value::as_str) {
+        Some("restricted") => {
+            parse_permission_profile_restricted_file_system(file_system, permissions)
+        }
+        Some("unrestricted") => {
+            permissions.record_full_file_system_access();
+            Ok(())
+        }
+        Some(other) => {
+            bail!("thread/resume permissionProfile fileSystem has unknown type {other:?}")
+        }
+        None => parse_permission_profile_restricted_file_system(file_system, permissions),
+    }
+}
+
+fn parse_permission_profile_restricted_file_system(
+    file_system: &serde_json::Map<String, Value>,
+    permissions: &mut PermissionProfilePermissions,
+) -> Result<()> {
     let entries = file_system
         .get("entries")
         .and_then(Value::as_array)
@@ -3612,7 +3828,7 @@ fn parse_permission_profile_permissions(value: &Value) -> Result<PermissionProfi
         let path_scope = parse_permission_profile_entry_path(entry)?;
         match entry.get("access").and_then(Value::as_str) {
             Some("read") => permissions.record_read_scope(&path_scope),
-            Some("none") => permissions.has_access_denials = true,
+            Some("none") => permissions.record_deny_scope(&path_scope),
             Some("write") => {
                 permissions.allows_write_access = true;
                 match path_scope {
@@ -3639,7 +3855,7 @@ fn parse_permission_profile_permissions(value: &Value) -> Result<PermissionProfi
             None => bail!("thread/resume permissionProfile entry missing access"),
         }
     }
-    Ok(permissions)
+    Ok(())
 }
 
 fn parse_permission_profile_entry_path(entry: &Value) -> Result<PermissionProfilePathScope> {
@@ -3681,8 +3897,10 @@ fn parse_permission_profile_path(path: &Value) -> Result<PermissionProfilePathSc
                     | "slash_tmp"),
                 ) => kind,
                 Some(kind @ "project_roots") => {
-                    if permission_profile_special_has_subpath(value, "subpath")? {
-                        "project_roots_subpath"
+                    if let Some(subpath) = permission_profile_special_subpath(value, "subpath")? {
+                        return Ok(PermissionProfilePathScope::Special(format!(
+                            "project_roots_subpath:{subpath}"
+                        )));
                     } else {
                         kind
                     }
@@ -3729,6 +3947,13 @@ fn ensure_permission_profile_legacy_write_equivalence(
     profile: &PermissionProfilePermissions,
     sandbox: &Value,
 ) -> Result<()> {
+    if matches!(profile.kind, PermissionProfileRuntimeKind::External) {
+        return if sandbox_policy_type(sandbox)? == "externalSandbox" {
+            Ok(())
+        } else {
+            bail!("thread/resume external permissionProfile cannot match non-external sandbox")
+        };
+    }
     if profile.has_access_denials {
         bail!(
             "thread/resume permissionProfile deny scope cannot be safely represented by legacy sandbox"
@@ -3769,11 +3994,11 @@ fn ensure_permission_profile_covers_legacy_read_access(
     match sandbox_policy_type(sandbox)? {
         "readOnly" => ensure_permission_profile_covers_read_access(
             profile,
-            sandbox_access(sandbox, "access")?,
+            &sandbox_access(sandbox, "access")?,
         ),
         "workspaceWrite" => ensure_permission_profile_covers_read_access(
             profile,
-            sandbox_access(sandbox, "readOnlyAccess")?,
+            &sandbox_access(sandbox, "readOnlyAccess")?,
         ),
         "dangerFullAccess" if profile.read_covers_path(Path::new("/")) => Ok(()),
         "dangerFullAccess" => {
@@ -3844,10 +4069,10 @@ fn validate_optional_string_field(value: &Value, field: &str) -> Result<()> {
     }
 }
 
-fn permission_profile_special_has_subpath(value: &Value, field: &str) -> Result<bool> {
+fn permission_profile_special_subpath(value: &Value, field: &str) -> Result<Option<String>> {
     match value.get(field) {
-        Some(Value::String(subpath)) => Ok(!subpath.is_empty()),
-        Some(Value::Null) | None => Ok(false),
+        Some(Value::String(subpath)) if !subpath.is_empty() => Ok(Some(subpath.to_owned())),
+        Some(Value::String(_)) | Some(Value::Null) | None => Ok(None),
         Some(_) => bail!("thread/resume permissionProfile special path {field} is not a string"),
     }
 }
@@ -3889,6 +4114,17 @@ fn turn_start_permission_overrides(
         &current_snapshot.approval_policy,
         effective.allows_approval,
     )?;
+    if let Some(permissions) = current_permission_profile_selection_for_turn_start(
+        startup_snapshot,
+        current_snapshot,
+        effective,
+    )? {
+        return Ok(json!({
+            "approvalPolicy": approval_policy,
+            "permissions": permissions,
+        }));
+    }
+    ensure_legacy_permission_fallback_compatible(startup_snapshot, current_snapshot)?;
     let sandbox_policy = pinned_sandbox_policy(
         &startup_snapshot.sandbox_policy,
         &current_snapshot.sandbox_policy,
@@ -3898,6 +4134,348 @@ fn turn_start_permission_overrides(
         "approvalPolicy": approval_policy,
         "sandboxPolicy": sandbox_policy,
     }))
+}
+
+fn current_permission_profile_selection_for_turn_start(
+    startup_snapshot: &CliPermissionSnapshot,
+    current_snapshot: &CliPermissionSnapshot,
+    effective: CliResolvedPermissions,
+) -> Result<Option<Value>> {
+    let selection = current_snapshot
+        .active_permission_profile_selection
+        .as_ref();
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+    if current_snapshot.source != CliPermissionSnapshotSource::PermissionProfile {
+        return Ok(None);
+    }
+    let current_resolved = current_snapshot.resolved_permissions();
+    if current_resolved.allows_network != effective.allows_network
+        || current_resolved.allows_write_access != effective.allows_write_access
+    {
+        return Ok(None);
+    }
+    if !active_permission_profile_id_is_stable_builtin(&selection.id) {
+        return Ok(None);
+    }
+    let Some(selection_permissions) = permission_profile_cap_from_active_selection(selection)?
+    else {
+        return Ok(None);
+    };
+    if selection_permissions.derived_permissions()
+        != (effective.allows_network, effective.allows_write_access)
+    {
+        return Ok(None);
+    }
+    if !current_permission_profile_selection_matches_current_profile(
+        selection,
+        &selection_permissions,
+        current_snapshot,
+    )? {
+        return Ok(None);
+    }
+    if !current_permission_profile_scope_within_startup(startup_snapshot, current_snapshot)? {
+        return Ok(None);
+    }
+    Ok(Some(selection.to_turn_start_permissions_json()))
+}
+
+fn active_permission_profile_id_is_stable_builtin(id: &str) -> bool {
+    matches!(id, ":read-only" | ":workspace" | ":danger-no-sandbox")
+}
+
+fn current_permission_profile_selection_matches_current_profile(
+    selection: &CliPermissionProfileSelection,
+    selection_permissions: &PermissionProfilePermissions,
+    current_snapshot: &CliPermissionSnapshot,
+) -> Result<bool> {
+    let Some(current_profile) = current_snapshot.permission_profile.as_ref() else {
+        return Ok(false);
+    };
+    let current_permissions = parse_permission_profile_permissions(current_profile)?;
+    let selection_preserves_current_denials =
+        selection_denials_cover_permission_profile(selection, &current_permissions);
+    if !permission_profile_scope_within(
+        selection_permissions,
+        &current_permissions,
+        selection_preserves_current_denials,
+    ) {
+        return Ok(false);
+    }
+    let current_preserves_selection_denials =
+        current_permission_profile_denials_preserve_startup_denials(
+            &current_permissions,
+            selection_permissions,
+        );
+    Ok(permission_profile_scope_within(
+        &current_permissions,
+        selection_permissions,
+        current_preserves_selection_denials,
+    ))
+}
+
+fn permission_profile_cap_from_active_selection(
+    selection: &CliPermissionProfileSelection,
+) -> Result<Option<PermissionProfilePermissions>> {
+    let mut permissions = match selection.id.as_str() {
+        ":read-only" => {
+            let mut permissions =
+                PermissionProfilePermissions::new(PermissionProfileRuntimeKind::Managed, false);
+            permissions.read_special_kinds.insert("root".to_owned());
+            permissions
+        }
+        ":workspace" => {
+            let mut permissions =
+                PermissionProfilePermissions::new(PermissionProfileRuntimeKind::Managed, false);
+            permissions.read_special_kinds.insert("root".to_owned());
+            permissions.allows_write_access = true;
+            permissions
+                .write_special_kinds
+                .insert("project_roots".to_owned());
+            permissions.write_special_kinds.insert("tmpdir".to_owned());
+            permissions
+                .write_special_kinds
+                .insert("slash_tmp".to_owned());
+            for subpath in [".git", ".agents", ".codex"] {
+                permissions
+                    .deny_special_kinds
+                    .insert(format!("project_roots_subpath:{subpath}"));
+            }
+            permissions.has_access_denials = true;
+            permissions
+        }
+        ":danger-no-sandbox" => {
+            PermissionProfilePermissions::full_access(PermissionProfileRuntimeKind::Disabled, true)
+        }
+        _ => return Ok(None),
+    };
+    if !selection.additional_writable_roots.is_empty() {
+        permissions.allows_write_access = true;
+        permissions
+            .write_paths
+            .extend(selection.additional_writable_roots.iter().cloned());
+    }
+    Ok(Some(permissions))
+}
+
+fn selection_denials_cover_permission_profile(
+    selection: &CliPermissionProfileSelection,
+    current_permissions: &PermissionProfilePermissions,
+) -> bool {
+    if !current_permissions.has_access_denials {
+        return true;
+    }
+    if current_permissions.has_unrepresentable_deny_scope {
+        return false;
+    }
+    match selection.id.as_str() {
+        ":workspace" => {
+            current_permissions.deny_paths.is_empty()
+                && current_permissions.deny_special_kinds.iter().all(|kind| {
+                    matches!(
+                        kind.as_str(),
+                        "project_roots_subpath:.git"
+                            | "project_roots_subpath:.agents"
+                            | "project_roots_subpath:.codex"
+                    )
+                })
+        }
+        _ => false,
+    }
+}
+
+fn current_permission_profile_scope_within_startup(
+    startup_snapshot: &CliPermissionSnapshot,
+    current_snapshot: &CliPermissionSnapshot,
+) -> Result<bool> {
+    let Some(current_profile) = current_snapshot.permission_profile.as_ref() else {
+        return Ok(false);
+    };
+    if startup_snapshot.permission_profile.as_ref() == Some(current_profile) {
+        return Ok(true);
+    }
+    let current_permissions = parse_permission_profile_permissions(current_profile)?;
+    if let Some(startup_profile) = startup_snapshot.permission_profile.as_ref() {
+        let startup_permissions = parse_permission_profile_permissions(startup_profile)?;
+        let current_denials_preserved = current_permission_profile_denials_preserve_startup_denials(
+            &current_permissions,
+            &startup_permissions,
+        );
+        return Ok(permission_profile_scope_within(
+            &current_permissions,
+            &startup_permissions,
+            current_denials_preserved,
+        ));
+    }
+    let Some(startup_permissions) =
+        permission_scope_cap_from_legacy_sandbox(&startup_snapshot.sandbox_policy)?
+    else {
+        return Ok(false);
+    };
+    Ok(permission_profile_scope_within(
+        &current_permissions,
+        &startup_permissions,
+        false,
+    ))
+}
+
+fn permission_scope_cap_from_legacy_sandbox(
+    sandbox: &Value,
+) -> Result<Option<PermissionProfilePermissions>> {
+    let sandbox_type = sandbox_policy_type(sandbox)?;
+    match sandbox_type {
+        "readOnly" => {
+            let mut permissions = PermissionProfilePermissions::new(
+                PermissionProfileRuntimeKind::Managed,
+                sandbox_required_bool_field(sandbox, "networkAccess")?,
+            );
+            record_sandbox_read_access(&mut permissions, &sandbox_access(sandbox, "access")?)?;
+            Ok(Some(permissions))
+        }
+        "workspaceWrite" => {
+            let mut permissions = PermissionProfilePermissions::new(
+                PermissionProfileRuntimeKind::Managed,
+                sandbox_required_bool_field(sandbox, "networkAccess")?,
+            );
+            permissions.allows_write_access = true;
+            record_sandbox_read_access(
+                &mut permissions,
+                &sandbox_access(sandbox, "readOnlyAccess")?,
+            )?;
+            for root in workspace_writable_roots(sandbox)? {
+                permissions
+                    .write_paths
+                    .push(normalize_workspace_writable_root(&root)?);
+            }
+            if !sandbox_required_bool_field(sandbox, "excludeTmpdirEnvVar")? {
+                permissions.write_special_kinds.insert("tmpdir".to_owned());
+            }
+            if !sandbox_required_bool_field(sandbox, "excludeSlashTmp")? {
+                permissions
+                    .write_special_kinds
+                    .insert("slash_tmp".to_owned());
+            }
+            Ok(Some(permissions))
+        }
+        "dangerFullAccess" => Ok(Some(PermissionProfilePermissions::full_access(
+            PermissionProfileRuntimeKind::Managed,
+            true,
+        ))),
+        "externalSandbox" => Ok(None),
+        other => bail!("thread/resume returned unknown sandbox type {other:?}"),
+    }
+}
+
+fn record_sandbox_read_access(
+    permissions: &mut PermissionProfilePermissions,
+    access: &Value,
+) -> Result<()> {
+    match read_only_access_type(access)? {
+        "fullAccess" => {
+            permissions.read_special_kinds.insert("root".to_owned());
+            Ok(())
+        }
+        "restricted" => {
+            for root in read_only_readable_roots(access)? {
+                permissions
+                    .read_paths
+                    .push(normalize_absolute_permission_profile_path(&root)?);
+            }
+            if sandbox_bool_field(access, "includePlatformDefaults", false)? {
+                permissions.has_unrepresentable_read_scope = true;
+            }
+            Ok(())
+        }
+        other => bail!("sandbox read-only access has unknown type {other:?}"),
+    }
+}
+
+fn permission_profile_scope_within(
+    current: &PermissionProfilePermissions,
+    startup_cap: &PermissionProfilePermissions,
+    current_denials_preserve_startup_denials: bool,
+) -> bool {
+    if current.allows_network && !startup_cap.allows_network {
+        return false;
+    }
+    if current.allows_write_access && !startup_cap.allows_write_access {
+        return false;
+    }
+    if startup_cap.has_access_denials && !current_denials_preserve_startup_denials {
+        return false;
+    }
+    permission_profile_read_scope_within(current, startup_cap)
+        && permission_profile_write_scope_within(current, startup_cap)
+}
+
+fn current_permission_profile_denials_preserve_startup_denials(
+    current: &PermissionProfilePermissions,
+    startup_cap: &PermissionProfilePermissions,
+) -> bool {
+    if !startup_cap.has_access_denials {
+        return true;
+    }
+    if startup_cap.has_unrepresentable_deny_scope {
+        return false;
+    }
+    startup_cap.deny_paths.iter().all(|path| {
+        current
+            .deny_paths
+            .iter()
+            .any(|current_path| path.starts_with(current_path))
+    }) && startup_cap
+        .deny_special_kinds
+        .iter()
+        .all(|kind| current.deny_special_kinds.contains(kind))
+}
+
+fn permission_profile_read_scope_within(
+    current: &PermissionProfilePermissions,
+    startup_cap: &PermissionProfilePermissions,
+) -> bool {
+    if current.has_unrepresentable_read_scope && !startup_cap.read_covers_path(Path::new("/")) {
+        return false;
+    }
+    current
+        .read_paths
+        .iter()
+        .all(|path| startup_cap.read_covers_path(path))
+        && current
+            .read_special_kinds
+            .iter()
+            .all(|kind| startup_cap.read_covers_special(kind))
+}
+
+fn permission_profile_write_scope_within(
+    current: &PermissionProfilePermissions,
+    startup_cap: &PermissionProfilePermissions,
+) -> bool {
+    if current.has_unrepresentable_write_scope && !startup_cap.write_covers_path(Path::new("/")) {
+        return false;
+    }
+    current
+        .write_paths
+        .iter()
+        .all(|path| startup_cap.write_covers_path(path))
+        && current
+            .write_special_kinds
+            .iter()
+            .all(|kind| startup_cap.write_covers_scope_kind(kind))
+}
+
+fn ensure_legacy_permission_fallback_compatible(
+    startup_snapshot: &CliPermissionSnapshot,
+    current_snapshot: &CliPermissionSnapshot,
+) -> Result<()> {
+    for (label, snapshot) in [("startup", startup_snapshot), ("current", current_snapshot)] {
+        if snapshot.source == CliPermissionSnapshotSource::PermissionProfile
+            && !snapshot.permission_profile_legacy_compatible
+        {
+            bail!("{label} permissionProfile cannot be safely represented by legacy sandboxPolicy");
+        }
+    }
+    Ok(())
 }
 
 fn pinned_approval_policy(
@@ -3971,47 +4549,40 @@ fn pinned_read_only_sandbox(
 ) -> Result<Value> {
     let startup_type = sandbox_policy_type(startup_sandbox)?;
     let current_type = sandbox_policy_type(current_sandbox)?;
-    match (startup_type, current_type) {
-        ("readOnly", "readOnly") => {
-            pinned_read_only_access(
-                sandbox_access(startup_sandbox, "access")?,
-                sandbox_access(current_sandbox, "access")?,
-            )?;
-        }
-        ("readOnly", "workspaceWrite") => {
-            pinned_read_only_access(
-                sandbox_access(startup_sandbox, "access")?,
-                sandbox_access(current_sandbox, "readOnlyAccess")?,
-            )?;
-        }
-        ("workspaceWrite", "readOnly") => {
-            pinned_read_only_access(
-                sandbox_access(startup_sandbox, "readOnlyAccess")?,
-                sandbox_access(current_sandbox, "access")?,
-            )?;
-        }
-        ("workspaceWrite", "workspaceWrite") => {
-            pinned_read_only_access(
-                sandbox_access(startup_sandbox, "readOnlyAccess")?,
-                sandbox_access(current_sandbox, "readOnlyAccess")?,
-            )?;
-        }
-        ("readOnly", _) => {
-            sandbox_access(startup_sandbox, "access")?;
-        }
-        (_, "readOnly") => {
-            sandbox_access(current_sandbox, "access")?;
-        }
+    let read_access = match (startup_type, current_type) {
+        ("readOnly", "readOnly") => pinned_read_only_access(
+            &sandbox_access(startup_sandbox, "access")?,
+            &sandbox_access(current_sandbox, "access")?,
+        )?,
+        ("readOnly", "workspaceWrite") => pinned_read_only_access(
+            &sandbox_access(startup_sandbox, "access")?,
+            &sandbox_access(current_sandbox, "readOnlyAccess")?,
+        )?,
+        ("workspaceWrite", "readOnly") => pinned_read_only_access(
+            &sandbox_access(startup_sandbox, "readOnlyAccess")?,
+            &sandbox_access(current_sandbox, "access")?,
+        )?,
+        ("workspaceWrite", "workspaceWrite") => pinned_read_only_access(
+            &sandbox_access(startup_sandbox, "readOnlyAccess")?,
+            &sandbox_access(current_sandbox, "readOnlyAccess")?,
+        )?,
+        ("readOnly", "dangerFullAccess") => sandbox_access(startup_sandbox, "access")?,
+        ("dangerFullAccess", "readOnly") => sandbox_access(current_sandbox, "access")?,
         ("workspaceWrite", "dangerFullAccess") => {
-            sandbox_access(startup_sandbox, "readOnlyAccess")?;
+            sandbox_access(startup_sandbox, "readOnlyAccess")?
         }
         ("dangerFullAccess", "workspaceWrite") => {
-            sandbox_access(current_sandbox, "readOnlyAccess")?;
+            sandbox_access(current_sandbox, "readOnlyAccess")?
         }
-        _ => {
-            strict_read_only_access();
+        ("dangerFullAccess", "dangerFullAccess") => full_read_only_access(),
+        ("externalSandbox", _) | (_, "externalSandbox") => {
+            bail!("externalSandbox cannot be pinned to readOnly sandboxPolicy")
+        }
+        (startup, current) => {
+            bail!("cannot pin unsupported read-only sandbox transition {startup:?} -> {current:?}")
         }
     };
+    ensure_legacy_turn_start_full_read_access(&read_access, "readOnly")?;
     Ok(json!({
         "type": "readOnly",
         "networkAccess": effective.allows_network,
@@ -4048,21 +4619,16 @@ fn pinned_workspace_write_sandbox(
     let exclude_slash_tmp =
         workspace_bool_if_workspace(startup_sandbox, startup_workspace, "excludeSlashTmp")?
             || workspace_bool_if_workspace(current_sandbox, current_workspace, "excludeSlashTmp")?;
-    match (startup_workspace, current_workspace) {
-        (true, true) => {
-            pinned_read_only_access(
-                sandbox_access(startup_sandbox, "readOnlyAccess")?,
-                sandbox_access(current_sandbox, "readOnlyAccess")?,
-            )?;
-        }
-        (true, false) => {
-            sandbox_access(startup_sandbox, "readOnlyAccess")?;
-        }
-        (false, true) => {
-            sandbox_access(current_sandbox, "readOnlyAccess")?;
-        }
+    let read_access = match (startup_workspace, current_workspace) {
+        (true, true) => pinned_read_only_access(
+            &sandbox_access(startup_sandbox, "readOnlyAccess")?,
+            &sandbox_access(current_sandbox, "readOnlyAccess")?,
+        )?,
+        (true, false) => sandbox_access(startup_sandbox, "readOnlyAccess")?,
+        (false, true) => sandbox_access(current_sandbox, "readOnlyAccess")?,
         (false, false) => bail!("workspaceWrite pin requested without workspace sandbox"),
-    }
+    };
+    ensure_legacy_turn_start_full_read_access(&read_access, "workspaceWrite")?;
     Ok(json!({
         "type": "workspaceWrite",
         "writableRoots": writable_roots,
@@ -4070,6 +4636,13 @@ fn pinned_workspace_write_sandbox(
         "excludeTmpdirEnvVar": exclude_tmpdir_env_var,
         "excludeSlashTmp": exclude_slash_tmp,
     }))
+}
+
+fn ensure_legacy_turn_start_full_read_access(access: &Value, label: &str) -> Result<()> {
+    if read_only_access_type(access)? == "fullAccess" {
+        return Ok(());
+    }
+    bail!("legacy {label} sandboxPolicy cannot safely represent restricted read access")
 }
 
 fn workspace_writable_roots_intersection(
@@ -4163,12 +4736,19 @@ fn workspace_bool_if_workspace(sandbox: &Value, is_workspace: bool, field: &str)
     }
 }
 
-fn sandbox_access<'a>(sandbox: &'a Value, field: &str) -> Result<&'a Value> {
-    let access = sandbox
-        .get(field)
-        .ok_or_else(|| anyhow::anyhow!("sandbox policy missing {field}"))?;
+fn sandbox_access(sandbox: &Value, field: &str) -> Result<Value> {
+    let Some(access) = sandbox.get(field) else {
+        return Ok(full_read_only_access());
+    };
     validate_read_only_access(access)?;
-    Ok(access)
+    Ok(access.clone())
+}
+
+fn validate_sandbox_access_if_present(sandbox: &Value, field: &str) -> Result<()> {
+    if let Some(access) = sandbox.get(field) {
+        validate_read_only_access(access)?;
+    }
+    Ok(())
 }
 
 fn validate_read_only_access(access: &Value) -> Result<()> {
@@ -4244,11 +4824,9 @@ fn read_only_readable_roots(access: &Value) -> Result<Vec<String>> {
         .collect()
 }
 
-fn strict_read_only_access() -> Value {
+fn full_read_only_access() -> Value {
     json!({
-        "type": "restricted",
-        "includePlatformDefaults": false,
-        "readableRoots": [],
+        "type": "fullAccess",
     })
 }
 
@@ -4313,6 +4891,37 @@ struct CliResolvedPermissions {
     allows_write_access: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CliPermissionProfileSelection {
+    id: String,
+    additional_writable_roots: Vec<PathBuf>,
+}
+
+impl CliPermissionProfileSelection {
+    fn to_turn_start_permissions_json(&self) -> Value {
+        let mut value = json!({
+            "type": "profile",
+            "id": self.id,
+        });
+        if !self.additional_writable_roots.is_empty() {
+            value["modifications"] = Value::Array(
+                self.additional_writable_roots
+                    .iter()
+                    .map(|path| {
+                        // The app-server v2 wire schema uses camelCase tags;
+                        // core protocol models use snake_case before conversion.
+                        json!({
+                            "type": "additionalWritableRoot",
+                            "path": path.to_string_lossy().to_string()
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        value
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct CliPermissionSnapshot {
     source: CliPermissionSnapshotSource,
@@ -4322,6 +4931,9 @@ struct CliPermissionSnapshot {
     approval_policy: Value,
     sandbox_policy: Value,
     permission_profile: Option<Value>,
+    permission_profile_legacy_compatible: bool,
+    active_permission_profile: Option<Value>,
+    active_permission_profile_selection: Option<CliPermissionProfileSelection>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4340,12 +4952,22 @@ impl CliPermissionSnapshotSource {
 }
 
 impl CliPermissionSnapshot {
+    fn resolved_permissions(&self) -> CliResolvedPermissions {
+        CliResolvedPermissions {
+            allows_approval: self.allows_approval,
+            allows_network: self.allows_network,
+            allows_write_access: self.allows_write_access,
+        }
+    }
+
     fn raw_json(&self, effective: CliResolvedPermissions) -> Value {
         json!({
             "source": self.source.as_str(),
             "approvalPolicy": self.approval_policy,
             "sandbox": self.sandbox_policy,
             "permissionProfile": self.permission_profile,
+            "permissionProfileLegacyCompatible": self.permission_profile_legacy_compatible,
+            "activePermissionProfile": self.active_permission_profile,
             "derived": {
                 "allows_approval": self.allows_approval,
                 "allows_network": self.allows_network,
@@ -5997,6 +6619,9 @@ fn permission_snapshot_drift_changes(
     if startup.permission_profile != current.permission_profile {
         changes.push(("permission_profile", "changed"));
     }
+    if startup.active_permission_profile != current.active_permission_profile {
+        changes.push(("active_permission_profile", "changed"));
+    }
     Ok(changes)
 }
 
@@ -6021,8 +6646,8 @@ fn sandbox_policy_drift_direction(startup: &Value, current: &Value) -> Result<&'
         "readOnly" => push_optional_direction(
             &mut directions,
             read_only_access_drift_direction(
-                sandbox_access(startup, "access")?,
-                sandbox_access(current, "access")?,
+                &sandbox_access(startup, "access")?,
+                &sandbox_access(current, "access")?,
             )?,
         ),
         "workspaceWrite" => {
@@ -6036,8 +6661,8 @@ fn sandbox_policy_drift_direction(startup: &Value, current: &Value) -> Result<&'
             push_optional_direction(
                 &mut directions,
                 read_only_access_drift_direction(
-                    sandbox_access(startup, "readOnlyAccess")?,
-                    sandbox_access(current, "readOnlyAccess")?,
+                    &sandbox_access(startup, "readOnlyAccess")?,
+                    &sandbox_access(current, "readOnlyAccess")?,
                 )?,
             );
             push_optional_direction(
@@ -9332,7 +9957,6 @@ mod tests {
             "approvalPolicy": "never",
             "sandbox": {
                 "type": "readOnly",
-                "access": restricted_access(&["/tmp/read"]),
                 "networkAccess": false
             }
         }))
@@ -9376,6 +10000,15 @@ mod tests {
                 "excludeTmpdirEnvVar": true,
                 "excludeSlashTmp": true
             },
+            "activePermissionProfile": {
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    }
+                ]
+            },
             "permissionProfile": {
                 "network": { "enabled": true },
                 "fileSystem": {
@@ -9403,8 +10036,289 @@ mod tests {
         assert!(snapshot.allows_write_access);
         assert!(snapshot.permission_profile.is_some());
         assert_eq!(
+            snapshot
+                .active_permission_profile_selection
+                .as_ref()
+                .expect("active profile selection")
+                .to_turn_start_permissions_json(),
+            json!({
+                "type": "profile",
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    }
+                ]
+            })
+        );
+        assert_eq!(
             snapshot.raw_json(resolved(&snapshot))["source"],
             serde_json::json!("permissionProfile")
+        );
+        assert_eq!(
+            snapshot.raw_json(resolved(&snapshot))["activePermissionProfile"]["id"],
+            json!(":workspace")
+        );
+    }
+
+    #[test]
+    fn permission_snapshot_parses_129_tagged_read_only_profile() {
+        let snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "never",
+            "sandbox": {
+                "type": "readOnly",
+                "networkAccess": false
+            },
+            "activePermissionProfile": {
+                "id": ":read-only"
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse 0.129 snapshot");
+
+        assert_eq!(
+            snapshot.source,
+            CliPermissionSnapshotSource::PermissionProfile
+        );
+        assert!(!snapshot.allows_approval);
+        assert!(!snapshot.allows_network);
+        assert!(!snapshot.allows_write_access);
+        assert_eq!(
+            snapshot
+                .active_permission_profile_selection
+                .as_ref()
+                .expect("active profile selection")
+                .to_turn_start_permissions_json(),
+            json!({
+                "type": "profile",
+                "id": ":read-only"
+            })
+        );
+    }
+
+    #[test]
+    fn permission_snapshot_accepts_core_snake_case_active_profile_modification() {
+        let snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additional_writable_root",
+                        "path": "/tmp/work"
+                    }
+                ]
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse core-shaped active profile metadata");
+
+        assert_eq!(
+            snapshot
+                .active_permission_profile_selection
+                .as_ref()
+                .expect("active profile selection")
+                .to_turn_start_permissions_json(),
+            json!({
+                "type": "profile",
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn permission_snapshot_rejects_malformed_active_permission_profiles() {
+        let cases = [
+            (
+                json!("invalid"),
+                "thread/resume activePermissionProfile is not an object",
+            ),
+            (
+                json!({ "id": ":workspace", "modifications": "invalid" }),
+                "thread/resume activePermissionProfile modifications is not an array",
+            ),
+            (
+                json!({
+                    "id": ":workspace",
+                    "modifications": [
+                        {
+                            "type": "unknown",
+                            "path": "/tmp/work"
+                        }
+                    ]
+                }),
+                "thread/resume activePermissionProfile has unknown modification",
+            ),
+            (
+                json!({
+                    "id": ":workspace",
+                    "modifications": [
+                        {
+                            "type": "additionalWritableRoot",
+                            "path": "relative"
+                        }
+                    ]
+                }),
+                "thread/resume activePermissionProfile additionalWritableRoot path is not absolute",
+            ),
+            (
+                json!({
+                    "id": ":workspace",
+                    "modifications": [
+                        {
+                            "type": "additionalWritableRoot",
+                            "path": "/tmp/work/../other"
+                        }
+                    ]
+                }),
+                "thread/resume permissionProfile path contains parent directory component",
+            ),
+        ];
+
+        for (active_permission_profile, expected) in cases {
+            let error = parse_thread_resume_permission_snapshot(&json!({
+                "approvalPolicy": "on-request",
+                "sandbox": {
+                    "type": "workspaceWrite",
+                    "networkAccess": false,
+                    "writableRoots": ["/tmp/work"],
+                    "excludeTmpdirEnvVar": true,
+                    "excludeSlashTmp": true
+                },
+                "activePermissionProfile": active_permission_profile
+            }))
+            .expect_err("malformed activePermissionProfile should fail closed");
+
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_snapshot_parses_129_disabled_profile() {
+        let snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "dangerFullAccess"
+            },
+            "permissionProfile": {
+                "type": "disabled"
+            }
+        }))
+        .expect("parse disabled profile");
+
+        assert_eq!(
+            snapshot.source,
+            CliPermissionSnapshotSource::PermissionProfile
+        );
+        assert!(snapshot.allows_approval);
+        assert!(snapshot.allows_network);
+        assert!(snapshot.allows_write_access);
+    }
+
+    #[test]
+    fn permission_snapshot_parses_129_external_profile() {
+        let snapshot = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "externalSandbox",
+                "networkAccess": "restricted"
+            },
+            "permissionProfile": {
+                "type": "external",
+                "network": { "enabled": false }
+            }
+        }))
+        .expect("parse external profile");
+
+        assert_eq!(
+            snapshot.source,
+            CliPermissionSnapshotSource::PermissionProfile
+        );
+        assert!(snapshot.allows_approval);
+        assert!(!snapshot.allows_network);
+        assert!(snapshot.allows_write_access);
+    }
+
+    #[test]
+    fn permission_snapshot_rejects_129_profile_narrower_than_legacy_full_read() {
+        let error = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "never",
+            "sandbox": {
+                "type": "readOnly",
+                "networkAccess": false
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": { "type": "path", "path": "/tmp/read" },
+                            "access": "read"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect_err("narrower 0.129 profile should not match full legacy read sandbox");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not cover legacy full read access"),
+            "unexpected error: {error:#}"
         );
     }
 
@@ -9828,13 +10742,16 @@ mod tests {
         }))
         .expect("parse snapshot");
         let effective = effective_permissions(resolved(&startup_snapshot), resolved(&current));
-        let overrides =
-            turn_start_permission_overrides(&startup_snapshot, &current, effective).expect("pin");
 
-        assert_eq!(overrides["approvalPolicy"], json!("never"));
-        assert_eq!(overrides["sandboxPolicy"]["type"], json!("readOnly"));
-        assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(false));
-        assert!(overrides["sandboxPolicy"].get("access").is_none());
+        let error = turn_start_permission_overrides(&startup_snapshot, &current, effective)
+            .expect_err("restricted read cannot be represented by legacy turn/start");
+
+        assert!(
+            error
+                .to_string()
+                .contains("legacy readOnly sandboxPolicy cannot safely represent restricted read"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
@@ -9843,7 +10760,6 @@ mod tests {
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
-                "readOnlyAccess": restricted_access(&["/tmp/read-a"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/a"],
                 "excludeTmpdirEnvVar": false,
@@ -9855,7 +10771,6 @@ mod tests {
             "approvalPolicy": "on-failure",
             "sandbox": {
                 "type": "workspaceWrite",
-                "readOnlyAccess": restricted_access(&["/tmp/read-a", "/tmp/read-b"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/a", "/tmp/b"],
                 "excludeTmpdirEnvVar": false,
@@ -9884,7 +10799,6 @@ mod tests {
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
-                "readOnlyAccess": restricted_access(&["/tmp/read"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/repo", "/tmp/other"],
                 "excludeTmpdirEnvVar": false,
@@ -9896,7 +10810,6 @@ mod tests {
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
-                "readOnlyAccess": restricted_access(&["/tmp/read"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/repo/subdir", "/tmp/repo/another", "/tmp/unrelated"],
                 "excludeTmpdirEnvVar": false,
@@ -9921,7 +10834,6 @@ mod tests {
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
-                "readOnlyAccess": restricted_access(&["/tmp/read"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/repo/subdir"],
                 "excludeTmpdirEnvVar": false,
@@ -9933,7 +10845,6 @@ mod tests {
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
-                "readOnlyAccess": restricted_access(&["/tmp/read"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/repo"],
                 "excludeTmpdirEnvVar": false,
@@ -9996,7 +10907,6 @@ mod tests {
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
-                "readOnlyAccess": restricted_access(&["/tmp/read-a", "/tmp/read-b"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/a", "/tmp/b"],
                 "excludeTmpdirEnvVar": false,
@@ -10008,7 +10918,6 @@ mod tests {
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
-                "readOnlyAccess": restricted_access_without_platform_defaults(&["/tmp/read-b", "/tmp/read-c"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/b", "/tmp/c"],
                 "excludeTmpdirEnvVar": false,
@@ -10036,7 +10945,6 @@ mod tests {
             "approvalPolicy": "on-failure",
             "sandbox": {
                 "type": "workspaceWrite",
-                "readOnlyAccess": restricted_access(&["/tmp/read-a", "/tmp/read-b"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/a", "/tmp/b"],
                 "excludeTmpdirEnvVar": false,
@@ -10048,7 +10956,6 @@ mod tests {
             "approvalPolicy": "untrusted",
             "sandbox": {
                 "type": "workspaceWrite",
-                "readOnlyAccess": restricted_access_without_platform_defaults(&["/tmp/read-b"]),
                 "networkAccess": false,
                 "writableRoots": ["/tmp/b"],
                 "excludeTmpdirEnvVar": false,
@@ -10073,12 +10980,950 @@ mod tests {
     }
 
     #[test]
+    fn pinned_turn_start_overrides_prefer_current_permission_profile_selection() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "dangerFullAccess"
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "untrusted",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access_without_platform_defaults(&["/tmp/read-b"]),
+                "networkAccess": false,
+                "writableRoots": ["/tmp/b"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/b"
+                    }
+                ]
+            },
+            "permissionProfile": {
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/b" },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "project_roots",
+                                    "subpath": ".git"
+                                }
+                            },
+                            "access": "none"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "project_roots",
+                                    "subpath": ".agents"
+                                }
+                            },
+                            "access": "none"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "project_roots",
+                                    "subpath": ".codex"
+                                }
+                            },
+                            "access": "none"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(overrides["approvalPolicy"], json!("untrusted"));
+        assert!(overrides.get("sandboxPolicy").is_none());
+        assert_eq!(
+            overrides["permissions"],
+            json!({
+                "type": "profile",
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/b"
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_prefer_exact_profile_when_canonical_denies_block_legacy() {
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    }
+                ]
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "project_roots",
+                                    "subpath": ".git"
+                                }
+                            },
+                            "access": "none"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "project_roots",
+                                    "subpath": ".agents"
+                                }
+                            },
+                            "access": "none"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "project_roots",
+                                    "subpath": ".codex"
+                                }
+                            },
+                            "access": "none"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse current snapshot with canonical deny carve-outs");
+        assert!(!current.permission_profile_legacy_compatible);
+        let mut startup = current.clone();
+        startup.approval_policy = json!("never");
+        startup.allows_approval = false;
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(overrides["approvalPolicy"], json!("never"));
+        assert!(overrides.get("sandboxPolicy").is_none());
+        assert_eq!(
+            overrides["permissions"],
+            json!({
+                "type": "profile",
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_fallback_when_active_selection_bool_cap_differs() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    }
+                ]
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": true },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = startup.clone();
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert!(overrides.get("permissions").is_none());
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("workspaceWrite"));
+        assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(true));
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/work"])
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_fallback_when_active_selection_misses_canonical_scope() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/var/extra"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace"
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/var/extra" },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = startup.clone();
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert!(overrides.get("permissions").is_none());
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("workspaceWrite"));
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/var/extra"])
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_fallback_to_legacy_when_current_profile_scope_loosened() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    }
+                ]
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work", "/var/extra"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    },
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/var/extra"
+                    }
+                ]
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/var/extra" },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert!(overrides.get("permissions").is_none());
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("workspaceWrite"));
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/work"])
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_fallback_when_active_selection_exceeds_current_profile() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    },
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/var/extra"
+                    }
+                ]
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse inconsistent active selection snapshot");
+        let current = startup.clone();
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert!(overrides.get("permissions").is_none());
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("workspaceWrite"));
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/work"])
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_reject_profile_exact_when_current_removes_startup_denial() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    }
+                ]
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "project_roots",
+                                    "subpath": ".git"
+                                }
+                            },
+                            "access": "none"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    }
+                ]
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let error = turn_start_permission_overrides(&startup, &current, effective)
+            .expect_err("current profile removed a startup deny carve-out");
+
+        assert!(
+            error
+                .to_string()
+                .contains("startup permissionProfile cannot be safely represented"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_reject_legacy_fallback_for_canonical_denies() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "never",
+            "sandbox": {
+                "type": "readOnly",
+                "networkAccess": false
+            },
+            "activePermissionProfile": {
+                "id": ":read-only"
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    }
+                ]
+            },
+            "permissionProfile": {
+                "type": "managed",
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": {
+                                    "kind": "project_roots",
+                                    "subpath": ".git"
+                                }
+                            },
+                            "access": "none"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse current snapshot with canonical deny carve-outs");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let error = turn_start_permission_overrides(&startup, &current, effective)
+            .expect_err("legacy fallback cannot represent canonical deny carve-outs");
+
+        assert!(
+            error
+                .to_string()
+                .contains("current permissionProfile cannot be safely represented"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_fallback_to_legacy_when_profile_is_looser_than_startup() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "never",
+            "sandbox": {
+                "type": "readOnly",
+                "networkAccess": false
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": true,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace"
+            },
+            "permissionProfile": {
+                "network": { "enabled": true },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert_eq!(overrides["approvalPolicy"], json!("never"));
+        assert!(overrides.get("permissions").is_none());
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("readOnly"));
+        assert_eq!(overrides["sandboxPolicy"]["networkAccess"], json!(false));
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_fallback_to_legacy_for_custom_active_profile() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": "custom-workspace"
+            },
+            "permissionProfile": {
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let overrides =
+            turn_start_permission_overrides(&startup, &current, effective).expect("pin");
+
+        assert!(overrides.get("permissions").is_none());
+        assert_eq!(overrides["approvalPolicy"], json!("on-request"));
+        assert_eq!(overrides["sandboxPolicy"]["type"], json!("workspaceWrite"));
+        assert_eq!(
+            overrides["sandboxPolicy"]["writableRoots"],
+            json!(["/tmp/work"])
+        );
+    }
+
+    #[test]
+    fn pinned_turn_start_overrides_reject_custom_profile_restricted_read_fallback() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access_without_platform_defaults(&["/tmp/read"]),
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access_without_platform_defaults(&["/tmp/read"]),
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": "custom-workspace"
+            },
+            "permissionProfile": {
+                "network": { "enabled": false },
+                "fileSystem": {
+                    "entries": [
+                        {
+                            "path": { "type": "path", "path": "/tmp/read" },
+                            "access": "read"
+                        },
+                        {
+                            "path": { "type": "path", "path": "/tmp/work" },
+                            "access": "write"
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("parse current snapshot");
+        let effective = effective_permissions(resolved(&startup), resolved(&current));
+
+        let error = turn_start_permission_overrides(&startup, &current, effective)
+            .expect_err("custom profile restricted read cannot use legacy fallback");
+
+        assert!(
+            error.to_string().contains(
+                "legacy workspaceWrite sandboxPolicy cannot safely represent restricted read"
+            ),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn pinned_turn_start_overrides_keep_startup_workspace_against_current_danger_full_access() {
         let startup = parse_thread_resume_permission_snapshot(&json!({
             "approvalPolicy": "on-request",
             "sandbox": {
                 "type": "workspaceWrite",
-                "readOnlyAccess": restricted_access(&["/tmp/read"]),
                 "networkAccess": true,
                 "writableRoots": ["/tmp/work"],
                 "excludeTmpdirEnvVar": true,
@@ -10368,6 +12213,55 @@ mod tests {
         assert_eq!(
             permission_snapshot_drift_changes(&startup, &current).expect("snapshot drift"),
             vec![("permission_profile", "changed")]
+        );
+    }
+
+    #[test]
+    fn permission_drift_tracks_active_permission_profile_body_changes() {
+        let startup = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":workspace",
+                "modifications": [
+                    {
+                        "type": "additionalWritableRoot",
+                        "path": "/tmp/work"
+                    }
+                ]
+            }
+        }))
+        .expect("parse startup snapshot");
+        let current = parse_thread_resume_permission_snapshot(&json!({
+            "approvalPolicy": "on-request",
+            "sandbox": {
+                "type": "workspaceWrite",
+                "readOnlyAccess": restricted_access(&["/tmp/read"]),
+                "networkAccess": false,
+                "writableRoots": ["/tmp/work"],
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true
+            },
+            "activePermissionProfile": {
+                "id": ":read-only"
+            }
+        }))
+        .expect("parse current snapshot");
+
+        assert_eq!(
+            permission_drift_changes(resolved(&startup), resolved(&current)),
+            Vec::<(&'static str, &'static str)>::new()
+        );
+        assert_eq!(
+            permission_snapshot_drift_changes(&startup, &current).expect("snapshot drift"),
+            vec![("active_permission_profile", "changed")]
         );
     }
 
