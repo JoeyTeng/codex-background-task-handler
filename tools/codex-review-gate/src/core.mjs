@@ -20,6 +20,15 @@ export class GateFailure extends Error {
   }
 }
 
+export class NonJsonResponseError extends Error {
+  constructor(description, text) {
+    const preview = truncate(String(text || "").replace(/\s+/g, " ").trim(), 200) || "<empty>";
+    super(`${description} returned a non-JSON response: ${preview}`);
+    this.name = "NonJsonResponseError";
+    this.preview = preview;
+  }
+}
+
 export function parseLoginSet(raw, fallback) {
   if (!raw || !raw.trim()) {
     return new Set(fallback);
@@ -613,6 +622,18 @@ export function addSeconds(isoTimestamp, seconds) {
 
 export function truncate(value, maxLength) {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
+}
+
+export function parseJsonResponseText(text, description) {
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new NonJsonResponseError(description, text);
+  }
 }
 
 function escapeRegExp(value) {
