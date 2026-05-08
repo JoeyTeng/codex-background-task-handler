@@ -20,6 +20,82 @@
 
 ## 核心设计
 
+### 运行拓扑与对应关系
+
+```mermaid
+flowchart TB
+  user["OS user"]
+
+  subgraph home["CBTH_HOME (default: ~/.cbth)"]
+    socket["run/cbth.sock"]
+    store[("SQLite store")]
+    taskFiles["tasks/task-id logs"]
+    artifacts["artifacts / manifests"]
+  end
+
+  daemon["cbth daemon serve<br/>one active daemon per OS user + CBTH_HOME"]
+
+  user --> home
+  home --> socket
+  home --> store
+  home --> taskFiles
+  home --> artifacts
+  socket <-->|same-user Unix IPC| daemon
+  daemon <-->|durable state| store
+  daemon --> taskFiles
+  daemon --> artifacts
+
+  subgraph fg1["cbth foreground wrapper process<br/>cbth resume thread-1 / cli run --bind-thread-id thread-1"]
+    lease1["app-server lease owner<br/>refreshes while foreground runs"]
+    sidecar1["sidecar websocket client<br/>auto-delivery observer"]
+    tui1["foreground codex TUI<br/>codex resume --remote URL"]
+  end
+
+  daemon <-->|reserve / ensure / refresh / stop| lease1
+
+  app1["daemon-owned codex app-server<br/>managed_session_id=M1<br/>bound_thread_id=thread-1<br/>session_epoch=E1"]
+  daemon --> app1
+  tui1 <-->|websocket| app1
+  sidecar1 <-->|websocket| app1
+
+  thread1[("Codex thread thread-1")]
+  app1 -.->|thread/resume, thread/read, turn/start| thread1
+  store -.->|managed session M1<br/>batches keyed by source_thread_id=thread-1| thread1
+
+  subgraph fg2["another active cbth foreground wrapper process"]
+    lease2["separate lease owner"]
+    sidecar2["separate sidecar client"]
+    tui2["separate foreground codex TUI"]
+  end
+
+  app2["daemon-owned codex app-server<br/>managed_session_id=M2<br/>bound_thread_id=thread-2"]
+  daemon <-->|reserve / ensure / refresh / stop| lease2
+  daemon --> app2
+  tui2 <-->|websocket| app2
+  sidecar2 <-->|websocket| app2
+  app2 -.->|targets| thread2[("Codex thread thread-2")]
+
+  subgraph submitter["short-lived cbth task submitter process<br/>cbth task run --source-thread-id thread-1 -- ..."]
+    taskRun["task run CLI"]
+  end
+
+  taskRun -->|same-user IPC request| daemon
+  daemon --> bgTask["daemon-owned background task<br/>child process group"]
+  bgTask -->|exit status + stdout/stderr tails| daemon
+  daemon -->|complete/fail job<br/>create delivery batch| store
+  sidecar1 -->|when thread-1 is idle<br/>deliver head batch FIFO| app1
+```
+
+对应关系：
+
+- `CBTH_HOME` 是本地状态与 IPC namespace。默认 `~/.cbth` 下包含 socket、SQLite store、task logs、artifact manifests；同一个 OS user 可以通过不同 `--home` / `CBTH_HOME` 拥有隔离的多套 daemon。
+- 默认运行模型是一个 OS user + 一个 `CBTH_HOME` 同时最多一个 active `cbth daemon serve`。daemon 通过 same-user Unix socket 接受 mutating CLI 请求。
+- daemon 可以同时管理多个 daemon-owned `codex app-server` 进程。每个 active app-server 绑定一个 `managed_session_id` 与一个 `bound_thread_id`，并由一个当前 foreground wrapper lease 刷新。
+- 一个 `bound_thread_id` / Codex thread 在任意时刻最多允许一个 active managed app-server / lease owner。后续新的 `cbth resume <thread_id>` 可以在旧 live part 已结束或可复用时 attach/reuse 同一 durable managed session，但不能并发再开第二个 active app-server。
+- 一个 foreground wrapper process 负责本次前台 Codex TUI、sidecar client、app-server lease refresh 和退出时 cleanup。它不是长期 daemon；退出后会停止 sidecar 并要求 daemon 停掉对应 app-server。
+- `cbth task run` submitter process 是短生命周期 CLI。它只把 `source_thread_id`、命令和 delivery policy 交给 daemon；命令本身随后由 daemon 作为 background task process group 监督。
+- background task 不连接 app-server，也不直接修改 Codex thread。它完成后只在 store 中产生 job result / delivery batch；匹配同一 `source_thread_id` 的 sidecar 在该 Codex thread idle 时按 head-batch FIFO 投递。
+
 ### 组件
 
 1. `shared app-server`

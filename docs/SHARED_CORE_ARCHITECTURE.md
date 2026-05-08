@@ -17,6 +17,7 @@
 - `artifact` 指由 `cbth` 管理和保留的任务产物，不是外部脚本临时路径本身。
 - `thread inbox` 指 `cbth` 为某个 `source_thread_id` 物化出的只读投递视图。
 - `delivery batch` 指对同一 caller thread 的一组有序任务结果投递单元。
+- CLI 路径里 `CBTH_HOME`、daemon、daemon-owned app-server、Codex thread、managed session、foreground wrapper process 和 background task 的拓扑关系见 `docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md` 的“运行拓扑与对应关系”。
 
 ## 已敲定的取舍
 
