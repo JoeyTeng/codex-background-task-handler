@@ -2,6 +2,14 @@
 
 All notable release changes for `cbth` are documented here.
 
+## v0.1.4 - 2026-05-09
+
+### Changed
+
+- Validated managed CLI startup and diagnostics against `codex-cli 0.130.x`.
+- Preferred Codex 0.130 `thread/turns/list` for accepted-turn reconciliation, with the existing `thread/read(includeTurns=true)` path kept as the compatibility fallback.
+- Documented Codex 0.130 remote-control and non-loopback authentication surfaces as upstream capabilities that remain outside cbth's local v1 safety model.
+
 ## v0.1.3 - 2026-05-08
 
 ### Added
