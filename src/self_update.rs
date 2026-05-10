@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
@@ -31,6 +31,19 @@ pub struct SelfUpdateOptions {
     pub version: Option<String>,
     pub check: bool,
     pub yes: bool,
+}
+
+#[derive(Debug)]
+struct ResolvedSelfUpdate {
+    current_version: Version,
+    target_version: Version,
+    target_tag: String,
+    target_triple: String,
+    release_url: Option<String>,
+    selected: SelectedReleaseAsset,
+    update_available: bool,
+    downgrade: bool,
+    requested_tag: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,13 +86,92 @@ struct SelectedReleaseAsset {
 }
 
 pub fn run_self_update(options: SelfUpdateOptions) -> Result<Value> {
+    let resolved = resolve_self_update(options.version.as_deref())?;
+    let same_version = resolved.target_version == resolved.current_version;
+
+    if options.check || same_version || (!resolved.update_available && !resolved.requested_tag) {
+        let message = self_update_status_message(
+            same_version,
+            resolved.downgrade,
+            resolved.update_available,
+            resolved.requested_tag,
+        )
+        .to_owned();
+        return Ok(self_update_report(
+            &resolved,
+            options.check,
+            options.yes,
+            false,
+            None,
+            message,
+        ));
+    }
+    if !options.yes {
+        bail!("self update modifies the current executable; rerun with --yes or use --check");
+    }
+
+    let install_path = install_resolved_self_update(&resolved)?;
+
+    Ok(self_update_report(
+        &resolved,
+        options.check,
+        options.yes,
+        true,
+        Some(install_path),
+        "cbth updated from GitHub Releases".to_owned(),
+    ))
+}
+
+pub fn run_self_update_interactive(version: Option<String>) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        bail!(
+            "self update --interactive requires a TTY; use --yes to install or --check to inspect"
+        );
+    }
+    let resolved = resolve_self_update(version.as_deref())?;
+    let same_version = resolved.target_version == resolved.current_version;
+    let installable = resolved.update_available
+        || (resolved.requested_tag && resolved.target_version != resolved.current_version);
+    if !installable {
+        println!(
+            "{}",
+            self_update_status_message(
+                same_version,
+                resolved.downgrade,
+                resolved.update_available,
+                resolved.requested_tag,
+            )
+        );
+        return Ok(());
+    }
+
+    println!("cbth self update");
+    println!("  current: {}", resolved.current_version);
+    println!(
+        "  target:  {} ({})",
+        resolved.target_version, resolved.target_tag
+    );
+    println!("  asset:   {}", resolved.selected.name);
+    if let Some(url) = &resolved.release_url {
+        println!("  release: {url}");
+    }
+    if !prompt_self_update_confirmation()? {
+        println!("Skipped.");
+        return Ok(());
+    }
+    let install_path = install_resolved_self_update(&resolved)?;
+    println!(
+        "Updated cbth to {} at {}.",
+        resolved.target_version,
+        install_path.display()
+    );
+    Ok(())
+}
+
+fn resolve_self_update(version: Option<&str>) -> Result<ResolvedSelfUpdate> {
     let target_triple = current_release_target_triple()
         .ok_or_else(|| anyhow!("self update is not supported on this platform"))?;
-    let requested_tag = options
-        .version
-        .as_deref()
-        .map(normalize_release_tag)
-        .transpose()?;
+    let requested_tag = version.map(normalize_release_tag).transpose()?;
     let release = fetch_release(requested_tag.as_deref())?;
     let target_tag = normalize_release_tag(&release.tag_name)?;
     if let Some(requested_tag) = &requested_tag
@@ -96,67 +188,87 @@ pub fn run_self_update(options: SelfUpdateOptions) -> Result<Value> {
     let selected = select_release_asset(&release, &target_tag, target_triple)?;
     let update_available = target_version > current_version;
     let downgrade = target_version < current_version;
-    let same_version = target_version == current_version;
+    Ok(ResolvedSelfUpdate {
+        current_version,
+        target_version,
+        target_tag,
+        target_triple: target_triple.to_owned(),
+        release_url: release.html_url,
+        selected,
+        update_available,
+        downgrade,
+        requested_tag: requested_tag.is_some(),
+    })
+}
 
-    if options.check || same_version || (!update_available && requested_tag.is_none()) {
-        let message = self_update_status_message(
-            same_version,
-            downgrade,
-            update_available,
-            requested_tag.is_some(),
-        )
-        .to_owned();
-        return Ok(json!({
-            "self_update": SelfUpdateReport {
-                current_version: current_version.to_string(),
-                target_version: target_version.to_string(),
-                target_tag,
-                target_triple: target_triple.to_owned(),
-                release_url: release.html_url,
-                asset_name: selected.name,
-                checksum_asset_name: selected.checksum_name,
-                update_available,
-                downgrade,
-                check: options.check,
-                yes: options.yes,
-                updated: false,
-                install_path: None,
-                message,
-            }
-        }));
-    }
-    if !options.yes {
-        bail!("self update modifies the current executable; rerun with --yes or use --check");
-    }
-
-    let checksum_text = http_get_text(&selected.checksum_download_url, MAX_CHECKSUM_BYTES)
-        .with_context(|| format!("download checksum asset {}", selected.checksum_name))?;
+fn install_resolved_self_update(resolved: &ResolvedSelfUpdate) -> Result<PathBuf> {
+    let checksum_text = http_get_text(&resolved.selected.checksum_download_url, MAX_CHECKSUM_BYTES)
+        .with_context(|| {
+            format!(
+                "download checksum asset {}",
+                resolved.selected.checksum_name
+            )
+        })?;
     let expected_sha256 = parse_sha256_checksum(&checksum_text)?;
-    let binary = http_get_bytes(&selected.download_url, MAX_BINARY_BYTES)
-        .with_context(|| format!("download release asset {}", selected.name))?;
+    let binary = http_get_bytes(&resolved.selected.download_url, MAX_BINARY_BYTES)
+        .with_context(|| format!("download release asset {}", resolved.selected.name))?;
     verify_sha256(&binary, &expected_sha256)?;
 
     let install_path = env::current_exe().context("resolve current cbth executable")?;
     install_binary_atomically(&install_path, &binary)?;
+    Ok(install_path)
+}
 
-    Ok(json!({
+fn self_update_report(
+    resolved: &ResolvedSelfUpdate,
+    check: bool,
+    yes: bool,
+    updated: bool,
+    install_path: Option<PathBuf>,
+    message: String,
+) -> Value {
+    json!({
         "self_update": SelfUpdateReport {
-            current_version: current_version.to_string(),
-            target_version: target_version.to_string(),
-            target_tag,
-            target_triple: target_triple.to_owned(),
-            release_url: release.html_url,
-            asset_name: selected.name,
-            checksum_asset_name: selected.checksum_name,
-            update_available,
-            downgrade,
-            check: options.check,
-            yes: options.yes,
-            updated: true,
-            install_path: Some(install_path),
-            message: "cbth updated from GitHub Releases".to_owned(),
+            current_version: resolved.current_version.to_string(),
+            target_version: resolved.target_version.to_string(),
+            target_tag: resolved.target_tag.clone(),
+            target_triple: resolved.target_triple.clone(),
+            release_url: resolved.release_url.clone(),
+            asset_name: resolved.selected.name.clone(),
+            checksum_asset_name: resolved.selected.checksum_name.clone(),
+            update_available: resolved.update_available,
+            downgrade: resolved.downgrade,
+            check,
+            yes,
+            updated,
+            install_path,
+            message,
         }
-    }))
+    })
+}
+
+fn prompt_self_update_confirmation() -> Result<bool> {
+    loop {
+        eprint!("Install now? [y/N] ");
+        io::stderr().flush()?;
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            eprintln!();
+            return Ok(false);
+        }
+        match parse_self_update_confirmation(&input) {
+            Some(confirmed) => return Ok(confirmed),
+            None => eprintln!("Please answer y or n."),
+        }
+    }
+}
+
+pub(crate) fn parse_self_update_confirmation(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" | "n" | "no" => Some(false),
+        "y" | "yes" => Some(true),
+        _ => None,
+    }
 }
 
 fn fetch_release(requested_tag: Option<&str>) -> Result<GitHubRelease> {
@@ -460,6 +572,16 @@ mod tests {
             self_update_status_message(true, false, false, true),
             "cbth is already at the requested version"
         );
+    }
+
+    #[test]
+    fn interactive_confirmation_parser_accepts_y_n_and_default_no() {
+        assert_eq!(parse_self_update_confirmation("y"), Some(true));
+        assert_eq!(parse_self_update_confirmation("YES\n"), Some(true));
+        assert_eq!(parse_self_update_confirmation(""), Some(false));
+        assert_eq!(parse_self_update_confirmation("n"), Some(false));
+        assert_eq!(parse_self_update_confirmation("No\n"), Some(false));
+        assert_eq!(parse_self_update_confirmation("install"), None);
     }
 
     #[test]

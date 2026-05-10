@@ -292,6 +292,7 @@ struct DaemonInfo {
 struct CliAppServerInfo {
     managed_session_id: String,
     bound_thread_id: String,
+    session_epoch: i64,
     url: String,
     pid: u32,
     started_at: i64,
@@ -4425,6 +4426,7 @@ fn cli_app_server_info(server: &ManagedCliAppServer) -> CliAppServerInfo {
     CliAppServerInfo {
         managed_session_id: server.managed_session_id.clone(),
         bound_thread_id: server.bound_thread_id.clone(),
+        session_epoch: server.session_epoch,
         url: server.url.clone(),
         pid: server.child.id(),
         started_at: server.started_at,

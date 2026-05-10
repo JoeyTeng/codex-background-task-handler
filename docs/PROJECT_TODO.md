@@ -5,5 +5,6 @@ Active backlog lives in [current follow-ups](project_journal/2026/05/2026-05-05-
 - [in_progress] Finish Desktop bridge writeback validation, binding lifecycle, artifact-read policy, and continuation-boundary contracts.
 - [pending] Finish remaining CLI/daemon recovery and fixed-thread contract work.
 - [done] Follow up `cbth resume` hardening in order: cwd UX parity, canonical permission profile parsing, Codex 0.129 stable built-in request-side permission profile selection with legacy fallback, and Codex CLI version compatibility warnings.
+- [done] Improve `cbth` operator UX with clearer help, `cli app-servers --format json|human`, and `self update --interactive`.
 - [pending] Implement external code-review delegation, app-server output bridge, and PR / GitHub Actions polling integrations.
 - [done] Migrate the long-form top-level trackers into project journal entries without dropping the original records.
