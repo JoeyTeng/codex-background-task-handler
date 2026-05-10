@@ -31,7 +31,7 @@ superseded_by:
 - Desktop heartbeat preflight attempts are recorded in [Desktop live preflight evidence](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md): direct heartbeat access to redundant chmod, `startup.lock`, Unix socket, and SQLite WAL paths failed under Desktop sandboxing even when POSIX ownership / mode looked correct.
 - The Desktop boundary is now split: a normal shell / daemon / future sidecar publishes the inbox snapshot, while the heartbeat consumes it through no-DB read helpers. Real heartbeat validation succeeded for `read-snapshot`, `list-arm-pending`, `list-pause-due`, and read/peek `claim-next-ready` without approval.
 - `read_transport_capability=validated` now covers the no-DB direct-file-read helper path against an already-published revision-consistent snapshot, including the manifest-referenced installation-state export. It does not validate heartbeat-owned `bridge-preflight`, SQLite access, artifact payload reads, or writeback helpers.
-- `note-arm-pending` and `note-arm` now exist as local writeback primitives with fake coverage. A hidden validation-only fixture and live validation doc are being added so real Desktop heartbeat can validate `note-arm-pending` / `note-arm` without direct SQLite edits; do not write `writeback_capability=validated` until that heartbeat run succeeds.
+- `note-arm-pending` and `note-arm` now exist as local writeback primitives with fake coverage, but real Desktop heartbeat validation failed before `note-arm-pending` could mutate state because daemon-routed writeback tried to open `~/.cbth/run/startup.lock` and hit sandbox `EPERM`. Do not write `writeback_capability=validated`; the next design must avoid heartbeat-owned startup-lock access and account for earlier SQLite WAL denial.
 - If large artifacts ever enter the automatic caller path, separately validate `cbth desktop read-artifact ...` in heartbeat / caller contexts and write the result back to `artifact_read_capability`.
 
 ## Desktop Bridge Implementation
@@ -44,7 +44,7 @@ superseded_by:
 - Implement bridge fairness and budget limits: independent reconcile and fresh-arm lanes, bounded item count / wall time, and `max_new_arms_per_wake=1`.
 - Implement real ready / arm / pause materialization behind the existing no-DB read helpers.
 - Extend `bridge_arm_lease` beyond the current `note-arm-pending` acquire / carry-forward primitive with overdue reconcile and cleanup semantics.
-- Validate writeback helpers `note-arm-pending` and `note-arm` in real Desktop heartbeat before marking installation `writeback_capability=validated`.
+- Redesign the writeback validation/execution path so Desktop heartbeat does not need daemon autostart / `startup.lock` access; only retry `note-arm-pending` / `note-arm` live validation after that boundary changes.
 - Implement `note-boundary-crossed` with prompt-token validation, binding / installation-state checks, `cooldown` and `armed_generation` preconditions, `handoff_recorded` close, and durable `boundary_recovery_envelope`.
 - Verify the continuation-boundary contract: only fresh `note-boundary-crossed` success allows inline handoff; post-boundary automatic replay and ordinary tool continuation remain out of v1.
 - Keep the v1 automatic path limited to read-only, no approval, no network, no write access batches, plus validated Desktop read and writeback capability; `requires_artifact_read=true` remains manual/operator follow-up.

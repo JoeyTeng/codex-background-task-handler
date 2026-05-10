@@ -274,3 +274,70 @@ read_transport_capability=validated
 artifact_read_capability=unknown
 writeback_capability=unknown
 ```
+
+## 2026-05-07 Attempt: Writeback Helpers Blocked By Startup Lock
+
+Result: `VALIDATION_FAILED`
+
+Evidence:
+
+- Code branch: `codex/desktop-writeback-live-evidence`
+- Base merge commit: `2fd0e0d95a69f14d593fdbee58d6de59b2b0990c`
+- Local binary: `/Users/hoteng/.cache/cargo-target/release/cbth`
+- Local binary version: `cbth 0.1.1` built from current `master`
+- Bridge thread id: `019db5e6-ba6a-7b80-95d2-a6867163281a`
+- Heartbeat automation id: `cbth-desktop-writeback-live-validation-20260507t195236z`
+- Validation marker: `CBTH_DESKTOP_WRITEBACK_HELPER_LIVE_20260507T195236Z`
+- Target rollout file: `/Users/hoteng/.codex/sessions/2026/04/22/rollout-2026-04-22T16-54-50-019db5e6-ba6a-7b80-95d2-a6867163281a.jsonl`
+- Heartbeat run timestamp: `2026-05-07T19:55:11.222Z`
+
+The operator shell created a validation-only fixture:
+
+```text
+source_thread_id=cbth-desktop-writeback-live-validation-20260507T195236Z
+caller_automation_id=cbth-desktop-writeback-live-validation-20260507T195236Z
+bridge_request_id=CBTH_DESKTOP_WRITEBACK_HELPER_LIVE_20260507T195236Z
+job_id=019e0400-eee1-7c73-8792-35f8e015a572
+batch_id=019e0400-eee1-7c73-8792-360120454fc5
+attempt_id=019e0400-eee1-7c73-8792-361330f0b674
+attempt_state=prepared
+attempt_generation=1
+requires_artifact_read=false
+created_at=2026-05-07T19:53:50Z
+```
+
+The first heartbeat writeback command failed before any durable writeback state changed:
+
+```text
+CBTH_DESKTOP_WRITEBACK_HELPER_LIVE_20260507T195236Z VALIDATION_FAILED step1_note_arm_pending_first_failed:open startup lock /Users/hoteng/.cbth/run/startup.lock: Operation not permitted (os error 1)
+```
+
+The heartbeat deleted the temporary automation after reporting the failure. Operator inspection afterwards showed:
+
+```text
+attempt_state=prepared
+desktop_armed_at=null
+bridge_request_id=null
+bridge_arm_lease_id=null
+batch_state=open
+delivery_attempt_count=0
+```
+
+The operator then closed the synthetic fixture batch:
+
+```text
+close_reason=operator_closed_unconfirmed
+closed_at=2026-05-07T19:56:09Z
+close_note=Desktop writeback helper live validation failed before note-arm-pending due Desktop startup.lock EPERM
+```
+
+The installation state remains:
+
+```text
+read_transport_capability=validated
+artifact_read_capability=unknown
+writeback_capability=unknown
+read_transport_generation=1
+```
+
+Conclusion: real Desktop heartbeat can execute `cbth`, but the current daemon-routed writeback helpers still hit the same `startup.lock` sandbox boundary before reaching `note-arm-pending`. Do not mark `writeback_capability=validated`. The next design step must avoid heartbeat-owned daemon autostart / startup-lock access for writeback, and should also account for the earlier evidence that heartbeat-owned SQLite WAL setup failed.
