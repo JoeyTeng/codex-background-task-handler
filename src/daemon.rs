@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use rusqlite::ErrorCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::artifact::{ingest_result_file, remove_ingest_marker_best_effort};
 use crate::cli_app_server_client::AppServerJsonRpcClient;
@@ -78,6 +78,8 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "cli-app-server-lifecycle",
     "cli-app-server-probe",
     "cli-thread-start-bootstrap",
+    "cli-thread-start-params",
+    "cli-foreground-thread-bootstrap",
     "cli-session-dispatch",
     "cli-session-capability-dispatch",
     "cli-session-permission-dispatch",
@@ -92,6 +94,9 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-writeback-helper-foundation",
     "desktop-writeback-live-validation-fixture",
 ];
+const CLI_THREAD_START_BOOTSTRAP_BOUND_THREAD_ID: &str = "__cbth_thread_start_bootstrap__";
+const CLI_FOREGROUND_THREAD_BOOTSTRAP_BOUND_THREAD_ID: &str =
+    "__cbth_foreground_thread_bootstrap__";
 const MAX_DISPATCH_WORKERS: usize = 32;
 const RESERVED_CONTROL_WORKERS: usize = 8;
 const MAX_CLIENT_WORKERS: usize = MAX_DISPATCH_WORKERS + RESERVED_CONTROL_WORKERS;
@@ -257,6 +262,16 @@ struct CliThreadStartPayload {
     cwd: String,
     lease_id: String,
     lease_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    thread_start_params: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CliForegroundThreadStartPayload {
+    codex_binary: Vec<u8>,
+    cwd: String,
+    lease_id: String,
+    lease_ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,6 +304,7 @@ struct DaemonInfo {
 struct CliAppServerInfo {
     managed_session_id: String,
     bound_thread_id: String,
+    session_epoch: i64,
     url: String,
     pid: u32,
     started_at: i64,
@@ -305,6 +321,12 @@ struct CliAppServerReservationInfo {
 struct CliThreadStartInfo {
     bootstrap_id: String,
     thread_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CliForegroundThreadStartInfo {
+    bootstrap_id: String,
+    url: String,
 }
 
 struct DaemonState {
@@ -642,7 +664,8 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            .process_group(0);
         let mut child = spawn_command_locked(&mut command).context("spawn cbth daemon")?;
         let child_pid = child.id();
 
@@ -1868,6 +1891,13 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
                 .context("parse cli thread/start bootstrap payload")?;
             json!({
                 "thread": start_cli_thread(state, payload)?,
+            })
+        }
+        "cli_foreground_thread_start" => {
+            let payload: CliForegroundThreadStartPayload = serde_json::from_value(request.payload)
+                .context("parse cli foreground thread bootstrap payload")?;
+            json!({
+                "thread": start_cli_foreground_thread(state, payload)?,
             })
         }
         "cli_thread_start_promote" => {
@@ -3528,15 +3558,16 @@ fn ensure_cli_app_server(
     ensure_cli_app_server_reservation_matches(state, &payload.bound_thread_id, &payload.lease_id)?;
     ensure_daemon_not_stopping(state)?;
 
-    let server = spawn_cli_app_server(
-        &payload.managed_session_id,
-        &payload.bound_thread_id,
-        payload.session_epoch,
-        &payload.codex_binary,
-        &payload.lease_id,
+    let server = spawn_cli_app_server(SpawnCliAppServerOptions {
+        managed_session_id: &payload.managed_session_id,
+        bound_thread_id: &payload.bound_thread_id,
+        session_epoch: payload.session_epoch,
+        codex_binary: &payload.codex_binary,
+        cwd: None,
+        lease_id: &payload.lease_id,
         lease_ttl,
-        &state.stop_requested,
-    )?;
+        stop_requested: &state.stop_requested,
+    })?;
     let mut server = Some(server);
     loop {
         let mut servers = state
@@ -3639,15 +3670,19 @@ fn probe_cli_app_server(
     validate_daemon_nonempty_bytes("codex_binary", &payload.codex_binary)?;
     ensure_daemon_not_stopping(state)?;
     let probe_id = new_id();
-    let server = spawn_cli_app_server(
-        &format!("doctor-probe-session-{probe_id}"),
-        &format!("doctor-probe-thread-{probe_id}"),
-        1,
-        &payload.codex_binary,
-        &format!("doctor-probe-lease-{probe_id}"),
-        Duration::from_secs(DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS),
-        &state.stop_requested,
-    )?;
+    let managed_session_id = format!("doctor-probe-session-{probe_id}");
+    let bound_thread_id = format!("doctor-probe-thread-{probe_id}");
+    let lease_id = format!("doctor-probe-lease-{probe_id}");
+    let server = spawn_cli_app_server(SpawnCliAppServerOptions {
+        managed_session_id: &managed_session_id,
+        bound_thread_id: &bound_thread_id,
+        session_epoch: 1,
+        codex_binary: &payload.codex_binary,
+        cwd: None,
+        lease_id: &lease_id,
+        lease_ttl: Duration::from_secs(DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS),
+        stop_requested: &state.stop_requested,
+    })?;
     let info = cli_app_server_info(&server);
     stop_managed_cli_app_server_process(server);
     Ok(info)
@@ -3710,15 +3745,16 @@ fn start_cli_thread(
     let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
     ensure_daemon_not_stopping(state)?;
     let bootstrap_id = new_id();
-    let server = spawn_cli_app_server(
-        &bootstrap_id,
-        "__cbth_thread_start_bootstrap__",
-        1,
-        &payload.codex_binary,
-        &payload.lease_id,
+    let server = spawn_cli_app_server(SpawnCliAppServerOptions {
+        managed_session_id: &bootstrap_id,
+        bound_thread_id: CLI_THREAD_START_BOOTSTRAP_BOUND_THREAD_ID,
+        session_epoch: 1,
+        codex_binary: &payload.codex_binary,
+        cwd: Some(&payload.cwd),
+        lease_id: &payload.lease_id,
         lease_ttl,
-        &state.stop_requested,
-    )?;
+        stop_requested: &state.stop_requested,
+    })?;
     let mut server = Some(server);
     let result = (|| {
         {
@@ -3754,10 +3790,11 @@ fn start_cli_thread(
         client
             .notify_initialized()
             .context("notify bootstrap cli app-server initialized")?;
+        let thread_start_params = cli_thread_start_params(&mut client, &payload)?;
         let started = client
             .request(
                 "thread/start",
-                json!({ "cwd": payload.cwd }),
+                thread_start_params,
                 CLI_THREAD_START_BOOTSTRAP_REQUEST_TIMEOUT,
             )
             .context("bootstrap cli thread/start")?;
@@ -3793,6 +3830,198 @@ fn start_cli_thread(
     result
 }
 
+fn start_cli_foreground_thread(
+    state: &DaemonState,
+    payload: CliForegroundThreadStartPayload,
+) -> Result<CliForegroundThreadStartInfo> {
+    validate_daemon_nonempty_bytes("codex_binary", &payload.codex_binary)?;
+    validate_daemon_nonempty("cwd", &payload.cwd)?;
+    validate_daemon_nonempty("lease_id", &payload.lease_id)?;
+    let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
+    ensure_daemon_not_stopping(state)?;
+    let bootstrap_id = new_id();
+    let server = spawn_cli_app_server(SpawnCliAppServerOptions {
+        managed_session_id: &bootstrap_id,
+        bound_thread_id: CLI_FOREGROUND_THREAD_BOOTSTRAP_BOUND_THREAD_ID,
+        session_epoch: 1,
+        codex_binary: &payload.codex_binary,
+        cwd: Some(&payload.cwd),
+        lease_id: &payload.lease_id,
+        lease_ttl,
+        stop_requested: &state.stop_requested,
+    })?;
+    let mut server = Some(server);
+    let result = (|| {
+        let url = server
+            .as_ref()
+            .expect("bootstrap app-server is still available")
+            .url
+            .clone();
+        {
+            let mut bootstraps = state.cli_thread_start_bootstraps.lock().map_err(|_| {
+                anyhow::anyhow!("CLI thread/start bootstrap registry lock is poisoned")
+            })?;
+            ensure_daemon_not_stopping(state)?;
+            bootstraps.insert(
+                bootstrap_id.clone(),
+                server
+                    .take()
+                    .expect("bootstrap app-server is still available"),
+            );
+        }
+        Ok(CliForegroundThreadStartInfo { bootstrap_id, url })
+    })();
+    if result.is_err()
+        && let Some(server) = server.take()
+    {
+        stop_managed_cli_app_server_process(server);
+    }
+    result
+}
+
+fn cli_thread_start_params(
+    client: &mut AppServerJsonRpcClient,
+    payload: &CliThreadStartPayload,
+) -> Result<Value> {
+    let mut params = match payload
+        .thread_start_params
+        .clone()
+        .unwrap_or_else(|| json!({ "cwd": payload.cwd.clone() }))
+    {
+        Value::Object(params) => params,
+        _ => bail!("thread_start_params must be an object"),
+    };
+    let cwd = match params.get("cwd").and_then(Value::as_str) {
+        Some(cwd) if !cwd.is_empty() => cwd.to_owned(),
+        _ => {
+            params.insert("cwd".to_owned(), Value::String(payload.cwd.clone()));
+            payload.cwd.clone()
+        }
+    };
+
+    // The app-server's fresh thread defaults can lag behind the foreground CLI
+    // defaults. Echo only the stable effective config values that affect the
+    // model picker display, unless the caller supplied an explicit override.
+    // config/read exposes the raw config shape, not the profile-resolved final
+    // Config, so leave active-profile cases to thread/start's normal config
+    // resolution path. The fresh bootstrap app-server is launched in this cwd
+    // so config/read still matches the target project if that method ignores
+    // the request cwd field.
+    if !thread_start_has_profile_override(&params)?
+        && let Some(config) = read_effective_codex_config(client, &cwd)?
+        && !effective_config_has_active_profile(&config)
+    {
+        merge_effective_config_into_thread_start_params(&mut params, &config)?;
+    }
+
+    Ok(Value::Object(params))
+}
+
+fn read_effective_codex_config(
+    client: &mut AppServerJsonRpcClient,
+    cwd: &str,
+) -> Result<Option<Map<String, Value>>> {
+    let response = match client.request(
+        "config/read",
+        json!({
+            "cwd": cwd,
+            "includeLayers": false,
+        }),
+        CLI_THREAD_START_BOOTSTRAP_REQUEST_TIMEOUT,
+    ) {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    // Current ConfigReadResponse exposes effective values under top-level
+    // `config`; accept a flat result as a protocol-drift fallback.
+    Ok(response
+        .get("config")
+        .and_then(Value::as_object)
+        .or_else(|| response.as_object())
+        .cloned())
+}
+
+fn merge_effective_config_into_thread_start_params(
+    params: &mut Map<String, Value>,
+    config: &Map<String, Value>,
+) -> Result<()> {
+    let provider_matches_config = thread_start_provider_matches_config(params, config);
+    if provider_matches_config
+        && !params.contains_key("model")
+        && let Some(model) = config.get("model").filter(|value| !value.is_null())
+    {
+        params.insert("model".to_owned(), model.clone());
+    }
+    if !params.contains_key("modelProvider")
+        && let Some(provider) = config
+            .get("model_provider")
+            .filter(|value| !value.is_null())
+    {
+        params.insert("modelProvider".to_owned(), provider.clone());
+    }
+
+    let mut config_overrides = Map::new();
+    for key in ["model_reasoning_effort", "model_reasoning_summary"] {
+        if provider_matches_config
+            && !thread_start_config_contains(params, key)?
+            && let Some(value) = config.get(key).filter(|value| !value.is_null())
+        {
+            config_overrides.insert(key.to_owned(), value.clone());
+        }
+    }
+    if !config_overrides.is_empty() {
+        let thread_config = params
+            .entry("config".to_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(thread_config) = thread_config.as_object_mut() else {
+            bail!("thread_start_params config must be an object");
+        };
+        thread_config.extend(config_overrides);
+    }
+
+    Ok(())
+}
+
+fn thread_start_provider_matches_config(
+    params: &Map<String, Value>,
+    config: &Map<String, Value>,
+) -> bool {
+    let Some(provider) = params.get("modelProvider").filter(|value| !value.is_null()) else {
+        return true;
+    };
+    config
+        .get("model_provider")
+        .filter(|value| !value.is_null())
+        .is_some_and(|config_provider| config_provider == provider)
+}
+
+fn thread_start_config_contains(params: &Map<String, Value>, key: &str) -> Result<bool> {
+    let Some(config) = params.get("config") else {
+        return Ok(false);
+    };
+    let Some(config) = config.as_object() else {
+        bail!("thread_start_params config must be an object");
+    };
+    Ok(config.contains_key(key))
+}
+
+fn thread_start_has_profile_override(params: &Map<String, Value>) -> Result<bool> {
+    let Some(config) = params.get("config") else {
+        return Ok(false);
+    };
+    let Some(config) = config.as_object() else {
+        bail!("thread_start_params config must be an object");
+    };
+    Ok(config
+        .get("profile")
+        .or_else(|| config.get("config_profile"))
+        .is_some_and(|value| !value.is_null()))
+}
+
+fn effective_config_has_active_profile(config: &Map<String, Value>) -> bool {
+    config.get("profile").is_some_and(|value| !value.is_null())
+}
+
 fn promote_cli_thread_start_app_server(
     state: &DaemonState,
     payload: CliThreadStartPromotePayload,
@@ -3821,7 +4050,9 @@ fn promote_cli_thread_start_app_server(
             .as_mut()
             .expect("bootstrap app-server is still available");
         ensure_daemon_not_stopping(state)?;
-        if server_ref.bound_thread_id != payload.bound_thread_id {
+        if server_ref.bound_thread_id == CLI_FOREGROUND_THREAD_BOOTSTRAP_BOUND_THREAD_ID {
+            server_ref.bound_thread_id = payload.bound_thread_id.clone();
+        } else if server_ref.bound_thread_id != payload.bound_thread_id {
             let started_thread = server_ref.bound_thread_id.clone();
             bail!(
                 "CLI thread/start bootstrap created thread {}, not {}",
@@ -3939,16 +4170,19 @@ fn parse_cli_thread_start_id(value: &Value) -> Result<String> {
     Ok(thread_id.to_owned())
 }
 
-fn spawn_cli_app_server(
-    managed_session_id: &str,
-    bound_thread_id: &str,
+struct SpawnCliAppServerOptions<'a> {
+    managed_session_id: &'a str,
+    bound_thread_id: &'a str,
     session_epoch: i64,
-    codex_binary: &[u8],
-    lease_id: &str,
+    codex_binary: &'a [u8],
+    cwd: Option<&'a str>,
+    lease_id: &'a str,
     lease_ttl: Duration,
-    stop_requested: &AtomicBool,
-) -> Result<ManagedCliAppServer> {
-    let codex_binary = OsString::from_vec(codex_binary.to_vec());
+    stop_requested: &'a AtomicBool,
+}
+
+fn spawn_cli_app_server(options: SpawnCliAppServerOptions<'_>) -> Result<ManagedCliAppServer> {
+    let codex_binary = OsString::from_vec(options.codex_binary.to_vec());
     let mut command = Command::new(&codex_binary);
     command
         .arg("app-server")
@@ -3958,6 +4192,9 @@ fn spawn_cli_app_server(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    if let Some(cwd) = options.cwd {
+        command.current_dir(cwd);
+    }
     let mut child = spawn_command_locked(&mut command)
         .with_context(|| format!("spawn codex app-server via {:?}", codex_binary))?;
     let stdout = child.stdout.take().context("capture app-server stdout")?;
@@ -3983,7 +4220,7 @@ fn spawn_cli_app_server(
     });
     let startup_deadline = Instant::now() + CLI_APP_SERVER_STARTUP_TIMEOUT;
     let url = loop {
-        if stop_requested.load(Ordering::Acquire) {
+        if options.stop_requested.load(Ordering::Acquire) {
             drain_running.store(false, Ordering::Release);
             stop_cli_app_server_process(&mut child);
             join_worker(stdout_worker);
@@ -4020,14 +4257,14 @@ fn spawn_cli_app_server(
     }
     let started_at = current_epoch_seconds()?;
     Ok(ManagedCliAppServer {
-        managed_session_id: managed_session_id.to_owned(),
-        bound_thread_id: bound_thread_id.to_owned(),
-        session_epoch,
+        managed_session_id: options.managed_session_id.to_owned(),
+        bound_thread_id: options.bound_thread_id.to_owned(),
+        session_epoch: options.session_epoch,
         url,
         child,
         started_at,
-        lease_id: lease_id.to_owned(),
-        lease_expires_at: Instant::now() + lease_ttl,
+        lease_id: options.lease_id.to_owned(),
+        lease_expires_at: Instant::now() + options.lease_ttl,
         drain_running,
         stdout_worker: Some(stdout_worker),
         stderr_worker: Some(stderr_worker),
@@ -4265,6 +4502,7 @@ fn cli_app_server_info(server: &ManagedCliAppServer) -> CliAppServerInfo {
     CliAppServerInfo {
         managed_session_id: server.managed_session_id.clone(),
         bound_thread_id: server.bound_thread_id.clone(),
+        session_epoch: server.session_epoch,
         url: server.url.clone(),
         pid: server.child.id(),
         started_at: server.started_at,
@@ -5571,6 +5809,7 @@ mod tests {
                 cwd: "/tmp".to_owned(),
                 lease_id: "lease-stopped-thread-start".to_owned(),
                 lease_ttl_seconds: None,
+                thread_start_params: None,
             },
         )
         .expect_err("stopped daemon should reject thread/start bootstrap");
@@ -5609,6 +5848,7 @@ mod tests {
                     cwd: home.path().display().to_string(),
                     lease_id: "lease-stopped-thread-start-registration".to_owned(),
                     lease_ttl_seconds: None,
+                    thread_start_params: None,
                 },
             )
         });

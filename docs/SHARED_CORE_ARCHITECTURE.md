@@ -17,6 +17,7 @@
 - `artifact` 指由 `cbth` 管理和保留的任务产物，不是外部脚本临时路径本身。
 - `thread inbox` 指 `cbth` 为某个 `source_thread_id` 物化出的只读投递视图。
 - `delivery batch` 指对同一 caller thread 的一组有序任务结果投递单元。
+- CLI 路径里 `CBTH_HOME`、daemon、daemon-owned app-server、Codex thread、managed session、foreground wrapper process 和 background task 的拓扑关系见 `docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md` 的“运行拓扑与对应关系”。
 
 ## 已敲定的取舍
 
@@ -868,7 +869,7 @@ cooldown -> superseded
   - 每次自动 `turn/start` 前重新读取 current snapshot，并逐维计算 `effective_allows = startup_allows && current_allows`
   - 当前收紧时按当前更紧权限投递；当前放宽时仍受 startup 限制；混合变化逐维取更紧值
 - drift 必须写 stderr warning 与 audit record，包含 startup/current/effective、方向和 changed dimensions
-- `turn/start` request 必须显式携带 effective 权限对应的 pinned `approvalPolicy` / legacy `sandboxPolicy`，避免 durable 记录和真实 turn 权限不一致；Codex 0.128 的 legacy `sandboxPolicy` 不再接受 restricted-read `access` / `readOnlyAccess` 字段，因此 pinned request 只发送可表示的 `type`、`networkAccess`、`writableRoots` 与 workspace exclude flags，restricted-read shape 只进入解析、收紧计算和 drift/audit。
+- `turn/start` request 必须显式携带 effective 权限对应的 pinned `approvalPolicy`，避免 durable 记录和真实 turn 权限不一致。Codex 0.129 形态下，permission snapshot 优先解析 tagged `managed` / `disabled` / `external` `permissionProfile`，legacy `sandbox` 缺少 `access` / `readOnlyAccess` 时按 full legacy read 兼容校验；如果 stable built-in current `activePermissionProfile` 能精确表示 effective sandbox cap，active selection 的 network/write 布尔值与 effective cap 一致，且 active selection 与 current canonical `permissionProfile` body 双向等价，则优先发送 `permissions: { type: "profile", id, modifications }` 且不发送 `sandboxPolicy`，并允许 canonical profile 保留 legacy sandbox 无法表达的 deny carve-outs；如果 effective cap 是 startup-tighter、mixed synthetic、来自 mutable user-defined profile id、current active selection 与 canonical body 不一致、或当前 active profile 无法无损表达，则 fallback 到 pinned legacy `sandboxPolicy`。legacy fallback 只发送可表示的 `type`、`networkAccess`、`writableRoots` 与 workspace exclude flags，且只有 canonical profile 可安全降级为 legacy sandbox、effective read access 为 full read 时才允许；restricted-read `access` / `readOnlyAccess` shape 只进入解析、收紧计算和 drift/audit，如果需要 legacy fallback 保留 restricted read scope 则 fail-closed。
 - workspace writable root 收紧必须先做安全规范化；含 parent-directory component 的 root 直接 fail-closed，避免路径解析后落到 startup cap 之外。
 - auto-pinned session 的 proof invalidation 只清掉 epoch-local current proof 并保留 startup cap；strict-safe 投递在 current permission snapshot 重新刷新前不得把旧 `session_allows_*` 风险布尔值当作可信证明。
 - 默认 `auto` reattach 不应把 fail-closed 初始 false 作为固定 profile 来匹配 durable `session_allows_*`；显式 `true` / `false` 仍按固定 profile 处理，profile drift、manual batch blocker、active attempt blocker 继续拒绝 reattach。
@@ -1318,11 +1319,12 @@ cbth desktop binding unbind
   - existing-thread mode：`cbth cli run --bind-thread-id <thread_id>`
     - 启动时显式建立 `bound_thread_id`
   - fresh-thread mode：`cbth cli run --new-thread`
-    - 仅当 capability probe 已证明 `thread/start` 可用时启用
-    - daemon 先创建 brand-new thread，再把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
+    - daemon 先启动 pending shared app-server
+    - foreground Codex 在该 app-server 上创建 brand-new thread
+    - `cbth` 监听 `thread/started`，把 foreground 返回的真实 thread id durable 绑定为新的 `bound_thread_id`
 - v1 不提供 late-bind stable surface。
 - 也不把 `managed_session_id` 暴露成需要外部回填 thread id 的 bootstrap 契约。
-- 如果调用方既拿不到 caller `thread_id`，也没有 `thread/start` capability：
+- 如果调用方既拿不到 caller `thread_id`，也不能通过 foreground-created `thread/started` 建立 fresh thread 绑定：
   - 该前台会话只能视为探索性 remote TUI
   - 不进入 v1 的 managed-session auto-continuation 合同
 - `cbth desktop ...` 预留给 Desktop bootstrap / helper。

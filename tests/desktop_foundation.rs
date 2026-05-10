@@ -2630,6 +2630,8 @@ fn desktop_bridge_preflight_require_existing_daemon_does_not_forward_client_only
                     "cli-app-server-lifecycle",
                     "cli-app-server-probe",
                     "cli-thread-start-bootstrap",
+                    "cli-thread-start-params",
+                    "cli-foreground-thread-bootstrap",
                     "cli-session-dispatch",
                     "cli-session-capability-dispatch",
                     "cli-session-permission-dispatch",

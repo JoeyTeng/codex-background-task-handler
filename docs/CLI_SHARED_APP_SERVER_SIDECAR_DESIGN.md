@@ -20,6 +20,82 @@
 
 ## 核心设计
 
+### 运行拓扑与对应关系
+
+```mermaid
+flowchart TB
+  user["OS user"]
+
+  subgraph home["CBTH_HOME (default: ~/.cbth)"]
+    socket["run/cbth.sock"]
+    store[("SQLite store")]
+    taskFiles["tasks/task-id logs"]
+    artifacts["artifacts / manifests"]
+  end
+
+  daemon["cbth daemon serve<br/>one active daemon per OS user + CBTH_HOME"]
+
+  user --> home
+  home --> socket
+  home --> store
+  home --> taskFiles
+  home --> artifacts
+  socket <-->|same-user Unix IPC| daemon
+  daemon <-->|durable state| store
+  daemon --> taskFiles
+  daemon --> artifacts
+
+  subgraph fg1["cbth foreground wrapper process<br/>cbth resume thread-1 / cli run --bind-thread-id thread-1"]
+    lease1["app-server lease owner<br/>refreshes while foreground runs"]
+    sidecar1["sidecar websocket client<br/>auto-delivery observer"]
+    tui1["foreground codex TUI<br/>codex resume --remote URL"]
+  end
+
+  daemon <-->|reserve / ensure / refresh / release| lease1
+
+  app1["daemon-owned codex app-server<br/>managed_session_id=M1<br/>bound_thread_id=thread-1<br/>session_epoch=E1"]
+  daemon --> app1
+  tui1 <-->|websocket| app1
+  sidecar1 <-->|websocket| app1
+
+  thread1[("Codex thread thread-1")]
+  app1 -.->|thread/resume, thread/read, turn/start| thread1
+  store -.->|managed session M1<br/>batches keyed by source_thread_id=thread-1| thread1
+
+  subgraph fg2["another active cbth foreground wrapper process"]
+    lease2["separate lease owner"]
+    sidecar2["separate sidecar client"]
+    tui2["separate foreground codex TUI"]
+  end
+
+  app2["daemon-owned codex app-server<br/>managed_session_id=M2<br/>bound_thread_id=thread-2"]
+  daemon <-->|reserve / ensure / refresh / release| lease2
+  daemon --> app2
+  tui2 <-->|websocket| app2
+  sidecar2 <-->|websocket| app2
+  app2 -.->|targets| thread2[("Codex thread thread-2")]
+
+  subgraph submitter["short-lived cbth task submitter process<br/>cbth task run --source-thread-id thread-1 -- ..."]
+    taskRun["task run CLI"]
+  end
+
+  taskRun -->|same-user IPC request| daemon
+  daemon --> bgTask["daemon-owned background task<br/>child process group"]
+  bgTask -->|exit status + stdout/stderr tails| daemon
+  daemon -->|complete/fail job<br/>create delivery batch| store
+  sidecar1 -->|when thread-1 is idle<br/>deliver head batch FIFO| app1
+```
+
+对应关系：
+
+- `CBTH_HOME` 是本地状态与 IPC namespace。默认 `~/.cbth` 下包含 socket、SQLite store、task logs、artifact manifests；同一个 OS user 可以通过不同 `--home` / `CBTH_HOME` 拥有隔离的多套 daemon。
+- 默认运行模型是一个 OS user + 一个 `CBTH_HOME` 同时最多一个 active `cbth daemon serve`。daemon 通过 same-user Unix socket 接受 mutating CLI 请求。
+- daemon 可以同时管理多个 daemon-owned `codex app-server` 进程。每个 active app-server 绑定一个 `managed_session_id` 与一个 `bound_thread_id`，并由一个当前 foreground wrapper lease 刷新。
+- 一个 `bound_thread_id` / Codex thread 在任意时刻最多允许一个 active managed app-server / lease owner。后续新的 `cbth resume <thread_id>` 可以在旧 live part 已结束或可复用时 attach/reuse 同一 durable managed session，但不能并发再开第二个 active app-server。
+- 一个 foreground wrapper process 负责本次前台 Codex TUI、sidecar client、app-server lease refresh 和退出时的 release / cleanup request。它不是长期 daemon；退出后会停止自己的 sidecar，并由 daemon 按后文的 shared app-server ownership 条件决定是保留、停止还是 park 对应 managed session。
+- `cbth task run` submitter process 是短生命周期 CLI。它只把 `source_thread_id`、命令和 delivery policy 交给 daemon；命令本身随后由 daemon 作为 background task process group 监督。
+- background task 不连接 app-server，也不直接修改 Codex thread。它完成后只在 store 中产生 job result / delivery batch；匹配同一 `source_thread_id` 的 sidecar 在该 Codex thread idle 时按 head-batch FIFO 投递。
+
 ### 组件
 
 1. `shared app-server`
@@ -89,17 +165,18 @@ codex --remote ws://127.0.0.1:<port>
      - existing-thread mode：
        - 启动时由 `cbth cli run --bind-thread-id <thread_id>` 显式建立 `bound_thread_id`
      - fresh-thread mode：
-       - 仅当 capability probe 证明 `thread/start` 可用时，允许 `cbth cli run --new-thread`
-       - daemon 先创建一个新 thread，再把返回的 `thread_id` durable 绑定成新的 `bound_thread_id`
+       - `cbth cli run --new-thread` 先启动 pending shared app-server
+       - foreground Codex 创建新 thread，`cbth` 从 `thread/started` 读取真实 thread id
+       - `cbth` 再把该 thread id durable 绑定成新的 `bound_thread_id`
    - 不提供 late-bind stable surface
    - 不提供依赖 `managed_session_id` 的外部发现/回填合同
-   - 如果调用方既拿不到 caller `thread_id`，也没有 `thread/start` 能力：
+   - 如果调用方既拿不到 caller `thread_id`，也不能通过 foreground-created `thread/started` 建立 fresh thread 绑定：
      - 该前台会话仍可作为探索性 remote TUI 使用
      - 但它不进入 v1 的 managed-session auto-continuation 合同
    - 这个启动时显式 bootstrap 在 v1 只决定 delivery target：
-     - 它不证明前台当前正在看的 thread 一定等于 `bound_thread_id`
-     - 它也不要求 `cbth` 能从 app-server 侧可靠读出“当前 foreground thread id”
-   - 因此，第一版的 fixed-thread 合同是“投递目标固定”，不是“前台焦点已校验”。
+     - fresh-thread path 会在启动时绑定 foreground 创建的真实 thread
+     - 但后续 foreground thread switch 仍不会自动重绑定
+   - 因此，第一版的 fixed-thread 合同是“投递目标固定”，不是“持续前台焦点追踪”。
    - 同一个 `bound_thread_id` 在任意时刻最多只允许一个 non-retired managed session：
      - `cbth cli run --bind-thread-id <thread_id>` 必须是 attach-or-create，而不是 blind create
      - 如果 daemon 已经找到同一个 `bound_thread_id` 的 `live` / `detached` session，就必须复用它
@@ -195,8 +272,9 @@ codex --remote ws://127.0.0.1:<port>
   - 如果存在 `stale` session：只有在它已满足 retirement 条件后才允许替换
   - 如果存在不可安全替换的 `stale` / conflicting session：直接 fail-closed，不得并发创建第二个 session
 - fresh-thread mode（`cbth cli run --new-thread`）的 v1 合同必须是：
-  - 只在 capability probe 已证明 `thread/start` 可用时允许
-  - daemon 必须先创建一个 brand-new thread，并把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
+  - daemon 必须先启动 pending shared app-server
+  - foreground Codex 必须在该 app-server 上创建 brand-new thread
+  - `cbth` 必须从 `thread/started` 读取 foreground 创建的 thread id，并把它 durable 绑定为新的 `bound_thread_id`
   - 这个新 `bound_thread_id` 之后同样进入既定的单 session / fixed-thread / attach-or-create 合同
 - 当同时满足以下条件时，daemon 才允许清理该 managed session：
   - 没有 active jobs
@@ -657,7 +735,7 @@ cbth cli run
 4. CLI bootstrap 必须先选定显式模式：
    - existing-thread mode：`cbth cli run --bind-thread-id <thread_id>`
    - native resume mode：`cbth resume <thread_id> [-- <codex_args>]`，前台进程为 `codex resume <thread_id> --remote <url> --cd <cwd> ...`
-   - fresh-thread mode：`cbth cli run --new-thread`（仅在 `thread/start` capability 已通过 probe 时允许）
+   - fresh-thread mode：`cbth cli run --new-thread`，前台进程先在 pending shared app-server 上创建新 thread，`cbth` 监听 `thread/started` 后再绑定
 5. attach-or-create / create-new 必须遵守：
    - existing-thread mode：
      - 同一 `bound_thread_id` 有 `live` / `detached` session 时，先比较 requested bootstrap profile 与 durable effective profile；只有完全一致才允许 attach/reuse
@@ -666,10 +744,11 @@ cbth cli run
      - 同一 `bound_thread_id` 有不可安全替换的 stale/conflicting session 时 fail-closed
      - 只有在没有 non-retired session，或旧 `parked/stale` session 已满足 retirement 条件时，才创建新的 managed session
    - fresh-thread mode：
-     - daemon 必须先调用 `thread/start` 创建 brand-new thread
-     - 再把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
+     - daemon 必须先启动 pending app-server
+     - foreground Codex 创建 brand-new thread
+     - `cbth` 再把 `thread/started` 的 thread id durable 绑定为新的 `bound_thread_id`
      - 同时仍适用同一 `bound_thread_id` 最多一个 non-retired managed session 的唯一性合同
-6. attach/create 成功后再启动前台 `codex --remote ...`
+6. existing-thread attach/create 成功后再启动前台 `codex --remote ...`；fresh-thread path 则必须先启动 foreground 才能发现并绑定新 thread id
 7. sidecar 从共享核心读取 per-thread `delivery batch`
 8. 任务 ready 后：
    - 默认只在 caller thread idle 时：`thread/resume + turn/start`
@@ -697,21 +776,23 @@ v1 范围外：
   - 尚未注册进 registry 的候选 app-server 不得触碰 session proof，只能停止候选进程，避免并发 ensure 误清真实 session。
   - daemon shutdown 例外采用 best-effort proof invalidation，然后仍然 kill/wait 子进程并 join drain worker，优先避免 daemon 退出时泄漏 app-server。
 - public `cbth cli run --new-thread` 已落地 fresh-thread bootstrap：
-  - wrapper 先请求 daemon-owned pending loopback app-server 执行 `thread/start`。
-  - bootstrap 成功后，返回的 `thread_id` 被用作后续 fixed-thread `bound_thread_id`，同一个 pending app-server 进程会被提升为 managed app-server，再复用 existing-thread sidecar / foreground 流程。
-  - wrapper 只在启动 foreground 前向 stderr 打印 `cbth: bound thread id: <thread_id>`；不发送 foreground prompt，不注入用户消息，也不改变原生 `codex --remote` 交互模型。
-  - 不能使用“short-lived bootstrap app-server 后关闭”的实现：Codex 0.128 的 fresh thread 在 first user message 前不会 materialize rollout，关闭 bootstrap app-server 后新的 app-server 会对该 thread 返回 `no rollout found` / `includeTurns is unavailable before first user message`。
+  - wrapper 先请求 daemon-owned pending loopback app-server，并在 foreground 启动前初始化 discovery client。
+  - foreground Codex 在这个 pending app-server 上创建真实新 thread；wrapper 从 `thread/started` notification 读取 thread id。
+  - discovery 成功后，返回的 thread id 被用作后续 fixed-thread `bound_thread_id`，同一个 pending app-server 进程会被提升为 managed app-server，再启动 existing-thread sidecar。
+  - wrapper 只在 durable bind/promote 后向 stderr 打印 `cbth: bound thread id: <thread_id>`；不发送 foreground prompt，不注入用户消息，也不改变原生 `codex --remote` 交互模型。
+  - 不能使用“short-lived bootstrap app-server 后关闭”的实现：当前 Codex app-server 的 fresh thread 在 first user message 前不会 materialize rollout，关闭 bootstrap app-server 后新的 app-server 会对该 thread 返回 `no rollout found` / `includeTurns is unavailable before first user message`。
   - bootstrap app-server 在 promote 前只存在于 pending registry，不触碰 managed session proof；bootstrap 失败、promote 失败、lease 过期或 daemon shutdown 时必须停止子进程并 join drain worker。
-  - bootstrap 的 remote error / timeout / closed / malformed response 都在 foreground 启动前 fail closed，不创建 managed session。
+  - discovery 的 remote error / timeout / closed / malformed response 都会 fail closed，不创建 managed session。
 - daemon status 现在会列出 active CLI app-server，并且 daemon capability 列表包含 `cli-app-server-lifecycle` / `cli-app-server-probe`；新 CLI 不会把 lifecycle 或 doctor probe request 投递给不支持该命令的旧 daemon。
-- public `cbth resume <thread_id> [-- <codex_args>]` 已作为 native resume wrapper 落地；它复用 fixed-thread managed session / daemon-owned app-server / passive sidecar 流程，前台命令为 `codex resume <thread_id> --remote <url> --cd <cwd> ...`。
-- 为避免 cold existing thread 被 sidecar 抢先 materialize，`cbth resume` 的 sidecar 首次 `thread/resume` 会携带从前台 argv 可推导出的 native resume overrides：`cwd`、`model`、`profile`、`approvalPolicy`、`sandbox`、`approvalsReviewer` 和 `persistExtendedHistory`；前台转发参数中的相对 `--cd` 会先按 caller cwd 规范成绝对路径，`--remote` / `--remote-auth-token-env` transport overrides 会被拒绝，避免前台 Codex 连接到非托管 app-server；`--add-dir` 也会被拒绝，因为当前 Codex `thread/resume` 没有能无损表达 additional writable roots 的字段，不能让 sidecar 用不完整的 root set 抢先记录启动权限快照。后续自动投递前的 permission refresh 仍使用只含 `threadId` 的 current-state `thread/resume`。
+- managed CLI startup 和 `cbth doctor cli` 会执行 `codex --version`，把当前 `codex-cli 0.130.x` 作为 soft validated range。版本不可解析或不在该范围内只输出 warning / doctor `warn` 状态，真实执行仍由后续 protocol field 解析与 capability gate fail-closed。
+- public `cbth resume <thread_id> [-- <codex_args>]` 已作为 native resume wrapper 落地；它复用 fixed-thread managed session / daemon-owned app-server / passive sidecar 流程，前台命令为 `codex resume <thread_id> --remote <url> ...`，只在 operator 显式转发 `--cd` / `-C` 或交互式 cwd 选择后附加单个 `--cd <cwd>`。
+- 为避免 cold existing thread 被 sidecar 抢先 materialize，`cbth resume` 的 sidecar 首次 `thread/resume` 会携带从前台 argv 可推导出的 native resume overrides：已确定的 `cwd`、`model`、`profile`、`approvalsReviewer` 和 `persistExtendedHistory`；前台转发参数中的相对 `--cd` 会先按 caller cwd 规范成绝对路径，未显式转发 cwd 的非交互式路径不会强制 caller cwd，交互式路径会先读历史 thread cwd 并在 current cwd / prior thread cwd 之间选择后再启动 sidecar materialization。resume prompt 后出现的 forwarded Codex option 会 fail-closed，因为 sidecar 无法安全复刻 Codex 的 post-positional option 解析并保证首次 `thread/resume` 同步；`--remote` / `--remote-auth-token-env` transport overrides 会被拒绝，避免前台 Codex 连接到非托管 app-server；`--add-dir` 也会被拒绝，因为当前 Codex `thread/resume` 没有能无损表达 additional writable roots 的字段，不能让 sidecar 用不完整的 root set 抢先记录启动权限快照；`--last` / `--all` / `--include-non-interactive` native resume selector 会被拒绝，因为它们可能让 foreground Codex resume 到不同于 managed bound thread id 的线程；`--oss` / `--local-provider` provider overrides 会被拒绝，因为当前启动 materialization 不能无损复刻 provider selection；`--sandbox` / `--ask-for-approval` / `--full-auto` / danger-bypass permission overrides 会被拒绝，让 managed resume 权限只来自启动 snapshot；`--search` 与 `--enable` / `--disable` feature overrides 会被拒绝，因为当前首次 `thread/resume` 不能无损表达 foreground feature state；`--config` / `-c` 只允许当前能镜像进首次 `thread/resume` 的键（`model`、`model_provider`、`profile`、`config_profile`、`approvals_reviewer`）。sandbox/permission-scope 与 feature-like config roots（例如 `approval_policy`、`sandbox_mode`、`sandbox_workspace_write.*`、`sandbox_read_only.*`、`sandbox_permissions.*`、`permissions.*`、`permission_profile.*`、`active_permission_profile.*`、`default_permissions`、`profiles.*`、`projects.*`、`trust_level`、`features.*`、`use_legacy_landlock`、`request_permissions`、`web_search*`、`tools` / `tools.web_search*`、`writable_roots`、`readable_roots`、`network_access`）同样会被拒绝；其它 unmirrored config key 也 fail-closed，直到 sidecar 能把它们无损带入首次 `thread/resume`。后续自动投递前的 permission refresh 仍使用只含 `threadId` 的 current-state `thread/resume`。
 - durable `cli_managed_sessions` schema 已落地，记录 `managed_session_id`、`bound_thread_id`、`session_epoch`、`session_state`、`activity_state`、`activity_revision`、current effective session risk profile、startup permission snapshot、last permission snapshot 和 timestamps。
 - hidden adapter-internal `cbth cli session bind` 已作为 existing-thread attach-or-create building block 落地；它接收 bootstrap risk profile（explicit flags 直接给出，default `auto` 先以 fail-closed false profile 绑定），会复用同一 `bound_thread_id` 上无阻塞工作的 `live` / `detached` session，并在 attach 时递增 `session_epoch`、把 `activity_state` 重置为 `unknown`、把 epoch-local `activity_revision` 重置为 0，同时清空旧 activity/capability/permission proof；profile drift、`parked` 或 `stale` 旧 session 只有在满足 retirement 条件后才会先 retire 再 replacement。
 - operator-facing `cbth cli session list` / `inspect` / `retire` 已落地；retire 拒绝 `live` session、active delivery attempt、以及仍有 open `manual_resolution_only` head batch 的 bound thread。
 - hidden adapter-internal `cbth cli session note-activity` 已作为 current-state sync 的临时 durable 写入面落地；当前只允许同 epoch 的 `live` / `detached` session 通过严格顺序递增的 `activity_revision` 被标成 `active` 或 `idle`，同 revision 只允许完全相同状态的幂等重放。
 - hidden adapter-internal `cbth cli session note-capabilities` 已作为 epoch-local capability probe 写入面落地；每次 bind / re-attach / continuity-loss fence 都会清空旧 capability proof。
-- hidden adapter-internal `cbth cli session note-permissions` 已作为 epoch-local permission snapshot 写入面落地；auto 模式从 `thread/resume.approvalPolicy` 与 `thread/resume.sandbox` 派生 current permissions，首次可信 snapshot pin 为 startup，上游缺字段、未知 approval policy、未知 sandbox type 或不可信字段形状都会 fail-closed。
+- hidden adapter-internal `cbth cli session note-permissions` 已作为 epoch-local permission snapshot 写入面落地；auto 模式优先从 `thread/resume.permissionProfile` 派生 current permissions，支持 Codex 0.129 tagged `managed` / `disabled` / `external` profile 与旧 pre-tagged profile shape，缺少 canonical profile 时 fallback 到 `thread/resume.approvalPolicy` 与 legacy `thread/resume.sandbox`。0.129 legacy `sandbox` 省略 `access` / `readOnlyAccess` 时，兼容校验按 full legacy read 处理；canonical / legacy 同时存在但派生 network/write 不一致时 fail-closed；首次可信 snapshot pin 为 startup，上游缺字段、未知 approval policy、未知 sandbox type 或不可信字段形状都会 fail-closed。
 - default passive auto session 在 `thread/resume` 缺少权限字段时仍可继续记录 activity/capability current-state proof；缺失 snapshot 只阻止自动投递，直到后续 refresh 获得可信权限快照。混合 explicit/auto bind 只放宽 auto 维度，显式 `true` / `false` 维度仍参与 profile drift 检查。
 - `begin-cli-accept` 已经要求引用一个匹配当前 batch `source_thread_id`、`session_epoch`、state、no-approval / no-network / no-write profile，且 `turn_start` 时同时具备最小 capability proof 和 `activity_state=idle` 的 managed session；不再接受任意字符串形式的 `managed_session_id`。
 - 当前最小 capability proof 要求 adapter 已证明 `turn_start`、`current_state_sync`、`turn_completed_event`、负终态 observation surface，以及 `thread_resume` 或 fresh `thread_start` 中至少一种 caller-thread attachment proof；缺任一项都会 fail-closed。
@@ -722,14 +803,14 @@ v1 范围外：
   - `turn/started`、`turn/completed` 与 `thread/status/changed` notification 会继续推进 monotonic `activity_revision`；`completed` / `failed` / `interrupted` / `replaced` 都视为 terminal turn status；activity 写入失败会先 invalidate 当前 proof，再把错误交回 adapter retry loop
   - request 等待窗口内收到的 lifecycle notification 不会覆盖后续 authoritative snapshot；如果 `thread/read` 缺少 authoritative snapshot 但 `thread/resume` 已给出可信 current-state snapshot，则会按顺序 replay `thread/resume` / `thread/read` 两个 request window 的 notification，避免丢失 resume 响应前到达的 active 信号；如果 `thread/read` 超时、protocol / decode / closed / remote-error 等失败，则关闭本轮连接并 fail-closed retry，避免复用可能存在 outstanding response 或已失同步的 websocket；如果 snapshot 缺失导致 epoch invalidation，则旧 epoch 的 buffered notification 不会写回新 epoch
   - default `auto` permission path 要求 existing-thread `thread/resume` 返回可信 permission snapshot；fresh unmaterialized `--new-thread` 在 first user message 前无法从 `thread/resume` 取到 snapshot 时不会记录 auto proof，但默认 passive activity/capability proof 仍可建立，自动投递必须等可信 permission snapshot 后才允许
-  - 自动 `turn/start` 前会重新执行 `thread/resume`，以 startup snapshot 为上限计算 effective permissions，并在 request params 中携带对应的 pinned `approvalPolicy` / legacy `sandboxPolicy`；pinned legacy sandbox 只发送 Codex 0.128 接受的 `type`、`networkAccess`、`writableRoots` 与 workspace exclude flags，`access` / `readOnlyAccess` restricted-read shape 只用于解析、收紧计算和 drift/audit，不写入 `turn/start`；workspace writable root containment 先做安全规范化，含 `..` 的 root fail-closed；权限 drift 会同时比较派生布尔值与 raw `approvalPolicy` / `sandbox` 细节，并输出 warning / 写 audit record；auto-pinned session 的 proof invalidation 会保留 startup cap，但 strict-safe 投递必须等 current permission snapshot 重新刷新后才能使用记录的风险布尔值；默认 `auto` bind reattach 不把 fail-closed 初始 false 当作固定 profile，因此不会因为上一轮 auto-derived effective profile 为 true 而触发 profile-drift replacement
+  - 自动 `turn/start` 前会重新执行 `thread/resume`，以 startup snapshot 为上限计算 effective permissions，并在 request params 中总是携带 pinned `approvalPolicy`；Codex 0.129 形态下，如果 stable built-in current `activePermissionProfile` 能精确表示 effective sandbox cap、active selection 的 network/write 布尔值与 effective cap 一致，且 active selection 与 current canonical `permissionProfile` body 双向等价，则优先发送 `permissions: { type: "profile", id, modifications }` 且不发送 `sandboxPolicy`，即使 canonical profile 带有 legacy sandbox 无法表达的 deny carve-outs；如果 effective cap 是 synthetic、startup-tighter、来自 mutable user-defined profile id、active selection 与 canonical body 不一致，或当前 active profile 无法无损表达，则 fallback 到 pinned legacy `sandboxPolicy`。legacy fallback 只发送协议接受的 `type`、`networkAccess`、`writableRoots` 与 workspace exclude flags，且只有 canonical profile 可安全降级为 legacy sandbox、effective read access 为 full read 时才允许；`access` / `readOnlyAccess` restricted-read shape 与 canonical `permissionProfile` 只用于解析、收紧计算和 drift/audit，不写入 `turn/start`；如果 legacy fallback 需要保留 restricted read scope，则 fail-closed，因为 Codex 0.129 request-side legacy `sandboxPolicy` 无法携带这些 read restrictions；canonical `access: "none"` deny scope、任何无法用 legacy sandbox 表达的 read scope、或比 legacy readable roots 更窄的 read scope 都会在需要 legacy fallback 时 fail-closed；workspace writable root containment 先做安全规范化，含 `..` 的 root fail-closed；权限 drift 会同时比较派生布尔值与 raw `approvalPolicy` / `sandbox` / `permissionProfile` / `activePermissionProfile` 细节，并输出 warning / 写 audit record；auto-pinned session 的 proof invalidation 会保留 startup cap，但 strict-safe 投递必须等 current permission snapshot 重新刷新后才能使用记录的风险布尔值；默认 `auto` bind reattach 不把 fail-closed 初始 false 当作固定 profile，因此不会因为上一轮 auto-derived effective profile 为 true 而触发 profile-drift replacement
   - 缺失 / foreign `threadId` 的 notification 不会污染当前 bound session；snapshot path 也要求 returned `thread.id` 匹配当前 bound thread；unknown turn status、`notLoaded` 与 `systemError` 不会被折叠成 `idle`
   - websocket continuity loss、activity write failure 或 authoritative current-state snapshot 缺失时，sidecar 会通过 hidden `cli session invalidate-proof` 推进 `session_epoch` 并清空旧 activity / capability proof；daemon 短超时失败时该 invalidation 命令允许 direct-store fallback；store 对“daemon 已经推进 epoch 并清空 proof”的旧 epoch 重放返回幂等成功，避免旧 proof 只被 best-effort 清理
   - passive sidecar 的 proof 写入路径必须使用短 SQLite busy timeout，并允许 lifecycle-aware bounded retry；不能把 1s client timeout 的 passive write 交给 daemon worker 后再让 worker 按普通 30s store timeout 阻塞，否则 DB lock 下的 retry loop 会耗尽 dispatch worker；foreground 退出 / sidecar shutdown 后也不能继续重试并阻塞 cleanup。
   - websocket receive 必须用 absolute deadline 贯穿 frame header / length / mask / payload 读取、control-frame loop 和 pong 写回；连续 ping/pong 或 trickled payload 不能无限延长一次 `recv`，control frame payload 也必须限制在 125 bytes，否则 foreground 退出时 sidecar join 会延迟 app-server cleanup。
   - 默认 `--auto-delivery-policy off` 时，sidecar 只记录 partial passive capability proof：existing-thread path 记录 `thread_resume=true`、`current_state_sync=true`；fresh unmaterialized `--new-thread` path 记录 `thread_start=true`、`current_state_sync=true`。两者都不会把 `turn_start` 或 terminal-event proof 标成 true，因此不会绕过当前最小 delivery gate
   - 显式 `--auto-delivery-policy trusted-all` 时，sidecar 会记录当前 epoch 的完整 automatic delivery capability，按 2 秒 poll interval 等待 durable idle proof，写入 accept-pending barrier 与 audit records，然后发送带唯一 marker 的 `turn/start`；acceptance response 最多等待 60 秒，用于容忍真实 app-server / model cold-start 或短时排队延迟
-  - accepted `turn.id` 会立即通过 `accept-cli` 进入 6 小时 v1 observation window；matching completed notification 关闭 batch 为 `delivered`，missed notification 可通过同一 websocket/session epoch 下的 `thread/read(includeTurns=true)` reconcile 收口
+  - accepted `turn.id` 会立即通过 `accept-cli` 进入 6 小时 v1 observation window；matching completed notification 关闭 batch 为 `delivered`，missed notification 优先通过同一 websocket/session epoch 下的 Codex 0.130 `thread/turns/list` + `itemsView=notLoaded` reconcile 收口；如果该 experimental method 返回 unsupported、分页内找不到 accepted turn，或需要旧协议兼容，则退回 `thread/read(includeTurns=true)`
   - accepted-turn observation window 由 accepted `turn.id` 主导，非终态 proof-only notification 不得废弃已 accepted attempt；fresh first-turn materialization 前 `thread/read(includeTurns=true)` 返回 `not materialized` / `includeTurns is unavailable before first user message` / `no rollout found` 时只表示本次 reconcile 暂无证据，不能自动 manualize
   - matching failed/interrupted/replaced terminal evidence 会 fail-close 到 `manual_resolution_only`
   - clear pre-accept rejection 会写入 `delivery_rpc_state=rejected_before_accept`，不递增 attempt count；timeout / closed / protocol ambiguity 不重发，保留 `accept_pending` 给 stale sweep 标成 `unknown + manual_resolution_only`
@@ -740,7 +821,7 @@ v1 范围外：
 - `turn/start` 返回 `turn.id` 后，adapter 会在有界窗口内重试幂等 `accept-cli` 持久化，并允许 daemon IPC 失败后的 direct-store fallback；只有在无法持久化 accepted turn id 后才 fail-closed。
 - `turn/start` 已被接受后，accepted-turn observation 是高优先级路径：accepted / started / terminal audit 记录为 best-effort；matching terminal evidence 会先写入 `attempt observe-cli-turn`，再做 passive activity bookkeeping / resync，避免审计或 activity 写入失败覆盖真实完成证据。
 - matching terminal evidence 的 `observe-cli-turn` 持久化同样使用有界重试与 direct-store fallback，避免已观察到的 accepted-turn completion 因 1 秒 daemon IPC/store timeout 被丢弃。
-- `thread/read(includeTurns=true)` reconcile 同时兼容 nested `thread.turns` 与真实 app-server 可能返回的 top-level `turns`，前提是 `thread.id` / top-level `id` 仍匹配 bound thread。
+- `thread/turns/list` reconcile 只读取 turn page 与 status，不加载 full item payload；`thread/read(includeTurns=true)` fallback 仍兼容 nested `thread.turns` 与真实 app-server 可能返回的 top-level `turns`，前提是 `thread.id` / top-level `id` 仍匹配 bound thread。
 - accepted-turn observation loop 也受 accepted attempt 的 `delivery_observation_deadline` 约束；本地 deadline 到期会触发一次 best-effort sweep / proof refresh 后退出观察，避免前台进程长期存活时旧 attempt 阻塞后续 head batch。
 - sidecar shutdown 是 `turn/start` 前的硬门禁：passive loop 在每次 auto-delivery poll 前重新检查 stop flag；如果 `begin-cli-accept` 后、真正发送 `turn/start` 前进入 shutdown，会写入 pre-accept rejection 并保留 batch 可重试，而不是在关闭窗口里继续发 side-effectful RPC。
 - 同一 pre-start cleanup 也覆盖 `begin-cli-accept` 后、`turn/start` 前的 prompt 构造 / attempt-start audit / response parsing 失败：这些失败都必须先 best-effort `reject-cli-before-accept`，避免从未发出 RPC 的 attempt 之后被 stale sweep 当作 unknown manualize。

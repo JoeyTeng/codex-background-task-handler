@@ -30,13 +30,21 @@ fn write_fake_codex_script(path: &Path) -> PathBuf {
     fs::write(
         path,
         r#"#!/bin/sh
-log="${FAKE_CODEX_LOG:?}"
-if [ "${1:-}" = "app-server" ]; then
+	log="${FAKE_CODEX_LOG:?}"
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' "${FAKE_CODEX_VERSION:-codex-cli 0.130.0}"
+  exit 0
+fi
+
+	if [ "${1:-}" = "app-server" ]; then
   printf 'app-server' >> "$log"
   for arg in "$@"; do
     printf '\t%s' "$arg" >> "$log"
   done
   printf '\n' >> "$log"
+  if [ "${FAKE_CODEX_LOG_CWD:-}" = "1" ]; then
+    printf 'app-server-cwd\t%s\n' "$(pwd)" >> "$log"
+  fi
   if [ -n "${FAKE_CODEX_APP_SERVER_PREFIX_BYTES:-}" ]; then
     i=0
     while [ "$i" -lt "$FAKE_CODEX_APP_SERVER_PREFIX_BYTES" ]; do
@@ -167,6 +175,28 @@ fn wait_for_cli_activity_state(home: &TempDir, bound_thread_id: &str, expected: 
 #[cfg(unix)]
 fn spawn_fake_app_server(thread_id: &'static str) -> (String, mpsc::Receiver<Result<(), String>>) {
     spawn_fake_app_server_with_options(thread_id, true, true, false, true, Duration::from_secs(5))
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_for_listing(
+    thread_id: &'static str,
+    cwd: &'static str,
+    title: &'static str,
+) -> (String, mpsc::Sender<()>, mpsc::Receiver<Result<(), String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = accept_fake_app_server_for_listing(&listener, &stop_rx, thread_id, cwd, title);
+        let _ = done_tx.send(result);
+    });
+
+    (url, stop_tx, done_rx)
 }
 
 #[cfg(unix)]
@@ -381,6 +411,8 @@ enum FakeAutoDeliveryOutcome {
     FreshUnmaterializedCompletedNotification,
     TwoCompletedNotifications,
     CompletedReconcile,
+    TurnsListUnsupportedThenCompletedReconcile,
+    TurnsListTimeoutThenCompletedReconcile,
     ProofInvalidationThenCompletedNotification,
     FreshUnmaterializedReadErrorThenCompletedNotification,
     FailedNotification,
@@ -392,17 +424,53 @@ enum FakeAutoDeliveryOutcome {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy)]
-enum FakeThreadStartOutcome {
-    Success,
-    MethodNotFound,
-    Timeout,
-    ClosedBeforeResponse,
-    MalformedResponse,
+type FakeMethodsReceiver = mpsc::Receiver<Result<Vec<String>, String>>;
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct FakePassiveCapture {
+    methods: Vec<String>,
+    resume_params: Option<serde_json::Value>,
 }
 
 #[cfg(unix)]
-fn spawn_fake_app_server_new_thread_then_capture_passive_methods(
+type FakePassiveCaptureReceiver = mpsc::Receiver<Result<FakePassiveCapture, String>>;
+
+#[cfg(unix)]
+fn spawn_fake_app_server_foreground_thread_then_capture_passive(
+    thread_id: &'static str,
+    observe_duration: Duration,
+) -> (String, FakePassiveCaptureReceiver) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
+    listener
+        .set_nonblocking(true)
+        .expect("set fake app-server nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("local address"));
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = (|| {
+            let mut methods =
+                accept_fake_app_server_foreground_thread_started(&listener, thread_id)?;
+            let mut passive = accept_fake_app_server_capture_passive(
+                &listener,
+                thread_id,
+                observe_duration,
+                true,
+                true,
+            )?;
+            methods.append(&mut passive.methods);
+            passive.methods = methods;
+            Ok(passive)
+        })();
+        let _ = done_tx.send(result);
+    });
+
+    (url, done_rx)
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_foreground_thread_then_capture_passive_methods(
     thread_id: &'static str,
     observe_duration: Duration,
 ) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
@@ -415,11 +483,8 @@ fn spawn_fake_app_server_new_thread_then_capture_passive_methods(
 
     thread::spawn(move || {
         let result = (|| {
-            let mut methods = accept_fake_app_server_thread_start(
-                &listener,
-                thread_id,
-                FakeThreadStartOutcome::Success,
-            )?;
+            let mut methods =
+                accept_fake_app_server_foreground_thread_started(&listener, thread_id)?;
             let mut passive_methods = accept_fake_app_server_capture_passive_methods(
                 &listener,
                 thread_id,
@@ -437,6 +502,17 @@ fn spawn_fake_app_server_new_thread_then_capture_passive_methods(
 }
 
 #[cfg(unix)]
+fn spawn_fake_app_server_foreground_thread_then_methods(
+    thread_id: &'static str,
+    observe_duration: Duration,
+) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
+    spawn_fake_app_server_foreground_thread_then_capture_passive_methods(
+        thread_id,
+        observe_duration,
+    )
+}
+
+#[cfg(unix)]
 fn spawn_fake_app_server_new_thread_then_auto_delivery(
     thread_id: &'static str,
     outcome: FakeAutoDeliveryOutcome,
@@ -450,11 +526,8 @@ fn spawn_fake_app_server_new_thread_then_auto_delivery(
 
     thread::spawn(move || {
         let result = (|| {
-            let mut methods = accept_fake_app_server_thread_start(
-                &listener,
-                thread_id,
-                FakeThreadStartOutcome::Success,
-            )?;
+            let mut methods =
+                accept_fake_app_server_foreground_thread_started(&listener, thread_id)?;
             let mut auto_methods =
                 accept_fake_app_server_auto_delivery(&listener, thread_id, outcome)?;
             methods.append(&mut auto_methods);
@@ -467,10 +540,7 @@ fn spawn_fake_app_server_new_thread_then_auto_delivery(
 }
 
 #[cfg(unix)]
-fn spawn_fake_app_server_thread_start_outcome(
-    thread_id: &'static str,
-    outcome: FakeThreadStartOutcome,
-) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
+fn spawn_fake_foreground_discovery_closed() -> (String, FakeMethodsReceiver) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
     listener
         .set_nonblocking(true)
@@ -479,7 +549,7 @@ fn spawn_fake_app_server_thread_start_outcome(
     let (done_tx, done_rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let result = accept_fake_app_server_thread_start(&listener, thread_id, outcome);
+        let result = accept_fake_app_server_foreground_thread_discovery_closed(&listener);
         let _ = done_tx.send(result);
     });
 
@@ -627,6 +697,93 @@ fn accept_fake_app_server_capture_initial_resume(
         return Err("fake app-server did not receive thread/read".to_owned());
     }
     captured_resume_params.ok_or_else(|| "fake app-server did not receive thread/resume".to_owned())
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_for_listing(
+    listener: &TcpListener,
+    stop_rx: &mpsc::Receiver<()>,
+    thread_id: &str,
+    cwd: &str,
+    title: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            return Ok(());
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                handle_fake_app_server_listing_client(&mut stream, thread_id, cwd, title)?
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err("timed out waiting for listing app-server clients".to_owned());
+            }
+            Err(error) => return Err(format!("accept fake app-server websocket: {error}")),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn handle_fake_app_server_listing_client(
+    stream: &mut TcpStream,
+    thread_id: &str,
+    cwd: &str,
+    title: &str,
+) -> Result<(), String> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set fake app-server stream blocking: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("set fake app-server read timeout: {error}"))?;
+    let websocket_accept = read_fake_http_upgrade(stream)?;
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("write fake app-server handshake: {error}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_thread_read = false;
+    while !saw_thread_read && Instant::now() < deadline {
+        let message = read_fake_client_text_frame(stream)?;
+        let method = message
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match method {
+            "initialize" => write_fake_json_response(
+                stream,
+                &message,
+                serde_json::json!({
+                    "userAgent": "fake-codex",
+                    "codexHome": "/tmp/fake-codex-home",
+                    "platformFamily": "unix",
+                    "platformOs": "macos"
+                }),
+            )?,
+            "initialized" => {}
+            "thread/resume" => {
+                write_fake_thread_response_with_title(stream, &message, thread_id, cwd, title)?
+            }
+            "thread/read" => {
+                write_fake_thread_response_with_title(stream, &message, thread_id, cwd, title)?;
+                saw_thread_read = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_thread_read {
+        return Err("fake app-server listing client did not receive thread/read".to_owned());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -783,11 +940,42 @@ fn accept_fake_app_server(
 }
 
 #[cfg(unix)]
-fn accept_fake_app_server_thread_start(
+fn accept_fake_app_server_foreground_thread_started(
     listener: &TcpListener,
     thread_id: &'static str,
-    outcome: FakeThreadStartOutcome,
 ) -> Result<Vec<String>, String> {
+    let (methods, mut stream) = accept_fake_app_server_foreground_discovery_connection(listener)?;
+    write_fake_server_text_frame(
+        stream
+            .as_mut()
+            .ok_or_else(|| "foreground discovery stream already closed".to_owned())?,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "thread/started",
+            "params": {
+                "threadId": thread_id,
+                "thread": {
+                    "id": thread_id,
+                    "source": "fake-foreground"
+                }
+            }
+        }),
+    )?;
+    Ok(methods)
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_foreground_thread_discovery_closed(
+    listener: &TcpListener,
+) -> Result<Vec<String>, String> {
+    let (methods, _stream) = accept_fake_app_server_foreground_discovery_connection(listener)?;
+    Ok(methods)
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_foreground_discovery_connection(
+    listener: &TcpListener,
+) -> Result<(Vec<String>, Option<TcpStream>), String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let (mut stream, _) = loop {
         match listener.accept() {
@@ -797,7 +985,7 @@ fn accept_fake_app_server_thread_start(
             }
             Err(error) => {
                 return Err(format!(
-                    "accept fake bootstrap app-server websocket: {error}"
+                    "accept fake foreground discovery websocket: {error}"
                 ));
             }
         }
@@ -805,17 +993,17 @@ fn accept_fake_app_server_thread_start(
 
     stream
         .set_nonblocking(false)
-        .map_err(|error| format!("set fake bootstrap app-server stream blocking: {error}"))?;
+        .map_err(|error| format!("set fake foreground discovery stream blocking: {error}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
-        .map_err(|error| format!("set fake bootstrap app-server read timeout: {error}"))?;
+        .map_err(|error| format!("set fake foreground discovery read timeout: {error}"))?;
     let websocket_accept = read_fake_http_upgrade(&mut stream)?;
     let response = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
     );
     stream
         .write_all(response.as_bytes())
-        .map_err(|error| format!("write fake bootstrap app-server handshake: {error}"))?;
+        .map_err(|error| format!("write fake foreground discovery handshake: {error}"))?;
 
     let mut methods = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -833,56 +1021,12 @@ fn accept_fake_app_server_thread_start(
                     "platformOs": "macos"
                 }),
             )?,
-            "initialized" => {}
-            "thread/start" => {
-                let cwd = message
-                    .get("params")
-                    .and_then(|params| params.get("cwd"))
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| format!("thread/start missing cwd: {message}"))?;
-                if cwd.is_empty() {
-                    return Err("thread/start cwd was empty".to_owned());
-                }
-                match outcome {
-                    FakeThreadStartOutcome::Success => {
-                        write_fake_json_response(
-                            &mut stream,
-                            &message,
-                            serde_json::json!({
-                                "thread": {
-                                    "id": thread_id,
-                                    "source": "fake-thread-start"
-                                }
-                            }),
-                        )?;
-                        return Ok(methods);
-                    }
-                    FakeThreadStartOutcome::MethodNotFound => {
-                        write_fake_json_error(&mut stream, &message, -32601, "method not found")?;
-                        return Ok(methods);
-                    }
-                    FakeThreadStartOutcome::Timeout => {
-                        thread::sleep(Duration::from_secs(6));
-                        return Ok(methods);
-                    }
-                    FakeThreadStartOutcome::ClosedBeforeResponse => {
-                        return Ok(methods);
-                    }
-                    FakeThreadStartOutcome::MalformedResponse => {
-                        write_fake_json_response(
-                            &mut stream,
-                            &message,
-                            serde_json::json!({ "thread": {} }),
-                        )?;
-                        return Ok(methods);
-                    }
-                }
-            }
+            "initialized" => return Ok((methods, Some(stream))),
             _ => {}
         }
     }
     Err(format!(
-        "fake bootstrap app-server did not receive thread/start; methods seen: {methods:?}"
+        "fake foreground discovery did not initialize; methods seen: {methods:?}"
     ))
 }
 
@@ -894,6 +1038,24 @@ fn accept_fake_app_server_capture_passive_methods(
     include_permissions: bool,
     resume_include_turns: bool,
 ) -> Result<Vec<String>, String> {
+    accept_fake_app_server_capture_passive(
+        listener,
+        thread_id,
+        observe_duration,
+        include_permissions,
+        resume_include_turns,
+    )
+    .map(|capture| capture.methods)
+}
+
+#[cfg(unix)]
+fn accept_fake_app_server_capture_passive(
+    listener: &TcpListener,
+    thread_id: &'static str,
+    observe_duration: Duration,
+    include_permissions: bool,
+    resume_include_turns: bool,
+) -> Result<FakePassiveCapture, String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let (mut stream, _) = loop {
         match listener.accept() {
@@ -920,6 +1082,7 @@ fn accept_fake_app_server_capture_passive_methods(
         .map_err(|error| format!("write fake app-server handshake: {error}"))?;
 
     let mut methods = Vec::new();
+    let mut resume_params = None;
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut saw_thread_read = false;
     while !saw_thread_read && Instant::now() < deadline {
@@ -937,13 +1100,16 @@ fn accept_fake_app_server_capture_passive_methods(
                 }),
             )?,
             "initialized" => {}
-            "thread/resume" => write_fake_thread_response_with_permissions(
-                &mut stream,
-                &message,
-                thread_id,
-                resume_include_turns,
-                include_permissions,
-            )?,
+            "thread/resume" => {
+                resume_params = message.get("params").cloned();
+                write_fake_thread_response_with_permissions(
+                    &mut stream,
+                    &message,
+                    thread_id,
+                    resume_include_turns,
+                    include_permissions,
+                )?;
+            }
             "thread/read" => {
                 write_fake_thread_response(&mut stream, &message, thread_id, true)?;
                 saw_thread_read = true;
@@ -970,7 +1136,10 @@ fn accept_fake_app_server_capture_passive_methods(
         }
     }
 
-    Ok(methods)
+    Ok(FakePassiveCapture {
+        methods,
+        resume_params,
+    })
 }
 
 #[cfg(unix)]
@@ -1074,8 +1243,12 @@ fn accept_fake_app_server_auto_delivery_with_options(
                         "completed",
                     )?;
                     terminal_count += 1;
-                } else if matches!(outcome, FakeAutoDeliveryOutcome::CompletedReconcile)
-                    && methods.iter().any(|method| method == "turn/start")
+                } else if matches!(
+                    outcome,
+                    FakeAutoDeliveryOutcome::CompletedReconcile
+                        | FakeAutoDeliveryOutcome::TurnsListUnsupportedThenCompletedReconcile
+                        | FakeAutoDeliveryOutcome::TurnsListTimeoutThenCompletedReconcile
+                ) && methods.iter().any(|method| method == "turn/start")
                 {
                     let turn_id = fake_auto_delivery_turn_id(turn_start_count);
                     write_fake_thread_turn_response(
@@ -1103,6 +1276,63 @@ fn accept_fake_app_server_auto_delivery_with_options(
                         }
                     }
                     write_fake_thread_response(&mut stream, &message, thread_id, true)?;
+                }
+            }
+            "thread/turns/list" => {
+                if matches!(outcome, FakeAutoDeliveryOutcome::CompletedReconcile)
+                    && methods.iter().any(|method| method == "turn/start")
+                {
+                    let turn_id = fake_auto_delivery_turn_id(turn_start_count);
+                    write_fake_thread_turns_list_response(
+                        &mut stream,
+                        &message,
+                        &turn_id,
+                        "completed",
+                    )?;
+                    terminal_count += 1;
+                } else if matches!(
+                    outcome,
+                    FakeAutoDeliveryOutcome::TurnsListUnsupportedThenCompletedReconcile
+                ) && methods.iter().any(|method| method == "turn/start")
+                {
+                    write_fake_json_error(
+                        &mut stream,
+                        &message,
+                        -32601,
+                        "thread/turns/list is not supported yet",
+                    )?;
+                } else if matches!(
+                    outcome,
+                    FakeAutoDeliveryOutcome::TurnsListTimeoutThenCompletedReconcile
+                ) && methods.iter().any(|method| method == "turn/start")
+                {
+                    thread::sleep(Duration::from_millis(3500));
+                } else if matches!(
+                    outcome,
+                    FakeAutoDeliveryOutcome::FreshUnmaterializedReadErrorThenCompletedNotification
+                ) && methods.iter().any(|method| method == "turn/start")
+                    && terminal_count == 0
+                {
+                    write_fake_json_error(
+                        &mut stream,
+                        &message,
+                        -32600,
+                        "thread thread-fresh is not materialized yet; includeTurns is unavailable before first user message",
+                    )?;
+                    let turn_id = fake_auto_delivery_turn_id(turn_start_count);
+                    write_fake_turn_completed_notification(
+                        &mut stream,
+                        thread_id,
+                        &turn_id,
+                        "completed",
+                    )?;
+                    terminal_count += 1;
+                } else {
+                    write_fake_json_response(
+                        &mut stream,
+                        &message,
+                        serde_json::json!({ "data": [], "nextCursor": null }),
+                    )?;
                 }
             }
             "turn/start" => {
@@ -1188,6 +1418,8 @@ fn accept_fake_app_server_auto_delivery_with_options(
                     | FakeAutoDeliveryOutcome::FreshUnmaterializedCompletedNotification
                     | FakeAutoDeliveryOutcome::TwoCompletedNotifications
                     | FakeAutoDeliveryOutcome::CompletedReconcile
+                    | FakeAutoDeliveryOutcome::TurnsListUnsupportedThenCompletedReconcile
+                    | FakeAutoDeliveryOutcome::TurnsListTimeoutThenCompletedReconcile
                     | FakeAutoDeliveryOutcome::ProofInvalidationThenCompletedNotification
                     | FakeAutoDeliveryOutcome::FreshUnmaterializedReadErrorThenCompletedNotification
                     | FakeAutoDeliveryOutcome::FailedNotification
@@ -1252,6 +1484,8 @@ fn accept_fake_app_server_auto_delivery_with_options(
                                 terminal_count += 1;
                             }
                             FakeAutoDeliveryOutcome::CompletedReconcile
+                            | FakeAutoDeliveryOutcome::TurnsListUnsupportedThenCompletedReconcile
+                            | FakeAutoDeliveryOutcome::TurnsListTimeoutThenCompletedReconcile
                             | FakeAutoDeliveryOutcome::FreshUnmaterializedReadErrorThenCompletedNotification
                             | FakeAutoDeliveryOutcome::RejectedBeforeAccept
                             | FakeAutoDeliveryOutcome::ClosedBeforeAccept => {}
@@ -1835,6 +2069,31 @@ fn write_fake_thread_response(
 }
 
 #[cfg(unix)]
+fn write_fake_thread_response_with_title(
+    stream: &mut TcpStream,
+    request: &serde_json::Value,
+    thread_id: &str,
+    cwd: &str,
+    title: &str,
+) -> Result<(), String> {
+    write_fake_json_response(
+        stream,
+        request,
+        serde_json::json!({
+            "thread": {
+                "id": thread_id,
+                "title": title,
+                "status": { "type": "idle" },
+                "turns": []
+            },
+            "cwd": cwd,
+            "model": "fake-model",
+            "modelProvider": "openai"
+        }),
+    )
+}
+
+#[cfg(unix)]
 fn write_fake_thread_response_with_permissions(
     stream: &mut TcpStream,
     request: &serde_json::Value,
@@ -1864,12 +2123,23 @@ fn write_fake_thread_response_with_permissions(
         response["approvalsReviewer"] = serde_json::json!("user");
         response["sandbox"] = serde_json::json!({
             "type": "readOnly",
-            "access": {
-                "type": "restricted",
-                "includePlatformDefaults": true,
-                "readableRoots": ["/tmp/fake-cwd"]
-            },
             "networkAccess": false
+        });
+        response["permissionProfile"] = serde_json::json!({
+            "type": "managed",
+            "network": { "enabled": false },
+            "fileSystem": {
+                "type": "restricted",
+                "entries": [
+                    {
+                        "path": {
+                            "type": "special",
+                            "value": { "kind": "root" }
+                        },
+                        "access": "read"
+                    }
+                ]
+            }
         });
     }
     write_fake_json_response(stream, request, response)
@@ -1894,6 +2164,25 @@ fn write_fake_thread_turn_response(
                     { "id": turn_id, "status": status, "items": [] }
                 ]
             }
+        }),
+    )
+}
+
+#[cfg(unix)]
+fn write_fake_thread_turns_list_response(
+    stream: &mut TcpStream,
+    request: &serde_json::Value,
+    turn_id: &str,
+    status: &str,
+) -> Result<(), String> {
+    write_fake_json_response(
+        stream,
+        request,
+        serde_json::json!({
+            "data": [
+                { "id": turn_id, "status": status, "items": [], "itemsView": "notLoaded" }
+            ],
+            "nextCursor": null
         }),
     )
 }
@@ -2028,6 +2317,17 @@ fn wait_for_fake_app_server_methods(
 ) -> Vec<String> {
     match done_rx.recv_timeout(Duration::from_secs(10)) {
         Ok(Ok(methods)) => methods,
+        Ok(Err(error)) => panic!("fake app-server failed: {error}"),
+        Err(error) => panic!("timed out waiting for fake app-server: {error}"),
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_fake_app_server_passive_capture(
+    done_rx: FakePassiveCaptureReceiver,
+) -> FakePassiveCapture {
+    match done_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(capture)) => capture,
         Ok(Err(error)) => panic!("fake app-server failed: {error}"),
         Err(error) => panic!("timed out waiting for fake app-server: {error}"),
     }
@@ -2363,18 +2663,139 @@ fn cli_run_binds_session_starts_foreground_codex_and_stops_app_server() {
 
 #[cfg(unix)]
 #[test]
-fn cbth_resume_launches_codex_resume_with_remote_and_cwd() {
+fn cli_app_servers_lists_running_managed_app_server_as_json_and_human() {
     let home = temp_home();
     let client_cwd = tempfile::tempdir().expect("client cwd");
     let script_dir = tempfile::tempdir().expect("script dir");
     let fake_codex = fake_codex_script(&script_dir);
     let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cli-app-server-list";
+    let thread_cwd = "/tmp/fake-list-cwd";
+    let thread_title = "Fake Listing Thread";
+    let (app_server_url, stop_server_tx, server_done) =
+        spawn_fake_app_server_for_listing(thread_id, thread_cwd, thread_title);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg(thread_id)
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "3")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cbth cli run");
+
+    wait_for_log_contains(&log_path, "foreground\t--remote");
+    wait_for_cli_activity_state(&home, thread_id, "idle");
+
+    let json_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("app-servers")
+        .output()
+        .expect("run app-servers json");
+    assert!(
+        json_output.status.success(),
+        "app-servers json failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&json_output.stdout),
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&json_output.stdout).expect("app-servers json");
+    let servers = json["cli_app_servers"].as_array().expect("servers array");
+    assert_eq!(servers.len(), 1, "unexpected app-server list: {json}");
+    let server = &servers[0];
+    assert_eq!(server["codex_session_id"], thread_id);
+    assert_eq!(server["ws_url"], app_server_url);
+    assert_eq!(server["cwd"], thread_cwd);
+    assert_eq!(server["title"], thread_title);
+    assert!(
+        server["session_epoch"]
+            .as_i64()
+            .is_some_and(|epoch| epoch > 0)
+    );
+    assert!(
+        server["started_at_local"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+
+    let human_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("app-servers")
+        .arg("--format")
+        .arg("human")
+        .output()
+        .expect("run app-servers human");
+    assert!(
+        human_output.status.success(),
+        "app-servers human failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&human_output.stdout),
+        String::from_utf8_lossy(&human_output.stderr)
+    );
+    let human = String::from_utf8_lossy(&human_output.stdout);
+    assert!(human.contains(thread_title));
+    assert!(human.contains(thread_id));
+    assert!(human.contains(&app_server_url));
+    assert!(human.contains(thread_cwd));
+    assert!(human.contains("started:"));
+
+    let output = wait_with_timeout(child, Duration::from_secs(10));
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = stop_server_tx.send(());
+    let server_result = server_done
+        .recv_timeout(Duration::from_secs(2))
+        .expect("fake listing server result");
+    assert!(
+        server_result.is_ok(),
+        "fake server failed: {server_result:?}"
+    );
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_without_explicit_cd_preserves_native_resume_cwd_choice() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cli-resume";
+    let (app_server_url, captured_resume) = spawn_fake_app_server_capture_initial_resume(thread_id);
 
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("--home")
         .arg(home.path())
         .arg("resume")
-        .arg("thread-cli-resume")
+        .arg(thread_id)
         .arg("--codex-bin")
         .arg(&fake_codex)
         .arg("--")
@@ -2382,6 +2803,8 @@ fn cbth_resume_launches_codex_resume_with_remote_and_cwd() {
         .arg("gpt-test")
         .current_dir(client_cwd.path())
         .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "1")
         .output()
         .expect("run cbth resume");
 
@@ -2395,13 +2818,23 @@ fn cbth_resume_launches_codex_resume_with_remote_and_cwd() {
 
     let log = fs::read_to_string(&log_path).expect("read fake codex log");
     assert!(log.contains("app-server\tapp-server\t--listen\tws://127.0.0.1:0"));
-    assert!(
-        log.contains(
-            "foreground\tresume\tthread-cli-resume\t--remote\tws://127.0.0.1:45678\t--cd\t"
-        )
-    );
-    assert!(log.contains(&client_cwd.path().display().to_string()));
+    assert!(log.contains(&format!(
+        "foreground\tresume\tthread-cli-resume\t--remote\t{app_server_url}"
+    )));
+    assert!(!log.contains("\t--cd\t"));
     assert!(log.contains("\t--model\tgpt-test"));
+    let params = match captured_resume.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(params)) => params,
+        Ok(Err(error)) => panic!("fake app-server failed: {error}"),
+        Err(error) => panic!("timed out waiting for fake app-server: {error}"),
+    };
+    assert_eq!(params["threadId"], serde_json::json!(thread_id));
+    assert!(
+        params.get("cwd").is_none(),
+        "unexpected cwd in params: {params}"
+    );
+    assert_eq!(params["model"], serde_json::json!("gpt-test"));
+    assert_eq!(params["persistExtendedHistory"], serde_json::json!(true));
 
     stop_daemon(&home);
 }
@@ -2433,10 +2866,6 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
         .arg("gpt-test")
         .arg("--profile")
         .arg("work")
-        .arg("--sandbox")
-        .arg("read-only")
-        .arg("--ask-for-approval")
-        .arg("never")
         .arg("--cd")
         .arg("subdir")
         .current_dir(client_cwd.path())
@@ -2468,8 +2897,6 @@ fn cbth_resume_initial_sidecar_resume_carries_foreground_overrides() {
     );
     assert_eq!(params["model"], serde_json::json!("gpt-test"));
     assert_eq!(params["config"]["profile"], serde_json::json!("work"));
-    assert_eq!(params["sandbox"], serde_json::json!("read-only"));
-    assert_eq!(params["approvalPolicy"], serde_json::json!("never"));
     assert_eq!(params["persistExtendedHistory"], serde_json::json!(true));
 
     let log = fs::read_to_string(&log_path).expect("read fake codex log");
@@ -2530,6 +2957,414 @@ fn cbth_resume_rejects_forwarded_add_dir() {
 
 #[cfg(unix)]
 #[test]
+fn cbth_resume_rejects_permission_affecting_config_overrides() {
+    let cases = [
+        vec![
+            "--config",
+            "sandbox_workspace_write.writable_roots=[\"/tmp/extra\"]",
+        ],
+        vec!["--config=sandbox_workspace_write.network_access=true"],
+        vec!["-c", "sandbox_read_only.readable_roots=[\"/tmp/read\"]"],
+        vec!["-csandbox-workspace-write.exclude-slash-tmp=false"],
+        vec!["--config=approval_policy=\"never\""],
+        vec!["--config=\"sandbox_mode\"=\"workspace-write\""],
+        vec!["--config=sandbox_mode=\"workspace-write\""],
+        vec!["--config", "sandbox_permissions.mode=\"workspace-write\""],
+        vec!["--config=permissions.network.enabled=true"],
+        vec!["-cpermissions.file_system.entries=[]"],
+        vec!["--config=permission_profile.network.enabled=true"],
+        vec!["--config=activePermissionProfile.id=\":workspace\""],
+        vec!["--config=default_permissions=\"read-only\""],
+        vec!["-cdefault-permissions=\"workspace-write\""],
+        vec!["--config=defaultPermissions=\"trusted-all\""],
+        vec!["--config=profiles.temp.sandbox_mode=\"danger-full-access\""],
+        vec![
+            "--config",
+            "profiles={temp={sandbox_mode=\"danger-full-access\"}}",
+        ],
+        vec!["--config=projects.\"/tmp/project\".trust_level=\"trusted\""],
+        vec![
+            "--config",
+            "projects={\"/tmp/project\"={trust_level=\"trusted\"}}",
+        ],
+        vec!["--config=trust_level=\"trusted\""],
+        vec!["--config=use_legacy_landlock=true"],
+        vec!["-cuse-legacy-landlock=true"],
+        vec!["--config=request_permissions=true"],
+        vec!["--config=features.web_search=true"],
+        vec!["--config=features.use_legacy_landlock=true"],
+        vec!["--config=features.request_permissions=true"],
+        vec!["--config=features.experimental=true"],
+        vec!["--config", "features={web_search=true}"],
+        vec!["--config=web_search=\"live\""],
+        vec!["--config=tools.\"web_search\".context_size=\"high\""],
+        vec!["--config=\"tools\".\"web_search\".context_size=\"high\""],
+        vec!["--config=tools.web_search.context_size=\"high\""],
+        vec!["--config", "tools={web_search={context_size=\"high\"}}"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-config-sandbox-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("managed resume does not allow forwarded --config sandbox/permission"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_unmirrored_config_overrides() {
+    let cases = [
+        vec!["--config=model_reasoning_effort=\"high\""],
+        vec!["--config=model-reasoning-summary=\"auto\""],
+        vec!["--config=unknown_key=true"],
+        vec!["--config", "unknown-key=true"],
+        vec!["--config", "unknown_key"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-config-unmirrored-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("managed resume does not allow forwarded --config override"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_forwarded_permission_policy_overrides() {
+    let cases = [
+        vec!["--sandbox", "read-only"],
+        vec!["--sandbox=read-only"],
+        vec!["-s", "read-only"],
+        vec!["-sread-only"],
+        vec!["--ask-for-approval", "never"],
+        vec!["--ask-for-approval=never"],
+        vec!["-a", "never"],
+        vec!["-anever"],
+        vec!["--dangerously-bypass-approvals-and-sandbox"],
+        vec!["--dangerously-bypass-approvals-and-sandbox=true"],
+        vec!["--full-auto"],
+        vec!["--full-auto=true"],
+        vec!["--yolo"],
+        vec!["--yolo=true"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-permission-override-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("managed resume does not allow forwarded"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_forwarded_provider_overrides() {
+    let cases = [
+        vec!["--oss"],
+        vec!["--oss=true"],
+        vec!["--local-provider", "ollama"],
+        vec!["--local-provider=ollama"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-provider-override-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("provider overrides"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_forwarded_thread_selectors() {
+    let cases = [
+        vec!["--last"],
+        vec!["--last=true"],
+        vec!["--all"],
+        vec!["--all=true"],
+        vec!["--include-non-interactive"],
+        vec!["--include-non-interactive=true"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-selector-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("native resume selectors"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_post_prompt_forwarded_options() {
+    let cases = [
+        vec!["please help", "--sandbox", "danger-full-access"],
+        vec!["please help", "--search"],
+        vec!["please help", "-C", "/tmp"],
+        vec!["please help", "--profile", "broad"],
+        vec!["please help", "--config", "model=\"gpt-test\""],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-post-prompt-option-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("after the resume prompt"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_resume_rejects_forwarded_live_web_search() {
+    let cases = [
+        vec!["--search"],
+        vec!["--search=true"],
+        vec!["--enable", "web_search"],
+        vec!["--enable=web-search"],
+        vec!["--enable", "web_search_request"],
+        vec!["--enable=web-search-request"],
+        vec!["--enable", "use_legacy_landlock"],
+        vec!["--enable=request_permissions"],
+        vec!["--disable", "use_legacy_landlock"],
+        vec!["--disable=request_permissions"],
+    ];
+
+    for (index, args) in cases.into_iter().enumerate() {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("resume")
+            .arg(format!("thread-cli-resume-search-{index}"))
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .arg("--")
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth resume");
+
+        assert!(
+            !output.status.success(),
+            "cbth resume unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("managed resume does not allow forwarded"),
+            "unexpected stderr: {stderr}"
+        );
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn cbth_resume_invalid_forwarded_args_do_not_start_app_server() {
     let home = temp_home();
     let client_cwd = tempfile::tempdir().expect("client cwd");
@@ -2558,7 +3393,10 @@ fn cbth_resume_invalid_forwarded_args_do_not_start_app_server() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported codex sandbox override"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("managed resume does not allow forwarded --sandbox")
+    );
     let log = fs::read_to_string(&log_path).unwrap_or_default();
     assert!(!log.contains("app-server\tapp-server"));
     assert!(!log.contains("foreground"));
@@ -2634,7 +3472,7 @@ fn cli_run_new_thread_bootstraps_thread_then_preserves_foreground_model() {
     let log_path = script_dir.path().join("fake-codex.log");
     let thread_id = "thread-cli-new-thread";
     let (app_server_url, fake_server_done) =
-        spawn_fake_app_server_new_thread_then_capture_passive_methods(
+        spawn_fake_app_server_foreground_thread_then_capture_passive(
             thread_id,
             Duration::from_secs(1),
         );
@@ -2668,19 +3506,24 @@ fn cli_run_new_thread_bootstraps_thread_then_preserves_foreground_model() {
         String::from_utf8_lossy(&output.stderr)
             .contains("cbth: bound thread id: thread-cli-new-thread")
     );
-    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    let FakePassiveCapture {
+        methods,
+        resume_params,
+    } = wait_for_fake_app_server_passive_capture(fake_server_done);
     assert_eq!(
         methods,
         vec![
             "initialize".to_owned(),
             "initialized".to_owned(),
-            "thread/start".to_owned(),
             "initialize".to_owned(),
             "initialized".to_owned(),
             "thread/resume".to_owned(),
             "thread/read".to_owned(),
         ]
     );
+    let resume_params =
+        resume_params.expect("fake app-server did not capture thread/resume params");
+    assert_eq!(resume_params["threadId"], serde_json::json!(thread_id));
 
     let log = fs::read_to_string(&log_path).expect("read fake codex log");
     assert_eq!(
@@ -2704,6 +3547,508 @@ fn cli_run_new_thread_bootstraps_thread_then_preserves_foreground_model() {
         .expect("query managed session");
     assert_eq!(session_count, 1);
     assert_eq!(session_state, "detached");
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_discovers_foreground_thread_and_forwards_codex_args() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_foreground_thread_then_methods(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--model")
+        .arg("gpt-test")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cbth: bound thread id: thread-cbth-new")
+    );
+
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(!methods.iter().any(|method| method == "config/read"));
+    assert!(!methods.iter().any(|method| method == "thread/start"));
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains("\t--model\tgpt-test"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_launches_bootstrap_app_server_in_thread_cwd() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    fs::create_dir(client_cwd.path().join("project")).expect("create project cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-cwd";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_foreground_thread_then_methods(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--cd")
+        .arg("project")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_LOG_CWD", "1")
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with --cd");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(!methods.iter().any(|method| method == "thread/start"));
+    let expected_cwd =
+        fs::canonicalize(client_cwd.path().join("project")).expect("canonical project cwd");
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains(&format!("app-server-cwd\t{}", expected_cwd.display())));
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains(&format!("\t--cd\t{}", expected_cwd.display())));
+    assert!(!log.contains("\t--cd\tproject"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_leaves_fresh_thread_defaults_to_foreground_codex() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-flat-config";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_foreground_thread_then_methods(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with flat config/read response");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(!methods.iter().any(|method| method == "config/read"));
+    assert!(!methods.iter().any(|method| method == "thread/start"));
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_provider_override_does_not_merge_default_model_from_other_provider() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-provider";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_foreground_thread_then_methods(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--oss")
+        .arg("--local-provider")
+        .arg("ollama")
+        .arg("--model")
+        .arg("qwen2.5-coder")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with provider override");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(!methods.iter().any(|method| method == "config/read"));
+    assert!(!methods.iter().any(|method| method == "thread/start"));
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains("\t--oss"));
+    assert!(log.contains("\t--local-provider\tollama"));
+    assert!(log.contains("\t--model\tqwen2.5-coder"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_oss_accepts_config_provider_override() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-config-provider";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_foreground_thread_then_methods(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--oss")
+        .arg("-c")
+        .arg("model_provider=ollama")
+        .arg("-c")
+        .arg("model=qwen2.5-coder")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with config provider override");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(!methods.iter().any(|method| method == "thread/start"));
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains("\t--oss"));
+    assert!(log.contains("\t-c\tmodel_provider=ollama"));
+    assert!(log.contains("\t-c\tmodel=qwen2.5-coder"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_profile_override_does_not_merge_default_profile_model_config() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-profile";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_foreground_thread_then_methods(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--profile")
+        .arg("work")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with profile");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(!methods.iter().any(|method| method == "config/read"));
+    assert!(!methods.iter().any(|method| method == "thread/start"));
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains("\t--profile\twork"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_active_config_profile_does_not_merge_top_level_model_config() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-active-profile";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_foreground_thread_then_methods(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with active profile config");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(!methods.iter().any(|method| method == "config/read"));
+    assert!(!methods.iter().any(|method| method == "thread/start"));
+
+    let log = fs::read_to_string(&log_path).expect("read fake codex log");
+    assert!(log.contains("foreground\t--remote\t"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_rejects_forwarded_full_auto_before_thread_start() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--full-auto")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .output()
+        .expect("run cbth new with full-auto");
+
+    assert!(
+        !output.status.success(),
+        "cbth new unexpectedly succeeded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("managed CLI session does not support forwarded --full-auto")
+    );
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(!log.contains("app-server\tapp-server"));
+    assert!(!log.contains("foreground"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_rejects_forwarded_thread_selectors() {
+    let cases = [
+        vec!["--last"],
+        vec!["--last=true"],
+        vec!["--all"],
+        vec!["--all=true"],
+        vec!["--include-non-interactive"],
+        vec!["--include-non-interactive=true"],
+    ];
+
+    for args in cases {
+        let home = temp_home();
+        let client_cwd = tempfile::tempdir().expect("client cwd");
+        let script_dir = tempfile::tempdir().expect("script dir");
+        let fake_codex = fake_codex_script(&script_dir);
+        let log_path = script_dir.path().join("fake-codex.log");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+            .arg("--home")
+            .arg(home.path())
+            .arg("new")
+            .arg("--codex-bin")
+            .arg(&fake_codex)
+            .args(args)
+            .current_dir(client_cwd.path())
+            .env("FAKE_CODEX_LOG", &log_path)
+            .output()
+            .expect("run cbth new with thread selector");
+
+        assert!(
+            !output.status.success(),
+            "cbth new unexpectedly succeeded\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("managed fresh thread"),
+            "unexpected stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.contains("app-server\tapp-server"));
+        assert!(!log.contains("foreground"));
+        stop_daemon(&home);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_forwards_oss_without_local_provider_to_foreground_codex() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-oss-provider-default";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_foreground_thread_then_methods(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--oss")
+        .arg("--model")
+        .arg("qwen2.5-coder")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with oss without local provider");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(!methods.iter().any(|method| method == "thread/start"));
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains("\t--oss"));
+    assert!(log.contains("\t--model\tqwen2.5-coder"));
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cbth_new_forwards_oss_without_model_to_foreground_codex() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cbth-new-oss-model-default";
+    let (app_server_url, fake_server_done) =
+        spawn_fake_app_server_foreground_thread_then_methods(thread_id, Duration::from_secs(1));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("new")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .arg("--oss")
+        .arg("--local-provider")
+        .arg("ollama")
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "2")
+        .output()
+        .expect("run cbth new with oss without model");
+
+    assert!(
+        output.status.success(),
+        "cbth new failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(!methods.iter().any(|method| method == "thread/start"));
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(log.contains("foreground\t--remote\t"));
+    assert!(log.contains("\t--oss"));
+    assert!(log.contains("\t--local-provider\tollama"));
     stop_daemon(&home);
 }
 
@@ -2801,7 +4146,7 @@ fn cli_run_new_thread_trusted_all_auto_delivery_closes_delivered() {
             .contains("cbth: bound thread id: thread-cli-new-auto")
     );
     let methods = wait_for_fake_app_server_methods(fake_server_done);
-    assert!(methods.iter().any(|method| method == "thread/start"));
+    assert!(!methods.iter().any(|method| method == "thread/start"));
     assert!(methods.iter().any(|method| method == "turn/start"));
     let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
     assert_eq!(inspected["batch"]["batch"]["state"], "closed");
@@ -2812,78 +4157,67 @@ fn cli_run_new_thread_trusted_all_auto_delivery_closes_delivered() {
 
 #[cfg(unix)]
 #[test]
-fn cli_run_new_thread_bootstrap_failures_do_not_launch_foreground_or_bind_session() {
-    for (name, outcome) in [
-        ("method-not-found", FakeThreadStartOutcome::MethodNotFound),
-        ("timeout", FakeThreadStartOutcome::Timeout),
-        ("closed", FakeThreadStartOutcome::ClosedBeforeResponse),
-        ("malformed", FakeThreadStartOutcome::MalformedResponse),
-    ] {
-        let home = temp_home();
-        let script_dir = tempfile::tempdir().expect("script dir");
-        let fake_codex = fake_codex_script(&script_dir);
-        let log_path = script_dir.path().join("fake-codex.log");
-        let (app_server_url, fake_server_done) =
-            spawn_fake_app_server_thread_start_outcome("thread-unused", outcome);
+fn cli_run_new_thread_discovery_failure_does_not_bind_session() {
+    let name = "closed-before-thread-started";
+    let home = temp_home();
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let (app_server_url, fake_server_done) = spawn_fake_foreground_discovery_closed();
 
-        let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
-            .arg("--home")
-            .arg(home.path())
-            .arg("cli")
-            .arg("run")
-            .arg("--new-thread")
-            .arg("--session-allows-approval")
-            .arg("false")
-            .arg("--session-allows-network")
-            .arg("false")
-            .arg("--session-allows-write-access")
-            .arg("false")
-            .arg("--codex-bin")
-            .arg(&fake_codex)
-            .env("FAKE_CODEX_LOG", &log_path)
-            .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
-            .output()
-            .unwrap_or_else(|error| panic!("run cbth cli run --new-thread {name}: {error}"));
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--new-thread")
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "5")
+        .output()
+        .unwrap_or_else(|error| panic!("run cbth cli run --new-thread {name}: {error}"));
 
-        assert!(
-            !output.status.success(),
-            "bootstrap failure {name} unexpectedly succeeded"
-        );
-        let methods = wait_for_fake_app_server_methods(fake_server_done);
-        assert!(methods.iter().any(|method| method == "thread/start"));
-        let log = fs::read_to_string(&log_path).unwrap_or_default();
-        assert!(
-            !log.contains("foreground\t--remote"),
-            "bootstrap failure {name} launched foreground: {log}"
-        );
-        let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
-        let session_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM cli_managed_sessions", [], |row| {
-                row.get(0)
-            })
-            .expect("count managed sessions");
-        assert_eq!(
-            session_count, 0,
-            "bootstrap failure {name} created a session"
-        );
-        let status = Command::new(env!("CARGO_BIN_EXE_cbth"))
-            .arg("--home")
-            .arg(home.path())
-            .arg("daemon")
-            .arg("status")
-            .output()
-            .expect("daemon status");
-        assert!(
-            status.status.success(),
-            "daemon status failed for {name}\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&status.stdout),
-            String::from_utf8_lossy(&status.stderr)
-        );
-        let status_json: serde_json::Value =
-            serde_json::from_slice(&status.stdout).expect("status json");
-        assert_eq!(status_json["cli_app_servers"], serde_json::json!([]));
-        stop_daemon(&home);
-    }
+    assert!(
+        !output.status.success(),
+        "discovery failure {name} unexpectedly succeeded"
+    );
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(!methods.iter().any(|method| method == "thread/start"));
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let session_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cli_managed_sessions", [], |row| {
+            row.get(0)
+        })
+        .expect("count managed sessions");
+    assert_eq!(
+        session_count, 0,
+        "discovery failure {name} created a session"
+    );
+    let status = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("status")
+        .output()
+        .expect("daemon status");
+    assert!(
+        status.status.success(),
+        "daemon status failed for {name}\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status json");
+    assert_eq!(status_json["cli_app_servers"], serde_json::json!([]));
+    stop_daemon(&home);
 }
 
 #[cfg(unix)]
@@ -3524,7 +4858,7 @@ fn cli_run_trusted_all_auto_delivery_skips_manual_resolution_head_without_audit(
 
 #[cfg(unix)]
 #[test]
-fn cli_run_trusted_all_auto_delivery_thread_read_reconcile_closes_delivered() {
+fn cli_run_trusted_all_auto_delivery_turns_list_reconcile_closes_delivered() {
     let home = temp_home();
     let thread_id = "thread-cli-auto-reconcile";
     let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
@@ -3536,9 +4870,9 @@ fn cli_run_trusted_all_auto_delivery_thread_read_reconcile_closes_delivered() {
     assert!(
         methods
             .iter()
-            .filter(|method| *method == "thread/read")
+            .filter(|method| *method == "thread/turns/list")
             .count()
-            >= 2
+            >= 1
     );
 
     let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
@@ -3562,6 +4896,62 @@ fn cli_run_trusted_all_auto_delivery_thread_read_reconcile_closes_delivered() {
             .iter()
             .any(|decision| decision["decision"] == "reconciled")
     );
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_auto_delivery_falls_back_when_turns_list_is_unsupported() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-reconcile-fallback";
+    let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    let (app_server_url, fake_server_done) = spawn_fake_app_server_auto_delivery(
+        thread_id,
+        FakeAutoDeliveryOutcome::TurnsListUnsupportedThenCompletedReconcile,
+    );
+
+    run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(methods.iter().any(|method| method == "thread/turns/list"));
+    assert!(
+        methods
+            .iter()
+            .filter(|method| *method == "thread/read")
+            .count()
+            >= 2
+    );
+
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "closed");
+    assert_eq!(inspected["batch"]["batch"]["close_reason"], "delivered");
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_auto_delivery_falls_back_when_turns_list_times_out() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-reconcile-timeout";
+    let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    let (app_server_url, fake_server_done) = spawn_fake_app_server_auto_delivery(
+        thread_id,
+        FakeAutoDeliveryOutcome::TurnsListTimeoutThenCompletedReconcile,
+    );
+
+    run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(methods.iter().any(|method| method == "thread/turns/list"));
+    assert!(
+        methods
+            .iter()
+            .filter(|method| *method == "thread/read")
+            .count()
+            >= 2
+    );
+
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "closed");
+    assert_eq!(inspected["batch"]["batch"]["close_reason"], "delivered");
     stop_daemon(&home);
 }
 
@@ -3608,7 +4998,7 @@ fn cli_run_trusted_all_tolerates_fresh_read_error_during_accepted_observation() 
         String::from_utf8_lossy(&output.stderr)
     );
     let methods = wait_for_fake_app_server_methods(fake_server_done);
-    assert!(methods.iter().any(|method| method == "thread/start"));
+    assert!(!methods.iter().any(|method| method == "thread/start"));
     assert!(
         methods
             .iter()
