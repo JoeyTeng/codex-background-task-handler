@@ -552,6 +552,27 @@ pub(crate) fn thread_result_turn_status(
     ThreadActivitySnapshotOrTurnStatus::Missing
 }
 
+pub(crate) fn thread_turns_list_turn_status(
+    result: &Value,
+    turn_id: &str,
+) -> ThreadActivitySnapshotOrTurnStatus {
+    let Some(turns) = result.get("data").and_then(Value::as_array) else {
+        return ThreadActivitySnapshotOrTurnStatus::Untrusted;
+    };
+    for turn in turns {
+        if turn.get("id").and_then(Value::as_str) == Some(turn_id) {
+            let Some(status) = turn.get("status").and_then(Value::as_str) else {
+                return ThreadActivitySnapshotOrTurnStatus::Untrusted;
+            };
+            return match TurnStatusSnapshot::from_status(status) {
+                Some(status) => ThreadActivitySnapshotOrTurnStatus::Turn(status),
+                None => ThreadActivitySnapshotOrTurnStatus::Untrusted,
+            };
+        }
+    }
+    ThreadActivitySnapshotOrTurnStatus::Missing
+}
+
 fn thread_result_identifiers_match(result: &Value, bound_thread_id: &str) -> bool {
     let mut matched = false;
     for candidate in [
@@ -920,7 +941,7 @@ mod tests {
     use super::{
         AppServerJsonRpcClient, AppServerNotification, AppServerReceive, ThreadActivitySnapshot,
         ThreadActivitySnapshotOrTurnStatus, TurnStatusSnapshot, decode_notification,
-        thread_result_activity_snapshot, thread_result_turn_status,
+        thread_result_activity_snapshot, thread_result_turn_status, thread_turns_list_turn_status,
         validate_websocket_handshake_response, websocket_accept_key,
     };
 
@@ -1403,6 +1424,41 @@ mod tests {
         });
         assert_eq!(
             thread_result_turn_status(&contradictory, "thread-1", "turn-1"),
+            ThreadActivitySnapshotOrTurnStatus::Untrusted
+        );
+    }
+
+    #[test]
+    fn thread_turns_list_turn_status_reads_paginated_turns() {
+        let result = json!({
+            "data": [
+                { "id": "turn-2", "status": "inProgress", "items": [], "itemsView": "notLoaded" },
+                { "id": "turn-1", "status": "completed", "items": [], "itemsView": "notLoaded" }
+            ],
+            "nextCursor": null
+        });
+
+        assert_eq!(
+            thread_turns_list_turn_status(&result, "turn-1"),
+            ThreadActivitySnapshotOrTurnStatus::Turn(TurnStatusSnapshot::Completed)
+        );
+        assert_eq!(
+            thread_turns_list_turn_status(&result, "turn-missing"),
+            ThreadActivitySnapshotOrTurnStatus::Missing
+        );
+    }
+
+    #[test]
+    fn thread_turns_list_turn_status_rejects_malformed_paginated_turns() {
+        assert_eq!(
+            thread_turns_list_turn_status(&json!({ "turns": [] }), "turn-1"),
+            ThreadActivitySnapshotOrTurnStatus::Untrusted
+        );
+        assert_eq!(
+            thread_turns_list_turn_status(
+                &json!({ "data": [{ "id": "turn-1", "status": "mystery" }] }),
+                "turn-1"
+            ),
             ThreadActivitySnapshotOrTurnStatus::Untrusted
         );
     }

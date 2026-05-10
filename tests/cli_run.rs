@@ -32,7 +32,7 @@ fn write_fake_codex_script(path: &Path) -> PathBuf {
         r#"#!/bin/sh
 	log="${FAKE_CODEX_LOG:?}"
 if [ "${1:-}" = "--version" ]; then
-  printf '%s\n' "${FAKE_CODEX_VERSION:-codex-cli 0.129.0}"
+  printf '%s\n' "${FAKE_CODEX_VERSION:-codex-cli 0.130.0}"
   exit 0
 fi
 
@@ -389,6 +389,8 @@ enum FakeAutoDeliveryOutcome {
     FreshUnmaterializedCompletedNotification,
     TwoCompletedNotifications,
     CompletedReconcile,
+    TurnsListUnsupportedThenCompletedReconcile,
+    TurnsListTimeoutThenCompletedReconcile,
     ProofInvalidationThenCompletedNotification,
     FreshUnmaterializedReadErrorThenCompletedNotification,
     FailedNotification,
@@ -1132,8 +1134,12 @@ fn accept_fake_app_server_auto_delivery_with_options(
                         "completed",
                     )?;
                     terminal_count += 1;
-                } else if matches!(outcome, FakeAutoDeliveryOutcome::CompletedReconcile)
-                    && methods.iter().any(|method| method == "turn/start")
+                } else if matches!(
+                    outcome,
+                    FakeAutoDeliveryOutcome::CompletedReconcile
+                        | FakeAutoDeliveryOutcome::TurnsListUnsupportedThenCompletedReconcile
+                        | FakeAutoDeliveryOutcome::TurnsListTimeoutThenCompletedReconcile
+                ) && methods.iter().any(|method| method == "turn/start")
                 {
                     let turn_id = fake_auto_delivery_turn_id(turn_start_count);
                     write_fake_thread_turn_response(
@@ -1161,6 +1167,63 @@ fn accept_fake_app_server_auto_delivery_with_options(
                         }
                     }
                     write_fake_thread_response(&mut stream, &message, thread_id, true)?;
+                }
+            }
+            "thread/turns/list" => {
+                if matches!(outcome, FakeAutoDeliveryOutcome::CompletedReconcile)
+                    && methods.iter().any(|method| method == "turn/start")
+                {
+                    let turn_id = fake_auto_delivery_turn_id(turn_start_count);
+                    write_fake_thread_turns_list_response(
+                        &mut stream,
+                        &message,
+                        &turn_id,
+                        "completed",
+                    )?;
+                    terminal_count += 1;
+                } else if matches!(
+                    outcome,
+                    FakeAutoDeliveryOutcome::TurnsListUnsupportedThenCompletedReconcile
+                ) && methods.iter().any(|method| method == "turn/start")
+                {
+                    write_fake_json_error(
+                        &mut stream,
+                        &message,
+                        -32601,
+                        "thread/turns/list is not supported yet",
+                    )?;
+                } else if matches!(
+                    outcome,
+                    FakeAutoDeliveryOutcome::TurnsListTimeoutThenCompletedReconcile
+                ) && methods.iter().any(|method| method == "turn/start")
+                {
+                    thread::sleep(Duration::from_millis(3500));
+                } else if matches!(
+                    outcome,
+                    FakeAutoDeliveryOutcome::FreshUnmaterializedReadErrorThenCompletedNotification
+                ) && methods.iter().any(|method| method == "turn/start")
+                    && terminal_count == 0
+                {
+                    write_fake_json_error(
+                        &mut stream,
+                        &message,
+                        -32600,
+                        "thread thread-fresh is not materialized yet; includeTurns is unavailable before first user message",
+                    )?;
+                    let turn_id = fake_auto_delivery_turn_id(turn_start_count);
+                    write_fake_turn_completed_notification(
+                        &mut stream,
+                        thread_id,
+                        &turn_id,
+                        "completed",
+                    )?;
+                    terminal_count += 1;
+                } else {
+                    write_fake_json_response(
+                        &mut stream,
+                        &message,
+                        serde_json::json!({ "data": [], "nextCursor": null }),
+                    )?;
                 }
             }
             "turn/start" => {
@@ -1246,6 +1309,8 @@ fn accept_fake_app_server_auto_delivery_with_options(
                     | FakeAutoDeliveryOutcome::FreshUnmaterializedCompletedNotification
                     | FakeAutoDeliveryOutcome::TwoCompletedNotifications
                     | FakeAutoDeliveryOutcome::CompletedReconcile
+                    | FakeAutoDeliveryOutcome::TurnsListUnsupportedThenCompletedReconcile
+                    | FakeAutoDeliveryOutcome::TurnsListTimeoutThenCompletedReconcile
                     | FakeAutoDeliveryOutcome::ProofInvalidationThenCompletedNotification
                     | FakeAutoDeliveryOutcome::FreshUnmaterializedReadErrorThenCompletedNotification
                     | FakeAutoDeliveryOutcome::FailedNotification
@@ -1310,6 +1375,8 @@ fn accept_fake_app_server_auto_delivery_with_options(
                                 terminal_count += 1;
                             }
                             FakeAutoDeliveryOutcome::CompletedReconcile
+                            | FakeAutoDeliveryOutcome::TurnsListUnsupportedThenCompletedReconcile
+                            | FakeAutoDeliveryOutcome::TurnsListTimeoutThenCompletedReconcile
                             | FakeAutoDeliveryOutcome::FreshUnmaterializedReadErrorThenCompletedNotification
                             | FakeAutoDeliveryOutcome::RejectedBeforeAccept
                             | FakeAutoDeliveryOutcome::ClosedBeforeAccept => {}
@@ -1963,6 +2030,25 @@ fn write_fake_thread_turn_response(
                     { "id": turn_id, "status": status, "items": [] }
                 ]
             }
+        }),
+    )
+}
+
+#[cfg(unix)]
+fn write_fake_thread_turns_list_response(
+    stream: &mut TcpStream,
+    request: &serde_json::Value,
+    turn_id: &str,
+    status: &str,
+) -> Result<(), String> {
+    write_fake_json_response(
+        stream,
+        request,
+        serde_json::json!({
+            "data": [
+                { "id": turn_id, "status": status, "items": [], "itemsView": "notLoaded" }
+            ],
+            "nextCursor": null
         }),
     )
 }
@@ -4519,7 +4605,7 @@ fn cli_run_trusted_all_auto_delivery_skips_manual_resolution_head_without_audit(
 
 #[cfg(unix)]
 #[test]
-fn cli_run_trusted_all_auto_delivery_thread_read_reconcile_closes_delivered() {
+fn cli_run_trusted_all_auto_delivery_turns_list_reconcile_closes_delivered() {
     let home = temp_home();
     let thread_id = "thread-cli-auto-reconcile";
     let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
@@ -4531,9 +4617,9 @@ fn cli_run_trusted_all_auto_delivery_thread_read_reconcile_closes_delivered() {
     assert!(
         methods
             .iter()
-            .filter(|method| *method == "thread/read")
+            .filter(|method| *method == "thread/turns/list")
             .count()
-            >= 2
+            >= 1
     );
 
     let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
@@ -4557,6 +4643,62 @@ fn cli_run_trusted_all_auto_delivery_thread_read_reconcile_closes_delivered() {
             .iter()
             .any(|decision| decision["decision"] == "reconciled")
     );
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_auto_delivery_falls_back_when_turns_list_is_unsupported() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-reconcile-fallback";
+    let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    let (app_server_url, fake_server_done) = spawn_fake_app_server_auto_delivery(
+        thread_id,
+        FakeAutoDeliveryOutcome::TurnsListUnsupportedThenCompletedReconcile,
+    );
+
+    run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(methods.iter().any(|method| method == "thread/turns/list"));
+    assert!(
+        methods
+            .iter()
+            .filter(|method| *method == "thread/read")
+            .count()
+            >= 2
+    );
+
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "closed");
+    assert_eq!(inspected["batch"]["batch"]["close_reason"], "delivered");
+    stop_daemon(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_run_trusted_all_auto_delivery_falls_back_when_turns_list_times_out() {
+    let home = temp_home();
+    let thread_id = "thread-cli-auto-reconcile-timeout";
+    let batch_id = submit_failed_fake_e2e_batch(&home, thread_id);
+    let (app_server_url, fake_server_done) = spawn_fake_app_server_auto_delivery(
+        thread_id,
+        FakeAutoDeliveryOutcome::TurnsListTimeoutThenCompletedReconcile,
+    );
+
+    run_cli_trusted_all_fake_e2e(&home, thread_id, &app_server_url);
+    let methods = wait_for_fake_app_server_methods(fake_server_done);
+    assert!(methods.iter().any(|method| method == "thread/turns/list"));
+    assert!(
+        methods
+            .iter()
+            .filter(|method| *method == "thread/read")
+            .count()
+            >= 2
+    );
+
+    let inspected = cbth_direct_json(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(inspected["batch"]["batch"]["state"], "closed");
+    assert_eq!(inspected["batch"]["batch"]["close_reason"], "delivered");
     stop_daemon(&home);
 }
 

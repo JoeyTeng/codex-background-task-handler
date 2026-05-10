@@ -27,7 +27,7 @@ use crate::cli_app_server_client::{
     AppServerJsonRpcClient, AppServerNotification, AppServerReceive, AppServerRequestError,
     AppServerRequestErrorKind, ThreadActivitySnapshot, ThreadActivitySnapshotOrTurnStatus,
     TurnStatusSnapshot, decode_notification, thread_result_activity_snapshot,
-    thread_result_turn_status,
+    thread_result_turn_status, thread_turns_list_turn_status,
 };
 use crate::daemon::{
     DaemonEnsureOptions, DaemonServeOptions, daemon_ensure, daemon_request, daemon_request_payload,
@@ -72,11 +72,13 @@ const CLI_APP_SERVER_DURABLE_WRITE_RETRY_TIMEOUT_SECONDS: u64 = 30;
 const CLI_APP_SERVER_DURABLE_WRITE_RETRY_INTERVAL_MS: u64 = 250;
 const CLI_APP_SERVER_DELIVERY_OBSERVATION_WINDOW_SECONDS: i64 = MAX_CLI_OBSERVATION_WINDOW_SECONDS;
 const CLI_APP_SERVER_RECONCILE_INTERVAL_MS: u64 = 2_000;
+const CLI_APP_SERVER_TURNS_LIST_RECONCILE_PAGE_SIZE: u32 = 64;
+const CLI_APP_SERVER_TURNS_LIST_RECONCILE_MAX_PAGES: usize = 2;
 const DOCTOR_CODEX_VERSION_TIMEOUT_SECONDS: u64 = 5;
 const DOCTOR_APP_SERVER_PROBE_TIMEOUT_SECONDS: u64 = 15;
-const VALIDATED_CODEX_CLI_VERSION_REQUIREMENT: &str = "0.129.x";
+const VALIDATED_CODEX_CLI_VERSION_REQUIREMENT: &str = "0.130.x";
 const VALIDATED_CODEX_CLI_MAJOR: u64 = 0;
-const VALIDATED_CODEX_CLI_MINOR: u64 = 129;
+const VALIDATED_CODEX_CLI_MINOR: u64 = 130;
 const DESKTOP_INBOX_SCHEMA_VERSION: i64 = 1;
 const DESKTOP_INBOX_MAX_JSON_BYTES: u64 = 1024 * 1024;
 const DESKTOP_SNAPSHOT_REVISION_RETENTION: usize = 128;
@@ -4929,6 +4931,7 @@ struct CliAppServerPassiveAdapterState {
     last_activity_state: Option<CliSessionActivityState>,
     passive_capabilities_recorded: bool,
     durable_proof_may_exist: bool,
+    thread_turns_list_supported: Option<bool>,
     last_auto_delivery_poll: Option<Instant>,
     startup_permissions: Option<CliResolvedPermissions>,
     startup_permission_snapshot: Option<CliPermissionSnapshot>,
@@ -5048,6 +5051,7 @@ fn spawn_cli_app_server_passive_adapter(
         last_activity_state: None,
         passive_capabilities_recorded: false,
         durable_proof_may_exist: config.activity_revision != 0 || config.capability_revision != 0,
+        thread_turns_list_supported: None,
         last_auto_delivery_poll: None,
         startup_permissions: None,
         startup_permission_snapshot: None,
@@ -6202,6 +6206,11 @@ fn reconcile_cli_auto_delivery_turn(
     running: &AtomicBool,
     accepted: &CliAcceptedTurn,
 ) -> Result<bool> {
+    if let Some(reconciled) =
+        reconcile_cli_auto_delivery_turns_list(config, state, client, running, accepted)?
+    {
+        return Ok(reconciled);
+    }
     let (read_result, read_messages) = passive_adapter_request(
         client,
         "thread/read",
@@ -6246,6 +6255,107 @@ fn reconcile_cli_auto_delivery_turn(
             bail!("thread/read reconcile returned untrusted turn snapshot")
         }
     }
+}
+
+fn reconcile_cli_auto_delivery_turns_list(
+    config: &CliAppServerPassiveAdapterConfig,
+    state: &mut CliAppServerPassiveAdapterState,
+    client: &mut AppServerJsonRpcClient,
+    running: &AtomicBool,
+    accepted: &CliAcceptedTurn,
+) -> Result<Option<bool>> {
+    if state.thread_turns_list_supported == Some(false) {
+        return Ok(None);
+    }
+    let mut cursor: Option<String> = None;
+    for _ in 0..CLI_APP_SERVER_TURNS_LIST_RECONCILE_MAX_PAGES {
+        let mut params = json!({
+            "threadId": config.bound_thread_id,
+            "itemsView": "notLoaded",
+            "limit": CLI_APP_SERVER_TURNS_LIST_RECONCILE_PAGE_SIZE,
+            "sortDirection": "desc",
+        });
+        if let Some(cursor) = cursor.as_deref() {
+            params["cursor"] = json!(cursor);
+        }
+        let (list_result, list_messages) = passive_adapter_request(
+            client,
+            "thread/turns/list",
+            params,
+            Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+        );
+        if handle_cli_auto_delivery_messages(
+            config,
+            state,
+            client,
+            running,
+            accepted,
+            list_messages,
+        )? {
+            return Ok(Some(true));
+        }
+        let list = match list_result {
+            Ok(list) => {
+                state.thread_turns_list_supported = Some(true);
+                list
+            }
+            Err(error) if remote_error_is_unsupported_app_server_method(&error) => {
+                state.thread_turns_list_supported = Some(false);
+                return Ok(None);
+            }
+            Err(error) if error.kind() == AppServerRequestErrorKind::Timeout => return Ok(None),
+            Err(error)
+                if config.fresh_thread_bootstrap
+                    && error.kind() == AppServerRequestErrorKind::Remote
+                    && remote_error_is_temporarily_unreadable_thread(&error) =>
+            {
+                state.thread_turns_list_supported = Some(true);
+                return Ok(Some(false));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match thread_turns_list_turn_status(&list, &accepted.delivery_turn_id) {
+            ThreadActivitySnapshotOrTurnStatus::Turn(TurnStatusSnapshot::InProgress) => {
+                return Ok(Some(false));
+            }
+            ThreadActivitySnapshotOrTurnStatus::Turn(status) => {
+                let turn_event = cli_turn_event_for_turn_status(status);
+                observe_cli_auto_delivery_terminal(
+                    config,
+                    state,
+                    client,
+                    running,
+                    accepted,
+                    turn_event,
+                    "reconciled",
+                )?;
+                return Ok(Some(true));
+            }
+            ThreadActivitySnapshotOrTurnStatus::Missing => {
+                cursor = list
+                    .get("nextCursor")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                if cursor.is_none() {
+                    return Ok(None);
+                }
+            }
+            ThreadActivitySnapshotOrTurnStatus::Untrusted => {
+                bail!("thread/turns/list reconcile returned untrusted turn snapshot")
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn remote_error_is_unsupported_app_server_method(error: &AppServerRequestError) -> bool {
+    if error.kind() != AppServerRequestErrorKind::Remote {
+        return false;
+    }
+    let message = error.message();
+    message.contains("-32601")
+        || message.contains("method not found")
+        || message.contains("not supported")
 }
 
 fn remote_error_is_temporarily_unreadable_thread(error: &AppServerRequestError) -> bool {
