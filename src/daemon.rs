@@ -79,6 +79,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "cli-app-server-probe",
     "cli-thread-start-bootstrap",
     "cli-thread-start-params",
+    "cli-foreground-thread-bootstrap",
     "cli-session-dispatch",
     "cli-session-capability-dispatch",
     "cli-session-permission-dispatch",
@@ -93,6 +94,9 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-writeback-helper-foundation",
     "desktop-writeback-live-validation-fixture",
 ];
+const CLI_THREAD_START_BOOTSTRAP_BOUND_THREAD_ID: &str = "__cbth_thread_start_bootstrap__";
+const CLI_FOREGROUND_THREAD_BOOTSTRAP_BOUND_THREAD_ID: &str =
+    "__cbth_foreground_thread_bootstrap__";
 const MAX_DISPATCH_WORKERS: usize = 32;
 const RESERVED_CONTROL_WORKERS: usize = 8;
 const MAX_CLIENT_WORKERS: usize = MAX_DISPATCH_WORKERS + RESERVED_CONTROL_WORKERS;
@@ -263,6 +267,14 @@ struct CliThreadStartPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct CliForegroundThreadStartPayload {
+    codex_binary: Vec<u8>,
+    cwd: String,
+    lease_id: String,
+    lease_ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CliThreadStartPromotePayload {
     bootstrap_id: String,
     managed_session_id: String,
@@ -308,6 +320,12 @@ struct CliAppServerReservationInfo {
 struct CliThreadStartInfo {
     bootstrap_id: String,
     thread_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CliForegroundThreadStartInfo {
+    bootstrap_id: String,
+    url: String,
 }
 
 struct DaemonState {
@@ -1872,6 +1890,13 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
                 .context("parse cli thread/start bootstrap payload")?;
             json!({
                 "thread": start_cli_thread(state, payload)?,
+            })
+        }
+        "cli_foreground_thread_start" => {
+            let payload: CliForegroundThreadStartPayload = serde_json::from_value(request.payload)
+                .context("parse cli foreground thread bootstrap payload")?;
+            json!({
+                "thread": start_cli_foreground_thread(state, payload)?,
             })
         }
         "cli_thread_start_promote" => {
@@ -3721,7 +3746,7 @@ fn start_cli_thread(
     let bootstrap_id = new_id();
     let server = spawn_cli_app_server(SpawnCliAppServerOptions {
         managed_session_id: &bootstrap_id,
-        bound_thread_id: "__cbth_thread_start_bootstrap__",
+        bound_thread_id: CLI_THREAD_START_BOOTSTRAP_BOUND_THREAD_ID,
         session_epoch: 1,
         codex_binary: &payload.codex_binary,
         cwd: Some(&payload.cwd),
@@ -3800,6 +3825,55 @@ fn start_cli_thread(
                 stop_managed_cli_app_server_process(server);
             }
         }
+    }
+    result
+}
+
+fn start_cli_foreground_thread(
+    state: &DaemonState,
+    payload: CliForegroundThreadStartPayload,
+) -> Result<CliForegroundThreadStartInfo> {
+    validate_daemon_nonempty_bytes("codex_binary", &payload.codex_binary)?;
+    validate_daemon_nonempty("cwd", &payload.cwd)?;
+    validate_daemon_nonempty("lease_id", &payload.lease_id)?;
+    let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
+    ensure_daemon_not_stopping(state)?;
+    let bootstrap_id = new_id();
+    let server = spawn_cli_app_server(SpawnCliAppServerOptions {
+        managed_session_id: &bootstrap_id,
+        bound_thread_id: CLI_FOREGROUND_THREAD_BOOTSTRAP_BOUND_THREAD_ID,
+        session_epoch: 1,
+        codex_binary: &payload.codex_binary,
+        cwd: Some(&payload.cwd),
+        lease_id: &payload.lease_id,
+        lease_ttl,
+        stop_requested: &state.stop_requested,
+    })?;
+    let mut server = Some(server);
+    let result = (|| {
+        let url = server
+            .as_ref()
+            .expect("bootstrap app-server is still available")
+            .url
+            .clone();
+        {
+            let mut bootstraps = state.cli_thread_start_bootstraps.lock().map_err(|_| {
+                anyhow::anyhow!("CLI thread/start bootstrap registry lock is poisoned")
+            })?;
+            ensure_daemon_not_stopping(state)?;
+            bootstraps.insert(
+                bootstrap_id.clone(),
+                server
+                    .take()
+                    .expect("bootstrap app-server is still available"),
+            );
+        }
+        Ok(CliForegroundThreadStartInfo { bootstrap_id, url })
+    })();
+    if result.is_err()
+        && let Some(server) = server.take()
+    {
+        stop_managed_cli_app_server_process(server);
     }
     result
 }
@@ -3975,7 +4049,9 @@ fn promote_cli_thread_start_app_server(
             .as_mut()
             .expect("bootstrap app-server is still available");
         ensure_daemon_not_stopping(state)?;
-        if server_ref.bound_thread_id != payload.bound_thread_id {
+        if server_ref.bound_thread_id == CLI_FOREGROUND_THREAD_BOOTSTRAP_BOUND_THREAD_ID {
+            server_ref.bound_thread_id = payload.bound_thread_id.clone();
+        } else if server_ref.bound_thread_id != payload.bound_thread_id {
             let started_thread = server_ref.bound_thread_id.clone();
             bail!(
                 "CLI thread/start bootstrap created thread {}, not {}",

@@ -165,17 +165,18 @@ codex --remote ws://127.0.0.1:<port>
      - existing-thread mode：
        - 启动时由 `cbth cli run --bind-thread-id <thread_id>` 显式建立 `bound_thread_id`
      - fresh-thread mode：
-       - 仅当 capability probe 证明 `thread/start` 可用时，允许 `cbth cli run --new-thread`
-       - daemon 先创建一个新 thread，再把返回的 `thread_id` durable 绑定成新的 `bound_thread_id`
+       - `cbth cli run --new-thread` 先启动 pending shared app-server
+       - foreground Codex 创建新 thread，`cbth` 从 `thread/started` 读取真实 thread id
+       - `cbth` 再把该 thread id durable 绑定成新的 `bound_thread_id`
    - 不提供 late-bind stable surface
    - 不提供依赖 `managed_session_id` 的外部发现/回填合同
-   - 如果调用方既拿不到 caller `thread_id`，也没有 `thread/start` 能力：
+   - 如果调用方既拿不到 caller `thread_id`，也不能通过 foreground-created `thread/started` 建立 fresh thread 绑定：
      - 该前台会话仍可作为探索性 remote TUI 使用
      - 但它不进入 v1 的 managed-session auto-continuation 合同
    - 这个启动时显式 bootstrap 在 v1 只决定 delivery target：
-     - 它不证明前台当前正在看的 thread 一定等于 `bound_thread_id`
-     - 它也不要求 `cbth` 能从 app-server 侧可靠读出“当前 foreground thread id”
-   - 因此，第一版的 fixed-thread 合同是“投递目标固定”，不是“前台焦点已校验”。
+     - fresh-thread path 会在启动时绑定 foreground 创建的真实 thread
+     - 但后续 foreground thread switch 仍不会自动重绑定
+   - 因此，第一版的 fixed-thread 合同是“投递目标固定”，不是“持续前台焦点追踪”。
    - 同一个 `bound_thread_id` 在任意时刻最多只允许一个 non-retired managed session：
      - `cbth cli run --bind-thread-id <thread_id>` 必须是 attach-or-create，而不是 blind create
      - 如果 daemon 已经找到同一个 `bound_thread_id` 的 `live` / `detached` session，就必须复用它
@@ -271,8 +272,9 @@ codex --remote ws://127.0.0.1:<port>
   - 如果存在 `stale` session：只有在它已满足 retirement 条件后才允许替换
   - 如果存在不可安全替换的 `stale` / conflicting session：直接 fail-closed，不得并发创建第二个 session
 - fresh-thread mode（`cbth cli run --new-thread`）的 v1 合同必须是：
-  - 只在 capability probe 已证明 `thread/start` 可用时允许
-  - daemon 必须先创建一个 brand-new thread，并把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
+  - daemon 必须先启动 pending shared app-server
+  - foreground Codex 必须在该 app-server 上创建 brand-new thread
+  - `cbth` 必须从 `thread/started` 读取 foreground 创建的 thread id，并把它 durable 绑定为新的 `bound_thread_id`
   - 这个新 `bound_thread_id` 之后同样进入既定的单 session / fixed-thread / attach-or-create 合同
 - 当同时满足以下条件时，daemon 才允许清理该 managed session：
   - 没有 active jobs
@@ -733,7 +735,7 @@ cbth cli run
 4. CLI bootstrap 必须先选定显式模式：
    - existing-thread mode：`cbth cli run --bind-thread-id <thread_id>`
    - native resume mode：`cbth resume <thread_id> [-- <codex_args>]`，前台进程为 `codex resume <thread_id> --remote <url> --cd <cwd> ...`
-   - fresh-thread mode：`cbth cli run --new-thread`（仅在 `thread/start` capability 已通过 probe 时允许）
+   - fresh-thread mode：`cbth cli run --new-thread`，前台进程先在 pending shared app-server 上创建新 thread，`cbth` 监听 `thread/started` 后再绑定
 5. attach-or-create / create-new 必须遵守：
    - existing-thread mode：
      - 同一 `bound_thread_id` 有 `live` / `detached` session 时，先比较 requested bootstrap profile 与 durable effective profile；只有完全一致才允许 attach/reuse
@@ -742,10 +744,11 @@ cbth cli run
      - 同一 `bound_thread_id` 有不可安全替换的 stale/conflicting session 时 fail-closed
      - 只有在没有 non-retired session，或旧 `parked/stale` session 已满足 retirement 条件时，才创建新的 managed session
    - fresh-thread mode：
-     - daemon 必须先调用 `thread/start` 创建 brand-new thread
-     - 再把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
+     - daemon 必须先启动 pending app-server
+     - foreground Codex 创建 brand-new thread
+     - `cbth` 再把 `thread/started` 的 thread id durable 绑定为新的 `bound_thread_id`
      - 同时仍适用同一 `bound_thread_id` 最多一个 non-retired managed session 的唯一性合同
-6. attach/create 成功后再启动前台 `codex --remote ...`
+6. existing-thread attach/create 成功后再启动前台 `codex --remote ...`；fresh-thread path 则必须先启动 foreground 才能发现并绑定新 thread id
 7. sidecar 从共享核心读取 per-thread `delivery batch`
 8. 任务 ready 后：
    - 默认只在 caller thread idle 时：`thread/resume + turn/start`
@@ -773,12 +776,13 @@ v1 范围外：
   - 尚未注册进 registry 的候选 app-server 不得触碰 session proof，只能停止候选进程，避免并发 ensure 误清真实 session。
   - daemon shutdown 例外采用 best-effort proof invalidation，然后仍然 kill/wait 子进程并 join drain worker，优先避免 daemon 退出时泄漏 app-server。
 - public `cbth cli run --new-thread` 已落地 fresh-thread bootstrap：
-  - wrapper 先请求 daemon-owned pending loopback app-server 执行 `thread/start`。
-  - bootstrap 成功后，返回的 `thread_id` 被用作后续 fixed-thread `bound_thread_id`，同一个 pending app-server 进程会被提升为 managed app-server，再复用 existing-thread sidecar / foreground 流程。
-  - wrapper 只在启动 foreground 前向 stderr 打印 `cbth: bound thread id: <thread_id>`；不发送 foreground prompt，不注入用户消息，也不改变原生 `codex --remote` 交互模型。
+  - wrapper 先请求 daemon-owned pending loopback app-server，并在 foreground 启动前初始化 discovery client。
+  - foreground Codex 在这个 pending app-server 上创建真实新 thread；wrapper 从 `thread/started` notification 读取 thread id。
+  - discovery 成功后，返回的 thread id 被用作后续 fixed-thread `bound_thread_id`，同一个 pending app-server 进程会被提升为 managed app-server，再启动 existing-thread sidecar。
+  - wrapper 只在 durable bind/promote 后向 stderr 打印 `cbth: bound thread id: <thread_id>`；不发送 foreground prompt，不注入用户消息，也不改变原生 `codex --remote` 交互模型。
   - 不能使用“short-lived bootstrap app-server 后关闭”的实现：当前 Codex app-server 的 fresh thread 在 first user message 前不会 materialize rollout，关闭 bootstrap app-server 后新的 app-server 会对该 thread 返回 `no rollout found` / `includeTurns is unavailable before first user message`。
   - bootstrap app-server 在 promote 前只存在于 pending registry，不触碰 managed session proof；bootstrap 失败、promote 失败、lease 过期或 daemon shutdown 时必须停止子进程并 join drain worker。
-  - bootstrap 的 remote error / timeout / closed / malformed response 都在 foreground 启动前 fail closed，不创建 managed session。
+  - discovery 的 remote error / timeout / closed / malformed response 都会 fail closed，不创建 managed session。
 - daemon status 现在会列出 active CLI app-server，并且 daemon capability 列表包含 `cli-app-server-lifecycle` / `cli-app-server-probe`；新 CLI 不会把 lifecycle 或 doctor probe request 投递给不支持该命令的旧 daemon。
 - managed CLI startup 和 `cbth doctor cli` 会执行 `codex --version`，把当前 `codex-cli 0.130.x` 作为 soft validated range。版本不可解析或不在该范围内只输出 warning / doctor `warn` 状态，真实执行仍由后续 protocol field 解析与 capability gate fail-closed。
 - public `cbth resume <thread_id> [-- <codex_args>]` 已作为 native resume wrapper 落地；它复用 fixed-thread managed session / daemon-owned app-server / passive sidecar 流程，前台命令为 `codex resume <thread_id> --remote <url> ...`，只在 operator 显式转发 `--cd` / `-C` 或交互式 cwd 选择后附加单个 `--cd <cwd>`。

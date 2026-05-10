@@ -71,6 +71,9 @@ impl fmt::Display for AppServerRequestError {
 impl Error for AppServerRequestError {}
 
 pub(crate) enum AppServerNotification {
+    ThreadStarted {
+        thread_id: String,
+    },
     TurnStarted {
         thread_id: Option<String>,
         turn_id: Option<String>,
@@ -413,6 +416,8 @@ pub(crate) fn decode_notification(value: &Value) -> Option<AppServerNotification
     let method = value.get("method")?.as_str()?;
     let params = value.get("params").unwrap_or(&Value::Null);
     match method {
+        "thread/started" => thread_started_id(params)
+            .map(|thread_id| AppServerNotification::ThreadStarted { thread_id }),
         "turn/started" => Some(AppServerNotification::TurnStarted {
             thread_id: string_field(params, "threadId"),
             turn_id: turn_string_field(params, "id"),
@@ -452,6 +457,19 @@ pub(crate) fn decode_notification(value: &Value) -> Option<AppServerNotification
         }
         _ => None,
     }
+}
+
+fn thread_started_id(params: &Value) -> Option<String> {
+    string_field(params, "threadId")
+        .or_else(|| string_field(params, "id"))
+        .or_else(|| {
+            params
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|thread_id| !thread_id.is_empty())
 }
 
 pub(crate) fn thread_result_activity_snapshot(
@@ -1310,6 +1328,35 @@ mod tests {
             decode_notification(&malformed),
             Some(AppServerNotification::ThreadProofInvalidated { .. })
         ));
+    }
+
+    #[test]
+    fn thread_started_notification_reads_thread_id_variants() {
+        let nested = json!({
+            "method": "thread/started",
+            "params": {
+                "thread": { "id": "thread-nested" }
+            }
+        });
+        assert!(matches!(
+            decode_notification(&nested),
+            Some(AppServerNotification::ThreadStarted { thread_id }) if thread_id == "thread-nested"
+        ));
+
+        let top_level = json!({
+            "method": "thread/started",
+            "params": { "threadId": "thread-top-level" }
+        });
+        assert!(matches!(
+            decode_notification(&top_level),
+            Some(AppServerNotification::ThreadStarted { thread_id }) if thread_id == "thread-top-level"
+        ));
+
+        let malformed = json!({
+            "method": "thread/started",
+            "params": { "thread": {} }
+        });
+        assert!(decode_notification(&malformed).is_none());
     }
 
     #[test]
