@@ -1319,11 +1319,12 @@ cbth desktop binding unbind
   - existing-thread mode：`cbth cli run --bind-thread-id <thread_id>`
     - 启动时显式建立 `bound_thread_id`
   - fresh-thread mode：`cbth cli run --new-thread`
-    - 仅当 capability probe 已证明 `thread/start` 可用时启用
-    - daemon 先创建 brand-new thread，再把返回的 `thread_id` durable 绑定为新的 `bound_thread_id`
+    - daemon 先启动 pending shared app-server
+    - foreground Codex 在该 app-server 上创建 brand-new thread
+    - `cbth` 监听 `thread/started`，把 foreground 返回的真实 thread id durable 绑定为新的 `bound_thread_id`
 - v1 不提供 late-bind stable surface。
 - 也不把 `managed_session_id` 暴露成需要外部回填 thread id 的 bootstrap 契约。
-- 如果调用方既拿不到 caller `thread_id`，也没有 `thread/start` capability：
+- 如果调用方既拿不到 caller `thread_id`，也不能通过 foreground-created `thread/started` 建立 fresh thread 绑定：
   - 该前台会话只能视为探索性 remote TUI
   - 不进入 v1 的 managed-session auto-continuation 合同
 - `cbth desktop ...` 预留给 Desktop bootstrap / helper。
