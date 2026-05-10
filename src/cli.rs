@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CStr, OsStr, OsString};
 use std::fmt;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -46,7 +46,9 @@ use crate::models::{
     NewDesktopInstallationRepair, NewDesktopWritebackFixture, NewJob, PartialDeliveryPolicy,
     SubmitMetadata, SweepReport,
 };
-use crate::self_update::{SelfUpdateOptions, current_release_target_triple, run_self_update};
+use crate::self_update::{
+    SelfUpdateOptions, current_release_target_triple, run_self_update, run_self_update_interactive,
+};
 use crate::store::{Store, new_id};
 
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
@@ -110,17 +112,34 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
 #[command(about = "Codex background task handler")]
 #[command(version)]
 pub struct Cli {
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Use an alternate cbth home directory instead of ~/.cbth"
+    )]
     home: Option<PathBuf>,
 
     #[arg(long, global = true, hide = true)]
     direct_store: bool,
 
-    #[arg(long, global = true, default_value_t = DEFAULT_DAEMON_STARTUP_TIMEOUT_SECONDS)]
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECONDS",
+        default_value_t = DEFAULT_DAEMON_STARTUP_TIMEOUT_SECONDS,
+        help = "How long client commands wait for daemon autostart"
+    )]
     auto_daemon_startup_timeout_seconds: u64,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Json,
+    Human,
 }
 
 #[derive(Debug, Subcommand)]
@@ -130,14 +149,17 @@ enum Commands {
         #[command(subcommand)]
         command: DoctorCommand,
     },
+    #[command(about = "Run and inspect local supervised background tasks")]
     Task {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    #[command(about = "Submit, inspect, and finish delivery jobs")]
     Job {
         #[command(subcommand)]
         command: JobCommand,
     },
+    #[command(about = "Inspect or close per-thread delivery batches")]
     Batch {
         #[command(subcommand)]
         command: BatchCommand,
@@ -147,11 +169,12 @@ enum Commands {
         #[command(subcommand)]
         command: AttemptCommand,
     },
+    #[command(about = "Inspect durable delivery audit decisions")]
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
     },
-    #[command(name = "self")]
+    #[command(name = "self", about = "Manage the installed cbth binary")]
     Self_ {
         #[command(subcommand)]
         command: SelfCommand,
@@ -160,6 +183,7 @@ enum Commands {
     Resume(CliResumeArgs),
     #[command(about = "Start a new Codex thread through the managed cbth CLI bridge")]
     New(CliNewArgs),
+    #[command(about = "Run Codex through the managed cbth CLI bridge")]
     Cli {
         #[command(subcommand)]
         command: CliCommand,
@@ -169,10 +193,12 @@ enum Commands {
         #[command(subcommand)]
         command: DesktopCommand,
     },
+    #[command(about = "Run local maintenance and recovery operations")]
     Maintenance {
         #[command(subcommand)]
         command: MaintenanceCommand,
     },
+    #[command(about = "Control the same-user cbth daemon")]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -473,163 +499,321 @@ struct DesktopNoteArmArgs {
 
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
+    #[command(about = "Start a supervised local command and return immediately")]
     Run(TaskRunArgs),
+    #[command(about = "Inspect one supervised task and its linked delivery state")]
     Inspect(TaskInspectArgs),
+    #[command(about = "List supervised tasks, optionally filtered by source thread or status")]
     List(TaskListArgs),
+    #[command(about = "Request cancellation for a running supervised task")]
     Cancel(TaskCancelArgs),
 }
 
 #[derive(Debug, Args)]
 struct TaskRunArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "THREAD_ID",
+        help = "Codex thread that should receive delivery"
+    )]
     source_thread_id: String,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "Short operator-facing summary of the task"
+    )]
     summary: String,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Optional JSON metadata file merged into the delivery prompt"
+    )]
     metadata_file: Option<PathBuf>,
 
-    #[arg(long, value_parser = clap::value_parser!(bool))]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = clap::value_parser!(bool),
+        help = "Override whether delivery should run read-only"
+    )]
     delivery_read_only: Option<bool>,
 
-    #[arg(long, value_parser = clap::value_parser!(bool))]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = clap::value_parser!(bool),
+        help = "Override whether delivery requires approval"
+    )]
     delivery_requires_approval: Option<bool>,
 
-    #[arg(long, value_parser = clap::value_parser!(bool))]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = clap::value_parser!(bool),
+        help = "Override whether delivery requires network access"
+    )]
     delivery_requires_network: Option<bool>,
 
-    #[arg(long, value_parser = clap::value_parser!(bool))]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = clap::value_parser!(bool),
+        help = "Override whether delivery requires write access"
+    )]
     delivery_requires_write_access: Option<bool>,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Working directory for the supervised command"
+    )]
     cwd: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        help = "Optional wall-clock timeout for the command"
+    )]
     timeout_seconds: Option<u64>,
 
-    #[arg(long, default_value_t = DEFAULT_MAX_DELIVERY_ATTEMPTS)]
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = DEFAULT_MAX_DELIVERY_ATTEMPTS,
+        help = "Maximum delivery attempts before giving up"
+    )]
     max_delivery_attempts: i64,
 
-    #[arg(long, default_value_t = DEFAULT_REDELIVERY_WINDOW_SECONDS)]
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = DEFAULT_REDELIVERY_WINDOW_SECONDS,
+        help = "Window used to coalesce repeated delivery attempts"
+    )]
     redelivery_window_seconds: i64,
 
-    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(
+        value_name = "COMMAND...",
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = "Command and arguments to supervise, placed after --"
+    )]
     command: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
 struct TaskInspectArgs {
-    #[arg(long)]
+    #[arg(long, value_name = "TASK_ID", help = "Task id returned by task run")]
     task_id: String,
 }
 
 #[derive(Debug, Args)]
 struct TaskListArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "THREAD_ID",
+        help = "Only show tasks for this source thread"
+    )]
     source_thread_id: Option<String>,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "STATUS",
+        help = "Only show tasks in this lifecycle status"
+    )]
     status: Option<String>,
 
-    #[arg(long, default_value_t = 50)]
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = 50,
+        help = "Maximum tasks to return"
+    )]
     limit: i64,
 }
 
 #[derive(Debug, Args)]
 struct TaskCancelArgs {
-    #[arg(long)]
+    #[arg(long, value_name = "TASK_ID", help = "Task id to cancel")]
     task_id: String,
 }
 
 #[derive(Debug, Subcommand)]
 enum JobCommand {
+    #[command(about = "Create a delivery job for a source thread")]
     Submit(JobSubmitArgs),
+    #[command(about = "Mark a job successful and attach its result file")]
     Complete(JobCompleteArgs),
+    #[command(about = "Mark a job failed with an operator-visible reason")]
     Fail(JobFailArgs),
+    #[command(about = "Inspect one delivery job")]
     Inspect(JobInspectArgs),
+    #[command(about = "List delivery jobs, optionally filtered by source thread or status")]
     List(JobListArgs),
 }
 
 #[derive(Debug, Args)]
 struct JobSubmitArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "THREAD_ID",
+        help = "Codex thread that should receive delivery"
+    )]
     source_thread_id: String,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "Short operator-facing summary of the job"
+    )]
     summary: String,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Optional JSON metadata file merged into the delivery prompt"
+    )]
     metadata_file: Option<PathBuf>,
 
-    #[arg(long, value_parser = clap::value_parser!(bool))]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = clap::value_parser!(bool),
+        help = "Override whether delivery should run read-only"
+    )]
     delivery_read_only: Option<bool>,
 
-    #[arg(long, value_parser = clap::value_parser!(bool))]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = clap::value_parser!(bool),
+        help = "Override whether delivery requires approval"
+    )]
     delivery_requires_approval: Option<bool>,
 
-    #[arg(long, value_parser = clap::value_parser!(bool))]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = clap::value_parser!(bool),
+        help = "Override whether delivery requires network access"
+    )]
     delivery_requires_network: Option<bool>,
 
-    #[arg(long, value_parser = clap::value_parser!(bool))]
+    #[arg(
+        long,
+        value_name = "BOOL",
+        value_parser = clap::value_parser!(bool),
+        help = "Override whether delivery requires write access"
+    )]
     delivery_requires_write_access: Option<bool>,
 }
 
 #[derive(Debug, Args)]
 struct JobCompleteArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "JOB_ID",
+        help = "Job id returned by job submit or task run"
+    )]
     job_id: String,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "File containing the result to deliver"
+    )]
     result_file: PathBuf,
 
-    #[arg(long)]
+    #[arg(long, value_name = "TEXT", help = "Optional completion summary")]
     summary: Option<String>,
 
-    #[arg(long, default_value_t = DEFAULT_MAX_DELIVERY_ATTEMPTS)]
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = DEFAULT_MAX_DELIVERY_ATTEMPTS,
+        help = "Maximum delivery attempts before giving up"
+    )]
     max_delivery_attempts: i64,
 
-    #[arg(long, default_value_t = DEFAULT_REDELIVERY_WINDOW_SECONDS)]
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = DEFAULT_REDELIVERY_WINDOW_SECONDS,
+        help = "Window used to coalesce repeated delivery attempts"
+    )]
     redelivery_window_seconds: i64,
 }
 
 #[derive(Debug, Args)]
 struct JobFailArgs {
-    #[arg(long)]
+    #[arg(long, value_name = "JOB_ID", help = "Job id to fail")]
     job_id: String,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "Failure reason recorded for operators"
+    )]
     reason: String,
 
-    #[arg(long, default_value_t = DEFAULT_MAX_DELIVERY_ATTEMPTS)]
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = DEFAULT_MAX_DELIVERY_ATTEMPTS,
+        help = "Maximum delivery attempts before giving up"
+    )]
     max_delivery_attempts: i64,
 
-    #[arg(long, default_value_t = DEFAULT_REDELIVERY_WINDOW_SECONDS)]
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = DEFAULT_REDELIVERY_WINDOW_SECONDS,
+        help = "Window used to coalesce repeated delivery attempts"
+    )]
     redelivery_window_seconds: i64,
 }
 
 #[derive(Debug, Args)]
 struct JobInspectArgs {
-    #[arg(long)]
+    #[arg(long, value_name = "JOB_ID", help = "Job id to inspect")]
     job_id: String,
 }
 
 #[derive(Debug, Args)]
 struct JobListArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "THREAD_ID",
+        help = "Only show jobs for this source thread"
+    )]
     source_thread_id: Option<String>,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "STATUS",
+        help = "Only show jobs in this lifecycle status"
+    )]
     status: Option<String>,
 
-    #[arg(long, default_value_t = 100)]
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = 100,
+        help = "Maximum jobs to return"
+    )]
     limit: i64,
 }
 
 #[derive(Debug, Subcommand)]
 enum BatchCommand {
+    #[command(about = "Inspect the open delivery batch for a source thread")]
     InspectHead(BatchInspectHeadArgs),
+    #[command(about = "Inspect a delivery batch by id")]
     Inspect(BatchInspectArgs),
+    #[command(about = "Close the open delivery batch for a source thread")]
     CloseHead(BatchCloseHeadArgs),
 }
 
@@ -647,6 +831,7 @@ enum AttemptCommand {
 
 #[derive(Debug, Subcommand)]
 enum AuditCommand {
+    #[command(about = "List durable delivery audit decisions")]
     List(AuditListArgs),
     #[command(hide = true)]
     Record(Box<AuditRecordArgs>),
@@ -654,7 +839,10 @@ enum AuditCommand {
 
 #[derive(Debug, Subcommand)]
 enum SelfCommand {
-    #[command(about = "Update the cbth binary from GitHub Releases")]
+    #[command(
+        about = "Update the cbth binary from GitHub Releases",
+        long_about = "Update the current cbth executable from GitHub Releases. Use --check to inspect without installing, --interactive/-i to prompt with Install now? [y/N], or --yes for non-interactive scripts."
+    )]
     Update(SelfUpdateArgs),
 }
 
@@ -665,22 +853,72 @@ struct SelfUpdateArgs {
 
     #[arg(
         long,
+        conflicts_with_all = ["yes", "interactive"],
         help = "Check whether an update is available without installing it"
     )]
     check: bool,
 
-    #[arg(long, help = "Confirm non-interactive update; accepted for scripts")]
+    #[arg(
+        long,
+        conflicts_with_all = ["check", "interactive"],
+        help = "Confirm non-interactive update; accepted for scripts"
+    )]
     yes: bool,
+
+    #[arg(
+        long,
+        short = 'i',
+        conflicts_with_all = ["check", "yes"],
+        help = "Prompt before installing an available or requested release"
+    )]
+    interactive: bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    #[command(about = "Launch foreground Codex attached to a managed app-server")]
     Run(CliRunArgs),
+    #[command(
+        name = "app-servers",
+        about = "List running daemon-owned Codex app-servers",
+        long_about = "List running daemon-owned Codex app-servers without starting a daemon. JSON output is intended for tools; --human/-H prints a compact operator summary with the websocket URL, Codex session id, cwd, title, and local start time."
+    )]
+    AppServers(CliAppServersArgs),
     #[command(about = "Inspect and recover managed CLI sessions")]
     Session {
         #[command(subcommand)]
         command: CliSessionCommand,
     },
+}
+
+#[derive(Debug, Args)]
+struct CliAppServersArgs {
+    #[arg(
+        long,
+        value_enum,
+        value_name = "json|human",
+        default_value_t = OutputFormat::Json,
+        help = "Choose machine-readable JSON or compact human-readable output"
+    )]
+    format: OutputFormat,
+
+    #[arg(
+        long,
+        short = 'H',
+        conflicts_with = "format",
+        help = "Print compact human-readable output"
+    )]
+    human: bool,
+}
+
+impl CliAppServersArgs {
+    fn effective_format(&self) -> OutputFormat {
+        if self.human {
+            OutputFormat::Human
+        } else {
+            self.format
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -705,49 +943,116 @@ enum CliSessionCommand {
 
 #[derive(Debug, Args)]
 struct CliRunArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "THREAD_ID",
+        help = "Bind the managed app-server to an existing Codex thread"
+    )]
     bind_thread_id: Option<String>,
 
-    #[arg(long, conflicts_with = "bind_thread_id")]
+    #[arg(
+        long,
+        conflicts_with = "bind_thread_id",
+        help = "Start a brand-new Codex thread"
+    )]
     new_thread: bool,
 
-    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    #[arg(
+        long,
+        value_name = "auto|true|false",
+        default_value_t = SessionAllowsValue::Auto,
+        help = "Whether this session may ask for approvals"
+    )]
     session_allows_approval: SessionAllowsValue,
 
-    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    #[arg(
+        long,
+        value_name = "auto|true|false",
+        default_value_t = SessionAllowsValue::Auto,
+        help = "Whether this session may use network access"
+    )]
     session_allows_network: SessionAllowsValue,
 
-    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    #[arg(
+        long,
+        value_name = "auto|true|false",
+        default_value_t = SessionAllowsValue::Auto,
+        help = "Whether this session may write outside read-only mode"
+    )]
     session_allows_write_access: SessionAllowsValue,
 
-    #[arg(long, default_value = "codex")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "codex",
+        help = "Codex CLI executable"
+    )]
     codex_bin: OsString,
 
-    #[arg(long, value_enum, default_value_t = CliAutoDeliveryPolicy::Off)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliAutoDeliveryPolicy::Off,
+        help = "Policy for automatic delivery attempt acceptance"
+    )]
     auto_delivery_policy: CliAutoDeliveryPolicy,
 
-    #[arg(last = true)]
+    #[arg(
+        value_name = "CODEX_ARGS...",
+        last = true,
+        help = "Arguments passed to Codex after --"
+    )]
     codex_args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
 struct CliNewArgs {
-    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    #[arg(
+        long,
+        value_name = "auto|true|false",
+        default_value_t = SessionAllowsValue::Auto,
+        help = "Whether this session may ask for approvals"
+    )]
     session_allows_approval: SessionAllowsValue,
 
-    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    #[arg(
+        long,
+        value_name = "auto|true|false",
+        default_value_t = SessionAllowsValue::Auto,
+        help = "Whether this session may use network access"
+    )]
     session_allows_network: SessionAllowsValue,
 
-    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    #[arg(
+        long,
+        value_name = "auto|true|false",
+        default_value_t = SessionAllowsValue::Auto,
+        help = "Whether this session may write outside read-only mode"
+    )]
     session_allows_write_access: SessionAllowsValue,
 
-    #[arg(long, default_value = "codex")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "codex",
+        help = "Codex CLI executable"
+    )]
     codex_bin: OsString,
 
-    #[arg(long, value_enum, default_value_t = CliAutoDeliveryPolicy::Off)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliAutoDeliveryPolicy::Off,
+        help = "Policy for automatic delivery attempt acceptance"
+    )]
     auto_delivery_policy: CliAutoDeliveryPolicy,
 
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(
+        value_name = "CODEX_ARGS...",
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        help = "Arguments passed through to Codex"
+    )]
     codex_args: Vec<OsString>,
 }
 
@@ -784,48 +1089,90 @@ impl FromStr for SessionAllowsValue {
 
 #[derive(Debug, Args)]
 struct CliResumeArgs {
+    #[arg(value_name = "THREAD_ID", help = "Existing Codex thread id to resume")]
     thread_id: String,
 
-    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    #[arg(
+        long,
+        value_name = "auto|true|false",
+        default_value_t = SessionAllowsValue::Auto,
+        help = "Whether this session may ask for approvals"
+    )]
     session_allows_approval: SessionAllowsValue,
 
-    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    #[arg(
+        long,
+        value_name = "auto|true|false",
+        default_value_t = SessionAllowsValue::Auto,
+        help = "Whether this session may use network access"
+    )]
     session_allows_network: SessionAllowsValue,
 
-    #[arg(long, default_value_t = SessionAllowsValue::Auto)]
+    #[arg(
+        long,
+        value_name = "auto|true|false",
+        default_value_t = SessionAllowsValue::Auto,
+        help = "Whether this session may write outside read-only mode"
+    )]
     session_allows_write_access: SessionAllowsValue,
 
-    #[arg(long, default_value = "codex")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "codex",
+        help = "Codex CLI executable"
+    )]
     codex_bin: OsString,
 
-    #[arg(long, value_enum, default_value_t = CliAutoDeliveryPolicy::Off)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CliAutoDeliveryPolicy::Off,
+        help = "Policy for automatic delivery attempt acceptance"
+    )]
     auto_delivery_policy: CliAutoDeliveryPolicy,
 
-    #[arg(last = true)]
+    #[arg(
+        value_name = "CODEX_ARGS...",
+        last = true,
+        help = "Arguments passed to Codex after --"
+    )]
     codex_args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
 struct BatchInspectHeadArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "THREAD_ID",
+        help = "Source thread whose open batch should be inspected"
+    )]
     source_thread_id: String,
 }
 
 #[derive(Debug, Args)]
 struct BatchInspectArgs {
-    #[arg(long)]
+    #[arg(long, value_name = "BATCH_ID", help = "Delivery batch id to inspect")]
     batch_id: String,
 }
 
 #[derive(Debug, Args)]
 struct BatchCloseHeadArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "THREAD_ID",
+        help = "Source thread whose open batch should be closed"
+    )]
     source_thread_id: String,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, help = "Reason recorded for closing the batch")]
     reason: CloseReason,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "Optional operator note recorded with the close event"
+    )]
     note: Option<String>,
 }
 
@@ -1014,16 +1361,29 @@ struct AttemptExpireCliObservationArgs {
 
 #[derive(Debug, Args)]
 struct AttemptInspectArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "ATTEMPT_ID",
+        help = "Delivery attempt id to inspect"
+    )]
     attempt_id: String,
 }
 
 #[derive(Debug, Args)]
 struct AuditListArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "THREAD_ID",
+        help = "Only show audit entries for this source thread"
+    )]
     source_thread_id: Option<String>,
 
-    #[arg(long, default_value_t = 100)]
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = 100,
+        help = "Maximum audit entries to return"
+    )]
     limit: i64,
 }
 
@@ -1401,7 +1761,11 @@ struct CliSessionInvalidateProofArgs {
 
 #[derive(Debug, Args)]
 struct CliSessionInspectArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "SESSION_ID",
+        help = "Managed session id to inspect"
+    )]
     managed_session_id: String,
 }
 
@@ -1428,22 +1792,35 @@ impl CliSessionStateFilter {
 
 #[derive(Debug, Args)]
 struct CliSessionListArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "THREAD_ID",
+        help = "Only show sessions bound to this Codex thread"
+    )]
     bound_thread_id: Option<String>,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, help = "Only show sessions in this managed state")]
     state: Option<CliSessionStateFilter>,
 
-    #[arg(long, default_value_t = 50)]
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = 50,
+        help = "Maximum sessions to return"
+    )]
     limit: i64,
 }
 
 #[derive(Debug, Args)]
 struct CliSessionRetireArgs {
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "SESSION_ID",
+        help = "Detached, parked, or stale managed session id"
+    )]
     managed_session_id: String,
 
-    #[arg(long)]
+    #[arg(long, value_name = "TEXT", help = "Operator-visible retirement reason")]
     reason: String,
 
     #[arg(long, hide = true)]
@@ -1452,30 +1829,41 @@ struct CliSessionRetireArgs {
 
 #[derive(Debug, Subcommand)]
 enum MaintenanceCommand {
+    #[command(about = "Sweep expired leases, stale sessions, and old delivery state")]
     Sweep(MaintenanceSweepArgs),
 }
 
 #[derive(Debug, Args)]
 struct MaintenanceSweepArgs {
-    #[arg(long)]
+    #[arg(long, hide = true)]
     now: Option<i64>,
 }
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
+    #[command(about = "Run the daemon process in the foreground")]
     Serve(DaemonServeArgs),
+    #[command(about = "Start the daemon if needed and wait until it is ready")]
     Ensure(DaemonEnsureArgs),
+    #[command(about = "Check whether the daemon socket is alive and compatible")]
     Ping,
+    #[command(about = "Inspect daemon process state and owned resources")]
     Status,
+    #[command(about = "Ask the daemon to stop cleanly")]
     Stop,
 }
 
 #[derive(Debug, Args)]
 struct DaemonServeArgs {
-    #[arg(long, default_value_t = 300)]
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 300,
+        help = "Exit after this many idle seconds"
+    )]
     idle_timeout_seconds: u64,
 
-    #[arg(long)]
+    #[arg(long, hide = true)]
     now: Option<i64>,
 
     #[arg(long, hide = true)]
@@ -1484,10 +1872,20 @@ struct DaemonServeArgs {
 
 #[derive(Debug, Args)]
 struct DaemonEnsureArgs {
-    #[arg(long, default_value_t = 300)]
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 300,
+        help = "Idle timeout to use if a daemon must be started"
+    )]
     idle_timeout_seconds: u64,
 
-    #[arg(long, default_value_t = 5)]
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 5,
+        help = "How long to wait for startup readiness"
+    )]
     startup_timeout_seconds: u64,
 }
 
@@ -1528,6 +1926,13 @@ pub fn run() -> Result<()> {
                 run_cli_session(config, &layout, cli.auto_daemon_startup_timeout_seconds)?;
             std::process::exit(exit_code);
         }
+        Commands::Cli {
+            command: CliCommand::AppServers(args),
+        } if args.effective_format() == OutputFormat::Human => {
+            let report = collect_cli_app_servers(&layout);
+            write_cli_app_servers_human(&report)?;
+            return Ok(());
+        }
         Commands::New(args) => {
             if cli.direct_store {
                 bail!("new does not support --direct-store");
@@ -1548,11 +1953,17 @@ pub fn run() -> Result<()> {
         }
         Commands::Self_ {
             command: SelfCommand::Update(args),
-        } => run_self_update(SelfUpdateOptions {
-            version: args.version,
-            check: args.check,
-            yes: args.yes,
-        })?,
+        } => {
+            if args.interactive {
+                run_self_update_interactive(args.version)?;
+                return Ok(());
+            }
+            run_self_update(SelfUpdateOptions {
+                version: args.version,
+                check: args.check,
+                yes: args.yes,
+            })?
+        }
         command => dispatch(
             command,
             &layout,
@@ -1823,11 +2234,16 @@ fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
         Commands::Audit { command } => dispatch_audit(command, layout),
         Commands::Self_ {
             command: SelfCommand::Update(args),
-        } => run_self_update(SelfUpdateOptions {
-            version: args.version,
-            check: args.check,
-            yes: args.yes,
-        }),
+        } => {
+            if args.interactive {
+                bail!("self update --interactive must execute from the foreground client");
+            }
+            run_self_update(SelfUpdateOptions {
+                version: args.version,
+                check: args.check,
+                yes: args.yes,
+            })
+        }
         Commands::New(_) => bail!("new must execute from the foreground client"),
         Commands::Resume(_) => bail!("resume must execute from the foreground client"),
         Commands::Cli { command } => dispatch_cli(command, layout),
@@ -2050,6 +2466,289 @@ fn validate_cli_session_target(target: &CliSessionTargetConfig) -> Result<()> {
         }
         CliSessionTargetConfig::NewThread => Ok(()),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct CliAppServersReport {
+    cli_app_servers: Vec<CliAppServerSummary>,
+    daemon: Option<CliAppServersDaemonSummary>,
+    daemon_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CliAppServersDaemonSummary {
+    pid: Option<u64>,
+    started_at: Option<i64>,
+    started_at_local: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CliAppServerSummary {
+    codex_session_id: String,
+    managed_session_id: String,
+    session_epoch: i64,
+    ws_url: String,
+    pid: u64,
+    started_at: i64,
+    started_at_local: String,
+    lease_seconds_remaining: u64,
+    cwd: Option<String>,
+    title: Option<String>,
+    thread_info_error: Option<String>,
+}
+
+#[derive(Default)]
+struct CliAppServerThreadInfo {
+    cwd: Option<String>,
+    title: Option<String>,
+    error: Option<String>,
+}
+
+fn collect_cli_app_servers(layout: &FsLayout) -> CliAppServersReport {
+    let status = match daemon_request(layout, "status") {
+        Ok(status) => status,
+        Err(error) => {
+            return CliAppServersReport {
+                cli_app_servers: Vec::new(),
+                daemon: None,
+                daemon_error: Some(format!("{error:#}")),
+            };
+        }
+    };
+    let daemon = status.get("daemon").map(|daemon| {
+        let started_at = daemon.get("started_at").and_then(Value::as_i64);
+        CliAppServersDaemonSummary {
+            pid: daemon.get("pid").and_then(Value::as_u64),
+            started_at,
+            started_at_local: started_at.map(format_local_epoch_seconds),
+        }
+    });
+    let cli_app_servers = status
+        .get("cli_app_servers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(cli_app_server_summary_from_status)
+        .collect();
+    CliAppServersReport {
+        cli_app_servers,
+        daemon,
+        daemon_error: None,
+    }
+}
+
+fn cli_app_server_summary_from_status(server: &Value) -> Option<CliAppServerSummary> {
+    let codex_session_id = server.get("bound_thread_id")?.as_str()?.to_owned();
+    let managed_session_id = server.get("managed_session_id")?.as_str()?.to_owned();
+    let ws_url = server.get("url")?.as_str()?.to_owned();
+    let pid = server.get("pid").and_then(Value::as_u64).unwrap_or(0);
+    let started_at = server
+        .get("started_at")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let session_epoch = server
+        .get("session_epoch")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let lease_seconds_remaining = server
+        .get("lease_seconds_remaining")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let thread_info = read_cli_app_server_thread_info(&ws_url, &codex_session_id);
+    Some(CliAppServerSummary {
+        codex_session_id,
+        managed_session_id,
+        session_epoch,
+        ws_url,
+        pid,
+        started_at,
+        started_at_local: format_local_epoch_seconds(started_at),
+        lease_seconds_remaining,
+        cwd: thread_info.cwd,
+        title: thread_info.title,
+        thread_info_error: thread_info.error,
+    })
+}
+
+fn read_cli_app_server_thread_info(url: &str, codex_session_id: &str) -> CliAppServerThreadInfo {
+    let mut info = CliAppServerThreadInfo::default();
+    let mut client = match AppServerJsonRpcClient::connect(
+        url,
+        Duration::from_millis(CLI_APP_SERVER_PASSIVE_CONNECT_TIMEOUT_MS),
+    ) {
+        Ok(client) => client,
+        Err(error) => {
+            info.error = Some(format!("{error:#}"));
+            return info;
+        }
+    };
+    let initialize = match client.initialize(
+        env!("CARGO_PKG_VERSION"),
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+    ) {
+        Ok(initialize) => initialize,
+        Err(error) => {
+            info.error = Some(format!("{error:#}"));
+            return info;
+        }
+    };
+    let codex_home = initialize
+        .get("codexHome")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    if let Err(error) = client.notify_initialized() {
+        info.error = Some(format!("{error:#}"));
+    } else {
+        match client
+            .request(
+                "thread/read",
+                json!({
+                    "threadId": codex_session_id,
+                    "includeTurns": false,
+                }),
+                Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+            )
+            .map_err(anyhow::Error::new)
+        {
+            Ok(read) => {
+                info.cwd =
+                    thread_read_cwd_from_response(&read, codex_session_id).map(str::to_owned);
+                info.title =
+                    thread_read_title_from_response(&read, codex_session_id).map(str::to_owned);
+            }
+            Err(error) => {
+                info.error = Some(format!("{error:#}"));
+            }
+        }
+    }
+    if info.title.is_none() {
+        info.title = codex_home.as_deref().and_then(|home| {
+            read_session_index_title(home, codex_session_id)
+                .ok()
+                .flatten()
+        });
+    }
+    info
+}
+
+fn thread_read_title_from_response<'a>(read: &'a Value, thread_id: &str) -> Option<&'a str> {
+    if !thread_read_response_matches_thread(read, thread_id) {
+        return None;
+    }
+    [
+        read.get("thread")
+            .and_then(|thread| thread.get("title"))
+            .and_then(Value::as_str),
+        read.get("title").and_then(Value::as_str),
+        read.get("thread")
+            .and_then(|thread| thread.get("name"))
+            .and_then(Value::as_str),
+        read.get("name").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| !value.is_empty())
+}
+
+fn read_session_index_title(codex_home: &Path, codex_session_id: &str) -> Result<Option<String>> {
+    let path = codex_home.join("session_index.jsonl");
+    let file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+    let reader = io::BufReader::new(file);
+    let mut latest_title = None;
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        let value: Value =
+            serde_json::from_str(&line).with_context(|| format!("parse {}", path.display()))?;
+        if value.get("id").and_then(Value::as_str) == Some(codex_session_id)
+            && let Some(title) = value.get("thread_name").and_then(Value::as_str)
+            && !title.is_empty()
+        {
+            latest_title = Some(title.to_owned());
+        }
+    }
+    Ok(latest_title)
+}
+
+fn write_cli_app_servers_human(report: &CliAppServersReport) -> Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    if report.cli_app_servers.is_empty() {
+        writeln!(out, "No managed CLI app-servers are running.")?;
+        if let Some(error) = &report.daemon_error {
+            writeln!(out, "Daemon: unavailable ({error})")?;
+        }
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "{} managed CLI app-server{}",
+        report.cli_app_servers.len(),
+        if report.cli_app_servers.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    )?;
+    for server in &report.cli_app_servers {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "{}",
+            server.title.as_deref().unwrap_or("<unknown title>")
+        )?;
+        writeln!(out, "  codex session: {}", server.codex_session_id)?;
+        writeln!(out, "  managed session: {}", server.managed_session_id)?;
+        writeln!(out, "  epoch: {}", server.session_epoch)?;
+        writeln!(out, "  ws: {}", server.ws_url)?;
+        writeln!(
+            out,
+            "  cwd: {}",
+            server.cwd.as_deref().unwrap_or("<unknown>")
+        )?;
+        writeln!(out, "  started: {}", server.started_at_local)?;
+        writeln!(out, "  pid: {}", server.pid)?;
+        writeln!(
+            out,
+            "  lease: {}s remaining",
+            server.lease_seconds_remaining
+        )?;
+        if let Some(error) = &server.thread_info_error {
+            writeln!(out, "  thread info: unavailable ({error})")?;
+        }
+    }
+    Ok(())
+}
+
+fn format_local_epoch_seconds(epoch: i64) -> String {
+    format_local_epoch_seconds_impl(epoch).unwrap_or_else(|| epoch.to_string())
+}
+
+fn format_local_epoch_seconds_impl(epoch: i64) -> Option<String> {
+    let time = epoch as libc::time_t;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let tm = unsafe {
+        if libc::localtime_r(&time, tm.as_mut_ptr()).is_null() {
+            return None;
+        }
+        tm.assume_init()
+    };
+    let format = b"%Y-%m-%d %H:%M:%S %Z\0";
+    let mut buffer = [0 as libc::c_char; 64];
+    let len = unsafe {
+        libc::strftime(
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            format.as_ptr().cast(),
+            &tm,
+        )
+    };
+    if len == 0 {
+        return None;
+    }
+    unsafe { CStr::from_ptr(buffer.as_ptr()) }
+        .to_str()
+        .ok()
+        .map(str::to_owned)
 }
 
 struct CliRunThreadTarget {
@@ -7961,7 +8660,7 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
         | Commands::New(_)
         | Commands::Resume(_)
         | Commands::Cli {
-            command: CliCommand::Run(_),
+            command: CliCommand::Run(_) | CliCommand::AppServers(_),
         }
         | Commands::Cli {
             command:
@@ -8950,6 +9649,9 @@ fn dispatch_audit(command: AuditCommand, layout: &FsLayout) -> Result<Value> {
 }
 
 fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
+    if matches!(&command, CliCommand::AppServers(_)) {
+        return Ok(json!(collect_cli_app_servers(layout)));
+    }
     let mut store = if cli_command_uses_lifecycle_store_timeout(&command) {
         Store::open_for_daemon_lifecycle(layout)?
     } else {
@@ -8957,6 +9659,7 @@ fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
     };
     match command {
         CliCommand::Run(_) => bail!("cli run must execute from the foreground client"),
+        CliCommand::AppServers(_) => unreachable!("handled before opening store"),
         CliCommand::Session { command } => match command {
             CliSessionCommand::Bind(args) => {
                 validate_nonempty("bound_thread_id", &args.bound_thread_id)?;
@@ -10113,6 +10816,64 @@ mod tests {
                 "thread-1"
             ),
             None
+        );
+    }
+
+    #[test]
+    fn thread_read_title_prefers_nested_title_and_requires_matching_thread() {
+        assert_eq!(
+            thread_read_title_from_response(
+                &json!({
+                    "thread": {
+                        "id": "thread-1",
+                        "title": "Nested Title",
+                        "name": "Nested Name"
+                    },
+                    "title": "Top Title",
+                    "name": "Top Name"
+                }),
+                "thread-1"
+            ),
+            Some("Nested Title")
+        );
+        assert_eq!(
+            thread_read_title_from_response(
+                &json!({
+                    "thread": { "id": "thread-1", "name": "Nested Name" },
+                    "title": "Top Title"
+                }),
+                "thread-1"
+            ),
+            Some("Top Title")
+        );
+        assert_eq!(
+            thread_read_title_from_response(
+                &json!({
+                    "thread": { "id": "thread-other", "title": "Wrong Thread" },
+                    "title": "Top Title"
+                }),
+                "thread-1"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn session_index_title_uses_last_matching_name() {
+        let home = tempfile::tempdir().expect("temp codex home");
+        fs::write(
+            home.path().join("session_index.jsonl"),
+            concat!(
+                "{\"id\":\"thread-1\",\"thread_name\":\"Old Title\"}\n",
+                "{\"id\":\"thread-other\",\"thread_name\":\"Other Title\"}\n",
+                "{\"id\":\"thread-1\",\"thread_name\":\"New Title\"}\n",
+            ),
+        )
+        .expect("write session index");
+
+        assert_eq!(
+            read_session_index_title(home.path(), "thread-1").expect("read session title"),
+            Some("New Title".to_owned())
         );
     }
 

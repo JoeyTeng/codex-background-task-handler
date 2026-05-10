@@ -85,10 +85,11 @@ Upgrade an installed binary:
 
 ```bash
 cbth self update --check
+cbth self update -i
 cbth self update --yes
 ```
 
-`cbth self update --yes` downloads the matching GitHub Release binary and `.sha256`, verifies the checksum, writes a temporary file next to the current executable, and atomically replaces it. It does not use `sudo`; if the current executable is not writable, reinstall into a user-writable directory.
+`cbth self update --interactive` / `-i` checks GitHub Releases and prompts before installing. `cbth self update --yes` downloads the matching GitHub Release binary and `.sha256`, verifies the checksum, writes a temporary file next to the current executable, and atomically replaces it. It does not use `sudo`; if the current executable is not writable, reinstall into a user-writable directory.
 
 ## Local Development Install
 
@@ -145,7 +146,7 @@ CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --
 
 ## Rust CLI Usage
 
-The Rust CLI currently provides read-only store inspection commands, daemon-routed mutating job/batch/task/maintenance commands, `cbth cli run`, operator-facing CLI session recovery commands, adapter-internal attempt commands, an audit log, explicit `cbth self update`, and a daemon control surface backed by a same-user Unix socket.
+The Rust CLI currently provides read-only store inspection commands, daemon-routed mutating job/batch/task/maintenance commands, `cbth cli run`, operator-facing CLI app-server/session recovery commands, adapter-internal attempt commands, an audit log, explicit `cbth self update`, and a daemon control surface backed by a same-user Unix socket.
 
 Run the deployment readiness check before dogfooding a fresh install:
 
@@ -239,6 +240,8 @@ The local-store and daemon IPC semantics are supported on macOS and Linux; pure 
 By default, `job submit`, `job complete`, `job fail`, `batch close-head`, and `maintenance sweep` first ensure the local daemon is running, then execute through its same-user Unix socket. Read-only commands such as `job inspect`, `job list`, `batch inspect-head`, and `batch inspect` read the local store directly.
 Use `--auto-daemon-startup-timeout-seconds <seconds>` on routed mutating commands when a large startup sweep or slow disk needs more than the default 5 seconds.
 
+Use `cbth cli app-servers` to inspect currently running daemon-owned Codex app-servers without autostarting the daemon. Default JSON output includes the websocket URL, Codex session id, managed session id, session epoch, pid, lease, local start time, cwd, title, and any best-effort thread-info error. For operator use, `cbth cli app-servers --human` / `-H` prints the same core state as a compact human-readable summary.
+
 `cbth task run` is daemon-owned background supervision for local commands. It creates a durable task plus associated job, spawns the command in its own process group using the caller's environment, returns immediately with `task_id` / `job_id`, and lets the daemon complete or fail the job when the command exits. stdout and stderr are spooled to task log files under `~/.cbth/tasks/<task-id>/`, with bounded in-memory tails, 64 MiB per-stream spool caps, a 16 active-task daemon cap, and cleanup only after linked delivery batches have closed and their retention window has elapsed. The delivery prompt includes command metadata, exit status, byte/truncation flags, small tail previews, and managed artifact refs; large logs stay in the managed files/artifacts. `task cancel` records the cancel request and asks the daemon to terminate the task process group with SIGTERM, then SIGKILL after a grace window; daemon startup recovery validates a persisted process identity before killing a lost task process group.
 
 ```bash
@@ -247,6 +250,9 @@ cargo run --bin cbth -- \
 
 cargo run --bin cbth -- \
   self update --check
+
+cargo run --bin cbth -- \
+  cli app-servers -H
 
 cargo run --bin cbth -- \
   job submit \
