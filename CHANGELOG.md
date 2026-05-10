@@ -2,6 +2,14 @@
 
 All notable release changes for `cbth` are documented here.
 
+## v0.1.5 - 2026-05-10
+
+### Added
+
+- Added clearer `cbth` help text for the top-level CLI, public subcommands, and visible arguments.
+- Added `cbth cli app-servers --format json|human` plus `-H/--human` for concise managed app-server summaries.
+- Added `cbth self update -i/--interactive` for prompted self-update installs.
+
 ## v0.1.4 - 2026-05-09
 
 ### Changed
