@@ -837,7 +837,7 @@ enum AuditCommand {
 enum SelfCommand {
     #[command(
         about = "Update the cbth binary from GitHub Releases",
-        long_about = "Update the current cbth executable from GitHub Releases. Use --check to inspect without installing, --interactive to prompt with Install now? [y/N], or --yes for non-interactive scripts."
+        long_about = "Update the current cbth executable from GitHub Releases. Use --check to inspect without installing, --interactive/-i to prompt with Install now? [y/N], or --yes for non-interactive scripts."
     )]
     Update(SelfUpdateArgs),
 }
@@ -863,6 +863,7 @@ struct SelfUpdateArgs {
 
     #[arg(
         long,
+        short = 'i',
         conflicts_with_all = ["check", "yes"],
         help = "Prompt before installing an available or requested release"
     )]
@@ -876,7 +877,7 @@ enum CliCommand {
     #[command(
         name = "app-servers",
         about = "List running daemon-owned Codex app-servers",
-        long_about = "List running daemon-owned Codex app-servers without starting a daemon. JSON output is intended for tools; --format human prints a compact operator summary with the websocket URL, Codex session id, cwd, title, and local start time."
+        long_about = "List running daemon-owned Codex app-servers without starting a daemon. JSON output is intended for tools; --human/-H prints a compact operator summary with the websocket URL, Codex session id, cwd, title, and local start time."
     )]
     AppServers(CliAppServersArgs),
     #[command(about = "Inspect and recover managed CLI sessions")]
@@ -896,6 +897,24 @@ struct CliAppServersArgs {
         help = "Choose machine-readable JSON or compact human-readable output"
     )]
     format: OutputFormat,
+
+    #[arg(
+        long,
+        short = 'H',
+        conflicts_with = "format",
+        help = "Print compact human-readable output"
+    )]
+    human: bool,
+}
+
+impl CliAppServersArgs {
+    fn effective_format(&self) -> OutputFormat {
+        if self.human {
+            OutputFormat::Human
+        } else {
+            self.format
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1905,7 +1924,7 @@ pub fn run() -> Result<()> {
         }
         Commands::Cli {
             command: CliCommand::AppServers(args),
-        } if args.format == OutputFormat::Human => {
+        } if args.effective_format() == OutputFormat::Human => {
             let report = collect_cli_app_servers(&layout);
             write_cli_app_servers_human(&report)?;
             return Ok(());

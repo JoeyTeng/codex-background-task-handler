@@ -34,6 +34,8 @@ fn cli_help_lists_app_server_operator_command() {
 #[test]
 fn cli_app_servers_help_describes_formats_and_non_autostart_behavior() {
     let stdout = help(&["cli", "app-servers", "--help"]);
+    assert!(stdout.contains("-H"));
+    assert!(stdout.contains("--human"));
     assert!(stdout.contains("--format"));
     assert!(stdout.contains("without starting a daemon"));
     assert!(stdout.contains("websocket URL"));
@@ -42,6 +44,7 @@ fn cli_app_servers_help_describes_formats_and_non_autostart_behavior() {
 #[test]
 fn self_update_help_describes_interactive_mode() {
     let stdout = help(&["self", "update", "--help"]);
+    assert!(stdout.contains("-i"));
     assert!(stdout.contains("--interactive"));
     assert!(stdout.contains("Prompt before installing"));
     assert!(stdout.contains("--check"));
@@ -56,8 +59,7 @@ fn cli_app_servers_human_does_not_autostart_daemon() {
         .arg(home.path())
         .arg("cli")
         .arg("app-servers")
-        .arg("--format")
-        .arg("human")
+        .arg("-H")
         .output()
         .expect("run app-servers human");
     assert!(
@@ -77,7 +79,7 @@ fn self_update_interactive_requires_tty_before_network() {
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
         .arg("self")
         .arg("update")
-        .arg("--interactive")
+        .arg("-i")
         .output()
         .expect("run self update interactive");
     assert!(!output.status.success());
@@ -91,9 +93,24 @@ fn self_update_modes_are_mutually_exclusive() {
         .arg("self")
         .arg("update")
         .arg("--check")
-        .arg("--interactive")
+        .arg("-i")
         .output()
         .expect("run conflicting self update modes");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot be used with"));
+}
+
+#[test]
+fn cli_app_servers_human_short_conflicts_with_explicit_format() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("cli")
+        .arg("app-servers")
+        .arg("-H")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("run conflicting app-servers output modes");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cannot be used with"));

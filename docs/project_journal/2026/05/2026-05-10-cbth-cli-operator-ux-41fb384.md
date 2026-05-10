@@ -14,8 +14,8 @@ superseded_by:
 
 ## Summary
 - `cbth` now has clearer Clap help for the public command groups and visible operator parameters.
-- `cbth cli app-servers` lists currently running daemon-owned Codex app-servers without daemon autostart; JSON is the default, and `--format human` prints a compact summary.
-- `cbth self update --interactive` checks GitHub Releases and prompts with y/N before installing.
+- `cbth cli app-servers` lists currently running daemon-owned Codex app-servers without daemon autostart; JSON is the default, and `--human` / `-H` prints a compact summary.
+- `cbth self update --interactive` / `-i` checks GitHub Releases and prompts with y/N before installing.
 
 ## Current State
 - App-server JSON entries include Codex session id, managed session id, session epoch, websocket URL, pid, lease, start time in local time, cwd, title, and best-effort thread-info errors.
