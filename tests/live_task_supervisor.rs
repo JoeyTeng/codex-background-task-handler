@@ -83,15 +83,25 @@ fi
 
 exit_file="${CBTH_LIVE_FOREGROUND_EXIT_FILE:?}"
 timeout_seconds="${CBTH_LIVE_FOREGROUND_TIMEOUT_SECONDS:-360}"
+"${CBTH_LIVE_REAL_CODEX_BIN:?}" "$@" &
+child="$!"
+trap 'kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true' INT TERM EXIT
+
 elapsed=0
 while [ "$elapsed" -lt "$timeout_seconds" ]; do
   if [ -f "$exit_file" ]; then
+    kill "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+    trap - INT TERM EXIT
     exit 0
   fi
   sleep 1
   elapsed=$((elapsed + 1))
 done
 
+kill "$child" 2>/dev/null || true
+wait "$child" 2>/dev/null || true
+trap - INT TERM EXIT
 echo "cbth live foreground wrapper timed out" >&2
 exit 124
 "#,

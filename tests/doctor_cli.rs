@@ -27,7 +27,7 @@ if [ "${1:-}" = "--version" ]; then
   if [ "${FAKE_CODEX_VERSION_GRANDCHILD_STDOUT:-}" = "1" ]; then
     (trap '' TERM; while :; do sleep 1; done) &
   fi
-  printf '%s\n' "${FAKE_CODEX_VERSION:-codex-cli 0.129.0}"
+  printf '%s\n' "${FAKE_CODEX_VERSION:-codex-cli 0.130.0}"
   exit 0
 fi
 
@@ -241,7 +241,7 @@ fn doctor_cli_warns_when_codex_version_is_outside_validated_range() {
     let output = run_doctor(
         &home,
         &fake_codex,
-        &[("FAKE_CODEX_VERSION", "codex-cli 0.130.0")],
+        &[("FAKE_CODEX_VERSION", "codex-cli 0.131.0")],
     );
     stop_daemon(&home);
 
@@ -257,12 +257,12 @@ fn doctor_cli_warns_when_codex_version_is_outside_validated_range() {
     assert_eq!(codex_binary["status"], "warn");
     assert_eq!(
         codex_binary["details"]["compatibility"]["validated_range"],
-        "0.129.x"
+        "0.130.x"
     );
     assert!(
         codex_binary["details"]["compatibility"]["warning"]
             .as_str()
-            .is_some_and(|warning| warning.contains("0.130.0")),
+            .is_some_and(|warning| warning.contains("0.131.0")),
         "missing version warning: {codex_binary}"
     );
 }

@@ -1,3 +1,15 @@
+---
+id: 20260508-6431a08-codex-129-permission-selection
+title: Codex 0.129 Permission Selection
+status: completed
+created: 2026-05-08
+updated: 2026-05-08
+branch: wip/codex-129-permission-selection
+pr:
+supersedes: []
+superseded_by:
+---
+
 # Codex 0.129 Permission Selection
 
 - status: completed
