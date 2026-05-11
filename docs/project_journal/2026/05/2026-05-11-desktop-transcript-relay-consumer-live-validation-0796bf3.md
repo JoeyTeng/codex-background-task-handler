@@ -36,11 +36,41 @@ superseded_by:
 
 ## Current State
 
-- Planned from `master` commit `0796bf3ec04c`.
-- `writeback_capability` remains `unknown` until this live validation succeeds.
+- Live validation succeeded from `master` commit `0796bf3ec04c`.
+- A real Desktop heartbeat emitted both arm-pending and arm transcript envelopes into trusted `function_call_output` carriers.
+- A normal shell consumed those envelopes with `cbth desktop relay consume-transcript`, advancing the fixture attempt from `prepared` to `arm_pending` to `cooldown`.
+- `writeback_capability` has been explicitly repaired to `validated`; `artifact_read_capability` remains `unknown`.
+- The synthetic fixture batch was closed after evidence collection.
+
+## Live Evidence
+
+- Local binary: `/Users/hoteng/.cache/cargo-target/release/cbth`
+- Local binary version: `cbth 0.1.5`
+- Heartbeat thread id: `019db5e6-ba6a-7b80-95d2-a6867163281a`
+- Rollout file: `/Users/hoteng/.codex/sessions/2026/04/22/rollout-2026-04-22T16-54-50-019db5e6-ba6a-7b80-95d2-a6867163281a.jsonl`
+- Source thread id: `cbth-desktop-transcript-relay-consumer-live-20260511T211238Z`
+- Caller automation id: `cbth-desktop-transcript-relay-consumer-live`
+- Bridge request id: `CBTH_DESKTOP_RELAY_CONSUMER_LIVE_20260511T211238Z`
+- Batch id: `019e18e2-baea-7a20-9975-8f1296acd76a`
+- Attempt id: `019e18e2-baea-7a20-9975-8f2262980523`
+- Generation: `1`
+- Pending marker: `CBTH_DESKTOP_RELAY_PENDING_20260511T211238Z`
+- Pending trusted carrier line: `457`
+- Pending consumer outcome: `arm_pending`, replay state `fresh`; repeated consume replay state `replayed`
+- Bridge arm lease id: `019e18e5-83a0-7a03-b125-c4213ab926f5`
+- Arm marker: `CBTH_DESKTOP_RELAY_ARM_20260511T211238Z`
+- Arm trusted carrier line: `476`
+- Arm consumer outcome: `armed`, replay state `fresh`; repeated consume replay state `replayed`
+- Final attempt state: `cooldown`
+- Final batch `delivery_attempt_count`: `1`
+- Pause-due snapshot revision: `019e18eb-2c6c-7921-9209-80af1cafe2da`
+- Pause-due readback: `count=1`, `overdue=true`
+- Capability repair result: `writeback_capability=validated`, `artifact_read_capability=unknown`, `read_transport_generation=2`
+- Capability repair note: `degraded_bindings=2` because the validation fingerprint moved to the current `0.1.5` binary path.
+- Cleanup: fixture batch closed with `operator_confirmed_delivery`.
 
 ## Next Steps
 
-- Run the live validation flow and update this journal with the observed result.
-- If successful, record evidence and repair `writeback_capability=validated`.
-- If blocked, leave capability state unchanged and record the exact blocker before designing production tailing.
+- Add a production sidecar scanner with rollout discovery, durable scan cursors, marker issuance, and replay retention cleanup.
+- Implement ready materialization and caller wake only after production relay consumption, pause reconcile, and continuation-boundary contracts are complete.
+- Validate artifact-read capability separately before allowing `requires_artifact_read=true` batches on the automatic Desktop path.

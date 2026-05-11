@@ -8,7 +8,7 @@ branch: codex/desktop-transcript-relay-consumer-foundation
 pr:
 supersedes:
   - 20260511-eeef583-desktop-transcript-relay-validation
-superseded_by:
+superseded_by: 20260511-0796bf3-desktop-transcript-relay-consumer-live-validation
 ---
 
 # Desktop Transcript Relay Writeback Consumer Foundation
@@ -45,11 +45,10 @@ superseded_by:
 ## Current State
 
 - Transcript relay can now carry writeback requests to a durable consumer in fake/default tests.
-- `writeback_capability` remains `unknown` until a real heartbeat plus non-Desktop consumer live validation succeeds and an operator explicitly repairs installation state.
+- Follow-up live validation succeeded in [Desktop transcript relay consumer live validation](2026-05-11-desktop-transcript-relay-consumer-live-validation-0796bf3.md), and `writeback_capability` was explicitly repaired to `validated`.
 - Production sidecar tailing, rollout auto-discovery, durable scan cursors, nonce generation / issuance, ready materialization, caller wake, pause reconcile, and boundary crossing remain future work.
 
 ## Next Steps
 
-- Run opt-in live validation with a real Desktop heartbeat automation and record whether the consumer path can safely drive the existing CAS transitions.
 - Add a production sidecar scanner with durable scan cursors and marker issuance after live validation proves the manual consumer path.
 - Implement ready materialization and caller wake only after writeback consumption, pause reconcile, and continuation-boundary contracts are validated.
