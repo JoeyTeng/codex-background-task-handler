@@ -63,6 +63,18 @@ struct LostTaskRecovery {
     max_delivery_attempts: i64,
     redelivery_window_seconds: i64,
     cancel_requested_at: Option<i64>,
+    supervisor_daemon_generation: Option<String>,
+}
+
+fn supervisor_generation_matches_recovery_owners(
+    supervisor_daemon_generation: Option<&str>,
+    include_unowned: bool,
+    supervisor_daemon_generations: &HashSet<String>,
+) -> bool {
+    match supervisor_daemon_generation {
+        Some(generation) => supervisor_daemon_generations.contains(generation),
+        None => include_unowned,
+    }
 }
 
 pub struct TaskFinishUpdate<'a> {
@@ -142,14 +154,22 @@ impl Store {
     }
 
     pub fn submit_job(&mut self, job: NewJob) -> Result<JobRecord> {
+        self.submit_job_for_supervisor_generation(job, None)
+    }
+
+    pub fn submit_job_for_supervisor_generation(
+        &mut self,
+        job: NewJob,
+        supervisor_daemon_generation: Option<&str>,
+    ) -> Result<JobRecord> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO jobs (
                 job_id, source_thread_id, status, summary, metadata_json,
                 created_at, updated_at, delivery_read_only,
                 delivery_requires_approval, delivery_requires_network,
-                delivery_requires_write_access
-            ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
+                delivery_requires_write_access, supervisor_daemon_generation
+            ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 job.job_id,
                 job.source_thread_id,
@@ -161,6 +181,7 @@ impl Store {
                 bool_to_i64(job.policy.delivery_requires_approval),
                 bool_to_i64(job.policy.delivery_requires_network),
                 bool_to_i64(job.policy.delivery_requires_write_access),
+                supervisor_daemon_generation,
             ],
         )?;
         let record = query_job_tx(&tx, &job.job_id)?;
@@ -168,10 +189,20 @@ impl Store {
         Ok(record)
     }
 
+    #[cfg(test)]
     pub fn create_task_with_job(
         &mut self,
         job: NewJob,
         task: NewTask,
+    ) -> Result<(JobRecord, TaskRecord)> {
+        self.create_task_with_job_for_supervisor_generation(job, task, None)
+    }
+
+    pub fn create_task_with_job_for_supervisor_generation(
+        &mut self,
+        job: NewJob,
+        task: NewTask,
+        supervisor_daemon_generation: Option<&str>,
     ) -> Result<(JobRecord, TaskRecord)> {
         if job.job_id != task.job_id {
             bail!("task job_id must match created job");
@@ -185,8 +216,8 @@ impl Store {
                 job_id, source_thread_id, status, summary, metadata_json,
                 created_at, updated_at, delivery_read_only,
                 delivery_requires_approval, delivery_requires_network,
-                delivery_requires_write_access
-            ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
+                delivery_requires_write_access, supervisor_daemon_generation
+            ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 job.job_id,
                 job.source_thread_id,
@@ -198,14 +229,15 @@ impl Store {
                 bool_to_i64(job.policy.delivery_requires_approval),
                 bool_to_i64(job.policy.delivery_requires_network),
                 bool_to_i64(job.policy.delivery_requires_write_access),
+                supervisor_daemon_generation,
             ],
         )?;
         tx.execute(
             "INSERT INTO tasks (
                 task_id, job_id, source_thread_id, status, summary, command_json,
                 cwd, timeout_seconds, max_delivery_attempts,
-                redelivery_window_seconds, created_at
-            ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)",
+                redelivery_window_seconds, supervisor_daemon_generation, created_at
+            ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 task.task_id,
                 task.job_id,
@@ -216,6 +248,7 @@ impl Store {
                 task.timeout_seconds,
                 task.max_delivery_attempts,
                 task.redelivery_window_seconds,
+                supervisor_daemon_generation,
                 task.created_at,
             ],
         )?;
@@ -472,9 +505,54 @@ impl Store {
         }
     }
 
+    #[allow(dead_code)]
     pub fn lost_pending_task_processes(&self) -> Result<Vec<LostPendingTaskProcess>> {
+        self.lost_pending_task_processes_matching(|_| true)
+    }
+
+    #[allow(dead_code)]
+    pub fn lost_pending_task_processes_without_supervisor_generation(
+        &self,
+    ) -> Result<Vec<LostPendingTaskProcess>> {
+        self.lost_pending_task_processes_matching(|task_supervisor_generation| {
+            task_supervisor_generation.is_none()
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn lost_pending_task_processes_for_supervisor_generation(
+        &self,
+        supervisor_daemon_generation: &str,
+    ) -> Result<Vec<LostPendingTaskProcess>> {
+        self.lost_pending_task_processes_matching(|task_supervisor_generation| {
+            task_supervisor_generation == Some(supervisor_daemon_generation)
+        })
+    }
+
+    pub fn lost_pending_task_processes_for_recovery_owners(
+        &self,
+        include_unowned: bool,
+        supervisor_daemon_generations: &HashSet<String>,
+    ) -> Result<Vec<LostPendingTaskProcess>> {
+        self.lost_pending_task_processes_matching(|task_supervisor_generation| {
+            supervisor_generation_matches_recovery_owners(
+                task_supervisor_generation,
+                include_unowned,
+                supervisor_daemon_generations,
+            )
+        })
+    }
+
+    fn lost_pending_task_processes_matching<F>(
+        &self,
+        mut matches_supervisor_generation: F,
+    ) -> Result<Vec<LostPendingTaskProcess>>
+    where
+        F: FnMut(Option<&str>) -> bool,
+    {
         let mut stmt = self.conn.prepare(
-            "SELECT tasks.task_id, tasks.pid, tasks.pid_identity
+            "SELECT tasks.task_id, tasks.pid, tasks.pid_identity,
+                    tasks.supervisor_daemon_generation
              FROM tasks
              JOIN jobs ON jobs.job_id = tasks.job_id
              WHERE tasks.status IN ('queued', 'running')
@@ -487,26 +565,34 @@ impl Store {
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         processes
             .into_iter()
-            .map(|(task_id, pid, pid_identity)| {
-                Ok(LostPendingTaskProcess {
-                    task_id,
-                    pid: u32::try_from(pid)
-                        .with_context(|| format!("stored task pid {pid} is invalid"))?,
-                    pid_identity,
-                })
+            .filter(|(_, _, _, supervisor_daemon_generation)| {
+                matches_supervisor_generation(supervisor_daemon_generation.as_deref())
             })
+            .map(
+                |(task_id, pid, pid_identity, _supervisor_daemon_generation)| {
+                    Ok(LostPendingTaskProcess {
+                        task_id,
+                        pid: u32::try_from(pid)
+                            .with_context(|| format!("stored task pid {pid} is invalid"))?,
+                        pid_identity,
+                    })
+                },
+            )
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn fail_lost_tasks(&mut self, now: i64) -> Result<usize> {
         self.fail_lost_tasks_excluding(now, &HashSet::new())
     }
 
+    #[allow(dead_code)]
     pub fn fail_lost_tasks_excluding(
         &mut self,
         now: i64,
@@ -515,6 +601,7 @@ impl Store {
         self.fail_lost_tasks_excluding_with(now, |task_id| Ok(active_task_ids.contains(task_id)))
     }
 
+    #[allow(dead_code)]
     pub fn fail_lost_tasks_excluding_with<F>(
         &mut self,
         now: i64,
@@ -523,11 +610,83 @@ impl Store {
     where
         F: FnMut(&str) -> Result<bool>,
     {
+        self.fail_lost_tasks_matching_excluding_with(now, |_| true, &mut is_active_task)
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_lost_tasks_without_supervisor_generation_excluding_with<F>(
+        &mut self,
+        now: i64,
+        mut is_active_task: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> Result<bool>,
+    {
+        self.fail_lost_tasks_matching_excluding_with(
+            now,
+            |task_supervisor_generation| task_supervisor_generation.is_none(),
+            &mut is_active_task,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_lost_tasks_for_supervisor_generation_excluding_with<F>(
+        &mut self,
+        now: i64,
+        supervisor_daemon_generation: &str,
+        mut is_active_task: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> Result<bool>,
+    {
+        self.fail_lost_tasks_matching_excluding_with(
+            now,
+            |task_supervisor_generation| {
+                task_supervisor_generation == Some(supervisor_daemon_generation)
+            },
+            &mut is_active_task,
+        )
+    }
+
+    pub fn fail_lost_tasks_for_recovery_owners_excluding_with<F>(
+        &mut self,
+        now: i64,
+        include_unowned: bool,
+        supervisor_daemon_generations: &HashSet<String>,
+        mut is_active_task: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> Result<bool>,
+    {
+        self.fail_lost_tasks_matching_excluding_with(
+            now,
+            |task_supervisor_generation| {
+                supervisor_generation_matches_recovery_owners(
+                    task_supervisor_generation,
+                    include_unowned,
+                    supervisor_daemon_generations,
+                )
+            },
+            &mut is_active_task,
+        )
+    }
+
+    fn fail_lost_tasks_matching_excluding_with<F, G>(
+        &mut self,
+        now: i64,
+        mut matches_supervisor_generation: G,
+        is_active_task: &mut F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> Result<bool>,
+        G: FnMut(Option<&str>) -> bool,
+    {
         let tasks = {
             let mut stmt = self.conn.prepare(
                 "SELECT tasks.task_id, tasks.job_id, jobs.status, jobs.completed_at,
                         jobs.failed_at, jobs.failure_reason, tasks.max_delivery_attempts,
-                        tasks.redelivery_window_seconds, tasks.cancel_requested_at
+                        tasks.redelivery_window_seconds, tasks.cancel_requested_at,
+                        tasks.supervisor_daemon_generation
                  FROM tasks
                  JOIN jobs ON jobs.job_id = tasks.job_id
                  WHERE tasks.status IN ('queued', 'running')
@@ -545,12 +704,16 @@ impl Store {
                     max_delivery_attempts: row.get(6)?,
                     redelivery_window_seconds: row.get(7)?,
                     cancel_requested_at: row.get(8)?,
+                    supervisor_daemon_generation: row.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut recovered = 0;
         for task in &tasks {
+            if !matches_supervisor_generation(task.supervisor_daemon_generation.as_deref()) {
+                continue;
+            }
             if is_active_task(&task.task_id)? {
                 continue;
             }
@@ -2452,6 +2615,7 @@ impl Store {
         .map_err(Into::into)
     }
 
+    #[allow(dead_code)]
     pub fn daemon_lifecycle_status(
         &self,
         now: i64,
@@ -2483,6 +2647,157 @@ impl Store {
             open_batches_due_now,
             open_batches_due_within_idle,
         })
+    }
+
+    #[allow(dead_code)]
+    pub fn daemon_lifecycle_status_without_supervisor_generation(
+        &self,
+        now: i64,
+        idle_horizon_at: i64,
+    ) -> Result<DaemonLifecycleStatus> {
+        let active_jobs = self.conn.query_row(
+            "SELECT COUNT(*) FROM jobs
+             WHERE status = 'pending'
+               AND supervisor_daemon_generation IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let nonterminal_tasks = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE status IN ('queued', 'running')
+               AND supervisor_daemon_generation IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let active_cli_acceptances = count_active_cli_acceptances(&self.conn, now)?;
+        let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
+        let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
+        let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
+        let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
+        Ok(DaemonLifecycleStatus {
+            active_jobs,
+            nonterminal_tasks,
+            active_cli_acceptances,
+            cli_acceptances_stale_now,
+            active_cli_observations,
+            cli_observations_due_now,
+            open_batches_due_now,
+            open_batches_due_within_idle,
+        })
+    }
+
+    pub fn daemon_lifecycle_status_for_recovery_owners(
+        &self,
+        now: i64,
+        idle_horizon_at: i64,
+        include_unowned: bool,
+        supervisor_daemon_generations: &HashSet<String>,
+    ) -> Result<DaemonLifecycleStatus> {
+        let active_jobs = self.count_recovery_owner_rows(
+            "SELECT supervisor_daemon_generation FROM jobs
+             WHERE status = 'pending'",
+            include_unowned,
+            supervisor_daemon_generations,
+        )?;
+        let nonterminal_tasks = self.count_recovery_owner_rows(
+            "SELECT supervisor_daemon_generation FROM tasks
+             WHERE status IN ('queued', 'running')",
+            include_unowned,
+            supervisor_daemon_generations,
+        )?;
+        let active_cli_acceptances = count_active_cli_acceptances(&self.conn, now)?;
+        let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
+        let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
+        let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
+        let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
+        Ok(DaemonLifecycleStatus {
+            active_jobs,
+            nonterminal_tasks,
+            active_cli_acceptances,
+            cli_acceptances_stale_now,
+            active_cli_observations,
+            cli_observations_due_now,
+            open_batches_due_now,
+            open_batches_due_within_idle,
+        })
+    }
+
+    fn count_recovery_owner_rows(
+        &self,
+        sql: &str,
+        include_unowned: bool,
+        supervisor_daemon_generations: &HashSet<String>,
+    ) -> Result<i64> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Option<String>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|supervisor_daemon_generation| {
+                supervisor_generation_matches_recovery_owners(
+                    supervisor_daemon_generation.as_deref(),
+                    include_unowned,
+                    supervisor_daemon_generations,
+                )
+            })
+            .count()
+            .try_into()
+            .expect("matching recovery owner row count fits i64"))
+    }
+
+    #[allow(dead_code)]
+    pub fn daemon_lifecycle_status_for_supervisor_generation(
+        &self,
+        supervisor_daemon_generation: &str,
+        now: i64,
+        idle_horizon_at: i64,
+    ) -> Result<DaemonLifecycleStatus> {
+        let active_jobs = self.conn.query_row(
+            "SELECT COUNT(*) FROM jobs
+             WHERE status = 'pending'
+               AND supervisor_daemon_generation = ?",
+            params![supervisor_daemon_generation],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let nonterminal_tasks = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE status IN ('queued', 'running')
+               AND supervisor_daemon_generation = ?",
+            params![supervisor_daemon_generation],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let active_cli_acceptances = count_active_cli_acceptances(&self.conn, now)?;
+        let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
+        let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
+        let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
+        let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
+        Ok(DaemonLifecycleStatus {
+            active_jobs,
+            nonterminal_tasks,
+            active_cli_acceptances,
+            cli_acceptances_stale_now,
+            active_cli_observations,
+            cli_observations_due_now,
+            open_batches_due_now,
+            open_batches_due_within_idle,
+        })
+    }
+
+    pub fn nonterminal_task_supervisor_generations(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT supervisor_daemon_generation
+             FROM tasks
+             WHERE status IN ('queued', 'running')
+               AND supervisor_daemon_generation IS NOT NULL
+             ORDER BY supervisor_daemon_generation ASC",
+        )?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn close_head(
@@ -2893,7 +3208,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             delivery_read_only INTEGER NOT NULL,
             delivery_requires_approval INTEGER NOT NULL,
             delivery_requires_network INTEGER NOT NULL,
-            delivery_requires_write_access INTEGER NOT NULL
+            delivery_requires_write_access INTEGER NOT NULL,
+            supervisor_daemon_generation TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_jobs_thread_created
@@ -2914,6 +3230,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             redelivery_window_seconds INTEGER NOT NULL DEFAULT 86400,
             pid INTEGER,
             pid_identity TEXT,
+            supervisor_daemon_generation TEXT,
             created_at INTEGER NOT NULL,
             started_at INTEGER,
             completed_at INTEGER,
@@ -3337,6 +3654,17 @@ fn migrate(conn: &Connection) -> Result<()> {
     )?;
     ensure_column(
         conn,
+        "jobs",
+        "supervisor_daemon_generation",
+        "ALTER TABLE jobs ADD COLUMN supervisor_daemon_generation TEXT",
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_supervisor_generation_status
+         ON jobs(supervisor_daemon_generation, status)",
+        [],
+    )?;
+    ensure_column(
+        conn,
         "tasks",
         "max_delivery_attempts",
         "ALTER TABLE tasks ADD COLUMN max_delivery_attempts INTEGER NOT NULL DEFAULT 3",
@@ -3352,6 +3680,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         "tasks",
         "pid_identity",
         "ALTER TABLE tasks ADD COLUMN pid_identity TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "tasks",
+        "supervisor_daemon_generation",
+        "ALTER TABLE tasks ADD COLUMN supervisor_daemon_generation TEXT",
     )?;
     Ok(())
 }
@@ -6231,6 +6565,95 @@ mod tests {
     }
 
     #[test]
+    fn daemon_lifecycle_and_recovery_scopes_separate_unowned_and_generation_tasks() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        create_test_task(
+            &mut store,
+            "job-unowned-scope",
+            "task-unowned-scope",
+            "thread-unowned-scope",
+            3,
+            10,
+        );
+        store
+            .create_task_with_job_for_supervisor_generation(
+                NewJob {
+                    job_id: "job-generation-scope".to_owned(),
+                    source_thread_id: "thread-generation-scope".to_owned(),
+                    summary: "generation scoped task".to_owned(),
+                    metadata_json: "{}".to_owned(),
+                    policy: test_policy(),
+                    created_at: 10,
+                },
+                NewTask {
+                    task_id: "task-generation-scope".to_owned(),
+                    job_id: "job-generation-scope".to_owned(),
+                    source_thread_id: "thread-generation-scope".to_owned(),
+                    summary: "generation scoped task".to_owned(),
+                    command_json: r#"["/bin/sh","-c","true"]"#.to_owned(),
+                    cwd: "/tmp".to_owned(),
+                    timeout_seconds: None,
+                    max_delivery_attempts: 3,
+                    redelivery_window_seconds: 10,
+                    created_at: 10,
+                },
+                Some("generation-a"),
+            )
+            .expect("create generation task");
+
+        let unowned = store
+            .daemon_lifecycle_status_without_supervisor_generation(100, 101)
+            .expect("unowned lifecycle");
+        assert_eq!(unowned.active_jobs, 1);
+        assert_eq!(unowned.nonterminal_tasks, 1);
+        let generation = store
+            .daemon_lifecycle_status_for_supervisor_generation("generation-a", 100, 101)
+            .expect("generation lifecycle");
+        assert_eq!(generation.active_jobs, 1);
+        assert_eq!(generation.nonterminal_tasks, 1);
+        let all = store
+            .daemon_lifecycle_status(100, 101)
+            .expect("all lifecycle");
+        assert_eq!(all.active_jobs, 2);
+        assert_eq!(all.nonterminal_tasks, 2);
+
+        let recovered_unowned = store
+            .fail_lost_tasks_without_supervisor_generation_excluding_with(200, |_| Ok(false))
+            .expect("recover unowned lost tasks");
+        assert_eq!(recovered_unowned, 1);
+        assert_eq!(
+            store
+                .inspect_task("task-unowned-scope")
+                .expect("inspect unowned task")
+                .status,
+            "lost"
+        );
+        assert_eq!(
+            store
+                .inspect_task("task-generation-scope")
+                .expect("inspect generation task")
+                .status,
+            "queued"
+        );
+
+        let recovered_generation = store
+            .fail_lost_tasks_for_supervisor_generation_excluding_with(201, "generation-a", |_| {
+                Ok(false)
+            })
+            .expect("recover generation lost tasks");
+        assert_eq!(recovered_generation, 1);
+        assert_eq!(
+            store
+                .inspect_task("task-generation-scope")
+                .expect("inspect recovered generation task")
+                .status,
+            "lost"
+        );
+    }
+
+    #[test]
     fn supervised_error_fallback_preserves_completed_job_task_status() {
         let home = tempfile::tempdir().expect("temp home");
         let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
@@ -6433,11 +6856,31 @@ mod tests {
         assert_eq!(active.open_batches_due_now, 0);
         assert!(!active.has_due_maintenance());
 
+        let generation_active = store
+            .daemon_lifecycle_status_for_supervisor_generation("generation-a", 399, 400)
+            .expect("generation active");
+        assert_eq!(generation_active.active_jobs, 0);
+        assert_eq!(generation_active.nonterminal_tasks, 0);
+        assert_eq!(generation_active.active_cli_acceptances, 1);
+        assert_eq!(generation_active.cli_acceptances_stale_now, 0);
+        assert_eq!(generation_active.open_batches_due_now, 0);
+        assert!(!generation_active.has_due_maintenance());
+
         let stale = store.daemon_lifecycle_status(400, 401).expect("stale");
         assert_eq!(stale.active_cli_acceptances, 0);
         assert_eq!(stale.cli_acceptances_stale_now, 1);
         assert_eq!(stale.open_batches_due_now, 0);
         assert!(stale.has_due_maintenance());
+
+        let generation_stale = store
+            .daemon_lifecycle_status_for_supervisor_generation("generation-a", 400, 401)
+            .expect("generation stale");
+        assert_eq!(generation_stale.active_jobs, 0);
+        assert_eq!(generation_stale.nonterminal_tasks, 0);
+        assert_eq!(generation_stale.active_cli_acceptances, 0);
+        assert_eq!(generation_stale.cli_acceptances_stale_now, 1);
+        assert_eq!(generation_stale.open_batches_due_now, 0);
+        assert!(generation_stale.has_due_maintenance());
     }
 
     #[test]

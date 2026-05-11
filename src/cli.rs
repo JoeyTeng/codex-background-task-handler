@@ -30,8 +30,10 @@ use crate::cli_app_server_client::{
     thread_result_turn_status, thread_turns_list_turn_status,
 };
 use crate::daemon::{
-    DaemonEnsureOptions, DaemonServeOptions, daemon_ensure, daemon_request, daemon_request_payload,
-    daemon_request_payload_timeout, daemon_serve, validate_daemon_autostart_endpoint,
+    DaemonEndpoint, DaemonEnsureOptions, DaemonServeOptions, DaemonSocketKind,
+    daemon_endpoint_from_response, daemon_ensure, daemon_request, daemon_request_at_endpoint,
+    daemon_request_payload, daemon_request_payload_at_endpoint,
+    daemon_request_payload_timeout_at_endpoint, daemon_serve, validate_daemon_autostart_endpoint,
     validate_daemon_request_budget,
 };
 use crate::fs_layout::{
@@ -986,6 +988,9 @@ struct CliAppServersArgs {
         help = "Print compact human-readable output"
     )]
     human: bool,
+
+    #[arg(long, help = "Inspect all known daemon endpoints")]
+    all_daemons: bool,
 }
 
 impl CliAppServersArgs {
@@ -1925,7 +1930,7 @@ enum DaemonCommand {
     #[command(about = "Check whether the daemon socket is alive and compatible")]
     Ping,
     #[command(about = "Inspect daemon process state and owned resources")]
-    Status,
+    Status(DaemonStatusArgs),
     #[command(about = "Ask the daemon to stop cleanly")]
     Stop,
 }
@@ -1945,6 +1950,9 @@ struct DaemonServeArgs {
 
     #[arg(long, hide = true)]
     skip_startup_sweep: bool,
+
+    #[arg(long, hide = true, value_enum, default_value_t = DaemonSocketKindArg::Default)]
+    socket_kind: DaemonSocketKindArg,
 }
 
 #[derive(Debug, Args)]
@@ -1967,9 +1975,30 @@ struct DaemonEnsureArgs {
 
     #[arg(
         long,
-        help = "Explicitly stop and replace an incompatible daemon instead of failing closed"
+        help = "Explicitly stop and replace an incompatible daemon instead of using a parallel compatible daemon"
     )]
     replace_incompatible: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DaemonSocketKindArg {
+    Default,
+    Generation,
+}
+
+impl From<DaemonSocketKindArg> for DaemonSocketKind {
+    fn from(value: DaemonSocketKindArg) -> Self {
+        match value {
+            DaemonSocketKindArg::Default => Self::Default,
+            DaemonSocketKindArg::Generation => Self::Generation,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct DaemonStatusArgs {
+    #[arg(long, help = "Inspect all known daemon endpoints")]
+    all: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -2012,7 +2041,7 @@ pub fn run() -> Result<()> {
         Commands::Cli {
             command: CliCommand::AppServers(args),
         } if args.effective_format() == OutputFormat::Human => {
-            let report = collect_cli_app_servers(&layout);
+            let report = collect_cli_app_servers(&layout, args.all_daemons);
             write_cli_app_servers_human(&report)?;
             return Ok(());
         }
@@ -2137,8 +2166,14 @@ fn dispatch(command: Commands, layout: &FsLayout, mode: DispatchMode) -> Result<
             startup_sweep_now,
             replace_incompatible: false,
         };
-        daemon_ensure(layout, ensure_options)?;
-        return daemon_request_payload(layout, "dispatch", json!({ "argv": argv_payload(argv) }));
+        let ensure = daemon_ensure(layout, ensure_options)?;
+        let endpoint = daemon_endpoint_from_response(layout, &ensure)?;
+        return daemon_request_payload_at_endpoint(
+            layout,
+            &endpoint,
+            "dispatch",
+            json!({ "argv": argv_payload(argv) }),
+        );
     }
 
     dispatch_direct(command, layout)
@@ -2187,6 +2222,21 @@ fn dispatch_existing_daemon_command(command: Commands, layout: &FsLayout) -> Res
     let ping = daemon_request(layout, "ping").context("probe existing daemon")?;
     validate_existing_daemon_compatible(&ping)?;
     daemon_request_payload(layout, "dispatch", json!({ "argv": argv_payload(argv) }))
+}
+
+fn dispatch_mutating_command_at_endpoint(
+    command: Commands,
+    layout: &FsLayout,
+    endpoint: &DaemonEndpoint,
+) -> Result<Value> {
+    let argv = daemon_argv_for_mutating_command(&command)?
+        .context("command cannot be dispatched to daemon endpoint")?;
+    daemon_request_payload_at_endpoint(
+        layout,
+        endpoint,
+        "dispatch",
+        json!({ "argv": argv_payload(argv) }),
+    )
 }
 
 fn validate_existing_daemon_compatible(response: &Value) -> Result<()> {
@@ -2286,7 +2336,7 @@ fn dispatch_daemon_task_command(
         )
     })?;
     validate_daemon_autostart_endpoint(layout)?;
-    daemon_ensure(
+    let ensure = daemon_ensure(
         layout,
         DaemonEnsureOptions {
             idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
@@ -2295,10 +2345,15 @@ fn dispatch_daemon_task_command(
             replace_incompatible: false,
         },
     )?;
-    daemon_request_payload(layout, daemon_command, payload)
+    let endpoint = daemon_endpoint_from_response(layout, &ensure)?;
+    daemon_request_payload_at_endpoint(layout, &endpoint, daemon_command, payload)
 }
 
-pub(crate) fn dispatch_daemon_argv(layout: &FsLayout, argv: Vec<Vec<u8>>) -> Result<Value> {
+pub(crate) fn dispatch_daemon_argv(
+    layout: &FsLayout,
+    argv: Vec<Vec<u8>>,
+    supervisor_daemon_generation: Option<&str>,
+) -> Result<Value> {
     let mut parse_argv = Vec::with_capacity(argv.len() + 1);
     parse_argv.push(OsString::from("cbth"));
     parse_argv.extend(argv.into_iter().map(OsString::from_vec));
@@ -2312,17 +2367,29 @@ pub(crate) fn dispatch_daemon_argv(layout: &FsLayout, argv: Vec<Vec<u8>>) -> Res
     match cli.command {
         Commands::Daemon { .. } => bail!("daemon dispatch cannot execute daemon commands"),
         Commands::Self_ { .. } => bail!("daemon dispatch cannot execute self update commands"),
-        command => dispatch(command, layout, DispatchMode::Direct),
+        command => dispatch_direct_with_supervisor_generation(
+            command,
+            layout,
+            supervisor_daemon_generation,
+        ),
     }
 }
 
 fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
+    dispatch_direct_with_supervisor_generation(command, layout, None)
+}
+
+fn dispatch_direct_with_supervisor_generation(
+    command: Commands,
+    layout: &FsLayout,
+    supervisor_daemon_generation: Option<&str>,
+) -> Result<Value> {
     match command {
         Commands::Doctor {
             command: DoctorCommand::Cli(args),
         } => dispatch_doctor_cli(args, layout, DEFAULT_DAEMON_STARTUP_TIMEOUT_SECONDS),
         Commands::Task { command } => dispatch_task(command, layout),
-        Commands::Job { command } => dispatch_job(command, layout),
+        Commands::Job { command } => dispatch_job(command, layout, supervisor_daemon_generation),
         Commands::Batch { command } => dispatch_batch(command, layout),
         Commands::Attempt { command } => dispatch_attempt(command, layout),
         Commands::Audit { command } => dispatch_audit(command, layout),
@@ -2367,7 +2434,7 @@ fn run_cli_session(
     validate_codex_resume_foreground_args(&config.foreground_mode, &cwd, &foreground.codex_args)?;
 
     validate_daemon_autostart_endpoint(layout)?;
-    daemon_ensure(
+    let ensure = daemon_ensure(
         layout,
         DaemonEnsureOptions {
             idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
@@ -2376,11 +2443,12 @@ fn run_cli_session(
             replace_incompatible: false,
         },
     )?;
+    let daemon_endpoint = daemon_endpoint_from_response(layout, &ensure)?;
     if matches!(&config.target, CliSessionTargetConfig::NewThread) {
         return run_cli_new_thread_session(
             config,
             layout,
-            startup_timeout_seconds,
+            daemon_endpoint,
             codex_binary,
             cwd,
             lease_id,
@@ -2389,46 +2457,56 @@ fn run_cli_session(
     }
     let target = resolve_cli_run_thread_target(&config.target)?;
     let bound_thread_id = target.bound_thread_id.clone();
-    reserve_cli_app_server_for_thread(layout, &bound_thread_id, &lease_id).inspect_err(|_| {
-        abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
-    })?;
+    reserve_cli_app_server_for_thread(layout, &daemon_endpoint, &bound_thread_id, &lease_id)
+        .inspect_err(|_| {
+            abort_cli_thread_start_bootstrap_best_effort(
+                layout,
+                &daemon_endpoint,
+                &target.bootstrap_id,
+                &lease_id,
+            );
+        })?;
 
     let initial_profile = config.permission_inputs.initial_profile();
     let profile_requirement = config
         .permission_inputs
         .profile_requirement(&initial_profile);
-    let bind = match dispatch(
-        Commands::Cli {
-            command: CliCommand::Session {
-                command: CliSessionCommand::Bind(CliSessionBindArgs {
-                    bound_thread_id: bound_thread_id.clone(),
-                    session_allows_approval: initial_profile.session_allows_approval,
-                    session_allows_network: initial_profile.session_allows_network,
-                    session_allows_write_access: initial_profile.session_allows_write_access,
-                    auto_profile: config.permission_inputs.uses_auto(),
-                    session_allows_approval_explicit: profile_requirement
-                        .session_allows_approval
-                        .is_some(),
-                    session_allows_network_explicit: profile_requirement
-                        .session_allows_network
-                        .is_some(),
-                    session_allows_write_access_explicit: profile_requirement
-                        .session_allows_write_access
-                        .is_some(),
-                    now: None,
-                }),
-            },
+    let bind_command = Commands::Cli {
+        command: CliCommand::Session {
+            command: CliSessionCommand::Bind(CliSessionBindArgs {
+                bound_thread_id: bound_thread_id.clone(),
+                session_allows_approval: initial_profile.session_allows_approval,
+                session_allows_network: initial_profile.session_allows_network,
+                session_allows_write_access: initial_profile.session_allows_write_access,
+                auto_profile: config.permission_inputs.uses_auto(),
+                session_allows_approval_explicit: profile_requirement
+                    .session_allows_approval
+                    .is_some(),
+                session_allows_network_explicit: profile_requirement
+                    .session_allows_network
+                    .is_some(),
+                session_allows_write_access_explicit: profile_requirement
+                    .session_allows_write_access
+                    .is_some(),
+                now: None,
+            }),
         },
-        layout,
-        DispatchMode::Client {
-            direct_store: false,
-            startup_timeout_seconds,
-        },
-    ) {
+    };
+    let bind = match dispatch_mutating_command_at_endpoint(bind_command, layout, &daemon_endpoint) {
         Ok(bind) => bind,
         Err(error) => {
-            release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
-            abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
+            release_cli_app_server_reservation_best_effort(
+                layout,
+                &daemon_endpoint,
+                &bound_thread_id,
+                &lease_id,
+            );
+            abort_cli_thread_start_bootstrap_best_effort(
+                layout,
+                &daemon_endpoint,
+                &target.bootstrap_id,
+                &lease_id,
+            );
             return Err(error);
         }
     };
@@ -2440,24 +2518,39 @@ fn run_cli_session(
     let capability_revision = json_i64(session, "capability_revision")?;
     let app_server = match ensure_cli_run_app_server(
         layout,
-        &target.bootstrap_id,
-        &managed_session_id,
-        &bound_thread_id,
-        session_epoch,
-        &codex_binary,
-        &lease_id,
+        &daemon_endpoint,
+        CliRunAppServerEnsure {
+            bootstrap_id: &target.bootstrap_id,
+            managed_session_id: &managed_session_id,
+            bound_thread_id: &bound_thread_id,
+            session_epoch,
+            codex_binary: &codex_binary,
+            lease_id: &lease_id,
+        },
     ) {
         Ok(app_server) => app_server,
         Err(error) => {
-            release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
-            abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
+            release_cli_app_server_reservation_best_effort(
+                layout,
+                &daemon_endpoint,
+                &bound_thread_id,
+                &lease_id,
+            );
+            abort_cli_thread_start_bootstrap_best_effort(
+                layout,
+                &daemon_endpoint,
+                &target.bootstrap_id,
+                &lease_id,
+            );
             return Err(error);
         }
     };
     let url = json_string(&app_server["cli_app_server"], "url")?;
+    let app_server_daemon_endpoint = Arc::new(Mutex::new(daemon_endpoint.clone()));
     let refresh_running = Arc::new(AtomicBool::new(true));
     spawn_cli_app_server_lease_refresher(
         layout.clone(),
+        Arc::clone(&app_server_daemon_endpoint),
         managed_session_id.clone(),
         lease_id.clone(),
         Arc::clone(&refresh_running),
@@ -2466,9 +2559,16 @@ fn run_cli_session(
         resolve_managed_resume_foreground_cwd(&config.foreground_mode, &mut foreground, &url, &cwd)
     {
         refresh_running.store(false, Ordering::Release);
-        release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
-        let _ = daemon_request_payload_timeout(
+        release_cli_app_server_reservation_best_effort(
             layout,
+            &daemon_endpoint,
+            &bound_thread_id,
+            &lease_id,
+        );
+        let stop_endpoint = current_cli_app_server_daemon_endpoint(&app_server_daemon_endpoint);
+        let _ = daemon_request_payload_timeout_at_endpoint(
+            layout,
+            &stop_endpoint,
             "cli_app_server_stop",
             json!({
                 "managed_session_id": managed_session_id,
@@ -2476,7 +2576,12 @@ fn run_cli_session(
             }),
             Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
         );
-        abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
+        abort_cli_thread_start_bootstrap_best_effort(
+            layout,
+            &daemon_endpoint,
+            &target.bootstrap_id,
+            &lease_id,
+        );
         return Err(error);
     }
     let initial_thread_resume_params = match initial_passive_thread_resume_params(
@@ -2489,23 +2594,36 @@ fn run_cli_session(
         Ok(params) => params,
         Err(error) => {
             refresh_running.store(false, Ordering::Release);
-            release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
-            let _ = daemon_request_payload_timeout(
+            release_cli_app_server_reservation_best_effort(
                 layout,
+                &daemon_endpoint,
+                &bound_thread_id,
+                &lease_id,
+            );
+            let stop_endpoint = current_cli_app_server_daemon_endpoint(&app_server_daemon_endpoint);
+            let _ = daemon_request_payload_timeout_at_endpoint(
+                layout,
+                &stop_endpoint,
                 "cli_app_server_stop",
                 json!({
-                    "managed_session_id": managed_session_id,
+                "managed_session_id": managed_session_id,
                     "lease_id": lease_id,
                 }),
                 Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
             );
-            abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
+            abort_cli_thread_start_bootstrap_best_effort(
+                layout,
+                &daemon_endpoint,
+                &target.bootstrap_id,
+                &lease_id,
+            );
             return Err(error);
         }
     };
     let mut passive_adapter =
         spawn_cli_app_server_passive_adapter(CliAppServerPassiveAdapterConfig {
             layout: layout.clone(),
+            daemon_endpoint: Arc::clone(&app_server_daemon_endpoint),
             url: url.clone(),
             managed_session_id: managed_session_id.clone(),
             bound_thread_id: bound_thread_id.clone(),
@@ -2537,8 +2655,10 @@ fn run_cli_session(
         .with_context(|| format!("spawn foreground codex via {:?}", codex_binary));
     let passive_stop_result = passive_adapter.stop();
     refresh_running.store(false, Ordering::Release);
-    let stop_result = daemon_request_payload_timeout(
+    let stop_endpoint = current_cli_app_server_daemon_endpoint(&app_server_daemon_endpoint);
+    let stop_result = daemon_request_payload_timeout_at_endpoint(
         layout,
+        &stop_endpoint,
         "cli_app_server_stop",
         json!({
             "managed_session_id": managed_session_id,
@@ -2567,17 +2687,28 @@ fn validate_cli_session_target(target: &CliSessionTargetConfig) -> Result<()> {
 struct CliAppServersReport {
     cli_app_servers: Vec<CliAppServerSummary>,
     daemon: Option<CliAppServersDaemonSummary>,
+    daemons: Vec<CliAppServersDaemonReport>,
     daemon_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct CliAppServersDaemonSummary {
     pid: Option<u64>,
+    binary_version: Option<String>,
+    socket_path: Option<String>,
+    quiescing: Option<bool>,
     started_at: Option<i64>,
     started_at_local: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
+struct CliAppServersDaemonReport {
+    daemon: Option<CliAppServersDaemonSummary>,
+    cli_app_servers: Vec<CliAppServerSummary>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct CliAppServerSummary {
     codex_session_id: String,
     managed_session_id: String,
@@ -2599,13 +2730,45 @@ struct CliAppServerThreadInfo {
     error: Option<String>,
 }
 
-fn collect_cli_app_servers(layout: &FsLayout) -> CliAppServersReport {
-    let status = match daemon_request(layout, "status") {
+fn collect_cli_app_servers(layout: &FsLayout, all_daemons: bool) -> CliAppServersReport {
+    if all_daemons {
+        return collect_cli_app_servers_all_daemons(layout);
+    }
+    let endpoint = DaemonEndpoint::default(layout);
+    collect_cli_app_servers_for_endpoint(layout, &endpoint)
+}
+
+fn collect_cli_app_servers_all_daemons(layout: &FsLayout) -> CliAppServersReport {
+    let mut reports = Vec::new();
+    let mut all_servers = Vec::new();
+    for endpoint in known_daemon_endpoints(layout) {
+        let report = collect_cli_app_servers_for_endpoint(layout, &endpoint);
+        all_servers.extend(report.cli_app_servers.clone());
+        reports.push(CliAppServersDaemonReport {
+            daemon: report.daemon,
+            cli_app_servers: report.cli_app_servers,
+            error: report.daemon_error,
+        });
+    }
+    CliAppServersReport {
+        cli_app_servers: all_servers,
+        daemon: None,
+        daemons: reports,
+        daemon_error: None,
+    }
+}
+
+fn collect_cli_app_servers_for_endpoint(
+    layout: &FsLayout,
+    endpoint: &DaemonEndpoint,
+) -> CliAppServersReport {
+    let status = match daemon_request_at_endpoint(layout, endpoint, "status") {
         Ok(status) => status,
         Err(error) => {
             return CliAppServersReport {
                 cli_app_servers: Vec::new(),
                 daemon: None,
+                daemons: Vec::new(),
                 daemon_error: Some(format!("{error:#}")),
             };
         }
@@ -2614,6 +2777,15 @@ fn collect_cli_app_servers(layout: &FsLayout) -> CliAppServersReport {
         let started_at = daemon.get("started_at").and_then(Value::as_i64);
         CliAppServersDaemonSummary {
             pid: daemon.get("pid").and_then(Value::as_u64),
+            binary_version: daemon
+                .get("binary_version")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            socket_path: daemon
+                .get("socket_path")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            quiescing: daemon.get("quiescing").and_then(Value::as_bool),
             started_at,
             started_at_local: started_at.map(format_local_epoch_seconds),
         }
@@ -2628,8 +2800,27 @@ fn collect_cli_app_servers(layout: &FsLayout) -> CliAppServersReport {
     CliAppServersReport {
         cli_app_servers,
         daemon,
+        daemons: Vec::new(),
         daemon_error: None,
     }
+}
+
+fn known_daemon_endpoints(layout: &FsLayout) -> Vec<DaemonEndpoint> {
+    let mut endpoints = vec![DaemonEndpoint::default(layout)];
+    if let Ok(entries) = fs::read_dir(layout.daemon_generations_dir()) {
+        let mut generation_sockets = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("cbth.sock"))
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        generation_sockets.sort();
+        endpoints.extend(
+            generation_sockets
+                .into_iter()
+                .map(DaemonEndpoint::from_socket_path),
+        );
+    }
+    endpoints
 }
 
 fn cli_app_server_summary_from_status(server: &Value) -> Option<CliAppServerSummary> {
@@ -2767,6 +2958,53 @@ fn read_session_index_title(codex_home: &Path, codex_session_id: &str) -> Result
 fn write_cli_app_servers_human(report: &CliAppServersReport) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    if !report.daemons.is_empty() {
+        writeln!(
+            out,
+            "{} daemon endpoint{}",
+            report.daemons.len(),
+            if report.daemons.len() == 1 { "" } else { "s" }
+        )?;
+        for daemon_report in &report.daemons {
+            writeln!(out)?;
+            if let Some(daemon) = &daemon_report.daemon {
+                writeln!(
+                    out,
+                    "Daemon {}",
+                    daemon.socket_path.as_deref().unwrap_or("<unknown socket>")
+                )?;
+                if let Some(pid) = daemon.pid {
+                    writeln!(out, "  pid: {pid}")?;
+                }
+                if let Some(version) = &daemon.binary_version {
+                    writeln!(out, "  version: {version}")?;
+                }
+                if let Some(quiescing) = daemon.quiescing {
+                    writeln!(out, "  quiescing: {quiescing}")?;
+                }
+            } else {
+                writeln!(out, "Daemon unavailable")?;
+            }
+            if let Some(error) = &daemon_report.error {
+                writeln!(out, "  error: {error}")?;
+            }
+            if daemon_report.cli_app_servers.is_empty() {
+                writeln!(out, "  app-servers: none")?;
+                continue;
+            }
+            for server in &daemon_report.cli_app_servers {
+                writeln!(
+                    out,
+                    "  app-server {} ({}) pid={} lease={}s",
+                    server.codex_session_id,
+                    server.ws_url,
+                    server.pid,
+                    server.lease_seconds_remaining
+                )?;
+            }
+        }
+        return Ok(());
+    }
     if report.cli_app_servers.is_empty() {
         writeln!(out, "No managed CLI app-servers are running.")?;
         if let Some(error) = &report.daemon_error {
@@ -2863,24 +3101,29 @@ fn resolve_cli_run_thread_target(target: &CliSessionTargetConfig) -> Result<CliR
     }
 }
 
+struct CliRunAppServerEnsure<'a> {
+    bootstrap_id: &'a Option<String>,
+    managed_session_id: &'a str,
+    bound_thread_id: &'a str,
+    session_epoch: i64,
+    codex_binary: &'a OsStr,
+    lease_id: &'a str,
+}
+
 fn ensure_cli_run_app_server(
     layout: &FsLayout,
-    bootstrap_id: &Option<String>,
-    managed_session_id: &str,
-    bound_thread_id: &str,
-    session_epoch: i64,
-    codex_binary: &OsStr,
-    lease_id: &str,
+    daemon_endpoint: &DaemonEndpoint,
+    request: CliRunAppServerEnsure<'_>,
 ) -> Result<Value> {
-    let command = if let Some(bootstrap_id) = bootstrap_id {
+    let command = if let Some(bootstrap_id) = request.bootstrap_id {
         (
             "cli_thread_start_promote",
             json!({
                 "bootstrap_id": bootstrap_id,
-                "managed_session_id": managed_session_id,
-                "bound_thread_id": bound_thread_id,
-                "session_epoch": session_epoch,
-                "lease_id": lease_id,
+                "managed_session_id": request.managed_session_id,
+                "bound_thread_id": request.bound_thread_id,
+                "session_epoch": request.session_epoch,
+                "lease_id": request.lease_id,
                 "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
             }),
         )
@@ -2888,17 +3131,18 @@ fn ensure_cli_run_app_server(
         (
             "cli_app_server_ensure",
             json!({
-                "managed_session_id": managed_session_id,
-                "bound_thread_id": bound_thread_id,
-                "session_epoch": session_epoch,
-                "codex_binary": codex_binary.as_bytes(),
-                "lease_id": lease_id,
+                "managed_session_id": request.managed_session_id,
+                "bound_thread_id": request.bound_thread_id,
+                "session_epoch": request.session_epoch,
+                "codex_binary": request.codex_binary.as_bytes(),
+                "lease_id": request.lease_id,
                 "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
             }),
         )
     };
-    daemon_request_payload_timeout(
+    daemon_request_payload_timeout_at_endpoint(
         layout,
+        daemon_endpoint,
         command.0,
         command.1,
         Duration::from_secs(CLI_APP_SERVER_ENSURE_TIMEOUT_SECONDS),
@@ -2913,20 +3157,26 @@ struct CliForegroundThreadBootstrap {
 fn run_cli_new_thread_session(
     config: CliSessionRunConfig,
     layout: &FsLayout,
-    startup_timeout_seconds: u64,
+    daemon_endpoint: DaemonEndpoint,
     codex_binary: OsString,
     cwd: PathBuf,
     lease_id: String,
     mut foreground: ForegroundCodexArgs,
 ) -> Result<i32> {
     let foreground_cwd = foreground.cwd_arg.as_deref().unwrap_or(&cwd);
-    let bootstrap =
-        start_cli_foreground_thread_bootstrap(layout, &codex_binary, foreground_cwd, &lease_id)?;
+    let bootstrap = start_cli_foreground_thread_bootstrap(
+        layout,
+        &daemon_endpoint,
+        &codex_binary,
+        foreground_cwd,
+        &lease_id,
+    )?;
     let discovery_rx = match spawn_foreground_thread_discovery(&bootstrap.url) {
         Ok(discovery_rx) => discovery_rx,
         Err(error) => {
             abort_cli_thread_start_bootstrap_best_effort(
                 layout,
+                &daemon_endpoint,
                 &Some(bootstrap.bootstrap_id),
                 &lease_id,
             );
@@ -2945,6 +3195,7 @@ fn run_cli_new_thread_session(
         Err(error) => {
             abort_cli_thread_start_bootstrap_best_effort(
                 layout,
+                &daemon_endpoint,
                 &Some(bootstrap.bootstrap_id),
                 &lease_id,
             );
@@ -2960,6 +3211,7 @@ fn run_cli_new_thread_session(
             terminate_foreground_child_best_effort(&mut foreground_child);
             abort_cli_thread_start_bootstrap_best_effort(
                 layout,
+                &daemon_endpoint,
                 &Some(bootstrap.bootstrap_id),
                 &lease_id,
             );
@@ -2967,48 +3219,58 @@ fn run_cli_new_thread_session(
         }
     };
     let bound_thread_id = target.bound_thread_id.clone();
-    reserve_cli_app_server_for_thread(layout, &bound_thread_id, &lease_id).inspect_err(|_| {
-        terminate_foreground_child_best_effort(&mut foreground_child);
-        abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
-    })?;
+    reserve_cli_app_server_for_thread(layout, &daemon_endpoint, &bound_thread_id, &lease_id)
+        .inspect_err(|_| {
+            terminate_foreground_child_best_effort(&mut foreground_child);
+            abort_cli_thread_start_bootstrap_best_effort(
+                layout,
+                &daemon_endpoint,
+                &target.bootstrap_id,
+                &lease_id,
+            );
+        })?;
 
     let initial_profile = config.permission_inputs.initial_profile();
     let profile_requirement = config
         .permission_inputs
         .profile_requirement(&initial_profile);
-    let bind = match dispatch(
-        Commands::Cli {
-            command: CliCommand::Session {
-                command: CliSessionCommand::Bind(CliSessionBindArgs {
-                    bound_thread_id: bound_thread_id.clone(),
-                    session_allows_approval: initial_profile.session_allows_approval,
-                    session_allows_network: initial_profile.session_allows_network,
-                    session_allows_write_access: initial_profile.session_allows_write_access,
-                    auto_profile: config.permission_inputs.uses_auto(),
-                    session_allows_approval_explicit: profile_requirement
-                        .session_allows_approval
-                        .is_some(),
-                    session_allows_network_explicit: profile_requirement
-                        .session_allows_network
-                        .is_some(),
-                    session_allows_write_access_explicit: profile_requirement
-                        .session_allows_write_access
-                        .is_some(),
-                    now: None,
-                }),
-            },
+    let bind_command = Commands::Cli {
+        command: CliCommand::Session {
+            command: CliSessionCommand::Bind(CliSessionBindArgs {
+                bound_thread_id: bound_thread_id.clone(),
+                session_allows_approval: initial_profile.session_allows_approval,
+                session_allows_network: initial_profile.session_allows_network,
+                session_allows_write_access: initial_profile.session_allows_write_access,
+                auto_profile: config.permission_inputs.uses_auto(),
+                session_allows_approval_explicit: profile_requirement
+                    .session_allows_approval
+                    .is_some(),
+                session_allows_network_explicit: profile_requirement
+                    .session_allows_network
+                    .is_some(),
+                session_allows_write_access_explicit: profile_requirement
+                    .session_allows_write_access
+                    .is_some(),
+                now: None,
+            }),
         },
-        layout,
-        DispatchMode::Client {
-            direct_store: false,
-            startup_timeout_seconds,
-        },
-    ) {
+    };
+    let bind = match dispatch_mutating_command_at_endpoint(bind_command, layout, &daemon_endpoint) {
         Ok(bind) => bind,
         Err(error) => {
-            release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
+            release_cli_app_server_reservation_best_effort(
+                layout,
+                &daemon_endpoint,
+                &bound_thread_id,
+                &lease_id,
+            );
             terminate_foreground_child_best_effort(&mut foreground_child);
-            abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
+            abort_cli_thread_start_bootstrap_best_effort(
+                layout,
+                &daemon_endpoint,
+                &target.bootstrap_id,
+                &lease_id,
+            );
             return Err(error);
         }
     };
@@ -3020,25 +3282,40 @@ fn run_cli_new_thread_session(
     let capability_revision = json_i64(session, "capability_revision")?;
     let app_server = match ensure_cli_run_app_server(
         layout,
-        &target.bootstrap_id,
-        &managed_session_id,
-        &bound_thread_id,
-        session_epoch,
-        &codex_binary,
-        &lease_id,
+        &daemon_endpoint,
+        CliRunAppServerEnsure {
+            bootstrap_id: &target.bootstrap_id,
+            managed_session_id: &managed_session_id,
+            bound_thread_id: &bound_thread_id,
+            session_epoch,
+            codex_binary: &codex_binary,
+            lease_id: &lease_id,
+        },
     ) {
         Ok(app_server) => app_server,
         Err(error) => {
-            release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
+            release_cli_app_server_reservation_best_effort(
+                layout,
+                &daemon_endpoint,
+                &bound_thread_id,
+                &lease_id,
+            );
             terminate_foreground_child_best_effort(&mut foreground_child);
-            abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
+            abort_cli_thread_start_bootstrap_best_effort(
+                layout,
+                &daemon_endpoint,
+                &target.bootstrap_id,
+                &lease_id,
+            );
             return Err(error);
         }
     };
     let url = json_string(&app_server["cli_app_server"], "url")?;
+    let app_server_daemon_endpoint = Arc::new(Mutex::new(daemon_endpoint.clone()));
     let refresh_running = Arc::new(AtomicBool::new(true));
     spawn_cli_app_server_lease_refresher(
         layout.clone(),
+        Arc::clone(&app_server_daemon_endpoint),
         managed_session_id.clone(),
         lease_id.clone(),
         Arc::clone(&refresh_running),
@@ -3053,24 +3330,37 @@ fn run_cli_new_thread_session(
         Ok(params) => params,
         Err(error) => {
             refresh_running.store(false, Ordering::Release);
-            release_cli_app_server_reservation_best_effort(layout, &bound_thread_id, &lease_id);
-            let _ = daemon_request_payload_timeout(
+            release_cli_app_server_reservation_best_effort(
                 layout,
+                &daemon_endpoint,
+                &bound_thread_id,
+                &lease_id,
+            );
+            let stop_endpoint = current_cli_app_server_daemon_endpoint(&app_server_daemon_endpoint);
+            let _ = daemon_request_payload_timeout_at_endpoint(
+                layout,
+                &stop_endpoint,
                 "cli_app_server_stop",
                 json!({
-                    "managed_session_id": managed_session_id,
+                "managed_session_id": managed_session_id,
                     "lease_id": lease_id,
                 }),
                 Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
             );
             terminate_foreground_child_best_effort(&mut foreground_child);
-            abort_cli_thread_start_bootstrap_best_effort(layout, &target.bootstrap_id, &lease_id);
+            abort_cli_thread_start_bootstrap_best_effort(
+                layout,
+                &daemon_endpoint,
+                &target.bootstrap_id,
+                &lease_id,
+            );
             return Err(error);
         }
     };
     let mut passive_adapter =
         spawn_cli_app_server_passive_adapter(CliAppServerPassiveAdapterConfig {
             layout: layout.clone(),
+            daemon_endpoint: Arc::clone(&app_server_daemon_endpoint),
             url: url.clone(),
             managed_session_id: managed_session_id.clone(),
             bound_thread_id: bound_thread_id.clone(),
@@ -3089,8 +3379,10 @@ fn run_cli_new_thread_session(
         .with_context(|| format!("wait for foreground codex via {:?}", codex_binary));
     let passive_stop_result = passive_adapter.stop();
     refresh_running.store(false, Ordering::Release);
-    let stop_result = daemon_request_payload_timeout(
+    let stop_endpoint = current_cli_app_server_daemon_endpoint(&app_server_daemon_endpoint);
+    let stop_result = daemon_request_payload_timeout_at_endpoint(
         layout,
+        &stop_endpoint,
         "cli_app_server_stop",
         json!({
             "managed_session_id": managed_session_id,
@@ -3108,6 +3400,7 @@ fn run_cli_new_thread_session(
 
 fn start_cli_foreground_thread_bootstrap(
     layout: &FsLayout,
+    daemon_endpoint: &DaemonEndpoint,
     codex_binary: &OsStr,
     cwd: &Path,
     lease_id: &str,
@@ -3116,8 +3409,9 @@ fn start_cli_foreground_thread_bootstrap(
         .as_os_str()
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("current directory path is not valid UTF-8"))?;
-    let started = daemon_request_payload_timeout(
+    let started = daemon_request_payload_timeout_at_endpoint(
         layout,
+        daemon_endpoint,
         "cli_foreground_thread_start",
         json!({
             "codex_binary": codex_binary.as_bytes(),
@@ -4145,12 +4439,14 @@ fn os_arg_to_utf8(value: &OsStr, field: &str) -> Result<String> {
 
 fn abort_cli_thread_start_bootstrap_best_effort(
     layout: &FsLayout,
+    daemon_endpoint: &DaemonEndpoint,
     bootstrap_id: &Option<String>,
     lease_id: &str,
 ) {
     if let Some(bootstrap_id) = bootstrap_id {
-        let _ = daemon_request_payload_timeout(
+        let _ = daemon_request_payload_timeout_at_endpoint(
             layout,
+            daemon_endpoint,
             "cli_thread_start_abort",
             json!({
                 "bootstrap_id": bootstrap_id,
@@ -4163,11 +4459,13 @@ fn abort_cli_thread_start_bootstrap_best_effort(
 
 fn reserve_cli_app_server_for_thread(
     layout: &FsLayout,
+    daemon_endpoint: &DaemonEndpoint,
     bound_thread_id: &str,
     lease_id: &str,
 ) -> Result<()> {
-    daemon_request_payload_timeout(
+    daemon_request_payload_timeout_at_endpoint(
         layout,
+        daemon_endpoint,
         "cli_app_server_reserve",
         json!({
             "bound_thread_id": bound_thread_id,
@@ -4181,11 +4479,13 @@ fn reserve_cli_app_server_for_thread(
 
 fn release_cli_app_server_reservation_best_effort(
     layout: &FsLayout,
+    daemon_endpoint: &DaemonEndpoint,
     bound_thread_id: &str,
     lease_id: &str,
 ) {
-    let _ = daemon_request_payload_timeout(
+    let _ = daemon_request_payload_timeout_at_endpoint(
         layout,
+        daemon_endpoint,
         "cli_app_server_release",
         json!({
             "bound_thread_id": bound_thread_id,
@@ -4197,6 +4497,7 @@ fn release_cli_app_server_reservation_best_effort(
 
 fn spawn_cli_app_server_lease_refresher(
     layout: FsLayout,
+    daemon_endpoint: Arc<Mutex<DaemonEndpoint>>,
     managed_session_id: String,
     lease_id: String,
     running: Arc<AtomicBool>,
@@ -4207,8 +4508,10 @@ fn spawn_cli_app_server_lease_refresher(
             if !running.load(Ordering::Acquire) {
                 break;
             }
-            let _ = daemon_request_payload_timeout(
+            let current_endpoint = current_cli_app_server_daemon_endpoint(&daemon_endpoint);
+            let refresh = daemon_request_payload_timeout_at_endpoint(
                 &layout,
+                &current_endpoint,
                 "cli_app_server_refresh",
                 json!({
                     "managed_session_id": managed_session_id,
@@ -4217,13 +4520,44 @@ fn spawn_cli_app_server_lease_refresher(
                 }),
                 Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
             );
+            if let Ok(response) = refresh {
+                follow_cli_app_server_handoff_endpoint(&daemon_endpoint, &response);
+            }
         }
     });
+}
+
+fn current_cli_app_server_daemon_endpoint(
+    daemon_endpoint: &Arc<Mutex<DaemonEndpoint>>,
+) -> DaemonEndpoint {
+    daemon_endpoint
+        .lock()
+        .map(|endpoint| endpoint.clone())
+        .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+}
+
+fn follow_cli_app_server_handoff_endpoint(
+    daemon_endpoint: &Arc<Mutex<DaemonEndpoint>>,
+    response: &Value,
+) {
+    let Some(socket_path) = response
+        .get("cli_app_server")
+        .and_then(|server| server.get("handoff_daemon_socket_path"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let updated = DaemonEndpoint::from_socket_path(PathBuf::from(socket_path));
+    match daemon_endpoint.lock() {
+        Ok(mut endpoint) => *endpoint = updated,
+        Err(poisoned) => *poisoned.into_inner() = updated,
+    }
 }
 
 #[derive(Clone)]
 struct CliAppServerPassiveAdapterConfig {
     layout: FsLayout,
+    daemon_endpoint: Arc<Mutex<DaemonEndpoint>>,
     url: String,
     managed_session_id: String,
     bound_thread_id: String,
@@ -8152,8 +8486,10 @@ fn dispatch_cli_adapter_command(
     let Some(argv) = daemon_argv_for_mutating_command(&command)? else {
         bail!("passive adapter command is not daemon-routable");
     };
-    let result = daemon_request_payload_timeout(
+    let daemon_endpoint = current_cli_app_server_daemon_endpoint(&config.daemon_endpoint);
+    let result = daemon_request_payload_timeout_at_endpoint(
         &config.layout,
+        &daemon_endpoint,
         "dispatch",
         json!({ "argv": argv_payload(argv) }),
         Duration::from_secs(CLI_APP_SERVER_PASSIVE_STORE_TIMEOUT_SECONDS),
@@ -9072,12 +9408,12 @@ fn dispatch_doctor_cli(
         }
     };
 
-    let mut daemon_ready = false;
+    let mut daemon_endpoint = None;
     if platform_supported {
         match doctor_check_daemon(layout, startup_timeout_seconds) {
-            Ok(details) => {
+            Ok((details, endpoint)) => {
                 report.ok("daemon-ipc", true, "same-user daemon IPC is ready", details);
-                daemon_ready = true;
+                daemon_endpoint = Some(endpoint);
             }
             Err(error) => report.fail(
                 "daemon-ipc",
@@ -9096,8 +9432,8 @@ fn dispatch_doctor_cli(
     }
 
     let mut daemon_capabilities_ready = false;
-    if daemon_ready {
-        match doctor_check_daemon_capabilities(layout) {
+    if let Some(endpoint) = daemon_endpoint.as_ref() {
+        match doctor_check_daemon_capabilities(layout, endpoint) {
             Ok(details) => {
                 report.ok(
                     "daemon-capabilities",
@@ -9123,8 +9459,12 @@ fn dispatch_doctor_cli(
         );
     }
 
-    if let (true, Some(codex_binary)) = (daemon_capabilities_ready, codex_binary.as_ref()) {
-        match doctor_check_app_server_probe(layout, codex_binary) {
+    if let (true, Some(endpoint), Some(codex_binary)) = (
+        daemon_capabilities_ready,
+        daemon_endpoint.as_ref(),
+        codex_binary.as_ref(),
+    ) {
+        match doctor_check_app_server_probe(layout, endpoint, codex_binary) {
             Ok(details) => report.ok(
                 "codex-app-server-listener",
                 true,
@@ -9302,7 +9642,10 @@ fn parse_codex_cli_version(raw_version: &str) -> Option<Version> {
         .find_map(|part| Version::parse(part.trim_start_matches('v')).ok())
 }
 
-fn doctor_check_daemon(layout: &FsLayout, startup_timeout_seconds: u64) -> Result<Value> {
+fn doctor_check_daemon(
+    layout: &FsLayout,
+    startup_timeout_seconds: u64,
+) -> Result<(Value, DaemonEndpoint)> {
     validate_daemon_autostart_endpoint(layout)?;
     let ensure = daemon_ensure(
         layout,
@@ -9313,15 +9656,19 @@ fn doctor_check_daemon(layout: &FsLayout, startup_timeout_seconds: u64) -> Resul
             replace_incompatible: false,
         },
     )?;
-    let status = daemon_request(layout, "status")?;
-    Ok(json!({
-        "ensure": ensure,
-        "status": status,
-    }))
+    let endpoint = daemon_endpoint_from_response(layout, &ensure)?;
+    let status = daemon_request_at_endpoint(layout, &endpoint, "status")?;
+    Ok((
+        json!({
+            "ensure": ensure,
+            "status": status,
+        }),
+        endpoint,
+    ))
 }
 
-fn doctor_check_daemon_capabilities(layout: &FsLayout) -> Result<Value> {
-    let status = daemon_request(layout, "status")?;
+fn doctor_check_daemon_capabilities(layout: &FsLayout, endpoint: &DaemonEndpoint) -> Result<Value> {
+    let status = daemon_request_at_endpoint(layout, endpoint, "status")?;
     let protocol_version = status["protocol_version"]
         .as_u64()
         .context("daemon status missing protocol_version")?;
@@ -9353,9 +9700,14 @@ fn doctor_check_daemon_capabilities(layout: &FsLayout) -> Result<Value> {
     }))
 }
 
-fn doctor_check_app_server_probe(layout: &FsLayout, codex_binary: &OsStr) -> Result<Value> {
-    let probe = daemon_request_payload_timeout(
+fn doctor_check_app_server_probe(
+    layout: &FsLayout,
+    endpoint: &DaemonEndpoint,
+    codex_binary: &OsStr,
+) -> Result<Value> {
+    let probe = daemon_request_payload_timeout_at_endpoint(
         layout,
+        endpoint,
         "cli_app_server_probe",
         json!({
             "codex_binary": codex_binary.as_bytes(),
@@ -9487,7 +9839,11 @@ fn dispatch_task(command: TaskCommand, layout: &FsLayout) -> Result<Value> {
     }
 }
 
-fn dispatch_job(command: JobCommand, layout: &FsLayout) -> Result<Value> {
+fn dispatch_job(
+    command: JobCommand,
+    layout: &FsLayout,
+    supervisor_daemon_generation: Option<&str>,
+) -> Result<Value> {
     let mut store = Store::open(layout)?;
     match command {
         JobCommand::Submit(args) => {
@@ -9502,14 +9858,22 @@ fn dispatch_job(command: JobCommand, layout: &FsLayout) -> Result<Value> {
                 },
             );
             let now = now_epoch_seconds()?;
-            let job = store.submit_job(NewJob {
+            let new_job = NewJob {
                 job_id: new_id(),
                 source_thread_id: args.source_thread_id,
                 summary: args.summary,
                 metadata_json,
                 policy,
                 created_at: now,
-            })?;
+            };
+            let job = if let Some(supervisor_daemon_generation) = supervisor_daemon_generation {
+                store.submit_job_for_supervisor_generation(
+                    new_job,
+                    Some(supervisor_daemon_generation),
+                )?
+            } else {
+                store.submit_job(new_job)?
+            };
             Ok(json!({ "job": job }))
         }
         JobCommand::Complete(args) => {
@@ -9754,8 +10118,8 @@ fn dispatch_audit(command: AuditCommand, layout: &FsLayout) -> Result<Value> {
 }
 
 fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
-    if matches!(&command, CliCommand::AppServers(_)) {
-        return Ok(json!(collect_cli_app_servers(layout)));
+    if let CliCommand::AppServers(args) = &command {
+        return Ok(json!(collect_cli_app_servers(layout, args.all_daemons)));
     }
     let mut store = if cli_command_uses_lifecycle_store_timeout(&command) {
         Store::open_for_daemon_lifecycle(layout)?
@@ -11224,6 +11588,7 @@ fn dispatch_daemon(command: DaemonCommand, layout: &FsLayout) -> Result<Value> {
                 DaemonServeOptions {
                     idle_timeout_seconds: args.idle_timeout_seconds,
                     startup_sweep_now,
+                    socket_kind: args.socket_kind.into(),
                 },
             )
         }
@@ -11241,9 +11606,36 @@ fn dispatch_daemon(command: DaemonCommand, layout: &FsLayout) -> Result<Value> {
             )
         }
         DaemonCommand::Ping => daemon_request(layout, "ping"),
-        DaemonCommand::Status => daemon_request(layout, "status"),
+        DaemonCommand::Status(args) => {
+            if args.all {
+                Ok(daemon_status_all(layout))
+            } else {
+                daemon_request(layout, "status")
+            }
+        }
         DaemonCommand::Stop => daemon_request(layout, "stop"),
     }
+}
+
+fn daemon_status_all(layout: &FsLayout) -> Value {
+    let daemons = known_daemon_endpoints(layout)
+        .into_iter()
+        .map(
+            |endpoint| match daemon_request_at_endpoint(layout, &endpoint, "status") {
+                Ok(status) => json!({
+                    "socket_path": endpoint.socket_path().display().to_string(),
+                    "ok": true,
+                    "status": status,
+                }),
+                Err(error) => json!({
+                    "socket_path": endpoint.socket_path().display().to_string(),
+                    "ok": false,
+                    "error": format!("{error:#}"),
+                }),
+            },
+        )
+        .collect::<Vec<_>>();
+    json!({ "daemons": daemons })
 }
 
 fn load_submit_metadata(path: Option<&Path>) -> Result<(String, DeliveryPolicy)> {
