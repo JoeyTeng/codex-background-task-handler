@@ -4,6 +4,8 @@
 
 本流程不启用 Desktop automatic delivery，不调用 `automation_update`，不唤醒 caller heartbeat，不实现 `note-boundary-crossed`，也不读取 artifact payload。
 
+Current status: this direct helper path is blocked in real Desktop heartbeat because it reaches daemon autostart / `startup.lock` before `note-arm-pending` can mutate state. Before retrying this flow, first validate or implement a non-startup-lock writeback path. The current narrow probe is documented in [DESKTOP_WRITEBACK_DROPBOX_PROBE_VALIDATION.md](DESKTOP_WRITEBACK_DROPBOX_PROBE_VALIDATION.md).
+
 ## Preconditions
 
 - `cbth` 已通过 GitHub Release 或本地 release build 安装到 Desktop heartbeat 可见的 `PATH`。

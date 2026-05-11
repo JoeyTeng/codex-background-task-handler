@@ -36,7 +36,7 @@ use crate::daemon::{
 };
 use crate::fs_layout::{
     FsLayout, atomic_write_private, create_private_file, remove_dir_all_durable,
-    validate_id_path_component,
+    set_private_file_permissions_if_exists, sync_dir, validate_id_path_component,
 };
 use crate::models::{
     CliManagedSessionCapabilities, CliManagedSessionPermissions, CliManagedSessionProfile,
@@ -84,6 +84,7 @@ const VALIDATED_CODEX_CLI_MINOR: u64 = 130;
 const DESKTOP_INBOX_SCHEMA_VERSION: i64 = 1;
 const DESKTOP_INBOX_MAX_JSON_BYTES: u64 = 1024 * 1024;
 const DESKTOP_SNAPSHOT_REVISION_RETENTION: usize = 128;
+const DESKTOP_WRITEBACK_DROPBOX_PROBE_MAX_MARKER_BYTES: usize = 4 * 1024;
 const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "dispatch",
     "attempt-dispatch",
@@ -399,6 +400,11 @@ enum DesktopValidationCommand {
         about = "Create a validation-only Desktop writeback fixture"
     )]
     PrepareWritebackFixture(DesktopPrepareWritebackFixtureArgs),
+    #[command(
+        name = "writeback-dropbox-probe",
+        about = "Write a validation-only Desktop dropbox probe file"
+    )]
+    WritebackDropboxProbe(DesktopWritebackDropboxProbeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -411,6 +417,33 @@ struct DesktopPrepareWritebackFixtureArgs {
 
     #[arg(long)]
     bridge_request_id: Option<String>,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopWritebackDropboxProbeArgs {
+    #[arg(long, help = "Desktop bridge thread id running the probe")]
+    bridge_thread_id: String,
+
+    #[arg(
+        long,
+        help = "Unique validation probe id used as the dropbox file name"
+    )]
+    probe_id: String,
+
+    #[arg(long, help = "Unique marker to write into the probe file")]
+    marker: String,
+
+    #[arg(
+        long,
+        help = "Append to an existing probe file instead of creating a new one"
+    )]
+    append_existing: bool,
 
     #[arg(long, help = "Emit JSON output")]
     json: bool,
@@ -8628,6 +8661,12 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             }
             argv
         }
+        Commands::Desktop {
+            command:
+                DesktopCommand::Validation {
+                    command: DesktopValidationCommand::WritebackDropboxProbe(_),
+                },
+        } => return Ok(None),
         Commands::Maintenance {
             command: MaintenanceCommand::Sweep(args),
         } => {
@@ -9893,6 +9932,20 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
             })?;
             Ok(json!({ "desktop_writeback_fixture": fixture }))
         }
+        DesktopCommand::Validation {
+            command: DesktopValidationCommand::WritebackDropboxProbe(args),
+        } => {
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            let probe = write_desktop_writeback_dropbox_probe(
+                layout,
+                &args.bridge_thread_id,
+                &args.probe_id,
+                &args.marker,
+                args.append_existing,
+                now,
+            )?;
+            Ok(json!({ "desktop_writeback_dropbox_probe": probe }))
+        }
         DesktopCommand::InstallationState(args) => {
             let mut store = Store::open(layout)?;
             match args.command {
@@ -10332,6 +10385,80 @@ fn desktop_validation_fingerprint(read_transport: &str) -> Result<String> {
         DESKTOP_INBOX_SCHEMA_VERSION,
         read_transport
     ))
+}
+
+fn write_desktop_writeback_dropbox_probe(
+    layout: &FsLayout,
+    bridge_thread_id: &str,
+    probe_id: &str,
+    marker: &str,
+    append_existing: bool,
+    now: i64,
+) -> Result<Value> {
+    validate_nonempty("bridge_thread_id", bridge_thread_id)?;
+    validate_id_path_component(probe_id, "probe_id")?;
+    validate_nonempty("marker", marker)?;
+    if marker.len() > DESKTOP_WRITEBACK_DROPBOX_PROBE_MAX_MARKER_BYTES {
+        bail!(
+            "marker exceeds {} bytes",
+            DESKTOP_WRITEBACK_DROPBOX_PROBE_MAX_MARKER_BYTES
+        );
+    }
+
+    let path = layout.desktop_writeback_dropbox_probe_path(probe_id);
+    let value = json!({
+        "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "probe_id": probe_id,
+        "bridge_thread_id": bridge_thread_id,
+        "marker": marker,
+        "created_at": now,
+    });
+    let mut bytes = serde_json::to_vec_pretty(&value)?;
+    bytes.push(b'\n');
+
+    if append_existing {
+        let metadata =
+            fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!("path exists but is not a regular file: {}", path.display());
+        }
+        set_private_file_permissions_if_exists(&path)?;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open existing probe file {}", path.display()))?;
+        write_desktop_probe_bytes(&path, &mut file, &bytes)?;
+    } else {
+        let mut file = create_private_file(&path)?;
+        let write_result = write_desktop_probe_bytes(&path, &mut file, &bytes);
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+    }
+
+    Ok(json!({
+        "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "probe_id": probe_id,
+        "bridge_thread_id": bridge_thread_id,
+        "marker": marker,
+        "created_at": now,
+        "path": path.display().to_string(),
+        "bytes": bytes.len(),
+        "write_mode": if append_existing { "append_existing" } else { "create_new" },
+    }))
+}
+
+fn write_desktop_probe_bytes(path: &Path, file: &mut fs::File, bytes: &[u8]) -> Result<()> {
+    file.write_all(bytes)
+        .with_context(|| format!("write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync {}", path.display()))?;
+    let parent = path
+        .parent()
+        .with_context(|| format!("path {} has no parent", path.display()))?;
+    sync_dir(parent)?;
+    Ok(())
 }
 
 fn publish_desktop_bridge_preflight(
