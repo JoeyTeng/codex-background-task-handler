@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -19,6 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::ErrorCode;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -72,6 +73,8 @@ const MAX_TASK_ENV_VARS: usize = 4096;
 const MAX_TASK_ENV_BYTES: usize = 1024 * 1024;
 const DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS: u64 = 60;
 const DAEMON_PROTOCOL_VERSION: u64 = 1;
+const DAEMON_HANDOFF_CAPABILITY: &str = "daemon-handoff-v1";
+const DAEMON_HANDOFF_MIN_BINARY_VERSION: &str = "0.2.0";
 const DAEMON_CAPABILITIES: &[&str] = &[
     "dispatch",
     "attempt-dispatch",
@@ -94,6 +97,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-writeback-helper-foundation",
     "desktop-writeback-live-validation-fixture",
     "desktop-transcript-relay-consumer",
+    DAEMON_HANDOFF_CAPABILITY,
 ];
 const CLI_THREAD_START_BOOTSTRAP_BOUND_THREAD_ID: &str = "__cbth_thread_start_bootstrap__";
 const CLI_FOREGROUND_THREAD_BOOTSTRAP_BOUND_THREAD_ID: &str =
@@ -120,6 +124,7 @@ fn spawn_command_locked(command: &mut Command) -> Result<Child> {
 pub struct DaemonServeOptions {
     pub idle_timeout_seconds: u64,
     pub startup_sweep_now: Option<i64>,
+    pub socket_kind: DaemonSocketKind,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -128,6 +133,79 @@ pub struct DaemonEnsureOptions {
     pub startup_timeout_seconds: u64,
     pub startup_sweep_now: Option<i64>,
     pub replace_incompatible: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DaemonSocketKind {
+    Default,
+    Generation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaemonEndpoint {
+    socket_path: PathBuf,
+}
+
+impl DaemonEndpoint {
+    pub fn default(layout: &FsLayout) -> Self {
+        Self {
+            socket_path: layout.daemon_socket_path(),
+        }
+    }
+
+    pub fn generation(layout: &FsLayout) -> Self {
+        Self {
+            socket_path: layout.daemon_generation_socket_path(current_daemon_generation_id()),
+        }
+    }
+
+    pub fn from_socket_path(socket_path: PathBuf) -> Self {
+        Self { socket_path }
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
+pub fn daemon_endpoint_from_response(
+    layout: &FsLayout,
+    response: &Value,
+) -> Result<DaemonEndpoint> {
+    let Some(socket_path) = response
+        .get("daemon")
+        .and_then(|daemon| daemon.get("socket_path"))
+        .and_then(Value::as_str)
+    else {
+        bail!("daemon ensure response missing daemon.socket_path");
+    };
+    let endpoint = DaemonEndpoint::from_socket_path(PathBuf::from(socket_path));
+    validate_socket_endpoint_path(layout, endpoint.socket_path())?;
+    Ok(endpoint)
+}
+
+fn daemon_info_from_response_or_endpoint(response: &Value, endpoint: &DaemonEndpoint) -> Value {
+    let mut daemon = response
+        .get("daemon")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    match &mut daemon {
+        Value::Object(daemon) => {
+            daemon
+                .entry("socket_path".to_owned())
+                .or_insert_with(|| Value::String(endpoint.socket_path().display().to_string()));
+        }
+        _ => {
+            daemon = json!({
+                "socket_path": endpoint.socket_path().display().to_string(),
+            });
+        }
+    }
+    daemon
+}
+
+pub fn current_daemon_generation_id() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 struct SocketCleanup<'a> {
@@ -292,14 +370,26 @@ struct CliThreadStartAbortPayload {
     lease_id: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct HandoffQuiescePayload {
+    #[serde(default)]
+    expected_pid: Option<u32>,
+    #[serde(default)]
+    expected_binary_version: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct DaemonInfo {
     pid: u32,
+    binary_version: &'static str,
     started_at: i64,
     uptime_seconds: u64,
     socket_path: String,
     idle_timeout_seconds: u64,
     stop_requested: bool,
+    quiescing: bool,
+    handoff_minimum_binary_version: &'static str,
+    handoff_eligible: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -333,11 +423,13 @@ struct CliForegroundThreadStartInfo {
 
 struct DaemonState {
     layout: FsLayout,
+    socket_path: PathBuf,
     started_instant: Instant,
     started_at: i64,
     idle_timeout: Duration,
     startup_sweep: SweepReport,
     stop_requested: AtomicBool,
+    quiescing: AtomicBool,
     lifecycle_maintenance_suppressed: AtomicBool,
     activity_generation: AtomicU64,
     active_clients: AtomicUsize,
@@ -346,6 +438,8 @@ struct DaemonState {
     cli_app_server_reservations: Mutex<HashMap<String, CliAppServerReservation>>,
     cli_thread_start_bootstraps: Mutex<HashMap<String, ManagedCliAppServer>>,
     supervised_tasks: Arc<Mutex<HashMap<String, Arc<SupervisedTaskControl>>>>,
+    task_recovery_scope: TaskRecoveryScope,
+    supervisor_daemon_generation: Option<String>,
 }
 
 #[derive(Default)]
@@ -439,6 +533,17 @@ struct DaemonLifecycleCache {
     status: DaemonLifecycleStatus,
 }
 
+#[derive(Clone, Debug)]
+enum TaskRecoveryScope {
+    Unowned,
+    CurrentGeneration,
+}
+
+struct TaskRecoveryOwners {
+    include_unowned: bool,
+    supervisor_daemon_generations: HashSet<String>,
+}
+
 impl DaemonLifecycleCache {
     fn has_exit_blockers(&self, maintenance_suppressed: bool) -> bool {
         self.refresh_failed
@@ -453,8 +558,16 @@ impl DaemonLifecycleCache {
 }
 
 pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Value> {
-    layout.ensure_run_dir()?;
-    let socket_path = layout.daemon_socket_path();
+    let socket_path = match options.socket_kind {
+        DaemonSocketKind::Default => {
+            layout.ensure_run_dir()?;
+            layout.daemon_socket_path()
+        }
+        DaemonSocketKind::Generation => {
+            layout.ensure_daemon_generation_dir(current_daemon_generation_id())?;
+            layout.daemon_generation_socket_path(current_daemon_generation_id())
+        }
+    };
     prepare_socket_path(&socket_path)?;
 
     let listener = UnixListener::bind(&socket_path)
@@ -464,13 +577,26 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
     listener
         .set_nonblocking(true)
         .with_context(|| format!("set nonblocking {}", socket_path.display()))?;
-    recover_lost_task_process_groups(layout)?;
+    let (task_recovery_scope, supervisor_daemon_generation) = match options.socket_kind {
+        DaemonSocketKind::Default => (TaskRecoveryScope::Unowned, None),
+        DaemonSocketKind::Generation => (
+            TaskRecoveryScope::CurrentGeneration,
+            Some(current_daemon_generation_id().to_owned()),
+        ),
+    };
     let recovery_now = match options.startup_sweep_now {
         Some(now) => now,
         None => current_epoch_seconds()?,
     };
     let mut store = Store::open(layout)?;
-    let _ = store.fail_lost_tasks(recovery_now)?;
+    let recovery_owners = task_recovery_owners_for_scope(layout, &store, &task_recovery_scope)?;
+    recover_lost_task_process_groups_for_owners(&store, &recovery_owners)?;
+    let _ = store.fail_lost_tasks_for_recovery_owners_excluding_with(
+        recovery_now,
+        recovery_owners.include_unowned,
+        &recovery_owners.supervisor_daemon_generations,
+        |_| Ok(false),
+    )?;
     let startup_sweep = if let Some(now) = options.startup_sweep_now {
         store.sweep(layout, now)?
     } else {
@@ -481,11 +607,13 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
     let started_at = current_epoch_seconds()?;
     let state = Arc::new(DaemonState {
         layout: layout.clone(),
+        socket_path: socket_path.clone(),
         started_instant: Instant::now(),
         started_at,
         idle_timeout: Duration::from_secs(options.idle_timeout_seconds),
         startup_sweep,
         stop_requested: AtomicBool::new(false),
+        quiescing: AtomicBool::new(false),
         lifecycle_maintenance_suppressed: AtomicBool::new(options.startup_sweep_now.is_none()),
         activity_generation: AtomicU64::new(0),
         active_clients: AtomicUsize::new(0),
@@ -494,6 +622,8 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         cli_app_server_reservations: Mutex::new(HashMap::new()),
         cli_thread_start_bootstraps: Mutex::new(HashMap::new()),
         supervised_tasks: Arc::new(Mutex::new(HashMap::new())),
+        task_recovery_scope,
+        supervisor_daemon_generation,
     });
     let mut last_activity = Instant::now();
     let mut last_activity_epoch = started_at;
@@ -632,122 +762,371 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
 pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<Value> {
     validate_daemon_autostart_endpoint(layout)?;
     let startup_deadline = Instant::now() + Duration::from_secs(options.startup_timeout_seconds);
-    if let Some(response) =
-        probe_existing_daemon_for_ensure(layout, options.replace_incompatible, startup_deadline)?
-    {
-        return Ok(json!({
-            "started": false,
-            "daemon": response["daemon"].clone(),
-        }));
+    let default_endpoint = DaemonEndpoint::default(layout);
+    match probe_daemon_endpoint_for_ensure(layout, &default_endpoint, startup_deadline)? {
+        DaemonEnsureProbe::Compatible(response) => {
+            return Ok(json!({
+                "started": false,
+                "daemon": daemon_info_from_response_or_endpoint(&response, &default_endpoint),
+            }));
+        }
+        DaemonEnsureProbe::Incompatible(response) => {
+            if options.replace_incompatible {
+                if let Some(response) =
+                    stop_incompatible_daemon(layout, &default_endpoint, startup_deadline)?
+                {
+                    return Ok(json!({
+                        "started": false,
+                        "daemon": daemon_info_from_response_or_endpoint(&response, &default_endpoint),
+                        "replaced_incompatible_daemon": true,
+                    }));
+                }
+            } else {
+                return ensure_generation_daemon_for_incompatible_default(
+                    layout,
+                    options,
+                    startup_deadline,
+                    response,
+                );
+            }
+        }
+        DaemonEnsureProbe::Unavailable => {}
     }
 
     layout.ensure_run_dir()?;
     let _startup_lock = acquire_startup_lock(layout, remaining_budget(startup_deadline)?)?;
-    if let Some(response) =
-        probe_existing_daemon_for_ensure(layout, options.replace_incompatible, startup_deadline)?
-    {
-        return Ok(json!({
-            "started": false,
-            "daemon": response["daemon"].clone(),
-        }));
-    }
-
-    loop {
-        let mut command =
-            Command::new(std::env::current_exe().context("locate current executable")?);
-        command
-            .arg("--home")
-            .arg(layout.home_dir())
-            .arg("daemon")
-            .arg("serve")
-            .arg("--idle-timeout-seconds")
-            .arg(options.idle_timeout_seconds.to_string());
-        if let Some(startup_sweep_now) = options.startup_sweep_now {
-            command.arg("--now").arg(startup_sweep_now.to_string());
-        } else {
-            command.arg("--skip-startup-sweep");
+    match probe_daemon_endpoint_for_ensure(layout, &default_endpoint, startup_deadline)? {
+        DaemonEnsureProbe::Compatible(response) => {
+            return Ok(json!({
+                "started": false,
+                "daemon": daemon_info_from_response_or_endpoint(&response, &default_endpoint),
+            }));
         }
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        let mut child = spawn_command_locked(&mut command).context("spawn cbth daemon")?;
-        let child_pid = child.id();
-
-        loop {
-            let probe_budget = match remaining_budget(startup_deadline) {
-                Ok(duration) => duration,
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    cleanup_stale_socket_best_effort(layout);
-                    bail!("daemon did not become ready: {error}");
-                }
-            };
-            match daemon_request_with_timeout(layout, "ping", probe_budget) {
-                Ok(response) if daemon_response_is_compatible(&response) => {
+        DaemonEnsureProbe::Incompatible(response) => {
+            if options.replace_incompatible {
+                if let Some(response) =
+                    stop_incompatible_daemon(layout, &default_endpoint, startup_deadline)?
+                {
                     return Ok(json!({
-                        "started": true,
-                        "spawned_pid": child_pid,
-                        "daemon": response["daemon"].clone(),
+                        "started": false,
+                        "daemon": daemon_info_from_response_or_endpoint(&response, &default_endpoint),
+                        "replaced_incompatible_daemon": true,
                     }));
                 }
-                Ok(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+            } else {
+                return ensure_generation_daemon_for_incompatible_default(
+                    layout,
+                    options,
+                    startup_deadline,
+                    response,
+                );
+            }
+        }
+        DaemonEnsureProbe::Unavailable => {}
+    }
+
+    let generation_endpoint = DaemonEndpoint::generation(layout);
+    match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)? {
+        DaemonEnsureProbe::Compatible(response) => {
+            if !options.replace_incompatible {
+                return Ok(json!({
+                    "started": false,
+                    "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
+                    "using_generation_daemon": true,
+                }));
+            }
+        }
+        DaemonEnsureProbe::Incompatible(_) => {
+            let mut replaced_incompatible_generation_daemon = false;
+            let _generation_startup_lock = acquire_generation_startup_lock(
+                layout,
+                current_daemon_generation_id(),
+                remaining_budget(startup_deadline)?,
+            )?;
+            match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)?
+            {
+                DaemonEnsureProbe::Compatible(response) => {
                     if !options.replace_incompatible {
-                        bail!(
-                            "incompatible daemon is already running; use --replace-incompatible to stop and replace it"
-                        );
-                    }
-                    if let Some(response) = stop_incompatible_daemon(layout, startup_deadline)? {
                         return Ok(json!({
                             "started": false,
-                            "daemon": response["daemon"].clone(),
-                            "replaced_incompatible_daemon": true,
+                            "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
+                            "using_generation_daemon": true,
                         }));
                     }
-                    break;
                 }
-                Err(last_error) => {
-                    if let Some(status) = child.try_wait().context("check daemon child status")? {
-                        if let Some(response) = probe_existing_daemon_for_ensure(
-                            layout,
-                            options.replace_incompatible,
-                            startup_deadline,
-                        )? {
-                            return Ok(json!({
-                                "started": false,
-                                "daemon": response["daemon"].clone(),
-                            }));
-                        }
-                        cleanup_stale_socket_best_effort(layout);
-                        bail!("daemon exited before accepting connections: {status}");
+                DaemonEnsureProbe::Incompatible(_) => {
+                    // The generation socket belongs to this binary-version namespace. A
+                    // stale incompatible process here blocks clients, unlike a legacy
+                    // default daemon that must keep serving older sessions.
+                    if let Some(response) =
+                        stop_incompatible_daemon(layout, &generation_endpoint, startup_deadline)?
+                    {
+                        return Ok(json!({
+                            "started": false,
+                            "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
+                            "using_generation_daemon": true,
+                            "replaced_incompatible_generation_daemon": true,
+                        }));
                     }
-                    if Instant::now() >= startup_deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        cleanup_stale_socket_best_effort(layout);
-                        bail!("daemon did not become ready: {last_error}");
-                    }
-                    thread::sleep(STARTUP_POLL_INTERVAL);
+                    replaced_incompatible_generation_daemon = true;
                 }
+                DaemonEnsureProbe::Unavailable => {}
+            }
+            let mut ensured = spawn_daemon_until_ready(
+                layout,
+                DaemonSocketKind::Default,
+                options,
+                startup_deadline,
+            )?;
+            if replaced_incompatible_generation_daemon {
+                ensured["replaced_incompatible_generation_daemon"] = Value::Bool(true);
+            }
+            return Ok(ensured);
+        }
+        DaemonEnsureProbe::Unavailable => {}
+    }
+
+    spawn_daemon_until_ready(layout, DaemonSocketKind::Default, options, startup_deadline)
+}
+
+fn spawn_daemon_until_ready(
+    layout: &FsLayout,
+    socket_kind: DaemonSocketKind,
+    options: DaemonEnsureOptions,
+    startup_deadline: Instant,
+) -> Result<Value> {
+    let endpoint = match socket_kind {
+        DaemonSocketKind::Default => DaemonEndpoint::default(layout),
+        DaemonSocketKind::Generation => DaemonEndpoint::generation(layout),
+    };
+    let mut command = Command::new(std::env::current_exe().context("locate current executable")?);
+    command
+        .arg("--home")
+        .arg(layout.home_dir())
+        .arg("daemon")
+        .arg("serve")
+        .arg("--idle-timeout-seconds")
+        .arg(options.idle_timeout_seconds.to_string());
+    if socket_kind == DaemonSocketKind::Generation {
+        command.arg("--socket-kind").arg("generation");
+    }
+    if let Some(startup_sweep_now) = options.startup_sweep_now {
+        command.arg("--now").arg(startup_sweep_now.to_string());
+    } else {
+        command.arg("--skip-startup-sweep");
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = spawn_command_locked(&mut command).context("spawn cbth daemon")?;
+    let child_pid = child.id();
+
+    loop {
+        let probe_budget = match remaining_budget(startup_deadline) {
+            Ok(duration) => duration,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                cleanup_stale_socket_best_effort(endpoint.socket_path());
+                bail!("daemon did not become ready: {error}");
+            }
+        };
+        match daemon_request_with_timeout_at_endpoint(layout, &endpoint, "ping", probe_budget) {
+            Ok(response) if daemon_response_is_compatible(&response) => {
+                return Ok(json!({
+                    "started": true,
+                    "spawned_pid": child_pid,
+                    "daemon": daemon_info_from_response_or_endpoint(&response, &endpoint),
+                }));
+            }
+            Ok(response) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "started daemon at {} is incompatible with this cbth binary: {}",
+                    endpoint.socket_path().display(),
+                    incompatible_daemon_summary(&response)
+                );
+            }
+            Err(last_error) => {
+                if let Some(status) = child.try_wait().context("check daemon child status")? {
+                    if let DaemonEnsureProbe::Compatible(response) =
+                        probe_daemon_endpoint_for_ensure(layout, &endpoint, startup_deadline)?
+                    {
+                        return Ok(json!({
+                            "started": false,
+                            "daemon": daemon_info_from_response_or_endpoint(&response, &endpoint),
+                        }));
+                    }
+                    cleanup_stale_socket_best_effort(endpoint.socket_path());
+                    bail!("daemon exited before accepting connections: {status}");
+                }
+                if Instant::now() >= startup_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    cleanup_stale_socket_best_effort(endpoint.socket_path());
+                    bail!("daemon did not become ready: {last_error}");
+                }
+                thread::sleep(STARTUP_POLL_INTERVAL);
             }
         }
     }
 }
 
+fn ensure_generation_daemon_for_incompatible_default(
+    layout: &FsLayout,
+    options: DaemonEnsureOptions,
+    startup_deadline: Instant,
+    legacy_response: Value,
+) -> Result<Value> {
+    let generation_endpoint = DaemonEndpoint::generation(layout);
+    let legacy_handoff_quiesce =
+        maybe_quiesce_handoff_eligible_legacy_daemon(layout, &legacy_response, startup_deadline)?;
+    let mut replaced_incompatible_generation_daemon = false;
+    match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)? {
+        DaemonEnsureProbe::Compatible(response) => {
+            let mut ensured = json!({
+                "started": false,
+                "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
+                "coexisting_with_incompatible_daemon": true,
+                "legacy_daemon": legacy_response["daemon"].clone(),
+            });
+            annotate_legacy_handoff_quiesce(&mut ensured, &legacy_handoff_quiesce);
+            return Ok(ensured);
+        }
+        DaemonEnsureProbe::Incompatible(_) => {}
+        DaemonEnsureProbe::Unavailable => {}
+    }
+
+    let _startup_lock = acquire_generation_startup_lock(
+        layout,
+        current_daemon_generation_id(),
+        remaining_budget(startup_deadline)?,
+    )?;
+    match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)? {
+        DaemonEnsureProbe::Compatible(response) => {
+            let mut ensured = json!({
+                "started": false,
+                "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
+                "coexisting_with_incompatible_daemon": true,
+                "legacy_daemon": legacy_response["daemon"].clone(),
+            });
+            annotate_legacy_handoff_quiesce(&mut ensured, &legacy_handoff_quiesce);
+            return Ok(ensured);
+        }
+        DaemonEnsureProbe::Incompatible(_response) => {
+            // The generation socket belongs to this binary-version namespace. A
+            // stale incompatible process here blocks coexistence, unlike the
+            // legacy default daemon that must keep serving older sessions.
+            if let Some(response) =
+                stop_incompatible_daemon(layout, &generation_endpoint, startup_deadline)?
+            {
+                let mut ensured = json!({
+                    "started": false,
+                    "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
+                    "coexisting_with_incompatible_daemon": true,
+                    "legacy_daemon": legacy_response["daemon"].clone(),
+                    "replaced_incompatible_generation_daemon": true,
+                });
+                annotate_legacy_handoff_quiesce(&mut ensured, &legacy_handoff_quiesce);
+                return Ok(ensured);
+            }
+            replaced_incompatible_generation_daemon = true;
+        }
+        DaemonEnsureProbe::Unavailable => {}
+    }
+
+    let mut ensured = spawn_daemon_until_ready(
+        layout,
+        DaemonSocketKind::Generation,
+        options,
+        startup_deadline,
+    )?;
+    ensured["coexisting_with_incompatible_daemon"] = Value::Bool(true);
+    ensured["legacy_daemon"] = legacy_response["daemon"].clone();
+    if replaced_incompatible_generation_daemon {
+        ensured["replaced_incompatible_generation_daemon"] = Value::Bool(true);
+    }
+    annotate_legacy_handoff_quiesce(&mut ensured, &legacy_handoff_quiesce);
+    Ok(ensured)
+}
+
+fn maybe_quiesce_handoff_eligible_legacy_daemon(
+    layout: &FsLayout,
+    legacy_response: &Value,
+    startup_deadline: Instant,
+) -> Result<Option<Value>> {
+    let gate = daemon_handoff_gate(legacy_response);
+    if gate != DaemonHandoffGate::Eligible {
+        return Ok(None);
+    }
+    let endpoint = DaemonEndpoint::default(layout);
+    let response = daemon_request_payload_with_timeout_at_endpoint(
+        layout,
+        &endpoint,
+        "handoff_quiesce",
+        json!({
+            "expected_pid": legacy_response["daemon"]["pid"].as_u64(),
+            "expected_binary_version": legacy_response["daemon"]["binary_version"].as_str(),
+        }),
+        remaining_budget(startup_deadline)?,
+    )
+    .with_context(|| {
+        format!(
+            "quiesce handoff-capable daemon at {}",
+            endpoint.socket_path().display()
+        )
+    })
+    .and_then(|response| {
+        let confirmed = response.get("quiescing").and_then(Value::as_bool) == Some(true)
+            || response
+                .get("daemon")
+                .and_then(|daemon| daemon.get("quiescing"))
+                .and_then(Value::as_bool)
+                == Some(true);
+        if !confirmed {
+            bail!("handoff-capable daemon did not confirm quiesce");
+        }
+        Ok(response)
+    })?;
+    Ok(Some(response))
+}
+
+fn annotate_legacy_handoff_quiesce(ensured: &mut Value, quiesce_response: &Option<Value>) {
+    if let Some(response) = quiesce_response {
+        ensured["legacy_daemon_quiesced"] = Value::Bool(true);
+        ensured["legacy_handoff_gate"] = Value::String(DaemonHandoffGate::Eligible.as_str().into());
+        ensured["legacy_handoff_quiesce"] = response.clone();
+    }
+}
+
 fn acquire_startup_lock(layout: &FsLayout, timeout: Duration) -> Result<StartupLock> {
-    let lock_path = layout.daemon_startup_lock_path();
+    acquire_startup_lock_path(&layout.daemon_startup_lock_path(), timeout)
+}
+
+fn acquire_generation_startup_lock(
+    layout: &FsLayout,
+    generation_id: &str,
+    timeout: Duration,
+) -> Result<StartupLock> {
+    layout.ensure_daemon_generation_dir(generation_id)?;
+    acquire_startup_lock_path(
+        &layout.daemon_generation_startup_lock_path(generation_id),
+        timeout,
+    )
+}
+
+fn acquire_startup_lock_path(lock_path: &Path, timeout: Duration) -> Result<StartupLock> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&lock_path)
+        .open(lock_path)
         .with_context(|| format!("open startup lock {}", lock_path.display()))?;
-    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+    fs::set_permissions(lock_path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", lock_path.display()))?;
     if let Some(parent) = lock_path.parent() {
         sync_dir(parent)?;
@@ -782,25 +1161,56 @@ pub fn daemon_request(layout: &FsLayout, command: &str) -> Result<Value> {
     daemon_request_payload_with_timeout(layout, command, Value::Null, CLIENT_READ_TIMEOUT)
 }
 
+pub fn daemon_request_at_endpoint(
+    layout: &FsLayout,
+    endpoint: &DaemonEndpoint,
+    command: &str,
+) -> Result<Value> {
+    daemon_request_payload_with_timeout_at_endpoint(
+        layout,
+        endpoint,
+        command,
+        Value::Null,
+        CLIENT_READ_TIMEOUT,
+    )
+}
+
 pub fn daemon_request_payload(layout: &FsLayout, command: &str, payload: Value) -> Result<Value> {
     daemon_request_payload_with_timeout(layout, command, payload, DOMAIN_REQUEST_TIMEOUT)
 }
 
-pub fn daemon_request_payload_timeout(
+pub fn daemon_request_payload_at_endpoint(
     layout: &FsLayout,
+    endpoint: &DaemonEndpoint,
+    command: &str,
+    payload: Value,
+) -> Result<Value> {
+    daemon_request_payload_with_timeout_at_endpoint(
+        layout,
+        endpoint,
+        command,
+        payload,
+        DOMAIN_REQUEST_TIMEOUT,
+    )
+}
+
+pub fn daemon_request_payload_timeout_at_endpoint(
+    layout: &FsLayout,
+    endpoint: &DaemonEndpoint,
     command: &str,
     payload: Value,
     timeout: Duration,
 ) -> Result<Value> {
-    daemon_request_payload_with_timeout(layout, command, payload, timeout)
+    daemon_request_payload_with_timeout_at_endpoint(layout, endpoint, command, payload, timeout)
 }
 
-fn daemon_request_with_timeout(
+fn daemon_request_with_timeout_at_endpoint(
     layout: &FsLayout,
+    endpoint: &DaemonEndpoint,
     command: &str,
     timeout: Duration,
 ) -> Result<Value> {
-    daemon_request_payload_with_timeout(layout, command, Value::Null, timeout)
+    daemon_request_payload_with_timeout_at_endpoint(layout, endpoint, command, Value::Null, timeout)
 }
 
 fn daemon_request_payload_with_timeout(
@@ -809,22 +1219,39 @@ fn daemon_request_payload_with_timeout(
     payload: Value,
     timeout: Duration,
 ) -> Result<Value> {
+    daemon_request_payload_with_timeout_at_endpoint(
+        layout,
+        &DaemonEndpoint::default(layout),
+        command,
+        payload,
+        timeout,
+    )
+}
+
+fn daemon_request_payload_with_timeout_at_endpoint(
+    layout: &FsLayout,
+    endpoint: &DaemonEndpoint,
+    command: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<Value> {
     if timeout.is_zero() {
         bail!("daemon request timeout is exhausted");
     }
-    daemon_request_until(layout, command, payload, Instant::now() + timeout)
+    daemon_request_until(layout, endpoint, command, payload, Instant::now() + timeout)
 }
 
 fn daemon_request_until(
     layout: &FsLayout,
+    endpoint: &DaemonEndpoint,
     command: &str,
     payload: Value,
     deadline: Instant,
 ) -> Result<Value> {
     let request = daemon_request_bytes(command, payload)?;
-    validate_socket_endpoint(layout)?;
-    let socket_path = layout.daemon_socket_path();
-    let mut stream = connect_unix_stream_until(&socket_path, deadline)
+    validate_socket_endpoint_path(layout, endpoint.socket_path())?;
+    let socket_path = endpoint.socket_path();
+    let mut stream = connect_unix_stream_until(socket_path, deadline)
         .with_context(|| format!("connect daemon socket {}", socket_path.display()))?;
     stream
         .set_nonblocking(true)
@@ -1035,22 +1462,28 @@ fn remaining_budget(deadline: Instant) -> Result<Duration> {
         .ok_or_else(|| anyhow::anyhow!("startup timeout is exhausted"))
 }
 
-fn probe_existing_daemon_for_ensure(
+enum DaemonEnsureProbe {
+    Compatible(Value),
+    Incompatible(Value),
+    Unavailable,
+}
+
+fn probe_daemon_endpoint_for_ensure(
     layout: &FsLayout,
-    replace_incompatible: bool,
+    endpoint: &DaemonEndpoint,
     startup_deadline: Instant,
-) -> Result<Option<Value>> {
+) -> Result<DaemonEnsureProbe> {
     loop {
-        match daemon_request_with_timeout(layout, "ping", remaining_budget(startup_deadline)?) {
-            Ok(response) if daemon_response_is_compatible(&response) => return Ok(Some(response)),
-            Ok(_) => {
-                if replace_incompatible {
-                    return stop_incompatible_daemon(layout, startup_deadline);
-                }
-                bail!(
-                    "incompatible daemon is already running; use --replace-incompatible to stop and replace it"
-                );
+        match daemon_request_with_timeout_at_endpoint(
+            layout,
+            endpoint,
+            "ping",
+            remaining_budget(startup_deadline)?,
+        ) {
+            Ok(response) if daemon_response_is_compatible(&response) => {
+                return Ok(DaemonEnsureProbe::Compatible(response));
             }
+            Ok(response) => return Ok(DaemonEnsureProbe::Incompatible(response)),
             Err(error) if error_is_daemon_busy(&error) => {
                 thread::sleep(STARTUP_POLL_INTERVAL);
             }
@@ -1058,7 +1491,7 @@ fn probe_existing_daemon_for_ensure(
                 if Instant::now() >= startup_deadline {
                     bail!("daemon did not become ready: {error}");
                 }
-                return Ok(None);
+                return Ok(DaemonEnsureProbe::Unavailable);
             }
         }
     }
@@ -1105,17 +1538,145 @@ fn daemon_response_is_compatible(response: &Value) -> bool {
     has_protocol && has_capabilities
 }
 
-fn stop_incompatible_daemon(layout: &FsLayout, startup_deadline: Instant) -> Result<Option<Value>> {
-    daemon_request_with_timeout(layout, "stop", remaining_budget(startup_deadline)?)
-        .context("stop incompatible daemon")?;
-    wait_for_incompatible_daemon_replaced_or_removed_until(layout, startup_deadline)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonHandoffGate {
+    Eligible,
+    UnsupportedProtocol,
+    MissingCapability,
+    MissingBinaryVersion,
+    InvalidBinaryVersion,
+    BinaryVersionBelowMinimum,
+    MissingPid,
+    InvalidPid,
+}
+
+impl DaemonHandoffGate {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::UnsupportedProtocol => "unsupported_protocol",
+            Self::MissingCapability => "missing_capability",
+            Self::MissingBinaryVersion => "missing_binary_version",
+            Self::InvalidBinaryVersion => "invalid_binary_version",
+            Self::BinaryVersionBelowMinimum => "binary_version_below_minimum",
+            Self::MissingPid => "missing_pid",
+            Self::InvalidPid => "invalid_pid",
+        }
+    }
+}
+
+fn daemon_handoff_gate(response: &Value) -> DaemonHandoffGate {
+    if response["protocol_version"].as_u64() != Some(DAEMON_PROTOCOL_VERSION) {
+        return DaemonHandoffGate::UnsupportedProtocol;
+    }
+    let has_handoff_capability = response
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .is_some_and(|reported| {
+            reported
+                .iter()
+                .any(|capability| capability.as_str() == Some(DAEMON_HANDOFF_CAPABILITY))
+        });
+    if !has_handoff_capability {
+        return DaemonHandoffGate::MissingCapability;
+    }
+    let Some(binary_version) = response
+        .get("daemon")
+        .and_then(|daemon| daemon.get("binary_version"))
+        .and_then(Value::as_str)
+    else {
+        return DaemonHandoffGate::MissingBinaryVersion;
+    };
+    match daemon_binary_version_supports_handoff(binary_version) {
+        Some(true) => {}
+        Some(false) => return DaemonHandoffGate::BinaryVersionBelowMinimum,
+        None => return DaemonHandoffGate::InvalidBinaryVersion,
+    }
+    let Some(pid) = response
+        .get("daemon")
+        .and_then(|daemon| daemon.get("pid"))
+        .and_then(Value::as_u64)
+    else {
+        return DaemonHandoffGate::MissingPid;
+    };
+    if u32::try_from(pid).is_err() {
+        return DaemonHandoffGate::InvalidPid;
+    }
+    DaemonHandoffGate::Eligible
+}
+
+fn daemon_binary_version_supports_handoff(binary_version: &str) -> Option<bool> {
+    let version = Version::parse(binary_version.trim_start_matches('v')).ok()?;
+    Some(version >= daemon_handoff_min_binary_version())
+}
+
+fn daemon_handoff_min_binary_version() -> Version {
+    Version::parse(DAEMON_HANDOFF_MIN_BINARY_VERSION)
+        .expect("daemon handoff minimum version is valid semver")
+}
+
+fn current_daemon_binary_supports_handoff() -> bool {
+    daemon_binary_version_supports_handoff(env!("CARGO_PKG_VERSION")).unwrap_or(false)
+}
+
+fn incompatible_daemon_summary(response: &Value) -> String {
+    let protocol = response["protocol_version"]
+        .as_u64()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "missing".to_owned());
+    let binary_version = response
+        .get("daemon")
+        .and_then(|daemon| daemon.get("binary_version"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let missing = missing_daemon_capabilities(response);
+    if missing.is_empty() {
+        format!("protocol_version={protocol}, binary_version={binary_version}")
+    } else {
+        format!(
+            "protocol_version={protocol}, binary_version={binary_version}, missing capabilities: {}",
+            missing.join(", ")
+        )
+    }
+}
+
+fn missing_daemon_capabilities(response: &Value) -> Vec<&'static str> {
+    let reported = response.get("capabilities").and_then(Value::as_array);
+    DAEMON_CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|required| {
+            !reported.is_some_and(|reported| {
+                reported
+                    .iter()
+                    .any(|capability| capability.as_str() == Some(*required))
+            })
+        })
+        .collect()
+}
+
+fn stop_incompatible_daemon(
+    layout: &FsLayout,
+    endpoint: &DaemonEndpoint,
+    startup_deadline: Instant,
+) -> Result<Option<Value>> {
+    daemon_request_payload_with_timeout_at_endpoint(
+        layout,
+        endpoint,
+        "stop",
+        Value::Null,
+        remaining_budget(startup_deadline)?,
+    )
+    .context("stop incompatible daemon")?;
+    wait_for_incompatible_daemon_replaced_or_removed_until(layout, endpoint, startup_deadline)
 }
 
 fn wait_for_incompatible_daemon_replaced_or_removed_until(
     layout: &FsLayout,
+    endpoint: &DaemonEndpoint,
     deadline: Instant,
 ) -> Result<Option<Value>> {
-    let socket_path = layout.daemon_socket_path();
+    let socket_path = endpoint.socket_path();
     let mut saw_socket_absent = false;
     loop {
         if !socket_path.exists() {
@@ -1135,7 +1696,12 @@ fn wait_for_incompatible_daemon_replaced_or_removed_until(
         }
         saw_socket_absent = false;
         let probe_budget = remaining_budget(deadline).unwrap_or(STARTUP_POLL_INTERVAL);
-        match daemon_request_with_timeout(layout, "ping", probe_budget.min(STARTUP_POLL_INTERVAL)) {
+        match daemon_request_with_timeout_at_endpoint(
+            layout,
+            endpoint,
+            "ping",
+            probe_budget.min(STARTUP_POLL_INTERVAL),
+        ) {
             Ok(response) if daemon_response_is_compatible(&response) => return Ok(Some(response)),
             Ok(_) => {}
             Err(error) if error_is_daemon_busy(&error) => return Ok(None),
@@ -1432,9 +1998,30 @@ fn mark_supervised_task_child_exit_observed(control: &SupervisedTaskControl) {
     control.child_exit_observed.store(true, Ordering::Release);
 }
 
+#[cfg(test)]
 fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
+    recover_lost_task_process_groups_for_scope(layout, &TaskRecoveryScope::Unowned)
+}
+
+#[cfg(test)]
+fn recover_lost_task_process_groups_for_scope(
+    layout: &FsLayout,
+    scope: &TaskRecoveryScope,
+) -> Result<()> {
     let store = Store::open(layout)?;
-    for process in store.lost_pending_task_processes()? {
+    let recovery_owners = task_recovery_owners_for_scope(layout, &store, scope)?;
+    recover_lost_task_process_groups_for_owners(&store, &recovery_owners)
+}
+
+fn recover_lost_task_process_groups_for_owners(
+    store: &Store,
+    recovery_owners: &TaskRecoveryOwners,
+) -> Result<()> {
+    let processes = store.lost_pending_task_processes_for_recovery_owners(
+        recovery_owners.include_unowned,
+        &recovery_owners.supervisor_daemon_generations,
+    )?;
+    for process in processes {
         let Some(expected_identity) = process.pid_identity.as_deref() else {
             continue;
         };
@@ -1448,6 +2035,72 @@ fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn task_recovery_owners_for_scope(
+    layout: &FsLayout,
+    store: &Store,
+    scope: &TaskRecoveryScope,
+) -> Result<TaskRecoveryOwners> {
+    let mut recovery_owners = match scope {
+        TaskRecoveryScope::Unowned => TaskRecoveryOwners {
+            include_unowned: true,
+            supervisor_daemon_generations: HashSet::new(),
+        },
+        TaskRecoveryScope::CurrentGeneration => {
+            let mut supervisor_daemon_generations = HashSet::new();
+            supervisor_daemon_generations.insert(current_daemon_generation_id().to_owned());
+            TaskRecoveryOwners {
+                include_unowned: false,
+                supervisor_daemon_generations,
+            }
+        }
+    };
+
+    for generation in store.nonterminal_task_supervisor_generations()? {
+        if generation == current_daemon_generation_id() {
+            continue;
+        }
+        if !daemon_generation_id_is_path_safe(&generation) {
+            continue;
+        }
+        if !daemon_generation_endpoint_has_listener(layout, &generation) {
+            recovery_owners
+                .supervisor_daemon_generations
+                .insert(generation);
+        }
+    }
+
+    Ok(recovery_owners)
+}
+
+fn daemon_generation_id_is_path_safe(generation_id: &str) -> bool {
+    !generation_id.is_empty()
+        && generation_id != "."
+        && generation_id != ".."
+        && !generation_id.contains('/')
+}
+
+fn daemon_generation_endpoint_has_listener(layout: &FsLayout, generation_id: &str) -> bool {
+    let socket_path = layout.daemon_generation_socket_path(generation_id);
+    if !socket_path.exists() {
+        return false;
+    }
+    if validate_socket_endpoint_path(layout, &socket_path).is_err() {
+        return true;
+    }
+    match UnixStream::connect(&socket_path) {
+        Ok(_) => true,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            false
+        }
+        Err(_) => true,
+    }
 }
 
 fn lost_task_process_leader_identity_matches(pid: u32, expected_identity: &str) -> bool {
@@ -1728,7 +2381,14 @@ fn refresh_lifecycle_status(
 ) -> Result<DaemonLifecycleStatus> {
     let now = current_epoch_seconds()?;
     let store = Store::open_for_daemon_lifecycle(&state.layout)?;
-    store.daemon_lifecycle_status(now, idle_horizon_at)
+    let recovery_owners =
+        task_recovery_owners_for_scope(&state.layout, &store, &state.task_recovery_scope)?;
+    store.daemon_lifecycle_status_for_recovery_owners(
+        now,
+        idle_horizon_at,
+        recovery_owners.include_unowned,
+        &recovery_owners.supervisor_daemon_generations,
+    )
 }
 
 fn maybe_spawn_lifecycle_maintenance(
@@ -1780,12 +2440,24 @@ fn recover_registryless_lost_tasks(state: &DaemonState) -> Result<usize> {
     recover_registryless_lost_task_process_groups(state)?;
     let now = current_epoch_seconds()?;
     let mut store = Store::open_for_daemon_lifecycle(&state.layout)?;
-    store.fail_lost_tasks_excluding_with(now, |task_id| supervised_task_is_active(state, task_id))
+    fail_lost_tasks_for_recovery_scope(
+        &state.layout,
+        &mut store,
+        now,
+        &state.task_recovery_scope,
+        |task_id| supervised_task_is_active(state, task_id),
+    )
 }
 
 fn recover_registryless_lost_task_process_groups(state: &DaemonState) -> Result<()> {
     let store = Store::open_for_daemon_lifecycle(&state.layout)?;
-    for process in store.lost_pending_task_processes()? {
+    let recovery_owners =
+        task_recovery_owners_for_scope(&state.layout, &store, &state.task_recovery_scope)?;
+    let processes = store.lost_pending_task_processes_for_recovery_owners(
+        recovery_owners.include_unowned,
+        &recovery_owners.supervisor_daemon_generations,
+    )?;
+    for process in processes {
         if supervised_task_is_active(state, &process.task_id)? {
             continue;
         }
@@ -1807,6 +2479,25 @@ fn recover_registryless_lost_task_process_groups(state: &DaemonState) -> Result<
         }
     }
     Ok(())
+}
+
+fn fail_lost_tasks_for_recovery_scope<F>(
+    layout: &FsLayout,
+    store: &mut Store,
+    now: i64,
+    scope: &TaskRecoveryScope,
+    is_active_task: F,
+) -> Result<usize>
+where
+    F: FnMut(&str) -> Result<bool>,
+{
+    let recovery_owners = task_recovery_owners_for_scope(layout, store, scope)?;
+    store.fail_lost_tasks_for_recovery_owners_excluding_with(
+        now,
+        recovery_owners.include_unowned,
+        &recovery_owners.supervisor_daemon_generations,
+        is_active_task,
+    )
 }
 
 fn supervised_task_is_active(state: &DaemonState, task_id: &str) -> Result<bool> {
@@ -1864,7 +2555,20 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
                 "cli_app_servers": cli_app_server_infos(state),
             })
         }
+        "handoff_quiesce" => {
+            let payload = if request.payload.is_null() {
+                HandoffQuiescePayload::default()
+            } else {
+                serde_json::from_value(request.payload).context("parse handoff quiesce payload")?
+            };
+            quiesce_for_handoff(state, payload)?;
+            json!({
+                "daemon": daemon_info(state),
+                "quiescing": true,
+            })
+        }
         "cli_app_server_reserve" => {
+            ensure_daemon_accepts_new_work(state)?;
             let payload: CliAppServerReservePayload = serde_json::from_value(request.payload)
                 .context("parse cli app-server reservation payload")?;
             json!({
@@ -1872,6 +2576,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "cli_app_server_ensure" => {
+            ensure_daemon_accepts_new_work(state)?;
             let payload: CliAppServerEnsurePayload =
                 serde_json::from_value(request.payload).context("parse cli app-server payload")?;
             json!({
@@ -1879,6 +2584,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "cli_app_server_probe" => {
+            ensure_daemon_accepts_new_work(state)?;
             let payload: CliAppServerProbePayload = serde_json::from_value(request.payload)
                 .context("parse cli app-server probe payload")?;
             json!({
@@ -1907,6 +2613,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "cli_thread_start" => {
+            ensure_daemon_accepts_new_work(state)?;
             let payload: CliThreadStartPayload = serde_json::from_value(request.payload)
                 .context("parse cli thread/start bootstrap payload")?;
             json!({
@@ -1914,6 +2621,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "cli_foreground_thread_start" => {
+            ensure_daemon_accepts_new_work(state)?;
             let payload: CliForegroundThreadStartPayload = serde_json::from_value(request.payload)
                 .context("parse cli foreground thread bootstrap payload")?;
             json!({
@@ -1921,6 +2629,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "cli_thread_start_promote" => {
+            ensure_daemon_accepts_new_work(state)?;
             let payload: CliThreadStartPromotePayload = serde_json::from_value(request.payload)
                 .context("parse cli thread/start promote payload")?;
             json!({
@@ -1942,15 +2651,21 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "dispatch" => {
+            ensure_daemon_accepts_new_work(state)?;
             state
                 .lifecycle_maintenance_suppressed
                 .store(false, Ordering::Release);
             let _dispatch_slot = try_acquire_dispatch_slot(state)?;
             let payload: DispatchPayload =
                 serde_json::from_value(request.payload).context("parse dispatch payload")?;
-            crate::cli::dispatch_daemon_argv(&state.layout, payload.argv)?
+            crate::cli::dispatch_daemon_argv(
+                &state.layout,
+                payload.argv,
+                state.supervisor_daemon_generation.as_deref(),
+            )?
         }
         "task_run" => {
+            ensure_daemon_accepts_new_work(state)?;
             state
                 .lifecycle_maintenance_suppressed
                 .store(false, Ordering::Release);
@@ -1980,11 +2695,15 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
 fn daemon_info(state: &DaemonState) -> DaemonInfo {
     DaemonInfo {
         pid: std::process::id(),
+        binary_version: env!("CARGO_PKG_VERSION"),
         started_at: state.started_at,
         uptime_seconds: state.started_instant.elapsed().as_secs(),
-        socket_path: state.layout.daemon_socket_path().display().to_string(),
+        socket_path: state.socket_path.display().to_string(),
         idle_timeout_seconds: state.idle_timeout.as_secs(),
         stop_requested: state.stop_requested.load(Ordering::Acquire),
+        quiescing: state.quiescing.load(Ordering::Acquire),
+        handoff_minimum_binary_version: DAEMON_HANDOFF_MIN_BINARY_VERSION,
+        handoff_eligible: current_daemon_binary_supports_handoff(),
     }
 }
 
@@ -1992,6 +2711,36 @@ fn ensure_daemon_not_stopping(state: &DaemonState) -> Result<()> {
     if state.stop_requested.load(Ordering::Acquire) {
         bail!("daemon is stopping");
     }
+    Ok(())
+}
+
+fn ensure_daemon_accepts_new_work(state: &DaemonState) -> Result<()> {
+    ensure_daemon_not_stopping(state)?;
+    if state.quiescing.load(Ordering::Acquire) {
+        bail!("daemon is quiescing for handoff");
+    }
+    Ok(())
+}
+
+fn quiesce_for_handoff(state: &DaemonState, payload: HandoffQuiescePayload) -> Result<()> {
+    ensure_daemon_not_stopping(state)?;
+    if let Some(expected_pid) = payload.expected_pid
+        && expected_pid != std::process::id()
+    {
+        bail!(
+            "handoff quiesce target pid mismatch: expected {expected_pid}, got {}",
+            std::process::id()
+        );
+    }
+    if let Some(expected_binary_version) = payload.expected_binary_version
+        && expected_binary_version != env!("CARGO_PKG_VERSION")
+    {
+        bail!(
+            "handoff quiesce target binary_version mismatch: expected {expected_binary_version}, got {}",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    state.quiescing.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -2130,7 +2879,11 @@ where
         return Err(error);
     }
     let (_job, task) = match retry_task_store_setup("create supervised task", || {
-        store.create_task_with_job(job.clone(), task.clone())
+        store.create_task_with_job_for_supervisor_generation(
+            job.clone(),
+            task.clone(),
+            state.supervisor_daemon_generation.as_deref(),
+        )
     }) {
         Ok(created) => created,
         Err(error) => {
@@ -5136,8 +5889,8 @@ fn error_chain_has_io_kind(error: &anyhow::Error, kind: io::ErrorKind) -> bool {
         .any(|io_error| io_error.kind() == kind)
 }
 
-fn cleanup_stale_socket_best_effort(layout: &FsLayout) {
-    let _ = prepare_socket_path(&layout.daemon_socket_path());
+fn cleanup_stale_socket_best_effort(socket_path: &Path) {
+    let _ = prepare_socket_path(socket_path);
 }
 
 pub fn validate_daemon_autostart_endpoint(layout: &FsLayout) -> Result<()> {
@@ -5152,13 +5905,17 @@ pub fn validate_daemon_autostart_endpoint(layout: &FsLayout) -> Result<()> {
     validate_socket_metadata(&socket_path, &metadata)
 }
 
-fn validate_socket_endpoint(layout: &FsLayout) -> Result<()> {
+fn validate_socket_endpoint_path(layout: &FsLayout, socket_path: &Path) -> Result<()> {
     validate_private_dir(layout.home_dir(), "cbth home")?;
     validate_private_dir(&layout.run_dir(), "cbth run directory")?;
-    let socket_path = layout.daemon_socket_path();
-    let metadata = fs::symlink_metadata(&socket_path)
+    if let Some(parent) = socket_path.parent()
+        && parent != layout.run_dir()
+    {
+        validate_private_dir(parent, "cbth daemon endpoint directory")?;
+    }
+    let metadata = fs::symlink_metadata(socket_path)
         .with_context(|| format!("stat {}", socket_path.display()))?;
-    validate_socket_metadata(&socket_path, &metadata)
+    validate_socket_metadata(socket_path, &metadata)
 }
 
 fn validate_socket_metadata(socket_path: &Path, metadata: &fs::Metadata) -> Result<()> {
@@ -5306,15 +6063,18 @@ mod tests {
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
             .expect("chmod temp home");
         let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let socket_path = layout.daemon_socket_path();
         (
             home,
             DaemonState {
                 layout,
+                socket_path,
                 started_instant: Instant::now(),
                 started_at: 0,
                 idle_timeout: Duration::from_secs(60),
                 startup_sweep: SweepReport::default(),
                 stop_requested: AtomicBool::new(false),
+                quiescing: AtomicBool::new(false),
                 lifecycle_maintenance_suppressed: AtomicBool::new(false),
                 activity_generation: AtomicU64::new(0),
                 active_clients: AtomicUsize::new(0),
@@ -5323,6 +6083,8 @@ mod tests {
                 cli_app_server_reservations: Mutex::new(HashMap::new()),
                 cli_thread_start_bootstraps: Mutex::new(HashMap::new()),
                 supervised_tasks: Arc::new(Mutex::new(HashMap::new())),
+                task_recovery_scope: TaskRecoveryScope::Unowned,
+                supervisor_daemon_generation: None,
             },
         )
     }
@@ -5544,6 +6306,125 @@ mod tests {
 
         drop(dispatch_slots);
         let _slot = try_acquire_dispatch_slot(&state).expect("released dispatch slot");
+    }
+
+    #[test]
+    fn handoff_gate_requires_capability_and_minimum_version() {
+        let response = json!({
+            "daemon": {
+                "pid": 1,
+                "binary_version": "0.2.0"
+            },
+            "protocol_version": DAEMON_PROTOCOL_VERSION,
+            "capabilities": [DAEMON_HANDOFF_CAPABILITY],
+        });
+        assert_eq!(daemon_handoff_gate(&response), DaemonHandoffGate::Eligible);
+
+        let below_minimum = json!({
+            "daemon": {
+                "pid": 1,
+                "binary_version": "0.1.5"
+            },
+            "protocol_version": DAEMON_PROTOCOL_VERSION,
+            "capabilities": [DAEMON_HANDOFF_CAPABILITY],
+        });
+        assert_eq!(
+            daemon_handoff_gate(&below_minimum),
+            DaemonHandoffGate::BinaryVersionBelowMinimum
+        );
+
+        let missing_capability = json!({
+            "daemon": {
+                "pid": 1,
+                "binary_version": "0.2.0"
+            },
+            "protocol_version": DAEMON_PROTOCOL_VERSION,
+            "capabilities": ["dispatch"],
+        });
+        assert_eq!(
+            daemon_handoff_gate(&missing_capability),
+            DaemonHandoffGate::MissingCapability
+        );
+
+        let missing_pid = json!({
+            "daemon": {
+                "binary_version": "0.2.0"
+            },
+            "protocol_version": DAEMON_PROTOCOL_VERSION,
+            "capabilities": [DAEMON_HANDOFF_CAPABILITY],
+        });
+        assert_eq!(
+            daemon_handoff_gate(&missing_pid),
+            DaemonHandoffGate::MissingPid
+        );
+    }
+
+    #[test]
+    fn handoff_quiesce_refuses_new_work_but_keeps_control_requests() {
+        let (_home, state) = test_state();
+
+        let quiesce = handle_test_request(&state, "handoff_quiesce", Value::Null);
+        assert_eq!(quiesce["ok"], true);
+        assert_eq!(quiesce["response"]["quiescing"], true);
+        assert_eq!(quiesce["response"]["daemon"]["quiescing"], true);
+
+        let ping = handle_test_request(&state, "ping", Value::Null);
+        assert_eq!(ping["ok"], true);
+        assert_eq!(ping["response"]["daemon"]["quiescing"], true);
+
+        let dispatch = handle_test_request(&state, "dispatch", Value::Null);
+        assert_eq!(dispatch["ok"], false);
+        assert_eq!(dispatch["error"], "daemon is quiescing for handoff");
+
+        let task_run = handle_test_request(&state, "task_run", Value::Null);
+        assert_eq!(task_run["ok"], false);
+        assert_eq!(task_run["error"], "daemon is quiescing for handoff");
+
+        let stop = handle_test_request(&state, "stop", Value::Null);
+        assert_eq!(stop["ok"], true);
+        assert_eq!(stop["response"]["stopping"], true);
+    }
+
+    #[test]
+    fn handoff_quiesce_rejects_pid_and_version_mismatch() {
+        let (_home, state) = test_state();
+
+        let wrong_pid = handle_test_request(
+            &state,
+            "handoff_quiesce",
+            json!({
+                "expected_pid": std::process::id().saturating_add(1),
+                "expected_binary_version": env!("CARGO_PKG_VERSION"),
+            }),
+        );
+        assert_eq!(wrong_pid["ok"], false);
+        assert!(
+            wrong_pid["error"]
+                .as_str()
+                .expect("pid mismatch error")
+                .contains("target pid mismatch"),
+            "{wrong_pid}"
+        );
+
+        let wrong_version = handle_test_request(
+            &state,
+            "handoff_quiesce",
+            json!({
+                "expected_pid": std::process::id(),
+                "expected_binary_version": "99.0.0",
+            }),
+        );
+        assert_eq!(wrong_version["ok"], false);
+        assert!(
+            wrong_version["error"]
+                .as_str()
+                .expect("version mismatch error")
+                .contains("target binary_version mismatch"),
+            "{wrong_version}"
+        );
+
+        let ping = handle_test_request(&state, "ping", Value::Null);
+        assert_eq!(ping["response"]["daemon"]["quiescing"], false);
     }
 
     #[test]

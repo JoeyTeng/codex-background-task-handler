@@ -2,10 +2,12 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
+use semver::Version;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -14,13 +16,18 @@ use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 
 fn temp_home() -> TempDir {
     let home = tempfile::tempdir().expect("temp home");
     #[cfg(unix)]
     fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("chmod temp home");
     home
+}
+
+fn handoff_eligible_for_version(version: &str) -> bool {
+    Version::parse(version).expect("test package version is semver")
+        >= Version::parse("0.2.0").expect("handoff minimum version is semver")
 }
 
 #[cfg(unix)]
@@ -261,7 +268,7 @@ fn wait_for_socket_removed(home: &TempDir) {
 }
 
 fn wait_for_path(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while !path.exists() {
         assert!(
             Instant::now() < deadline,
@@ -289,11 +296,35 @@ fn wait_for_nonempty_file(path: &Path) {
 
 fn wait_for_socket_removed_with_timeout(home: &TempDir, timeout: Duration) {
     let socket_path = home.path().join("run").join("cbth.sock");
+    wait_for_socket_path_removed(&socket_path, timeout);
+}
+
+fn wait_for_socket_path_removed(socket_path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while socket_path.exists() {
         assert!(Instant::now() < deadline, "daemon socket was not removed");
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[cfg(unix)]
+fn stop_daemon_at_socket_path(socket_path: &Path) {
+    let mut stream = UnixStream::connect(socket_path).expect("connect daemon socket");
+    stream
+        .write_all(br#"{"command":"stop","payload":null}"#)
+        .expect("write daemon stop");
+    stream.write_all(b"\n").expect("write daemon stop newline");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("shutdown daemon stop write");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read daemon stop response");
+    assert!(
+        response.contains(r#""ok":true"#),
+        "daemon stop failed: {response}"
+    );
 }
 
 fn process_group_exists(pid: u32) -> bool {
@@ -430,6 +461,13 @@ fn daemon_ensure_starts_ping_status_and_stop() {
     let ping = cbth(&home, &["daemon", "ping"]);
     assert_eq!(ping["message"], "pong");
     assert_eq!(ping["protocol_version"], 1);
+    assert_eq!(ping["daemon"]["binary_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(ping["daemon"]["quiescing"], false);
+    assert_eq!(ping["daemon"]["handoff_minimum_binary_version"], "0.2.0");
+    assert_eq!(
+        ping["daemon"]["handoff_eligible"],
+        handoff_eligible_for_version(env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(
         ping["capabilities"],
         json!([
@@ -453,13 +491,24 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "desktop-inbox-revisioned-installation-state",
             "desktop-writeback-helper-foundation",
             "desktop-writeback-live-validation-fixture",
-            "desktop-transcript-relay-consumer"
+            "desktop-transcript-relay-consumer",
+            "daemon-handoff-v1"
         ])
     );
     assert_eq!(ping["daemon"]["idle_timeout_seconds"], 10);
 
     let status = cbth(&home, &["daemon", "status"]);
     assert_eq!(status["daemon"]["stop_requested"], false);
+    assert_eq!(
+        status["daemon"]["binary_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(status["daemon"]["quiescing"], false);
+    assert_eq!(status["daemon"]["handoff_minimum_binary_version"], "0.2.0");
+    assert_eq!(
+        status["daemon"]["handoff_eligible"],
+        handoff_eligible_for_version(env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(status["protocol_version"], 1);
     assert_eq!(
         status["capabilities"],
@@ -484,7 +533,8 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "desktop-inbox-revisioned-installation-state",
             "desktop-writeback-helper-foundation",
             "desktop-writeback-live-validation-fixture",
-            "desktop-transcript-relay-consumer"
+            "desktop-transcript-relay-consumer",
+            "daemon-handoff-v1"
         ])
     );
     assert!(status["startup_sweep"].is_object());
@@ -524,16 +574,25 @@ fn daemon_ensure_restarts_incompatible_daemon() {
             stream
                 .read_to_string(&mut request)
                 .expect("read legacy request");
-            let response = if request.contains("\"stop\"") {
+            let is_stop = request.contains("\"stop\"");
+            let response = if is_stop {
                 r#"{"ok":true,"response":{"stopping":true}}"#
             } else {
                 r#"{"ok":true,"response":{"daemon":{"pid":1},"message":"pong"}}"#
             };
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response");
-            stream.write_all(b"\n").expect("write response newline");
-            if request.contains("\"stop\"") {
+            if let Err(error) = stream.write_all(response.as_bytes()) {
+                if !is_stop && is_peer_disconnect(&error) {
+                    continue;
+                }
+                panic!("write legacy response: {error}");
+            }
+            if let Err(error) = stream.write_all(b"\n") {
+                if !is_stop && is_peer_disconnect(&error) {
+                    continue;
+                }
+                panic!("write legacy response newline: {error}");
+            }
+            if is_stop {
                 break;
             }
         }
@@ -582,7 +641,8 @@ fn daemon_ensure_restarts_incompatible_daemon() {
             "desktop-inbox-revisioned-installation-state",
             "desktop-writeback-helper-foundation",
             "desktop-writeback-live-validation-fixture",
-            "desktop-transcript-relay-consumer"
+            "desktop-transcript-relay-consumer",
+            "daemon-handoff-v1"
         ])
     );
 
@@ -592,34 +652,62 @@ fn daemon_ensure_restarts_incompatible_daemon() {
 
 #[cfg(unix)]
 #[test]
-fn daemon_ensure_fails_closed_for_incompatible_daemon_without_stop() {
+fn daemon_ensure_coexists_with_incompatible_default_without_stop() {
     let home = temp_home();
     let run_dir = home.path().join("run");
     fs::create_dir(&run_dir).expect("create run dir");
     fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
     let socket_path = run_dir.join("cbth.sock");
-    let listener = UnixListener::bind(&socket_path).expect("bind legacy daemon socket");
+    let generation_socket_path = run_dir
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind old daemon socket");
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
-    let legacy_socket_path = socket_path.clone();
+    listener
+        .set_nonblocking(true)
+        .expect("set old listener nonblocking");
+    let old_socket_path = socket_path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let (request_tx, request_rx) = mpsc::channel();
     let handle = thread::spawn(move || {
-        let (mut stream, _addr) = listener.accept().expect("accept legacy request");
-        let mut request = String::new();
-        stream
-            .read_to_string(&mut request)
-            .expect("read legacy request");
-        assert!(
-            !request.contains("\"stop\""),
-            "default ensure must not stop incompatible daemon: {request}"
-        );
-        stream
-            .write_all(br#"{"ok":true,"response":{"daemon":{"pid":1},"message":"pong"}}"#)
-            .expect("write response");
-        stream.write_all(b"\n").expect("write response newline");
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let mut request = String::new();
+                    stream
+                        .read_to_string(&mut request)
+                        .expect("read old request");
+                    assert!(
+                        !request.contains("\"stop\""),
+                        "default ensure must not stop incompatible daemon: {request}"
+                    );
+                    assert!(
+                        !request.contains("\"handoff_quiesce\""),
+                        "below-minimum daemon must not be quiesced for handoff: {request}"
+                    );
+                    request_tx.send(request).expect("send observed request");
+                    stream
+                        .write_all(
+                            br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.1.5"},"protocol_version":1,"capabilities":["dispatch","daemon-handoff-v1"],"message":"pong"}}"#,
+                        )
+                        .expect("write old response");
+                    stream.write_all(b"\n").expect("write old response newline");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if done_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept old daemon request: {error}"),
+            }
+        }
         drop(listener);
-        fs::remove_file(&legacy_socket_path).expect("remove legacy socket");
+        fs::remove_file(&old_socket_path).expect("remove old socket");
     });
 
-    let stderr = cbth_failure(
+    let ensured = cbth(
         &home,
         &[
             "daemon",
@@ -630,11 +718,890 @@ fn daemon_ensure_fails_closed_for_incompatible_daemon_without_stop() {
             "5",
         ],
     );
-    assert!(
-        stderr.contains("--replace-incompatible"),
-        "unexpected stderr: {stderr}"
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("legacy daemon should be probed");
+    assert!(request.contains("\"ping\""));
+    assert_eq!(ensured["started"], true);
+    assert_eq!(ensured["coexisting_with_incompatible_daemon"], true);
+    assert_eq!(ensured["legacy_daemon"]["pid"], 1313);
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        generation_socket_path.display().to_string()
     );
-    handle.join().expect("legacy daemon thread");
+    assert!(
+        socket_path.exists(),
+        "legacy socket should remain owned by old daemon"
+    );
+    let all_status = cbth(&home, &["daemon", "status", "--all"]);
+    let all_status_daemons = all_status["daemons"].as_array().expect("status daemons");
+    assert!(
+        all_status_daemons.iter().any(|daemon| {
+            daemon["socket_path"] == socket_path.display().to_string() && daemon["ok"] == true
+        }),
+        "legacy daemon endpoint should be visible in status --all: {all_status}"
+    );
+    assert!(
+        all_status_daemons.iter().any(|daemon| {
+            daemon["socket_path"] == generation_socket_path.display().to_string()
+                && daemon["ok"] == true
+        }),
+        "generation daemon endpoint should be visible in status --all: {all_status}"
+    );
+    let app_servers = cbth(&home, &["cli", "app-servers", "--all-daemons"]);
+    let app_server_daemons = app_servers["daemons"]
+        .as_array()
+        .expect("app-server daemon reports");
+    assert!(
+        app_server_daemons.len() >= 2,
+        "app-servers --all-daemons should include both endpoints: {app_servers}"
+    );
+    assert_eq!(app_servers["cli_app_servers"], json!([]));
+
+    done_tx.send(()).expect("signal old daemon");
+    handle.join().expect("old daemon thread");
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_quiesces_handoff_eligible_incompatible_default() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let generation_socket_path = run_dir
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind handoff daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    listener
+        .set_nonblocking(true)
+        .expect("set handoff listener nonblocking");
+    let old_socket_path = socket_path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let (request_tx, request_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let mut request = String::new();
+                    stream
+                        .read_to_string(&mut request)
+                        .expect("read handoff request");
+                    request_tx
+                        .send(request.clone())
+                        .expect("send handoff request");
+                    if request.contains("\"handoff_quiesce\"") {
+                        stream
+                            .write_all(
+                                br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.2.0","quiescing":true},"quiescing":true}}"#,
+                            )
+                            .expect("write quiesce response");
+                    } else {
+                        assert!(
+                            request.contains("\"ping\""),
+                            "unexpected request: {request}"
+                        );
+                        stream
+                            .write_all(
+                                br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.2.0"},"protocol_version":1,"capabilities":["dispatch","daemon-handoff-v1"],"message":"pong"}}"#,
+                            )
+                            .expect("write handoff ping response");
+                    }
+                    stream
+                        .write_all(b"\n")
+                        .expect("write handoff response newline");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if done_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept handoff daemon request: {error}"),
+            }
+        }
+        drop(listener);
+        fs::remove_file(&old_socket_path).expect("remove handoff daemon socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    let first_request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("handoff daemon should be probed");
+    let second_request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("handoff daemon should be quiesced");
+    assert!(first_request.contains("\"ping\""));
+    assert!(second_request.contains("\"handoff_quiesce\""));
+    assert!(second_request.contains("\"expected_pid\":1313"));
+    assert!(second_request.contains("\"expected_binary_version\":\"0.2.0\""));
+    assert_eq!(ensured["started"], true);
+    assert_eq!(ensured["coexisting_with_incompatible_daemon"], true);
+    assert_eq!(ensured["legacy_daemon"]["pid"], 1313);
+    assert_eq!(ensured["legacy_daemon_quiesced"], true);
+    assert_eq!(ensured["legacy_handoff_gate"], "eligible");
+    assert_eq!(ensured["legacy_handoff_quiesce"]["quiescing"], true);
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        generation_socket_path.display().to_string()
+    );
+
+    done_tx.send(()).expect("signal handoff daemon");
+    handle.join().expect("handoff daemon thread");
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_replaces_stale_incompatible_generation_daemon() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let generation_dir = run_dir.join("daemons").join(env!("CARGO_PKG_VERSION"));
+    fs::create_dir_all(&generation_dir).expect("create generation dir");
+    fs::set_permissions(run_dir.join("daemons"), fs::Permissions::from_mode(0o700))
+        .expect("chmod daemons dir");
+    fs::set_permissions(&generation_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod generation dir");
+    let generation_socket_path = generation_dir.join("cbth.sock");
+
+    let legacy_listener = UnixListener::bind(&socket_path).expect("bind old daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    legacy_listener
+        .set_nonblocking(true)
+        .expect("set old listener nonblocking");
+    let legacy_socket_path = socket_path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let legacy_handle = thread::spawn(move || {
+        loop {
+            match legacy_listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let mut request = String::new();
+                    stream
+                        .read_to_string(&mut request)
+                        .expect("read old request");
+                    assert!(
+                        !request.contains("\"stop\""),
+                        "generation replacement must not stop legacy default daemon: {request}"
+                    );
+                    stream
+                        .write_all(
+                            br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.1.5"},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#,
+                        )
+                        .expect("write old response");
+                    stream.write_all(b"\n").expect("write old response newline");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if done_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept old daemon request: {error}"),
+            }
+        }
+        drop(legacy_listener);
+        fs::remove_file(&legacy_socket_path).expect("remove old socket");
+    });
+
+    let generation_listener =
+        UnixListener::bind(&generation_socket_path).expect("bind stale generation daemon socket");
+    fs::set_permissions(&generation_socket_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod generation socket");
+    let stale_generation_socket_path = generation_socket_path.clone();
+    let generation_handle = thread::spawn(move || {
+        let mut stopped = false;
+        for _ in 0..3 {
+            let (mut stream, _addr) = generation_listener
+                .accept()
+                .expect("accept stale generation request");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("read stale generation request");
+            if request.contains("\"stop\"") {
+                stopped = true;
+                stream
+                    .write_all(br#"{"ok":true,"response":{"stopping":true}}"#)
+                    .expect("write stale generation stop response");
+                stream
+                    .write_all(b"\n")
+                    .expect("write stale generation stop response newline");
+                break;
+            }
+            assert!(request.contains("\"ping\""));
+            stream
+                .write_all(
+                    br#"{"ok":true,"response":{"daemon":{"pid":5151,"binary_version":"0.1.5"},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#,
+                )
+                .expect("write stale generation ping response");
+            stream
+                .write_all(b"\n")
+                .expect("write stale generation ping response newline");
+        }
+        assert!(stopped, "stale generation daemon was not stopped");
+        drop(generation_listener);
+        fs::remove_file(&stale_generation_socket_path)
+            .expect("remove stale generation daemon socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert_eq!(ensured["started"], true);
+    assert_eq!(ensured["coexisting_with_incompatible_daemon"], true);
+    assert_eq!(ensured["replaced_incompatible_generation_daemon"], true);
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        generation_socket_path.display().to_string()
+    );
+
+    generation_handle.join().expect("stale generation thread");
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    done_tx.send(()).expect("signal old daemon");
+    legacy_handle.join().expect("old daemon thread");
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_replaces_stale_generation_daemon_without_legacy_default() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let generation_dir = run_dir.join("daemons").join(env!("CARGO_PKG_VERSION"));
+    fs::create_dir_all(&generation_dir).expect("create generation dir");
+    fs::set_permissions(run_dir.join("daemons"), fs::Permissions::from_mode(0o700))
+        .expect("chmod daemons dir");
+    fs::set_permissions(&generation_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod generation dir");
+    let generation_socket_path = generation_dir.join("cbth.sock");
+
+    let generation_listener =
+        UnixListener::bind(&generation_socket_path).expect("bind stale generation daemon socket");
+    fs::set_permissions(&generation_socket_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod generation socket");
+    let stale_generation_socket_path = generation_socket_path.clone();
+    let generation_handle = thread::spawn(move || {
+        let mut stopped = false;
+        for _ in 0..3 {
+            let (mut stream, _addr) = generation_listener
+                .accept()
+                .expect("accept stale generation request");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("read stale generation request");
+            if request.contains("\"stop\"") {
+                stopped = true;
+                stream
+                    .write_all(br#"{"ok":true,"response":{"stopping":true}}"#)
+                    .expect("write stale generation stop response");
+                stream
+                    .write_all(b"\n")
+                    .expect("write stale generation stop response newline");
+                break;
+            }
+            assert!(request.contains("\"ping\""));
+            stream
+                .write_all(
+                    br#"{"ok":true,"response":{"daemon":{"pid":5151,"binary_version":"0.1.5"},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#,
+                )
+                .expect("write stale generation ping response");
+            stream
+                .write_all(b"\n")
+                .expect("write stale generation ping response newline");
+        }
+        assert!(stopped, "stale generation daemon was not stopped");
+        drop(generation_listener);
+        fs::remove_file(&stale_generation_socket_path)
+            .expect("remove stale generation daemon socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert_eq!(ensured["started"], true);
+    assert_eq!(ensured["replaced_incompatible_generation_daemon"], true);
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        socket_path.display().to_string()
+    );
+
+    generation_handle.join().expect("stale generation thread");
+    stop_daemon_at_socket_path(&socket_path);
+    wait_for_socket_path_removed(&socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_dispatch_uses_probed_socket_when_ping_omits_socket_path() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind compatible daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    let cleanup_socket_path = socket_path.clone();
+    let handle = thread::spawn(move || {
+        let (mut ping_stream, _addr) = listener.accept().expect("accept ping request");
+        let mut ping_request = String::new();
+        ping_stream
+            .read_to_string(&mut ping_request)
+            .expect("read ping request");
+        assert!(ping_request.contains("\"ping\""));
+        let ping_response = json!({
+            "ok": true,
+            "response": {
+                "daemon": {
+                    "pid": 5151,
+                    "binary_version": env!("CARGO_PKG_VERSION")
+                },
+                "protocol_version": 1,
+                "capabilities": [
+                    "dispatch",
+                    "attempt-dispatch",
+                    "cli-app-server-lifecycle",
+                    "cli-app-server-probe",
+                    "cli-thread-start-bootstrap",
+                    "cli-thread-start-params",
+                    "cli-foreground-thread-bootstrap",
+                    "cli-session-dispatch",
+                    "cli-session-capability-dispatch",
+                    "cli-session-permission-dispatch",
+                    "cli-session-proof-invalidation-dispatch",
+                    "cli-session-recovery-dispatch",
+                    "cli-turn-observation-dispatch",
+                    "cli-turn-observation-expiry-dispatch",
+                    "cli-auto-delivery-dispatch",
+                    "task-supervisor",
+                    "desktop-bridge-foundation-dispatch",
+                    "desktop-inbox-revisioned-installation-state",
+                    "desktop-writeback-helper-foundation",
+                    "desktop-writeback-live-validation-fixture",
+                    "desktop-transcript-relay-consumer",
+                    "daemon-handoff-v1"
+                ],
+                "message": "pong"
+            }
+        });
+        writeln!(ping_stream, "{ping_response}").expect("write ping response");
+        drop(ping_stream);
+
+        let (mut dispatch_stream, _addr) = listener.accept().expect("accept dispatch request");
+        let mut dispatch_request = String::new();
+        dispatch_stream
+            .read_to_string(&mut dispatch_request)
+            .expect("read dispatch request");
+        assert!(dispatch_request.contains("\"dispatch\""));
+        let dispatch_response = json!({
+            "ok": true,
+            "response": {
+                "job": {
+                    "job_id": "accepted-via-fallback",
+                    "status": "pending"
+                }
+            }
+        });
+        writeln!(dispatch_stream, "{dispatch_response}").expect("write dispatch response");
+        drop(dispatch_stream);
+        drop(listener);
+        fs::remove_file(&cleanup_socket_path).expect("remove compatible daemon socket");
+    });
+
+    let submitted = cbth_daemon(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "socket-path-fallback",
+            "--summary",
+            "socket path fallback",
+        ],
+    );
+    assert_eq!(submitted["job"]["job_id"], "accepted-via-fallback");
+    handle.join().expect("compatible daemon thread");
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_reuses_generation_daemon_when_legacy_socket_is_absent() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let mut daemon = spawn_daemon(
+        &home,
+        "1",
+        &["--socket-kind", "generation", "--skip-startup-sweep"],
+    );
+    wait_for_path(&generation_socket_path);
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "1",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+
+    assert_eq!(ensured["started"], false);
+    assert_eq!(ensured["using_generation_daemon"], true);
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        generation_socket_path.display().to_string()
+    );
+    assert!(
+        !home.path().join("run").join("cbth.sock").exists(),
+        "default daemon socket should not be created while generation daemon is alive"
+    );
+
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(5));
+    daemon.wait().expect("generation daemon exits after idle");
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_replace_incompatible_starts_default_instead_of_reusing_generation() {
+    let home = temp_home();
+    let socket_path = home.path().join("run").join("cbth.sock");
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let mut generation_daemon = spawn_daemon(
+        &home,
+        "30",
+        &["--socket-kind", "generation", "--skip-startup-sweep"],
+    );
+    wait_for_path(&generation_socket_path);
+
+    let legacy_listener =
+        UnixListener::bind(&socket_path).expect("bind incompatible default daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod default socket");
+    let legacy_socket_path = socket_path.clone();
+    let legacy_handle = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _addr) = legacy_listener
+                .accept()
+                .expect("accept incompatible default request");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("read incompatible default request");
+            let is_stop = request.contains("\"stop\"");
+            let response = if is_stop {
+                r#"{"ok":true,"response":{"stopping":true}}"#
+            } else {
+                r#"{"ok":true,"response":{"daemon":{"pid":4242,"binary_version":"0.1.5"},"message":"pong"}}"#
+            };
+            stream
+                .write_all(response.as_bytes())
+                .expect("write incompatible default response");
+            stream
+                .write_all(b"\n")
+                .expect("write incompatible default response newline");
+            if is_stop {
+                break;
+            }
+        }
+        drop(legacy_listener);
+        fs::remove_file(&legacy_socket_path).expect("remove incompatible default socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--replace-incompatible",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert_eq!(ensured["started"], true);
+    assert!(ensured.get("using_generation_daemon").is_none());
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        socket_path.display().to_string()
+    );
+    assert!(generation_socket_path.exists());
+
+    legacy_handle.join().expect("incompatible default thread");
+    let ping = cbth(&home, &["daemon", "ping"]);
+    assert_eq!(ping["protocol_version"], 1);
+
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_path_removed(&socket_path, Duration::from_secs(10));
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    generation_daemon.wait().expect("generation daemon exits");
+}
+
+#[cfg(unix)]
+#[test]
+fn generation_daemon_startup_recovers_own_lost_task_process_group() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let marker = home.path().join("generation-lost-task-marker");
+    let marker_arg = marker.to_string_lossy().to_string();
+    let mut daemon = spawn_daemon(&home, "300", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-generation-lost-task",
+            "--summary",
+            "generation daemon lost task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 3; printf done > \"$1\"",
+            "cbth-task",
+            &marker_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+
+    daemon.kill().expect("kill generation daemon");
+    let _ = daemon.wait().expect("wait generation daemon");
+    let mut replacement = spawn_daemon(&home, "30", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+
+    let task = wait_for_task_status(&home, task_id, "lost");
+    assert_eq!(
+        task["task"]["failure_reason"],
+        "task supervisor lost after daemon restart"
+    );
+    thread::sleep(Duration::from_secs(4));
+    assert!(
+        !marker.exists(),
+        "generation-owned lost supervised process group survived startup recovery"
+    );
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    replacement
+        .wait()
+        .expect("replacement generation daemon exits");
+}
+
+#[cfg(unix)]
+#[test]
+fn generation_daemon_startup_recovers_stale_previous_generation_task_process_group() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let marker = home.path().join("stale-generation-lost-task-marker");
+    let marker_arg = marker.to_string_lossy().to_string();
+    let mut daemon = spawn_daemon(&home, "300", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-stale-generation-lost-task",
+            "--summary",
+            "stale generation daemon lost task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 3; printf done > \"$1\"",
+            "cbth-task",
+            &marker_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+
+    daemon.kill().expect("kill generation daemon");
+    let _ = daemon.wait().expect("wait generation daemon");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE jobs
+         SET supervisor_daemon_generation = '0.1.4'
+         WHERE job_id = (SELECT job_id FROM tasks WHERE task_id = ?)",
+        params![task_id],
+    )
+    .expect("retag stale generation job");
+    conn.execute(
+        "UPDATE tasks
+         SET supervisor_daemon_generation = '0.1.4'
+         WHERE task_id = ?",
+        params![task_id],
+    )
+    .expect("retag stale generation task");
+    drop(conn);
+
+    let mut replacement = spawn_daemon(&home, "30", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+
+    let task = wait_for_task_status(&home, task_id, "lost");
+    assert_eq!(
+        task["task"]["failure_reason"],
+        "task supervisor lost after daemon restart"
+    );
+    thread::sleep(Duration::from_secs(4));
+    assert!(
+        !marker.exists(),
+        "stale generation lost supervised process group survived startup recovery"
+    );
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    replacement
+        .wait()
+        .expect("replacement generation daemon exits");
+}
+
+#[cfg(unix)]
+#[test]
+fn generation_daemon_ignores_live_previous_generation_tasks_for_idle_exit() {
+    let home = temp_home();
+    let current_generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let previous_generation_dir = home.path().join("run").join("daemons").join("0.1.4");
+    fs::create_dir_all(&previous_generation_dir).expect("create previous generation dir");
+    fs::set_permissions(home.path().join("run"), fs::Permissions::from_mode(0o700))
+        .expect("chmod run dir");
+    fs::set_permissions(
+        home.path().join("run").join("daemons"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("chmod daemons dir");
+    fs::set_permissions(&previous_generation_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod previous generation dir");
+    let previous_generation_socket_path = previous_generation_dir.join("cbth.sock");
+    let previous_listener =
+        UnixListener::bind(&previous_generation_socket_path).expect("bind previous generation");
+    fs::set_permissions(
+        &previous_generation_socket_path,
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("chmod previous generation socket");
+
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "previous-generation-thread",
+            "--summary",
+            "previous generation pending job",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE jobs
+         SET supervisor_daemon_generation = '0.1.4'
+         WHERE job_id = ?",
+        params![job_id],
+    )
+    .expect("retag previous generation job");
+    conn.execute(
+        "INSERT INTO tasks (
+            task_id, job_id, source_thread_id, status, summary, command_json,
+            cwd, max_delivery_attempts, redelivery_window_seconds,
+            supervisor_daemon_generation, created_at
+         ) VALUES (
+            'previous-generation-live-task', ?, 'previous-generation-thread',
+            'queued', 'previous generation live task', '[]', '/', 3, 86400,
+            '0.1.4', 1
+         )",
+        params![job_id],
+    )
+    .expect("insert previous generation task");
+    drop(conn);
+
+    let mut daemon = spawn_daemon(&home, "1", &["--socket-kind", "generation"]);
+    wait_for_path(&current_generation_socket_path);
+    wait_for_socket_path_removed(&current_generation_socket_path, Duration::from_secs(10));
+    daemon
+        .wait()
+        .expect("current generation daemon exits after idle");
+
+    let task = cbth(
+        &home,
+        &[
+            "task",
+            "inspect",
+            "--task-id",
+            "previous-generation-live-task",
+        ],
+    );
+    assert_eq!(task["task"]["status"], "queued");
+    drop(previous_listener);
+    let _ = fs::remove_file(previous_generation_socket_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn generation_daemon_ignores_unowned_legacy_tasks_for_idle_exit() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "legacy-thread",
+            "--summary",
+            "legacy pending job",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "INSERT INTO tasks (
+            task_id, job_id, source_thread_id, status, summary, command_json,
+            cwd, max_delivery_attempts, redelivery_window_seconds, created_at
+         ) VALUES (
+            'legacy-unowned-task', ?, 'legacy-thread', 'queued',
+            'legacy unowned task', '[]', '/', 3, 86400, 1
+         )",
+        params![job_id],
+    )
+    .expect("insert legacy unowned task");
+    drop(conn);
+
+    let mut daemon = spawn_daemon(&home, "1", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    daemon.wait().expect("generation daemon exits after idle");
+
+    let task = cbth(
+        &home,
+        &["task", "inspect", "--task-id", "legacy-unowned-task"],
+    );
+    assert_eq!(task["task"]["status"], "queued");
+}
+
+#[cfg(unix)]
+#[test]
+fn generation_daemon_keeps_owned_pending_job_as_idle_blocker() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let mut daemon = spawn_daemon(&home, "1", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+
+    let submitted = cbth_daemon(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "generation-owned-pending-job",
+            "--summary",
+            "generation owned pending job",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let supervisor_generation: Option<String> = conn
+        .query_row(
+            "SELECT supervisor_daemon_generation FROM jobs WHERE job_id = ?",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .expect("query job supervisor generation");
+    assert_eq!(
+        supervisor_generation.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        generation_socket_path.exists(),
+        "generation daemon exited while it owned a pending job"
+    );
+    assert!(
+        daemon.try_wait().expect("poll generation daemon").is_none(),
+        "generation daemon process exited while it owned a pending job"
+    );
+
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    daemon.wait().expect("generation daemon exits");
 }
 
 #[cfg(unix)]
@@ -713,7 +1680,8 @@ fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
             "desktop-inbox-revisioned-installation-state",
             "desktop-writeback-helper-foundation",
             "desktop-writeback-live-validation-fixture",
-            "desktop-transcript-relay-consumer"
+            "desktop-transcript-relay-consumer",
+            "daemon-handoff-v1"
         ])
     );
 
@@ -797,7 +1765,8 @@ fn daemon_ensure_restarts_daemon_missing_auto_delivery_capability() {
             "desktop-inbox-revisioned-installation-state",
             "desktop-writeback-helper-foundation",
             "desktop-writeback-live-validation-fixture",
-            "desktop-transcript-relay-consumer"
+            "desktop-transcript-relay-consumer",
+            "daemon-handoff-v1"
         ])
     );
 
@@ -881,7 +1850,8 @@ fn daemon_ensure_restarts_daemon_missing_session_capability_dispatch() {
             "desktop-inbox-revisioned-installation-state",
             "desktop-writeback-helper-foundation",
             "desktop-writeback-live-validation-fixture",
-            "desktop-transcript-relay-consumer"
+            "desktop-transcript-relay-consumer",
+            "daemon-handoff-v1"
         ])
     );
 
@@ -949,7 +1919,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
                     assert!(request.contains("\"ping\""));
                     if let Err(error) = stream.write_all(
                         br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-thread-start-params",
-            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer"],"message":"pong"}}"#,
+            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","daemon-handoff-v1"],"message":"pong"}}"#,
                     ) {
                         if is_peer_disconnect(&error) {
                             continue;
@@ -1017,7 +1987,7 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
                 r#"{"ok":false,"error":"daemon connection limit reached"}"#
             } else {
                 r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-thread-start-params",
-            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer"],"message":"pong"}}"#
+            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","daemon-handoff-v1"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())
