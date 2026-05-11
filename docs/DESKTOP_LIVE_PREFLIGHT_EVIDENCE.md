@@ -411,7 +411,7 @@ Conclusion: real Desktop heartbeat can execute no-DB read helpers, but cannot cr
 
 ## 2026-05-11 Attempt: Interactive Desktop Transcript Relay Succeeded
 
-Result: `VALIDATION_OK` for the Desktop tool-output carrier. This validates the transcript relay scanner and the `function_call_output` carrier in a real Desktop thread. It does not validate the heartbeat automation carrier shape yet.
+Result: `VALIDATION_OK` for the Desktop tool-output carrier. This validates the transcript relay scanner and the `function_call_output` carrier in a real Desktop thread.
 
 Evidence:
 
@@ -446,3 +446,39 @@ trusted_auto[0].payload_type=function_call_output
 The first live scan also found a scanner defect: copied prefix text in non-trusted carrier contexts could make the command fail while parsing diagnostic text. The branch fixes that behavior so malformed prefix text in `diagnostic_only` remains non-automatic diagnostic evidence, while malformed prefixed envelopes in `function_call_output` still fail closed through `rejected_trusted_auto_envelopes`.
 
 Conclusion: transcript/tool-output relay is a viable side-channel candidate for Desktop writeback, provided a future sidecar only consumes exact prefixed envelopes from `function_call_output` and adds durable scan cursors, replay protection, high-entropy nonce / lease / generation validation, and CAS mutation. `writeback_capability` remains `unknown`; this evidence validates transport shape only.
+
+## 2026-05-11 Attempt: Heartbeat Automation Transcript Relay Succeeded
+
+Result: `VALIDATION_OK` for the Desktop heartbeat automation carrier. This validates that automation-delivered helper stdout uses the same trusted `response_item.payload.type=function_call_output` carrier as the interactive probe.
+
+Evidence:
+
+- Code branch: `codex/desktop-transcript-relay-validation`
+- Base merge commit: `eeef583099d22af196e9525aa80de2d4a4cd5397`
+- Local binary: `/Users/hoteng/.cache/cargo-target/release/cbth`
+- Local binary version: `cbth 0.1.5`
+- Heartbeat thread id: `019db5e6-ba6a-7b80-95d2-a6867163281a`
+- Temporary heartbeat automation id: `cbth-transcript-relay-heartbeat-validation-20260511t141427z`
+- Validation marker: `CBTH_TRANSCRIPT_RELAY_HEARTBEAT_20260511T141427Z`
+- Probe id: `cbth_transcript_relay_heartbeat_20260511T141427Z`
+- Rollout file: `/Users/hoteng/.codex/sessions/2026/04/22/rollout-2026-04-22T16-54-50-019db5e6-ba6a-7b80-95d2-a6867163281a.jsonl`
+- Trusted carrier line: `444`
+- Temporary automation cleanup: deleted after validation
+
+The scanner accepted the heartbeat rollout carrier as trusted automatic input:
+
+```text
+auto_decision.trusted=true
+auto_decision.reason=single_trusted_auto_envelope
+counts.trusted_auto=1
+counts.diagnostic_only=6
+counts.ignored_prompt=4
+counts.rejected=0
+trusted_auto[0].payload_type=function_call_output
+trusted_auto[0].envelope.marker=CBTH_TRANSCRIPT_RELAY_HEARTBEAT_20260511T141427Z
+trusted_auto[0].envelope.bridge_thread_id=019db5e6-ba6a-7b80-95d2-a6867163281a
+```
+
+The prompt copies of the marker appeared as `ignored_prompt`, and assistant / task-complete text appeared as `diagnostic_only`. This is the expected shape: only the exact helper stdout envelope inside `function_call_output` is eligible for future automatic writeback consumption.
+
+Conclusion: the transcript/tool-output side channel is validated for both interactive Desktop tool calls and heartbeat automation runs. `writeback_capability` still remains `unknown` because no production sidecar consumer, replay cursor, nonce / lease / generation verification, or durable CAS mutation has been implemented.

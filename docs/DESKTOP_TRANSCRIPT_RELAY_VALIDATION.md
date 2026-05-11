@@ -46,7 +46,9 @@ Only `trusted_auto` is a future automatic writeback input. `diagnostic_only` and
 5. Success requires `auto_decision.trusted=true`, `reason=single_trusted_auto_envelope`, and `counts.trusted_auto=1`.
 6. Record marker, rollout path, carrier, scanner JSON, and thread id in `DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md`.
 
-An interactive Desktop tool-output probe is useful as a lower-level transport sanity check when heartbeat scheduling cannot be triggered immediately. It proves that a real Desktop thread stores helper stdout in a `response_item.payload.type=function_call_output` carrier and that the scanner accepts that carrier. It does not by itself prove the heartbeat automation carrier shape.
+An interactive Desktop tool-output probe is useful as a lower-level transport sanity check when heartbeat scheduling cannot be triggered immediately. It proves that a real Desktop thread stores helper stdout in a `response_item.payload.type=function_call_output` carrier and that the scanner accepts that carrier.
+
+The 2026-05-11 heartbeat automation validation used the same helper and proved that automation-delivered helper stdout also appears as a `response_item.payload.type=function_call_output` carrier. The scanner accepted exactly one `trusted_auto` envelope, treated prompt copies as `ignored_prompt`, and treated assistant / task-complete text as `diagnostic_only`.
 
 This validation does not set `writeback_capability=validated`. A later production PR must add durable scan cursors, one-shot replay protection, nonce / lease / generation checks, and a sidecar consumer that converts a trusted envelope into the existing CAS writeback contract.
 

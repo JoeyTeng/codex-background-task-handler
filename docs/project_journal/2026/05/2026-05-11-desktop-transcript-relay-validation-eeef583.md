@@ -47,16 +47,22 @@ superseded_by:
   - carrier: `response_item.payload.type=function_call_output`
   - decision: `single_trusted_auto_envelope`
   - record line: `90911`
+- Heartbeat automation Desktop tool-output validation:
+  - marker: `CBTH_TRANSCRIPT_RELAY_HEARTBEAT_20260511T141427Z`
+  - rollout: `/Users/hoteng/.codex/sessions/2026/04/22/rollout-2026-04-22T16-54-50-019db5e6-ba6a-7b80-95d2-a6867163281a.jsonl`
+  - temporary automation id: `cbth-transcript-relay-heartbeat-validation-20260511t141427z`
+  - carrier: `response_item.payload.type=function_call_output`
+  - decision: `single_trusted_auto_envelope`
+  - record line: `444`
 
 ## Current State
 
 - Hidden emitter and scanner are implemented for this PR.
 - Fake tests cover trusted carrier extraction, prompt self-trigger rejection, diagnostic-only final text, duplicate trusted envelopes, malformed trusted envelopes, wrong-marker behavior, and malformed diagnostic text.
 - A real interactive Desktop tool-output probe succeeded and proved the scanner accepts exact prefixed stdout from `function_call_output`.
-- Heartbeat-specific transcript carrier validation remains a follow-up because the temporary heartbeat automation did not provide an immediate run during this branch.
+- A real Desktop heartbeat automation probe succeeded and proved automation-delivered helper stdout also uses `response_item.payload.type=function_call_output`; prompt copies were classified as `ignored_prompt`, and assistant / task-complete text was classified as `diagnostic_only`.
 - The production sidecar consumer, durable scan cursor, replay protection, and CAS mutation path remain future work.
 
 ## Next Steps
 
-- Run a heartbeat-specific transcript relay probe and record whether automation-delivered helper stdout uses the same `function_call_output` carrier or another structured carrier.
-- Design a production sidecar consumer only after heartbeat carrier shape is proven; it must include durable scan cursors, replay protection, high-entropy nonce / lease / generation validation, and CAS mutation.
+- Design a production sidecar consumer for the validated heartbeat transcript carrier. It must include durable scan cursors, replay protection, high-entropy nonce / lease / generation validation, and CAS mutation before it can touch cbth store.
