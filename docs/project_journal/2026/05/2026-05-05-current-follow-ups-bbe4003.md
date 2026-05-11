@@ -46,7 +46,7 @@ superseded_by:
 - Implement real ready / arm / pause materialization behind the existing no-DB read helpers.
 - Extend `bridge_arm_lease` beyond the current `note-arm-pending` acquire / carry-forward primitive with overdue reconcile and cleanup semantics.
 - Redesign the writeback validation/execution path so Desktop heartbeat does not need daemon autostart / `startup.lock` access; only retry `note-arm-pending` / `note-arm` live validation after that boundary changes.
-- Replace the local filesystem writeback idea with a non-filesystem Desktop side channel that can carry heartbeat output back to a non-Desktop consumer without requiring SQLite, daemon IPC, socket, startup-lock, or local file write permissions from heartbeat.
+- Validate the transcript / tool-output relay side channel: interactive Desktop tool-output now proves exact prefixed stdout can be recovered from rollout `function_call_output`; remaining live validation must confirm heartbeat automation emits the same trusted carrier or document the alternative structured carrier. Only trusted carrier evidence can later feed the durable writeback CAS path.
 - Implement `note-boundary-crossed` with prompt-token validation, binding / installation-state checks, `cooldown` and `armed_generation` preconditions, `handoff_recorded` close, and durable `boundary_recovery_envelope`.
 - Verify the continuation-boundary contract: only fresh `note-boundary-crossed` success allows inline handoff; post-boundary automatic replay and ordinary tool continuation remain out of v1.
 - Keep the v1 automatic path limited to read-only, no approval, no network, no write access batches, plus validated Desktop read and writeback capability; `requires_artifact_read=true` remains manual/operator follow-up.

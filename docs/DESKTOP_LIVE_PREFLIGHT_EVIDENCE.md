@@ -408,3 +408,41 @@ writeback_capability=unknown
 ```
 
 Conclusion: real Desktop heartbeat can execute no-DB read helpers, but cannot create directories, create files, or open pre-created files for append under `~/.cbth/inbox/writeback-dropbox`. Local filesystem writeback from Desktop heartbeat is not viable for v1. The next writeback design should use a non-filesystem side channel or a Desktop-exposed tool result / automation mechanism instead of heartbeat-authored local files.
+
+## 2026-05-11 Attempt: Interactive Desktop Transcript Relay Succeeded
+
+Result: `VALIDATION_OK` for the Desktop tool-output carrier. This validates the transcript relay scanner and the `function_call_output` carrier in a real Desktop thread. It does not validate the heartbeat automation carrier shape yet.
+
+Evidence:
+
+- Code branch: `codex/desktop-transcript-relay-validation`
+- Base merge commit: `eeef583099d22af196e9525aa80de2d4a4cd5397`
+- Local binary: `/Users/hoteng/.cache/cargo-target/release/cbth`
+- Local binary version: `cbth 0.1.5`
+- Interactive Desktop thread id: `019db478-a40c-7a62-b8d0-70ef2c3249d1`
+- Validation marker: `CBTH_TRANSCRIPT_RELAY_INTERACTIVE_20260511T132728Z`
+- Probe id: `cbth_transcript_relay_interactive_20260511T132728Z`
+- Rollout file: `/Users/hoteng/.codex/sessions/2026/04/22/rollout-2026-04-22T10-14-58-019db478-a40c-7a62-b8d0-70ef2c3249d1.jsonl`
+- Trusted carrier line: `90911`
+
+The validation-only emitter wrote one prefixed stdout envelope:
+
+```text
+CBTH_TRANSCRIPT_WRITEBACK_V1 {"bridge_thread_id":"019db478-a40c-7a62-b8d0-70ef2c3249d1","cbth_version":"0.1.5","channel":"desktop_transcript_writeback","created_at":1778506053,"kind":"validation_probe","marker":"CBTH_TRANSCRIPT_RELAY_INTERACTIVE_20260511T132728Z","probe_id":"cbth_transcript_relay_interactive_20260511T132728Z","schema_version":1}
+```
+
+The scanner accepted the rollout carrier as trusted automatic input:
+
+```text
+auto_decision.trusted=true
+auto_decision.reason=single_trusted_auto_envelope
+counts.trusted_auto=1
+counts.diagnostic_only=0
+counts.ignored_prompt=0
+counts.rejected=0
+trusted_auto[0].payload_type=function_call_output
+```
+
+The first live scan also found a scanner defect: copied prefix text in non-trusted carrier contexts could make the command fail while parsing diagnostic text. The branch fixes that behavior so malformed prefix text in `diagnostic_only` remains non-automatic diagnostic evidence, while malformed prefixed envelopes in `function_call_output` still fail closed through `rejected_trusted_auto_envelopes`.
+
+Conclusion: transcript/tool-output relay is a viable side-channel candidate for Desktop writeback, provided a future sidecar only consumes exact prefixed envelopes from `function_call_output` and adds durable scan cursors, replay protection, high-entropy nonce / lease / generation validation, and CAS mutation. `writeback_capability` remains `unknown`; this evidence validates transport shape only.
