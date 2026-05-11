@@ -494,8 +494,17 @@ impl Store {
         }
     }
 
+    #[allow(dead_code)]
     pub fn lost_pending_task_processes(&self) -> Result<Vec<LostPendingTaskProcess>> {
         self.lost_pending_task_processes_matching(|_| true)
+    }
+
+    pub fn lost_pending_task_processes_without_supervisor_generation(
+        &self,
+    ) -> Result<Vec<LostPendingTaskProcess>> {
+        self.lost_pending_task_processes_matching(|task_supervisor_generation| {
+            task_supervisor_generation.is_none()
+        })
     }
 
     pub fn lost_pending_task_processes_for_supervisor_generation(
@@ -551,10 +560,12 @@ impl Store {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn fail_lost_tasks(&mut self, now: i64) -> Result<usize> {
         self.fail_lost_tasks_excluding(now, &HashSet::new())
     }
 
+    #[allow(dead_code)]
     pub fn fail_lost_tasks_excluding(
         &mut self,
         now: i64,
@@ -563,6 +574,7 @@ impl Store {
         self.fail_lost_tasks_excluding_with(now, |task_id| Ok(active_task_ids.contains(task_id)))
     }
 
+    #[allow(dead_code)]
     pub fn fail_lost_tasks_excluding_with<F>(
         &mut self,
         now: i64,
@@ -572,6 +584,21 @@ impl Store {
         F: FnMut(&str) -> Result<bool>,
     {
         self.fail_lost_tasks_matching_excluding_with(now, |_| true, &mut is_active_task)
+    }
+
+    pub fn fail_lost_tasks_without_supervisor_generation_excluding_with<F>(
+        &mut self,
+        now: i64,
+        mut is_active_task: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> Result<bool>,
+    {
+        self.fail_lost_tasks_matching_excluding_with(
+            now,
+            |task_supervisor_generation| task_supervisor_generation.is_none(),
+            &mut is_active_task,
+        )
     }
 
     pub fn fail_lost_tasks_for_supervisor_generation_excluding_with<F>(
@@ -2536,6 +2563,7 @@ impl Store {
         .map_err(Into::into)
     }
 
+    #[allow(dead_code)]
     pub fn daemon_lifecycle_status(
         &self,
         now: i64,
@@ -2548,6 +2576,43 @@ impl Store {
         )?;
         let nonterminal_tasks = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks WHERE status IN ('queued', 'running')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let active_cli_acceptances = count_active_cli_acceptances(&self.conn, now)?;
+        let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
+        let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
+        let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
+        let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
+        Ok(DaemonLifecycleStatus {
+            active_jobs,
+            nonterminal_tasks,
+            active_cli_acceptances,
+            cli_acceptances_stale_now,
+            active_cli_observations,
+            cli_observations_due_now,
+            open_batches_due_now,
+            open_batches_due_within_idle,
+        })
+    }
+
+    pub fn daemon_lifecycle_status_without_supervisor_generation(
+        &self,
+        now: i64,
+        idle_horizon_at: i64,
+    ) -> Result<DaemonLifecycleStatus> {
+        let active_jobs = self.conn.query_row(
+            "SELECT COUNT(*) FROM jobs
+             WHERE status = 'pending'
+               AND supervisor_daemon_generation IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let nonterminal_tasks = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE status IN ('queued', 'running')
+               AND supervisor_daemon_generation IS NULL",
             [],
             |row| row.get::<_, i64>(0),
         )?;
@@ -6368,6 +6433,95 @@ mod tests {
         assert_eq!(
             task.failure_reason.as_deref(),
             Some("task supervisor lost after daemon restart")
+        );
+    }
+
+    #[test]
+    fn daemon_lifecycle_and_recovery_scopes_separate_unowned_and_generation_tasks() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        create_test_task(
+            &mut store,
+            "job-unowned-scope",
+            "task-unowned-scope",
+            "thread-unowned-scope",
+            3,
+            10,
+        );
+        store
+            .create_task_with_job_for_supervisor_generation(
+                NewJob {
+                    job_id: "job-generation-scope".to_owned(),
+                    source_thread_id: "thread-generation-scope".to_owned(),
+                    summary: "generation scoped task".to_owned(),
+                    metadata_json: "{}".to_owned(),
+                    policy: test_policy(),
+                    created_at: 10,
+                },
+                NewTask {
+                    task_id: "task-generation-scope".to_owned(),
+                    job_id: "job-generation-scope".to_owned(),
+                    source_thread_id: "thread-generation-scope".to_owned(),
+                    summary: "generation scoped task".to_owned(),
+                    command_json: r#"["/bin/sh","-c","true"]"#.to_owned(),
+                    cwd: "/tmp".to_owned(),
+                    timeout_seconds: None,
+                    max_delivery_attempts: 3,
+                    redelivery_window_seconds: 10,
+                    created_at: 10,
+                },
+                Some("generation-a"),
+            )
+            .expect("create generation task");
+
+        let unowned = store
+            .daemon_lifecycle_status_without_supervisor_generation(100, 101)
+            .expect("unowned lifecycle");
+        assert_eq!(unowned.active_jobs, 1);
+        assert_eq!(unowned.nonterminal_tasks, 1);
+        let generation = store
+            .daemon_lifecycle_status_for_supervisor_generation("generation-a", 100, 101)
+            .expect("generation lifecycle");
+        assert_eq!(generation.active_jobs, 1);
+        assert_eq!(generation.nonterminal_tasks, 1);
+        let all = store
+            .daemon_lifecycle_status(100, 101)
+            .expect("all lifecycle");
+        assert_eq!(all.active_jobs, 2);
+        assert_eq!(all.nonterminal_tasks, 2);
+
+        let recovered_unowned = store
+            .fail_lost_tasks_without_supervisor_generation_excluding_with(200, |_| Ok(false))
+            .expect("recover unowned lost tasks");
+        assert_eq!(recovered_unowned, 1);
+        assert_eq!(
+            store
+                .inspect_task("task-unowned-scope")
+                .expect("inspect unowned task")
+                .status,
+            "lost"
+        );
+        assert_eq!(
+            store
+                .inspect_task("task-generation-scope")
+                .expect("inspect generation task")
+                .status,
+            "queued"
+        );
+
+        let recovered_generation = store
+            .fail_lost_tasks_for_supervisor_generation_excluding_with(201, "generation-a", |_| {
+                Ok(false)
+            })
+            .expect("recover generation lost tasks");
+        assert_eq!(recovered_generation, 1);
+        assert_eq!(
+            store
+                .inspect_task("task-generation-scope")
+                .expect("inspect recovered generation task")
+                .status,
+            "lost"
         );
     }
 

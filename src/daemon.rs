@@ -421,6 +421,7 @@ struct DaemonState {
     cli_thread_start_bootstraps: Mutex<HashMap<String, ManagedCliAppServer>>,
     supervised_tasks: Arc<Mutex<HashMap<String, Arc<SupervisedTaskControl>>>>,
     task_recovery_scope: TaskRecoveryScope,
+    supervisor_daemon_generation: Option<String>,
 }
 
 #[derive(Default)]
@@ -516,7 +517,7 @@ struct DaemonLifecycleCache {
 
 #[derive(Clone, Debug)]
 enum TaskRecoveryScope {
-    All,
+    Unowned,
     CurrentGeneration,
 }
 
@@ -553,9 +554,12 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
     listener
         .set_nonblocking(true)
         .with_context(|| format!("set nonblocking {}", socket_path.display()))?;
-    let task_recovery_scope = match options.socket_kind {
-        DaemonSocketKind::Default => TaskRecoveryScope::All,
-        DaemonSocketKind::Generation => TaskRecoveryScope::CurrentGeneration,
+    let (task_recovery_scope, supervisor_daemon_generation) = match options.socket_kind {
+        DaemonSocketKind::Default => (TaskRecoveryScope::Unowned, None),
+        DaemonSocketKind::Generation => (
+            TaskRecoveryScope::CurrentGeneration,
+            Some(current_daemon_generation_id().to_owned()),
+        ),
     };
     let recovery_now = match options.startup_sweep_now {
         Some(now) => now,
@@ -564,7 +568,10 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
     let mut store = Store::open(layout)?;
     recover_lost_task_process_groups_for_scope(layout, &task_recovery_scope)?;
     let _ = match &task_recovery_scope {
-        TaskRecoveryScope::All => store.fail_lost_tasks(recovery_now)?,
+        TaskRecoveryScope::Unowned => store
+            .fail_lost_tasks_without_supervisor_generation_excluding_with(recovery_now, |_| {
+                Ok(false)
+            })?,
         TaskRecoveryScope::CurrentGeneration => store
             .fail_lost_tasks_for_supervisor_generation_excluding_with(
                 recovery_now,
@@ -597,6 +604,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         cli_thread_start_bootstraps: Mutex::new(HashMap::new()),
         supervised_tasks: Arc::new(Mutex::new(HashMap::new())),
         task_recovery_scope,
+        supervisor_daemon_generation,
     });
     let mut last_activity = Instant::now();
     let mut last_activity_epoch = started_at;
@@ -1834,7 +1842,7 @@ fn mark_supervised_task_child_exit_observed(control: &SupervisedTaskControl) {
 
 #[cfg(test)]
 fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
-    recover_lost_task_process_groups_for_scope(layout, &TaskRecoveryScope::All)
+    recover_lost_task_process_groups_for_scope(layout, &TaskRecoveryScope::Unowned)
 }
 
 fn recover_lost_task_process_groups_for_scope(
@@ -1843,7 +1851,9 @@ fn recover_lost_task_process_groups_for_scope(
 ) -> Result<()> {
     let store = Store::open(layout)?;
     let processes = match scope {
-        TaskRecoveryScope::All => store.lost_pending_task_processes()?,
+        TaskRecoveryScope::Unowned => {
+            store.lost_pending_task_processes_without_supervisor_generation()?
+        }
         TaskRecoveryScope::CurrentGeneration => store
             .lost_pending_task_processes_for_supervisor_generation(current_daemon_generation_id())?,
     };
@@ -2142,7 +2152,9 @@ fn refresh_lifecycle_status(
     let now = current_epoch_seconds()?;
     let store = Store::open_for_daemon_lifecycle(&state.layout)?;
     match &state.task_recovery_scope {
-        TaskRecoveryScope::All => store.daemon_lifecycle_status(now, idle_horizon_at),
+        TaskRecoveryScope::Unowned => {
+            store.daemon_lifecycle_status_without_supervisor_generation(now, idle_horizon_at)
+        }
         TaskRecoveryScope::CurrentGeneration => store
             .daemon_lifecycle_status_for_supervisor_generation(
                 current_daemon_generation_id(),
@@ -2209,7 +2221,9 @@ fn recover_registryless_lost_tasks(state: &DaemonState) -> Result<usize> {
 fn recover_registryless_lost_task_process_groups(state: &DaemonState) -> Result<()> {
     let store = Store::open_for_daemon_lifecycle(&state.layout)?;
     let processes = match &state.task_recovery_scope {
-        TaskRecoveryScope::All => store.lost_pending_task_processes()?,
+        TaskRecoveryScope::Unowned => {
+            store.lost_pending_task_processes_without_supervisor_generation()?
+        }
         TaskRecoveryScope::CurrentGeneration => store
             .lost_pending_task_processes_for_supervisor_generation(current_daemon_generation_id())?,
     };
@@ -2247,7 +2261,9 @@ where
     F: FnMut(&str) -> Result<bool>,
 {
     match scope {
-        TaskRecoveryScope::All => store.fail_lost_tasks_excluding_with(now, is_active_task),
+        TaskRecoveryScope::Unowned => {
+            store.fail_lost_tasks_without_supervisor_generation_excluding_with(now, is_active_task)
+        }
         TaskRecoveryScope::CurrentGeneration => store
             .fail_lost_tasks_for_supervisor_generation_excluding_with(
                 now,
@@ -2399,7 +2415,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             crate::cli::dispatch_daemon_argv(
                 &state.layout,
                 payload.argv,
-                Some(current_daemon_generation_id()),
+                state.supervisor_daemon_generation.as_deref(),
             )?
         }
         "task_run" => {
@@ -2585,7 +2601,7 @@ where
         store.create_task_with_job_for_supervisor_generation(
             job.clone(),
             task.clone(),
-            Some(current_daemon_generation_id()),
+            state.supervisor_daemon_generation.as_deref(),
         )
     }) {
         Ok(created) => created,
@@ -5785,7 +5801,8 @@ mod tests {
                 cli_app_server_reservations: Mutex::new(HashMap::new()),
                 cli_thread_start_bootstraps: Mutex::new(HashMap::new()),
                 supervised_tasks: Arc::new(Mutex::new(HashMap::new())),
-                task_recovery_scope: TaskRecoveryScope::All,
+                task_recovery_scope: TaskRecoveryScope::Unowned,
+                supervisor_daemon_generation: None,
             },
         )
     }
