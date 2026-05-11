@@ -3149,7 +3149,8 @@ fn desktop_bridge_preflight_require_existing_daemon_does_not_forward_client_only
                     "desktop-bridge-foundation-dispatch",
                     "desktop-inbox-revisioned-installation-state",
                     "desktop-writeback-helper-foundation",
-                    "desktop-writeback-live-validation-fixture"
+                    "desktop-writeback-live-validation-fixture",
+                    "daemon-handoff-v1"
                 ],
                 "message": "pong"
             }

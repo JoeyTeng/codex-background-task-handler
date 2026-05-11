@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, params};
+use semver::Version;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -22,6 +23,11 @@ fn temp_home() -> TempDir {
     #[cfg(unix)]
     fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("chmod temp home");
     home
+}
+
+fn handoff_eligible_for_version(version: &str) -> bool {
+    Version::parse(version).expect("test package version is semver")
+        >= Version::parse("0.2.0").expect("handoff minimum version is semver")
 }
 
 #[cfg(unix)]
@@ -455,6 +461,13 @@ fn daemon_ensure_starts_ping_status_and_stop() {
     let ping = cbth(&home, &["daemon", "ping"]);
     assert_eq!(ping["message"], "pong");
     assert_eq!(ping["protocol_version"], 1);
+    assert_eq!(ping["daemon"]["binary_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(ping["daemon"]["quiescing"], false);
+    assert_eq!(ping["daemon"]["handoff_minimum_binary_version"], "0.2.0");
+    assert_eq!(
+        ping["daemon"]["handoff_eligible"],
+        handoff_eligible_for_version(env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(
         ping["capabilities"],
         json!([
@@ -477,13 +490,24 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "desktop-bridge-foundation-dispatch",
             "desktop-inbox-revisioned-installation-state",
             "desktop-writeback-helper-foundation",
-            "desktop-writeback-live-validation-fixture"
+            "desktop-writeback-live-validation-fixture",
+            "daemon-handoff-v1"
         ])
     );
     assert_eq!(ping["daemon"]["idle_timeout_seconds"], 10);
 
     let status = cbth(&home, &["daemon", "status"]);
     assert_eq!(status["daemon"]["stop_requested"], false);
+    assert_eq!(
+        status["daemon"]["binary_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(status["daemon"]["quiescing"], false);
+    assert_eq!(status["daemon"]["handoff_minimum_binary_version"], "0.2.0");
+    assert_eq!(
+        status["daemon"]["handoff_eligible"],
+        handoff_eligible_for_version(env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(status["protocol_version"], 1);
     assert_eq!(
         status["capabilities"],
@@ -507,7 +531,8 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "desktop-bridge-foundation-dispatch",
             "desktop-inbox-revisioned-installation-state",
             "desktop-writeback-helper-foundation",
-            "desktop-writeback-live-validation-fixture"
+            "desktop-writeback-live-validation-fixture",
+            "daemon-handoff-v1"
         ])
     );
     assert!(status["startup_sweep"].is_object());
@@ -613,7 +638,8 @@ fn daemon_ensure_restarts_incompatible_daemon() {
             "desktop-bridge-foundation-dispatch",
             "desktop-inbox-revisioned-installation-state",
             "desktop-writeback-helper-foundation",
-            "desktop-writeback-live-validation-fixture"
+            "desktop-writeback-live-validation-fixture",
+            "daemon-handoff-v1"
         ])
     );
 
@@ -653,10 +679,14 @@ fn daemon_ensure_coexists_with_incompatible_default_without_stop() {
                         !request.contains("\"stop\""),
                         "default ensure must not stop incompatible daemon: {request}"
                     );
+                    assert!(
+                        !request.contains("\"handoff_quiesce\""),
+                        "below-minimum daemon must not be quiesced for handoff: {request}"
+                    );
                     request_tx.send(request).expect("send observed request");
                     stream
                         .write_all(
-                            br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.1.5"},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#,
+                            br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.1.5"},"protocol_version":1,"capabilities":["dispatch","daemon-handoff-v1"],"message":"pong"}}"#,
                         )
                         .expect("write old response");
                     stream.write_all(b"\n").expect("write old response newline");
@@ -727,6 +757,109 @@ fn daemon_ensure_coexists_with_incompatible_default_without_stop() {
 
     done_tx.send(()).expect("signal old daemon");
     handle.join().expect("old daemon thread");
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_quiesces_handoff_eligible_incompatible_default() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let generation_socket_path = run_dir
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind handoff daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    listener
+        .set_nonblocking(true)
+        .expect("set handoff listener nonblocking");
+    let old_socket_path = socket_path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let (request_tx, request_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let mut request = String::new();
+                    stream
+                        .read_to_string(&mut request)
+                        .expect("read handoff request");
+                    request_tx
+                        .send(request.clone())
+                        .expect("send handoff request");
+                    if request.contains("\"handoff_quiesce\"") {
+                        stream
+                            .write_all(
+                                br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.2.0","quiescing":true},"quiescing":true}}"#,
+                            )
+                            .expect("write quiesce response");
+                    } else {
+                        assert!(
+                            request.contains("\"ping\""),
+                            "unexpected request: {request}"
+                        );
+                        stream
+                            .write_all(
+                                br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.2.0"},"protocol_version":1,"capabilities":["dispatch","daemon-handoff-v1"],"message":"pong"}}"#,
+                            )
+                            .expect("write handoff ping response");
+                    }
+                    stream
+                        .write_all(b"\n")
+                        .expect("write handoff response newline");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if done_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept handoff daemon request: {error}"),
+            }
+        }
+        drop(listener);
+        fs::remove_file(&old_socket_path).expect("remove handoff daemon socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    let first_request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("handoff daemon should be probed");
+    let second_request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("handoff daemon should be quiesced");
+    assert!(first_request.contains("\"ping\""));
+    assert!(second_request.contains("\"handoff_quiesce\""));
+    assert!(second_request.contains("\"expected_pid\":1313"));
+    assert!(second_request.contains("\"expected_binary_version\":\"0.2.0\""));
+    assert_eq!(ensured["started"], true);
+    assert_eq!(ensured["coexisting_with_incompatible_daemon"], true);
+    assert_eq!(ensured["legacy_daemon"]["pid"], 1313);
+    assert_eq!(ensured["legacy_daemon_quiesced"], true);
+    assert_eq!(ensured["legacy_handoff_gate"], "eligible");
+    assert_eq!(ensured["legacy_handoff_quiesce"]["quiescing"], true);
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        generation_socket_path.display().to_string()
+    );
+
+    done_tx.send(()).expect("signal handoff daemon");
+    handle.join().expect("handoff daemon thread");
     stop_daemon_at_socket_path(&generation_socket_path);
     wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
 }
@@ -979,7 +1112,8 @@ fn daemon_dispatch_uses_probed_socket_when_ping_omits_socket_path() {
                     "desktop-bridge-foundation-dispatch",
                     "desktop-inbox-revisioned-installation-state",
                     "desktop-writeback-helper-foundation",
-                    "desktop-writeback-live-validation-fixture"
+                    "desktop-writeback-live-validation-fixture",
+                    "daemon-handoff-v1"
                 ],
                 "message": "pong"
             }
@@ -1541,7 +1675,8 @@ fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
             "desktop-bridge-foundation-dispatch",
             "desktop-inbox-revisioned-installation-state",
             "desktop-writeback-helper-foundation",
-            "desktop-writeback-live-validation-fixture"
+            "desktop-writeback-live-validation-fixture",
+            "daemon-handoff-v1"
         ])
     );
 
@@ -1624,7 +1759,8 @@ fn daemon_ensure_restarts_daemon_missing_auto_delivery_capability() {
             "desktop-bridge-foundation-dispatch",
             "desktop-inbox-revisioned-installation-state",
             "desktop-writeback-helper-foundation",
-            "desktop-writeback-live-validation-fixture"
+            "desktop-writeback-live-validation-fixture",
+            "daemon-handoff-v1"
         ])
     );
 
@@ -1707,7 +1843,8 @@ fn daemon_ensure_restarts_daemon_missing_session_capability_dispatch() {
             "desktop-bridge-foundation-dispatch",
             "desktop-inbox-revisioned-installation-state",
             "desktop-writeback-helper-foundation",
-            "desktop-writeback-live-validation-fixture"
+            "desktop-writeback-live-validation-fixture",
+            "daemon-handoff-v1"
         ])
     );
 
@@ -1775,7 +1912,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
                     assert!(request.contains("\"ping\""));
                     if let Err(error) = stream.write_all(
                         br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-thread-start-params",
-            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture"],"message":"pong"}}"#,
+            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","daemon-handoff-v1"],"message":"pong"}}"#,
                     ) {
                         if is_peer_disconnect(&error) {
                             continue;
@@ -1843,7 +1980,7 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
                 r#"{"ok":false,"error":"daemon connection limit reached"}"#
             } else {
                 r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-thread-start-params",
-            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture"],"message":"pong"}}"#
+            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","daemon-handoff-v1"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())

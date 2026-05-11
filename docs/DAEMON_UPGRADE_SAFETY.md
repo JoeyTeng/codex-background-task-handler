@@ -51,3 +51,35 @@ Pending jobs without tasks are not migrated in PR2。它们仍属于后续 jobs 
 - peer daemon enters quiesce mode before exporting owned resources
 
 低版本 daemon 不参与 handoff，只按 PR2 规则并存和 drain。
+
+## PR3 Handoff Protocol Skeleton
+
+PR3 只增加协议骨架和状态机，不迁移真实 app-server 或 live jobs。
+
+Daemon ping/status 新增以下协议面：
+
+- `daemon.binary_version`: 当前 daemon binary 的 package version。
+- `daemon.quiescing`: daemon 是否已经进入 handoff quiesce mode。
+- `daemon.handoff_minimum_binary_version`: 固定为 `0.2.0`。
+- `daemon.handoff_eligible`: 当前 daemon binary 是否达到 handoff minimum。
+- `capabilities` 包含 `daemon-handoff-v1`，用于声明 daemon 理解 quiesce/handoff 协议。
+
+Handoff initiator 的 gate 是 fail-closed 的：
+
+- protocol 必须是当前 daemon protocol。
+- peer 必须暴露 `daemon-handoff-v1`。
+- peer 必须报告可解析的 `daemon.binary_version`。
+- peer `binary_version` 必须 `>=0.2.0`。
+
+只有 gate 通过时，新 binary 才会向 incompatible legacy default daemon 发送 hidden `handoff_quiesce` request。低版本 daemon、缺 capability daemon、缺 version daemon、protocol 不匹配 daemon 都不会收到 quiesce request；它们继续按 PR2 并存路径处理。
+
+`handoff_quiesce` request carries the expected peer `pid` and `binary_version` from the gated ping response. The receiver validates both before setting quiescing state, so a default socket replacement race cannot accidentally quiesce a different daemon.
+
+Quiesce mode 的 PR3 语义：
+
+- `handoff_quiesce` idempotently sets in-memory quiescing state and returns daemon info with `quiescing=true`。
+- Quiescing daemon refuses new work: `dispatch`、`task_run`、CLI app-server reserve/ensure/probe、thread-start/bootstrap/promote。
+- Quiescing daemon keeps control/maintenance paths available: `ping`、`status`、`stop`、app-server lease refresh/release/stop、thread-start abort、`task_cancel`。
+- PR3 不导出 app-server registry，不 adopt app-server，不迁移或 drain live jobs。PR4/PR5 才实现这些资源面的行为。
+
+当 incompatible legacy default daemon 通过 handoff gate 时，`daemon ensure` 会先 quiesce legacy daemon，再启动或复用 generation daemon，并在 ensure response 中标注 `legacy_daemon_quiesced` 和 `legacy_handoff_quiesce`。如果 eligible daemon 未确认 quiesce，ensure fail closed，避免后续 PR 在未 quiesce 的 peer 上做资源接管。
