@@ -2322,7 +2322,11 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             let _dispatch_slot = try_acquire_dispatch_slot(state)?;
             let payload: DispatchPayload =
                 serde_json::from_value(request.payload).context("parse dispatch payload")?;
-            crate::cli::dispatch_daemon_argv(&state.layout, payload.argv)?
+            crate::cli::dispatch_daemon_argv(
+                &state.layout,
+                payload.argv,
+                Some(current_daemon_generation_id()),
+            )?
         }
         "task_run" => {
             state

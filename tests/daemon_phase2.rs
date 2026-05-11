@@ -881,6 +881,59 @@ fn generation_daemon_ignores_unowned_legacy_tasks_for_idle_exit() {
 
 #[cfg(unix)]
 #[test]
+fn generation_daemon_keeps_owned_pending_job_as_idle_blocker() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let mut daemon = spawn_daemon(&home, "1", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+
+    let submitted = cbth_daemon(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "generation-owned-pending-job",
+            "--summary",
+            "generation owned pending job",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let supervisor_generation: Option<String> = conn
+        .query_row(
+            "SELECT supervisor_daemon_generation FROM jobs WHERE job_id = ?",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .expect("query job supervisor generation");
+    assert_eq!(
+        supervisor_generation.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        generation_socket_path.exists(),
+        "generation daemon exited while it owned a pending job"
+    );
+    assert!(
+        daemon.try_wait().expect("poll generation daemon").is_none(),
+        "generation daemon process exited while it owned a pending job"
+    );
+
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    daemon.wait().expect("generation daemon exits");
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
     let home = temp_home();
     let run_dir = home.path().join("run");

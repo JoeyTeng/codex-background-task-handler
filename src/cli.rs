@@ -2296,7 +2296,11 @@ fn dispatch_daemon_task_command(
     daemon_request_payload_at_endpoint(layout, &endpoint, daemon_command, payload)
 }
 
-pub(crate) fn dispatch_daemon_argv(layout: &FsLayout, argv: Vec<Vec<u8>>) -> Result<Value> {
+pub(crate) fn dispatch_daemon_argv(
+    layout: &FsLayout,
+    argv: Vec<Vec<u8>>,
+    supervisor_daemon_generation: Option<&str>,
+) -> Result<Value> {
     let mut parse_argv = Vec::with_capacity(argv.len() + 1);
     parse_argv.push(OsString::from("cbth"));
     parse_argv.extend(argv.into_iter().map(OsString::from_vec));
@@ -2310,17 +2314,29 @@ pub(crate) fn dispatch_daemon_argv(layout: &FsLayout, argv: Vec<Vec<u8>>) -> Res
     match cli.command {
         Commands::Daemon { .. } => bail!("daemon dispatch cannot execute daemon commands"),
         Commands::Self_ { .. } => bail!("daemon dispatch cannot execute self update commands"),
-        command => dispatch(command, layout, DispatchMode::Direct),
+        command => dispatch_direct_with_supervisor_generation(
+            command,
+            layout,
+            supervisor_daemon_generation,
+        ),
     }
 }
 
 fn dispatch_direct(command: Commands, layout: &FsLayout) -> Result<Value> {
+    dispatch_direct_with_supervisor_generation(command, layout, None)
+}
+
+fn dispatch_direct_with_supervisor_generation(
+    command: Commands,
+    layout: &FsLayout,
+    supervisor_daemon_generation: Option<&str>,
+) -> Result<Value> {
     match command {
         Commands::Doctor {
             command: DoctorCommand::Cli(args),
         } => dispatch_doctor_cli(args, layout, DEFAULT_DAEMON_STARTUP_TIMEOUT_SECONDS),
         Commands::Task { command } => dispatch_task(command, layout),
-        Commands::Job { command } => dispatch_job(command, layout),
+        Commands::Job { command } => dispatch_job(command, layout, supervisor_daemon_generation),
         Commands::Batch { command } => dispatch_batch(command, layout),
         Commands::Attempt { command } => dispatch_attempt(command, layout),
         Commands::Audit { command } => dispatch_audit(command, layout),
@@ -9767,7 +9783,11 @@ fn dispatch_task(command: TaskCommand, layout: &FsLayout) -> Result<Value> {
     }
 }
 
-fn dispatch_job(command: JobCommand, layout: &FsLayout) -> Result<Value> {
+fn dispatch_job(
+    command: JobCommand,
+    layout: &FsLayout,
+    supervisor_daemon_generation: Option<&str>,
+) -> Result<Value> {
     let mut store = Store::open(layout)?;
     match command {
         JobCommand::Submit(args) => {
@@ -9782,14 +9802,22 @@ fn dispatch_job(command: JobCommand, layout: &FsLayout) -> Result<Value> {
                 },
             );
             let now = now_epoch_seconds()?;
-            let job = store.submit_job(NewJob {
+            let new_job = NewJob {
                 job_id: new_id(),
                 source_thread_id: args.source_thread_id,
                 summary: args.summary,
                 metadata_json,
                 policy,
                 created_at: now,
-            })?;
+            };
+            let job = if let Some(supervisor_daemon_generation) = supervisor_daemon_generation {
+                store.submit_job_for_supervisor_generation(
+                    new_job,
+                    Some(supervisor_daemon_generation),
+                )?
+            } else {
+                store.submit_job(new_job)?
+            };
             Ok(json!({ "job": job }))
         }
         JobCommand::Complete(args) => {

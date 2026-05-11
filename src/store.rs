@@ -143,14 +143,22 @@ impl Store {
     }
 
     pub fn submit_job(&mut self, job: NewJob) -> Result<JobRecord> {
+        self.submit_job_for_supervisor_generation(job, None)
+    }
+
+    pub fn submit_job_for_supervisor_generation(
+        &mut self,
+        job: NewJob,
+        supervisor_daemon_generation: Option<&str>,
+    ) -> Result<JobRecord> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO jobs (
                 job_id, source_thread_id, status, summary, metadata_json,
                 created_at, updated_at, delivery_read_only,
                 delivery_requires_approval, delivery_requires_network,
-                delivery_requires_write_access
-            ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
+                delivery_requires_write_access, supervisor_daemon_generation
+            ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 job.job_id,
                 job.source_thread_id,
@@ -162,6 +170,7 @@ impl Store {
                 bool_to_i64(job.policy.delivery_requires_approval),
                 bool_to_i64(job.policy.delivery_requires_network),
                 bool_to_i64(job.policy.delivery_requires_write_access),
+                supervisor_daemon_generation,
             ],
         )?;
         let record = query_job_tx(&tx, &job.job_id)?;
@@ -196,8 +205,8 @@ impl Store {
                 job_id, source_thread_id, status, summary, metadata_json,
                 created_at, updated_at, delivery_read_only,
                 delivery_requires_approval, delivery_requires_network,
-                delivery_requires_write_access
-            ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
+                delivery_requires_write_access, supervisor_daemon_generation
+            ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 job.job_id,
                 job.source_thread_id,
@@ -209,6 +218,7 @@ impl Store {
                 bool_to_i64(job.policy.delivery_requires_approval),
                 bool_to_i64(job.policy.delivery_requires_network),
                 bool_to_i64(job.policy.delivery_requires_write_access),
+                supervisor_daemon_generation,
             ],
         )?;
         tx.execute(
@@ -2564,12 +2574,9 @@ impl Store {
         supervisor_daemon_generation: &str,
     ) -> Result<DaemonLifecycleStatus> {
         let active_jobs = self.conn.query_row(
-            "SELECT COUNT(DISTINCT jobs.job_id)
-             FROM jobs
-             JOIN tasks ON tasks.job_id = jobs.job_id
-             WHERE jobs.status = 'pending'
-               AND tasks.status IN ('queued', 'running')
-               AND tasks.supervisor_daemon_generation = ?",
+            "SELECT COUNT(*) FROM jobs
+             WHERE status = 'pending'
+               AND supervisor_daemon_generation = ?",
             params![supervisor_daemon_generation],
             |row| row.get::<_, i64>(0),
         )?;
@@ -3000,7 +3007,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             delivery_read_only INTEGER NOT NULL,
             delivery_requires_approval INTEGER NOT NULL,
             delivery_requires_network INTEGER NOT NULL,
-            delivery_requires_write_access INTEGER NOT NULL
+            delivery_requires_write_access INTEGER NOT NULL,
+            supervisor_daemon_generation TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_jobs_thread_created
@@ -3441,6 +3449,17 @@ fn migrate(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_desktop_bindings_pause_due
          ON desktop_bindings(binding_state, pause_deadline)",
+        [],
+    )?;
+    ensure_column(
+        conn,
+        "jobs",
+        "supervisor_daemon_generation",
+        "ALTER TABLE jobs ADD COLUMN supervisor_daemon_generation TEXT",
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_supervisor_generation_status
+         ON jobs(supervisor_daemon_generation, status)",
         [],
     )?;
     ensure_column(
