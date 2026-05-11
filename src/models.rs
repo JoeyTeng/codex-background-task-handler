@@ -480,6 +480,30 @@ pub struct DesktopArmRecord {
     pub pause_deadline: Option<i64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct NewDesktopTranscriptRelayConsumption {
+    pub marker: String,
+    pub envelope_hash: String,
+    pub envelope_kind: String,
+    pub envelope_json: String,
+    pub source_thread_id: String,
+    pub attempt_id: String,
+    pub generation: i64,
+    pub bridge_request_id: String,
+    pub bridge_arm_lease_id: Option<String>,
+    pub now: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopTranscriptRelayConsumptionRecord {
+    pub marker: String,
+    pub envelope_hash: String,
+    pub envelope_kind: String,
+    pub replay_state: String,
+    pub consumed_at: i64,
+    pub outcome: Value,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct AuditDecisionRecord {
     pub audit_id: String,

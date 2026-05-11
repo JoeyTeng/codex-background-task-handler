@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,10 +23,11 @@ use crate::models::{
     DEFAULT_REDELIVERY_WINDOW_SECONDS, DaemonLifecycleStatus, DeliveryAttemptRecord,
     DeliveryPolicy, DesktopArmPendingRecord, DesktopArmRecord, DesktopBindingRecord,
     DesktopBindingRepairRecord, DesktopInstallationRepairRecord, DesktopInstallationStateRecord,
-    JobRecord, LostPendingTaskProcess, NewArtifact, NewAuditDecision, NewBatch,
-    NewCliAcceptPendingAttempt, NewCliManagedSessionPermissionSnapshot,
-    NewDesktopInstallationRepair, NewDesktopWritebackFixture, NewJob, NewTask,
-    ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport, TaskRecord,
+    DesktopTranscriptRelayConsumptionRecord, JobRecord, LostPendingTaskProcess, NewArtifact,
+    NewAuditDecision, NewBatch, NewCliAcceptPendingAttempt, NewCliManagedSessionPermissionSnapshot,
+    NewDesktopInstallationRepair, NewDesktopTranscriptRelayConsumption, NewDesktopWritebackFixture,
+    NewJob, NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
+    TaskRecord,
 };
 
 const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
@@ -43,6 +45,31 @@ const SQLITE_DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(100);
 const SQLITE_TASK_SUPERVISOR_SETUP_TIMEOUT: Duration = Duration::from_millis(100);
 const SQLITE_OPEN_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const SQLITE_OPEN_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
+
+#[derive(Debug)]
+struct DurableDesktopArmFailure {
+    message: String,
+}
+
+impl fmt::Display for DurableDesktopArmFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DurableDesktopArmFailure {}
+
+fn desktop_arm_lease_expired_error(attempt_id: &str, lease_deadline: i64) -> anyhow::Error {
+    anyhow::Error::new(DurableDesktopArmFailure {
+        message: format!(
+            "delivery attempt {attempt_id} bridge arm lease expired at {lease_deadline}"
+        ),
+    })
+}
+
+fn is_durable_desktop_arm_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DurableDesktopArmFailure>().is_some()
+}
 
 pub struct Store {
     conn: Connection,
@@ -2269,121 +2296,24 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let binding = query_desktop_binding_tx(&tx, source_thread_id)?;
-        let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
-        ensure_desktop_attempt_tokens(&attempt, source_thread_id, generation)?;
-
-        if attempt.state == "arm_pending" {
-            if attempt.bridge_request_id.as_deref() != Some(bridge_request_id) {
-                bail!(
-                    "delivery attempt {} is already arm_pending for another bridge request",
-                    attempt.attempt_id
-                );
-            }
-            ensure_desktop_binding_bound_for_arm(&binding)?;
-            let lease_deadline = attempt
-                .bridge_arm_lease_deadline
-                .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
-            if lease_deadline <= now {
-                abandon_desktop_arm_pending_tx(&tx, &attempt.attempt_id, now)?;
+        let result = note_desktop_arm_pending_tx(
+            &tx,
+            source_thread_id,
+            attempt_id,
+            generation,
+            bridge_request_id,
+            now,
+        );
+        match result {
+            Ok(record) => {
                 tx.commit()?;
-                bail!(
-                    "delivery attempt {} bridge arm lease expired at {}",
-                    attempt.attempt_id,
-                    lease_deadline
-                );
+                Ok(record)
             }
-            let lease_id = attempt
-                .bridge_arm_lease_id
-                .as_ref()
-                .context("arm_pending Desktop attempt is missing bridge_arm_lease_id")?
-                .clone();
-            tx.commit()?;
-            return Ok(DesktopArmPendingRecord {
-                outcome: "already_pending".to_owned(),
-                bridge_arm_lease_id: Some(lease_id),
-                bridge_arm_lease_deadline: attempt.bridge_arm_lease_deadline,
-                arm_pending_deadline: attempt.arm_pending_deadline,
-                attempt,
-                binding,
-            });
-        }
-
-        if matches!(attempt.state.as_str(), "cooldown" | "closed")
-            && attempt.bridge_request_id.as_deref() == Some(bridge_request_id)
-            && binding.armed_generation == Some(generation)
-        {
-            ensure_desktop_binding_bound_for_arm(&binding)?;
-            tx.commit()?;
-            return Ok(DesktopArmPendingRecord {
-                outcome: "already_armed".to_owned(),
-                bridge_arm_lease_id: attempt.bridge_arm_lease_id.clone(),
-                bridge_arm_lease_deadline: attempt.bridge_arm_lease_deadline,
-                arm_pending_deadline: attempt.arm_pending_deadline,
-                attempt,
-                binding,
-            });
-        }
-
-        ensure_desktop_binding_bound_for_arm(&binding)?;
-        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
-        ensure_desktop_attempt_head_and_batch_eligible(&tx, &attempt, &batch)?;
-
-        match attempt.state.as_str() {
-            "prepared" => {
-                ensure_desktop_binding_quiesced_for_fresh_arm(&binding)?;
-                ensure_no_other_active_attempt_for_thread_tx(&tx, source_thread_id, attempt_id)?;
-                ensure_attempt_budget_remaining(&batch)?;
-                let bridge_arm_lease_id = new_id();
-                let bridge_arm_lease_deadline = checked_timestamp_add(
-                    now,
-                    DESKTOP_BRIDGE_ARM_LEASE_TTL_SECONDS,
-                    "bridge_arm_lease_deadline",
-                )?;
-                let arm_pending_deadline = checked_timestamp_add(
-                    now,
-                    DESKTOP_ARM_PENDING_TIMEOUT_SECONDS,
-                    "arm_pending_deadline",
-                )?;
-                tx.execute(
-                    "UPDATE delivery_attempts
-                     SET state = 'arm_pending',
-                         bridge_request_id = ?,
-                         bridge_arm_lease_id = ?,
-                         bridge_arm_lease_deadline = ?,
-                         arm_pending_since = ?,
-                         arm_pending_deadline = ?,
-                         updated_at = ?
-                     WHERE attempt_id = ?
-                       AND state = 'prepared'
-                       AND generation = ?",
-                    params![
-                        bridge_request_id,
-                        bridge_arm_lease_id,
-                        bridge_arm_lease_deadline,
-                        now,
-                        arm_pending_deadline,
-                        now,
-                        attempt_id,
-                        generation,
-                    ],
-                )?;
-                let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
-                let binding = query_desktop_binding_tx(&tx, source_thread_id)?;
+            Err(error) if is_durable_desktop_arm_failure(&error) => {
                 tx.commit()?;
-                Ok(DesktopArmPendingRecord {
-                    outcome: "arm_pending".to_owned(),
-                    bridge_arm_lease_id: attempt.bridge_arm_lease_id.clone(),
-                    bridge_arm_lease_deadline: attempt.bridge_arm_lease_deadline,
-                    arm_pending_deadline: attempt.arm_pending_deadline,
-                    attempt,
-                    binding,
-                })
+                Err(error)
             }
-            _ => bail!(
-                "delivery attempt {} is not eligible for Desktop arm-pending transition",
-                attempt.attempt_id
-            ),
+            Err(error) => Err(error),
         }
     }
 
@@ -2404,123 +2334,148 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let binding = query_desktop_binding_tx(&tx, source_thread_id)?;
-        let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
-        ensure_desktop_attempt_tokens(&attempt, source_thread_id, generation)?;
-        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
+        let result = note_desktop_arm_tx(
+            &tx,
+            source_thread_id,
+            attempt_id,
+            generation,
+            bridge_request_id,
+            bridge_arm_lease_id,
+            now,
+        );
+        match result {
+            Ok(record) => {
+                tx.commit()?;
+                Ok(record)
+            }
+            Err(error) if is_durable_desktop_arm_failure(&error) => {
+                tx.commit()?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
 
-        if matches!(attempt.state.as_str(), "cooldown" | "closed")
-            && attempt.bridge_request_id.as_deref() == Some(bridge_request_id)
-            && attempt.bridge_arm_lease_id.as_deref() == Some(bridge_arm_lease_id)
-            && binding.armed_generation == Some(generation)
+    pub fn consume_desktop_transcript_relay(
+        &mut self,
+        consumption: NewDesktopTranscriptRelayConsumption,
+    ) -> Result<DesktopTranscriptRelayConsumptionRecord> {
+        ensure_nonempty_value("marker", &consumption.marker)?;
+        ensure_nonempty_value("envelope_hash", &consumption.envelope_hash)?;
+        ensure_nonempty_value("envelope_kind", &consumption.envelope_kind)?;
+        ensure_nonempty_value("envelope_json", &consumption.envelope_json)?;
+        ensure_nonempty_value("source_thread_id", &consumption.source_thread_id)?;
+        ensure_nonempty_value("attempt_id", &consumption.attempt_id)?;
+        ensure_positive_value("generation", consumption.generation)?;
+        ensure_nonempty_value("bridge_request_id", &consumption.bridge_request_id)?;
+        if consumption.envelope_kind == "arm_requested" {
+            ensure_nonempty_value(
+                "bridge_arm_lease_id",
+                consumption.bridge_arm_lease_id.as_deref().unwrap_or(""),
+            )?;
+        } else if consumption.envelope_kind != "arm_pending_requested" {
+            bail!(
+                "unsupported Desktop transcript relay envelope kind {}",
+                consumption.envelope_kind
+            );
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((existing_hash, existing_kind, consumed_at, outcome_json)) = tx
+            .query_row(
+                "SELECT envelope_hash, envelope_kind, consumed_at, outcome_json
+                 FROM desktop_transcript_relay_consumptions
+                 WHERE marker = ?",
+                params![&consumption.marker],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
         {
-            ensure_desktop_binding_bound_for_arm(&binding)?;
+            if existing_hash != consumption.envelope_hash {
+                bail!(
+                    "Desktop transcript relay marker {} was already consumed with another envelope hash",
+                    consumption.marker
+                );
+            }
+            let outcome: serde_json::Value =
+                serde_json::from_str(&outcome_json).context("parse stored relay outcome JSON")?;
             tx.commit()?;
-            return Ok(DesktopArmRecord {
-                outcome: "already_armed".to_owned(),
-                delivery_attempt_count: batch.delivery_attempt_count,
-                pause_not_before: binding.pause_not_before,
-                pause_deadline: binding.pause_deadline,
-                attempt,
-                binding,
+            return Ok(DesktopTranscriptRelayConsumptionRecord {
+                marker: consumption.marker,
+                envelope_hash: existing_hash,
+                envelope_kind: existing_kind,
+                replay_state: "replayed".to_owned(),
+                consumed_at,
+                outcome,
             });
         }
 
-        ensure_desktop_binding_bound_for_arm(&binding)?;
-        ensure_desktop_attempt_head_and_batch_eligible(&tx, &attempt, &batch)?;
-
-        if attempt.state != "arm_pending" {
-            bail!(
-                "delivery attempt {} is not arm_pending for Desktop arm transition",
-                attempt.attempt_id
-            );
-        }
-        if attempt.bridge_request_id.as_deref() != Some(bridge_request_id) {
-            bail!(
-                "delivery attempt {} bridge_request_id does not match",
-                attempt.attempt_id
-            );
-        }
-        if attempt.bridge_arm_lease_id.as_deref() != Some(bridge_arm_lease_id) {
-            bail!(
-                "delivery attempt {} bridge_arm_lease_id does not match",
-                attempt.attempt_id
-            );
-        }
-        let lease_deadline = attempt
-            .bridge_arm_lease_deadline
-            .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
-        if lease_deadline <= now {
-            abandon_desktop_arm_pending_tx(&tx, &attempt.attempt_id, now)?;
-            tx.commit()?;
-            bail!(
-                "delivery attempt {} bridge arm lease expired at {}",
-                attempt.attempt_id,
-                lease_deadline
-            );
-        }
-        ensure_attempt_budget_remaining(&batch)?;
-        let pause_not_before =
-            checked_timestamp_add(now, DESKTOP_PAUSE_NOT_BEFORE_SECONDS, "pause_not_before")?;
-        let pause_deadline = checked_timestamp_add(
-            pause_not_before,
-            DESKTOP_PAUSE_DEADLINE_GRACE_SECONDS,
-            "pause_deadline",
-        )?;
-        tx.execute(
-            "UPDATE delivery_attempts
-             SET state = 'cooldown',
-                 desktop_armed_at = ?,
-                 updated_at = ?
-             WHERE attempt_id = ?
-               AND state = 'arm_pending'
-               AND bridge_request_id = ?
-               AND bridge_arm_lease_id = ?",
-            params![now, now, attempt_id, bridge_request_id, bridge_arm_lease_id],
-        )?;
-        let changed = tx.execute(
-            "UPDATE batches
-             SET delivery_attempt_count = delivery_attempt_count + 1,
-                 updated_at = ?
-             WHERE batch_id = ?
-               AND state = 'open'
-               AND delivery_attempt_count < max_delivery_attempts",
-            params![now, attempt.batch_id],
-        )?;
-        if changed != 1 {
-            bail!(
-                "batch {} has no remaining delivery attempts",
-                attempt.batch_id
-            );
-        }
-        tx.execute(
-            "UPDATE desktop_bindings
-             SET armed_generation = ?,
-                 armed_generation_quiesced_at = NULL,
-                 pause_not_before = ?,
-                 pause_deadline = ?,
-                 updated_at = ?
-             WHERE source_thread_id = ?
-               AND binding_state = 'bound'",
-            params![
-                generation,
-                pause_not_before,
-                pause_deadline,
-                now,
-                source_thread_id,
-            ],
-        )?;
-        let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
-        let binding = query_desktop_binding_tx(&tx, source_thread_id)?;
-        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
+        let outcome_result = match consumption.envelope_kind.as_str() {
+            "arm_pending_requested" => {
+                match note_desktop_arm_pending_tx(
+                    &tx,
+                    &consumption.source_thread_id,
+                    &consumption.attempt_id,
+                    consumption.generation,
+                    &consumption.bridge_request_id,
+                    consumption.now,
+                ) {
+                    Ok(record) => serde_json::to_value(record).map_err(Into::into),
+                    Err(error) => Err(error),
+                }
+            }
+            "arm_requested" => {
+                let bridge_arm_lease_id = consumption
+                    .bridge_arm_lease_id
+                    .as_deref()
+                    .context("arm_requested envelope missing bridge_arm_lease_id")?;
+                match note_desktop_arm_tx(
+                    &tx,
+                    &consumption.source_thread_id,
+                    &consumption.attempt_id,
+                    consumption.generation,
+                    &consumption.bridge_request_id,
+                    bridge_arm_lease_id,
+                    consumption.now,
+                ) {
+                    Ok(record) => serde_json::to_value(record).map_err(Into::into),
+                    Err(error) => Err(error),
+                }
+            }
+            _ => unreachable!("envelope kind was validated above"),
+        };
+        let outcome = match outcome_result {
+            Ok(outcome) => outcome,
+            Err(error) if is_durable_desktop_arm_failure(&error) => {
+                let error_message = error.to_string();
+                let outcome = serde_json::json!({
+                    "outcome": "cas_failed",
+                    "error": &error_message,
+                });
+                insert_desktop_transcript_relay_consumption_tx(&tx, &consumption, &outcome)?;
+                tx.commit()?;
+                bail!("{error_message}");
+            }
+            Err(error) => return Err(error),
+        };
+        insert_desktop_transcript_relay_consumption_tx(&tx, &consumption, &outcome)?;
         tx.commit()?;
-        Ok(DesktopArmRecord {
-            outcome: "armed".to_owned(),
-            delivery_attempt_count: batch.delivery_attempt_count,
-            pause_not_before: binding.pause_not_before,
-            pause_deadline: binding.pause_deadline,
-            attempt,
-            binding,
+        Ok(DesktopTranscriptRelayConsumptionRecord {
+            marker: consumption.marker,
+            envelope_hash: consumption.envelope_hash,
+            envelope_kind: consumption.envelope_kind,
+            replay_state: "fresh".to_owned(),
+            consumed_at: consumption.now,
+            outcome,
         })
     }
 
@@ -3435,6 +3390,20 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_desktop_bindings_active_caller_automation
             ON desktop_bindings(caller_automation_id)
             WHERE binding_state IN ('bound', 'degraded');
+
+        CREATE TABLE IF NOT EXISTS desktop_transcript_relay_consumptions (
+            marker TEXT PRIMARY KEY,
+            envelope_hash TEXT NOT NULL,
+            envelope_kind TEXT NOT NULL CHECK (envelope_kind IN ('arm_pending_requested', 'arm_requested')),
+            envelope_json TEXT NOT NULL,
+            source_thread_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            consumed_at INTEGER NOT NULL,
+            outcome_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_desktop_transcript_relay_consumptions_thread
+            ON desktop_transcript_relay_consumptions(source_thread_id, consumed_at);
 
         CREATE TABLE IF NOT EXISTS batch_jobs (
             batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
@@ -4719,6 +4688,31 @@ fn rows_to_cli_managed_sessions(
     Ok(sessions)
 }
 
+fn insert_desktop_transcript_relay_consumption_tx(
+    tx: &Transaction<'_>,
+    consumption: &NewDesktopTranscriptRelayConsumption,
+    outcome: &serde_json::Value,
+) -> Result<()> {
+    let outcome_json = serde_json::to_string(outcome)?;
+    tx.execute(
+        "INSERT INTO desktop_transcript_relay_consumptions (
+            marker, envelope_hash, envelope_kind, envelope_json,
+            source_thread_id, attempt_id, consumed_at, outcome_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            &consumption.marker,
+            &consumption.envelope_hash,
+            &consumption.envelope_kind,
+            &consumption.envelope_json,
+            &consumption.source_thread_id,
+            &consumption.attempt_id,
+            consumption.now,
+            &outcome_json,
+        ],
+    )?;
+    Ok(())
+}
+
 fn query_active_delivery_attempt_for_cli_session_tx(
     tx: &Transaction<'_>,
     managed_session_id: &str,
@@ -4854,6 +4848,252 @@ fn ensure_no_other_active_attempt_for_thread_tx(
         bail!("thread {source_thread_id} already has active delivery attempt {active_attempt_id}");
     }
     Ok(())
+}
+
+fn note_desktop_arm_pending_tx(
+    tx: &Transaction<'_>,
+    source_thread_id: &str,
+    attempt_id: &str,
+    generation: i64,
+    bridge_request_id: &str,
+    now: i64,
+) -> Result<DesktopArmPendingRecord> {
+    let binding = query_desktop_binding_tx(tx, source_thread_id)?;
+    let attempt = query_delivery_attempt_tx(tx, attempt_id)?;
+    ensure_desktop_attempt_tokens(&attempt, source_thread_id, generation)?;
+
+    if attempt.state == "arm_pending" {
+        if attempt.bridge_request_id.as_deref() != Some(bridge_request_id) {
+            bail!(
+                "delivery attempt {} is already arm_pending for another bridge request",
+                attempt.attempt_id
+            );
+        }
+        ensure_desktop_binding_bound_for_arm(&binding)?;
+        let lease_deadline = attempt
+            .bridge_arm_lease_deadline
+            .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
+        if lease_deadline <= now {
+            abandon_desktop_arm_pending_tx(tx, &attempt.attempt_id, now)?;
+            return Err(desktop_arm_lease_expired_error(
+                &attempt.attempt_id,
+                lease_deadline,
+            ));
+        }
+        let lease_id = attempt
+            .bridge_arm_lease_id
+            .as_ref()
+            .context("arm_pending Desktop attempt is missing bridge_arm_lease_id")?
+            .clone();
+        return Ok(DesktopArmPendingRecord {
+            outcome: "already_pending".to_owned(),
+            bridge_arm_lease_id: Some(lease_id),
+            bridge_arm_lease_deadline: attempt.bridge_arm_lease_deadline,
+            arm_pending_deadline: attempt.arm_pending_deadline,
+            attempt,
+            binding,
+        });
+    }
+
+    if matches!(attempt.state.as_str(), "cooldown" | "closed")
+        && attempt.bridge_request_id.as_deref() == Some(bridge_request_id)
+        && binding.armed_generation == Some(generation)
+    {
+        ensure_desktop_binding_bound_for_arm(&binding)?;
+        return Ok(DesktopArmPendingRecord {
+            outcome: "already_armed".to_owned(),
+            bridge_arm_lease_id: attempt.bridge_arm_lease_id.clone(),
+            bridge_arm_lease_deadline: attempt.bridge_arm_lease_deadline,
+            arm_pending_deadline: attempt.arm_pending_deadline,
+            attempt,
+            binding,
+        });
+    }
+
+    ensure_desktop_binding_bound_for_arm(&binding)?;
+    let batch = query_batch_tx(tx, &attempt.batch_id)?;
+    ensure_desktop_attempt_head_and_batch_eligible(tx, &attempt, &batch)?;
+
+    match attempt.state.as_str() {
+        "prepared" => {
+            ensure_desktop_binding_quiesced_for_fresh_arm(&binding)?;
+            ensure_no_other_active_attempt_for_thread_tx(tx, source_thread_id, attempt_id)?;
+            ensure_attempt_budget_remaining(&batch)?;
+            let bridge_arm_lease_id = new_id();
+            let bridge_arm_lease_deadline = checked_timestamp_add(
+                now,
+                DESKTOP_BRIDGE_ARM_LEASE_TTL_SECONDS,
+                "bridge_arm_lease_deadline",
+            )?;
+            let arm_pending_deadline = checked_timestamp_add(
+                now,
+                DESKTOP_ARM_PENDING_TIMEOUT_SECONDS,
+                "arm_pending_deadline",
+            )?;
+            tx.execute(
+                "UPDATE delivery_attempts
+                 SET state = 'arm_pending',
+                     bridge_request_id = ?,
+                     bridge_arm_lease_id = ?,
+                     bridge_arm_lease_deadline = ?,
+                     arm_pending_since = ?,
+                     arm_pending_deadline = ?,
+                     updated_at = ?
+                 WHERE attempt_id = ?
+                   AND state = 'prepared'
+                   AND generation = ?",
+                params![
+                    bridge_request_id,
+                    bridge_arm_lease_id,
+                    bridge_arm_lease_deadline,
+                    now,
+                    arm_pending_deadline,
+                    now,
+                    attempt_id,
+                    generation,
+                ],
+            )?;
+            let attempt = query_delivery_attempt_tx(tx, attempt_id)?;
+            let binding = query_desktop_binding_tx(tx, source_thread_id)?;
+            Ok(DesktopArmPendingRecord {
+                outcome: "arm_pending".to_owned(),
+                bridge_arm_lease_id: attempt.bridge_arm_lease_id.clone(),
+                bridge_arm_lease_deadline: attempt.bridge_arm_lease_deadline,
+                arm_pending_deadline: attempt.arm_pending_deadline,
+                attempt,
+                binding,
+            })
+        }
+        _ => bail!(
+            "delivery attempt {} is not eligible for Desktop arm-pending transition",
+            attempt.attempt_id
+        ),
+    }
+}
+
+fn note_desktop_arm_tx(
+    tx: &Transaction<'_>,
+    source_thread_id: &str,
+    attempt_id: &str,
+    generation: i64,
+    bridge_request_id: &str,
+    bridge_arm_lease_id: &str,
+    now: i64,
+) -> Result<DesktopArmRecord> {
+    let binding = query_desktop_binding_tx(tx, source_thread_id)?;
+    let attempt = query_delivery_attempt_tx(tx, attempt_id)?;
+    ensure_desktop_attempt_tokens(&attempt, source_thread_id, generation)?;
+    let batch = query_batch_tx(tx, &attempt.batch_id)?;
+
+    if matches!(attempt.state.as_str(), "cooldown" | "closed")
+        && attempt.bridge_request_id.as_deref() == Some(bridge_request_id)
+        && attempt.bridge_arm_lease_id.as_deref() == Some(bridge_arm_lease_id)
+        && binding.armed_generation == Some(generation)
+    {
+        ensure_desktop_binding_bound_for_arm(&binding)?;
+        return Ok(DesktopArmRecord {
+            outcome: "already_armed".to_owned(),
+            delivery_attempt_count: batch.delivery_attempt_count,
+            pause_not_before: binding.pause_not_before,
+            pause_deadline: binding.pause_deadline,
+            attempt,
+            binding,
+        });
+    }
+
+    ensure_desktop_binding_bound_for_arm(&binding)?;
+    ensure_desktop_attempt_head_and_batch_eligible(tx, &attempt, &batch)?;
+
+    if attempt.state != "arm_pending" {
+        bail!(
+            "delivery attempt {} is not arm_pending for Desktop arm transition",
+            attempt.attempt_id
+        );
+    }
+    if attempt.bridge_request_id.as_deref() != Some(bridge_request_id) {
+        bail!(
+            "delivery attempt {} bridge_request_id does not match",
+            attempt.attempt_id
+        );
+    }
+    if attempt.bridge_arm_lease_id.as_deref() != Some(bridge_arm_lease_id) {
+        bail!(
+            "delivery attempt {} bridge_arm_lease_id does not match",
+            attempt.attempt_id
+        );
+    }
+    let lease_deadline = attempt
+        .bridge_arm_lease_deadline
+        .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
+    if lease_deadline <= now {
+        abandon_desktop_arm_pending_tx(tx, &attempt.attempt_id, now)?;
+        return Err(desktop_arm_lease_expired_error(
+            &attempt.attempt_id,
+            lease_deadline,
+        ));
+    }
+    ensure_attempt_budget_remaining(&batch)?;
+    let pause_not_before =
+        checked_timestamp_add(now, DESKTOP_PAUSE_NOT_BEFORE_SECONDS, "pause_not_before")?;
+    let pause_deadline = checked_timestamp_add(
+        pause_not_before,
+        DESKTOP_PAUSE_DEADLINE_GRACE_SECONDS,
+        "pause_deadline",
+    )?;
+    tx.execute(
+        "UPDATE delivery_attempts
+         SET state = 'cooldown',
+             desktop_armed_at = ?,
+             updated_at = ?
+         WHERE attempt_id = ?
+           AND state = 'arm_pending'
+           AND bridge_request_id = ?
+           AND bridge_arm_lease_id = ?",
+        params![now, now, attempt_id, bridge_request_id, bridge_arm_lease_id],
+    )?;
+    let changed = tx.execute(
+        "UPDATE batches
+         SET delivery_attempt_count = delivery_attempt_count + 1,
+             updated_at = ?
+         WHERE batch_id = ?
+           AND state = 'open'
+           AND delivery_attempt_count < max_delivery_attempts",
+        params![now, attempt.batch_id],
+    )?;
+    if changed != 1 {
+        bail!(
+            "batch {} has no remaining delivery attempts",
+            attempt.batch_id
+        );
+    }
+    tx.execute(
+        "UPDATE desktop_bindings
+         SET armed_generation = ?,
+             armed_generation_quiesced_at = NULL,
+             pause_not_before = ?,
+             pause_deadline = ?,
+             updated_at = ?
+         WHERE source_thread_id = ?
+           AND binding_state = 'bound'",
+        params![
+            generation,
+            pause_not_before,
+            pause_deadline,
+            now,
+            source_thread_id,
+        ],
+    )?;
+    let attempt = query_delivery_attempt_tx(tx, attempt_id)?;
+    let binding = query_desktop_binding_tx(tx, source_thread_id)?;
+    let batch = query_batch_tx(tx, &attempt.batch_id)?;
+    Ok(DesktopArmRecord {
+        outcome: "armed".to_owned(),
+        delivery_attempt_count: batch.delivery_attempt_count,
+        pause_not_before: binding.pause_not_before,
+        pause_deadline: binding.pause_deadline,
+        attempt,
+        binding,
+    })
 }
 
 fn abandon_desktop_arm_pending_tx(tx: &Transaction<'_>, attempt_id: &str, now: i64) -> Result<()> {

@@ -4,7 +4,8 @@ This document records the validation-only Desktop transcript relay path. It is a
 
 ## Contract
 
-The heartbeat side only emits stdout. It must not mutate cbth durable state:
+The heartbeat side only emits stdout. It must not mutate cbth durable state.
+The original transport probe remains available:
 
 ```sh
 cbth desktop validation emit-transcript-writeback-probe \
@@ -37,6 +38,45 @@ The scanner classifies carriers:
 
 Only `trusted_auto` is a future automatic writeback input. `diagnostic_only` and `ignored_prompt` must never mutate cbth store automatically.
 
+## Writeback Consumer Foundation
+
+The relay now also supports writeback request envelopes for the existing Desktop arm CAS primitives. These emit helpers are still heartbeat-safe stdout-only commands:
+
+```sh
+cbth desktop validation emit-transcript-arm-pending \
+  --source-thread-id <source-thread-id> \
+  --attempt-id <attempt-id> \
+  --generation <generation> \
+  --bridge-request-id <request-id> \
+  --marker <unique-marker> \
+  --json
+
+cbth desktop validation emit-transcript-arm \
+  --source-thread-id <source-thread-id> \
+  --attempt-id <attempt-id> \
+  --generation <generation> \
+  --bridge-request-id <request-id> \
+  --bridge-arm-lease-id <lease-id> \
+  --marker <unique-marker> \
+  --json
+```
+
+The non-Desktop consumer scans the rollout and, only for exactly one trusted `function_call_output` envelope, applies the matching durable CAS transition:
+
+```sh
+cbth desktop relay consume-transcript \
+  --rollout-path <rollout-jsonl> \
+  --marker <unique-marker> \
+  --json
+```
+
+Envelope kinds:
+
+- `arm_pending_requested`: calls the same store CAS as `cbth desktop note-arm-pending`.
+- `arm_requested`: calls the same store CAS as `cbth desktop note-arm` and must include `bridge_arm_lease_id`.
+
+Replay protection is durable and marker-scoped. The first accepted marker stores the canonical envelope hash and CAS outcome; replaying the same marker/hash returns the stored outcome without another CAS call, while the same marker with a different hash fails closed. Duplicate trusted envelopes, malformed trusted envelopes, prompt copies, final assistant text, unsupported envelope kinds, and wrong markers do not mutate state.
+
 ## Live Validation Flow
 
 1. Build or install the current `cbth` binary so the Desktop heartbeat can execute it.
@@ -50,7 +90,9 @@ An interactive Desktop tool-output probe is useful as a lower-level transport sa
 
 The 2026-05-11 heartbeat automation validation used the same helper and proved that automation-delivered helper stdout also appears as a `response_item.payload.type=function_call_output` carrier. The scanner accepted exactly one `trusted_auto` envelope, treated prompt copies as `ignored_prompt`, and treated assistant / task-complete text as `diagnostic_only`.
 
-This validation does not set `writeback_capability=validated`. A later production PR must add durable scan cursors, one-shot replay protection, nonce / lease / generation checks, and a sidecar consumer that converts a trusted envelope into the existing CAS writeback contract.
+This validation does not set `writeback_capability=validated`. The consumer foundation adds one-shot replay protection and CAS mutation, but `writeback_capability` still remains `unknown` until a real Desktop heartbeat emits arm envelopes, a non-Desktop consumer applies them, and an operator explicitly records that evidence with `installation-state repair`.
+
+The remaining production work is durable rollout discovery / scan cursors, marker issuance, background tailing, ready materialization, caller wake, pause reconcile, and continuation-boundary handling.
 
 ## Failure Interpretation
 

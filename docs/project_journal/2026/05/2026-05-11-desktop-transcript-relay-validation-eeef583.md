@@ -8,7 +8,7 @@ branch: codex/desktop-transcript-relay-validation
 pr:
 supersedes:
   - 20260511-2b4ea02-desktop-writeback-dropbox-probe
-superseded_by:
+superseded_by: 20260511-00afcf6-desktop-transcript-relay-consumer
 ---
 
 # Desktop Transcript Relay Validation
@@ -61,8 +61,8 @@ superseded_by:
 - Fake tests cover trusted carrier extraction, prompt self-trigger rejection, diagnostic-only final text, duplicate trusted envelopes, malformed trusted envelopes, wrong-marker behavior, and malformed diagnostic text.
 - A real interactive Desktop tool-output probe succeeded and proved the scanner accepts exact prefixed stdout from `function_call_output`.
 - A real Desktop heartbeat automation probe succeeded and proved automation-delivered helper stdout also uses `response_item.payload.type=function_call_output`; prompt copies were classified as `ignored_prompt`, and assistant / task-complete text was classified as `diagnostic_only`.
-- The production sidecar consumer, durable scan cursor, replay protection, and CAS mutation path remain future work.
+- The transport-only work is now followed by the relay consumer foundation, which adds marker/hash replay protection and explicit CAS mutation from trusted arm envelopes.
 
 ## Next Steps
 
-- Design a production sidecar consumer for the validated heartbeat transcript carrier. It must include durable scan cursors, replay protection, high-entropy nonce / lease / generation validation, and CAS mutation before it can touch cbth store.
+- Continue in [Desktop transcript relay consumer](2026-05-11-desktop-transcript-relay-consumer-00afcf6.md) for live consumer validation, durable scan cursors, marker issuance, and production sidecar tailing.

@@ -72,7 +72,7 @@
   - `cbth desktop list-arm-pending ...`
   - `cbth desktop list-pause-due ...`
   - `cbth desktop claim-next-ready ...`
-- 当前无论读路径怎么选，写回 helper 仍是既定窄依赖：
+- 当前无论读路径怎么选，写回仍落到既定窄 CAS primitive；真实 Desktop heartbeat 不一定直接执行这些 mutating helper，也可以通过 transcript relay 输出请求，由 Desktop sandbox 外的 consumer 执行 CAS：
   - `cbth desktop note-arm-pending ...`
   - `cbth desktop note-arm ...`
   - `cbth desktop note-boundary-crossed ...`
@@ -86,7 +86,7 @@
 - 因此，Desktop 第一版的自动续跑门槛不是“batch 只读”单条件，而是两层同时成立：
   - batch 自身满足只读 / 低风险 delivery policy
   - 当前安装上的 Desktop 读路径已被验证可在 heartbeat 中无审批执行
-  - 当前安装上的 Desktop writeback helpers 已被验证可在 heartbeat 中无审批执行
+  - 当前安装上的 Desktop writeback path 已被验证：heartbeat 能产生可信写回请求，且 Desktop sandbox 外的 consumer 能按 replay / CAS 合同写回
 - `requires_artifact_read=true` 的 batch 不再进入 v1 automatic caller path：
   - 它们直接留在 manual/operator follow-up
 - 这里的“只读 / 低风险”只约束自动投递与断点写回这条外围机制本身。
@@ -1476,6 +1476,7 @@ cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_un
 cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_delivery --json
 cbth batch inspect-head --source-thread-id <thread_id> --json
 cbth batch inspect --batch-id <batch_id> --json
+cbth desktop relay consume-transcript --rollout-path <rollout_jsonl> --marker <marker> --json
 cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <true|false> --json
 ```
 
@@ -1488,6 +1489,7 @@ cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <
     - `cbth desktop note-arm-pending ...`
     - `cbth desktop note-arm ...`
     - `cbth desktop note-boundary-crossed ...`
+    - 或 transcript relay consumer 对等执行 `note-arm-pending` / `note-arm` CAS
   - operator / future-expansion artifact helper：
     - `cbth desktop read-artifact ...`
 - 第一版无论 bridge 读取传输怎么选，都必须先能运行：

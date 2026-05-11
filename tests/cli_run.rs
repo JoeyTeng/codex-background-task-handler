@@ -13,6 +13,10 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+const FAKE_APP_SERVER_ACCEPT_TIMEOUT_SECONDS: u64 = 15;
+const FAKE_LOG_WAIT_TIMEOUT_SECONDS: u64 = 10;
+const FAKE_STATE_WAIT_TIMEOUT_SECONDS: u64 = 15;
+
 fn temp_home() -> TempDir {
     let home = tempfile::tempdir().expect("temp home");
     #[cfg(unix)]
@@ -85,7 +89,7 @@ exit 0
 
 #[cfg(unix)]
 fn wait_for_log_contains(path: &std::path::Path, needle: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(FAKE_LOG_WAIT_TIMEOUT_SECONDS);
     loop {
         if fs::read_to_string(path).is_ok_and(|log| log.contains(needle)) {
             return;
@@ -146,7 +150,7 @@ fn cbth_direct_json(home: &TempDir, args: &[&str]) -> serde_json::Value {
 #[cfg(unix)]
 fn wait_for_cli_activity_state(home: &TempDir, bound_thread_id: &str, expected: &str) -> i64 {
     let db_path = home.path().join("cbth.sqlite3");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(FAKE_STATE_WAIT_TIMEOUT_SECONDS);
     loop {
         if db_path.exists()
             && let Ok(conn) = Connection::open(&db_path)
@@ -634,7 +638,7 @@ fn accept_fake_app_server_capture_initial_resume(
     listener: &TcpListener,
     thread_id: &str,
 ) -> Result<serde_json::Value, String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(FAKE_APP_SERVER_ACCEPT_TIMEOUT_SECONDS);
     let (mut stream, _) = loop {
         match listener.accept() {
             Ok(accepted) => break accepted,
@@ -796,7 +800,7 @@ fn accept_fake_app_server(
     respond_to_thread_read: bool,
     hold_after_response: Duration,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(FAKE_APP_SERVER_ACCEPT_TIMEOUT_SECONDS);
     let (mut stream, _) = loop {
         match listener.accept() {
             Ok(accepted) => break accepted,
@@ -976,7 +980,7 @@ fn accept_fake_app_server_foreground_thread_discovery_closed(
 fn accept_fake_app_server_foreground_discovery_connection(
     listener: &TcpListener,
 ) -> Result<(Vec<String>, Option<TcpStream>), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(FAKE_APP_SERVER_ACCEPT_TIMEOUT_SECONDS);
     let (mut stream, _) = loop {
         match listener.accept() {
             Ok(accepted) => break accepted,
@@ -1056,7 +1060,7 @@ fn accept_fake_app_server_capture_passive(
     include_permissions: bool,
     resume_include_turns: bool,
 ) -> Result<FakePassiveCapture, String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(FAKE_APP_SERVER_ACCEPT_TIMEOUT_SECONDS);
     let (mut stream, _) = loop {
         match listener.accept() {
             Ok(accepted) => break accepted,
@@ -1158,7 +1162,7 @@ fn accept_fake_app_server_auto_delivery_with_options(
     outcome: FakeAutoDeliveryOutcome,
     expect_pinned_permissions: bool,
 ) -> Result<Vec<String>, String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(FAKE_APP_SERVER_ACCEPT_TIMEOUT_SECONDS);
     let (mut stream, _) = loop {
         match listener.accept() {
             Ok(accepted) => break accepted,
@@ -1557,7 +1561,7 @@ fn accept_fake_app_server_resume_started_before_missing_read_snapshot(
     listener: &TcpListener,
     thread_id: &'static str,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(FAKE_APP_SERVER_ACCEPT_TIMEOUT_SECONDS);
     let (mut stream, _) = loop {
         match listener.accept() {
             Ok(accepted) => break accepted,
@@ -1637,7 +1641,7 @@ fn accept_fake_app_server_idle_before_active_read_snapshot(
     listener: &TcpListener,
     thread_id: &'static str,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(FAKE_APP_SERVER_ACCEPT_TIMEOUT_SECONDS);
     let (mut stream, _) = loop {
         match listener.accept() {
             Ok(accepted) => break accepted,
@@ -1715,7 +1719,7 @@ fn accept_fake_app_server_untrusted_read_snapshot(
     listener: &TcpListener,
     thread_id: &'static str,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(FAKE_APP_SERVER_ACCEPT_TIMEOUT_SECONDS);
     let (mut stream, _) = loop {
         match listener.accept() {
             Ok(accepted) => break accepted,
