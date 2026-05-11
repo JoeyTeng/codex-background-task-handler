@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,7 +15,7 @@ use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 
 fn temp_home() -> TempDir {
     let home = tempfile::tempdir().expect("temp home");
@@ -289,6 +290,10 @@ fn wait_for_nonempty_file(path: &Path) {
 
 fn wait_for_socket_removed_with_timeout(home: &TempDir, timeout: Duration) {
     let socket_path = home.path().join("run").join("cbth.sock");
+    wait_for_socket_path_removed(&socket_path, timeout);
+}
+
+fn wait_for_socket_path_removed(socket_path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while socket_path.exists() {
         assert!(Instant::now() < deadline, "daemon socket was not removed");
@@ -589,34 +594,58 @@ fn daemon_ensure_restarts_incompatible_daemon() {
 
 #[cfg(unix)]
 #[test]
-fn daemon_ensure_fails_closed_for_incompatible_daemon_without_stop() {
+fn daemon_ensure_coexists_with_incompatible_default_without_stop() {
     let home = temp_home();
     let run_dir = home.path().join("run");
     fs::create_dir(&run_dir).expect("create run dir");
     fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
     let socket_path = run_dir.join("cbth.sock");
-    let listener = UnixListener::bind(&socket_path).expect("bind legacy daemon socket");
+    let generation_socket_path = run_dir
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind old daemon socket");
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
-    let legacy_socket_path = socket_path.clone();
+    listener
+        .set_nonblocking(true)
+        .expect("set old listener nonblocking");
+    let old_socket_path = socket_path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let (request_tx, request_rx) = mpsc::channel();
     let handle = thread::spawn(move || {
-        let (mut stream, _addr) = listener.accept().expect("accept legacy request");
-        let mut request = String::new();
-        stream
-            .read_to_string(&mut request)
-            .expect("read legacy request");
-        assert!(
-            !request.contains("\"stop\""),
-            "default ensure must not stop incompatible daemon: {request}"
-        );
-        stream
-            .write_all(br#"{"ok":true,"response":{"daemon":{"pid":1},"message":"pong"}}"#)
-            .expect("write response");
-        stream.write_all(b"\n").expect("write response newline");
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let mut request = String::new();
+                    stream
+                        .read_to_string(&mut request)
+                        .expect("read old request");
+                    assert!(
+                        !request.contains("\"stop\""),
+                        "default ensure must not stop incompatible daemon: {request}"
+                    );
+                    request_tx.send(request).expect("send observed request");
+                    stream
+                        .write_all(
+                            br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.1.5"},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#,
+                        )
+                        .expect("write old response");
+                    stream.write_all(b"\n").expect("write old response newline");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if done_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept old daemon request: {error}"),
+            }
+        }
         drop(listener);
-        fs::remove_file(&legacy_socket_path).expect("remove legacy socket");
+        fs::remove_file(&old_socket_path).expect("remove old socket");
     });
 
-    let stderr = cbth_failure(
+    let ensured = cbth(
         &home,
         &[
             "daemon",
@@ -627,11 +656,112 @@ fn daemon_ensure_fails_closed_for_incompatible_daemon_without_stop() {
             "5",
         ],
     );
-    assert!(
-        stderr.contains("--replace-incompatible"),
-        "unexpected stderr: {stderr}"
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("legacy daemon should be probed");
+    assert!(request.contains("\"ping\""));
+    assert_eq!(ensured["started"], true);
+    assert_eq!(ensured["coexisting_with_incompatible_daemon"], true);
+    assert_eq!(ensured["legacy_daemon"]["pid"], 1313);
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        generation_socket_path.display().to_string()
     );
-    handle.join().expect("legacy daemon thread");
+    assert!(
+        socket_path.exists(),
+        "legacy socket should remain owned by old daemon"
+    );
+    let all_status = cbth(&home, &["daemon", "status", "--all"]);
+    let all_status_daemons = all_status["daemons"].as_array().expect("status daemons");
+    assert!(
+        all_status_daemons.iter().any(|daemon| {
+            daemon["socket_path"] == socket_path.display().to_string() && daemon["ok"] == true
+        }),
+        "legacy daemon endpoint should be visible in status --all: {all_status}"
+    );
+    assert!(
+        all_status_daemons.iter().any(|daemon| {
+            daemon["socket_path"] == generation_socket_path.display().to_string()
+                && daemon["ok"] == true
+        }),
+        "generation daemon endpoint should be visible in status --all: {all_status}"
+    );
+    let app_servers = cbth(&home, &["cli", "app-servers", "--all-daemons"]);
+    let app_server_daemons = app_servers["daemons"]
+        .as_array()
+        .expect("app-server daemon reports");
+    assert!(
+        app_server_daemons.len() >= 2,
+        "app-servers --all-daemons should include both endpoints: {app_servers}"
+    );
+    assert_eq!(app_servers["cli_app_servers"], json!([]));
+
+    done_tx.send(()).expect("signal old daemon");
+    handle.join().expect("old daemon thread");
+    let mut generation_stream =
+        UnixStream::connect(&generation_socket_path).expect("connect generation daemon");
+    generation_stream
+        .write_all(br#"{"command":"stop","payload":null}"#)
+        .expect("write generation stop");
+    generation_stream
+        .write_all(b"\n")
+        .expect("write generation stop newline");
+    generation_stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("shutdown generation stop write");
+    let mut stop_response = String::new();
+    generation_stream
+        .read_to_string(&mut stop_response)
+        .expect("read generation stop response");
+    assert!(
+        stop_response.contains(r#""ok":true"#),
+        "generation stop failed: {stop_response}"
+    );
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_reuses_generation_daemon_when_legacy_socket_is_absent() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let mut daemon = spawn_daemon(
+        &home,
+        "1",
+        &["--socket-kind", "generation", "--skip-startup-sweep"],
+    );
+    wait_for_path(&generation_socket_path);
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "1",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+
+    assert_eq!(ensured["started"], false);
+    assert_eq!(ensured["using_generation_daemon"], true);
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        generation_socket_path.display().to_string()
+    );
+    assert!(
+        !home.path().join("run").join("cbth.sock").exists(),
+        "default daemon socket should not be created while generation daemon is alive"
+    );
+
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(5));
+    daemon.wait().expect("generation daemon exits after idle");
 }
 
 #[cfg(unix)]

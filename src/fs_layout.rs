@@ -53,6 +53,23 @@ impl FsLayout {
         self.run_dir().join("startup.lock")
     }
 
+    pub fn daemon_generations_dir(&self) -> PathBuf {
+        self.run_dir().join("daemons")
+    }
+
+    pub fn daemon_generation_dir(&self, generation_id: &str) -> PathBuf {
+        self.daemon_generations_dir().join(generation_id)
+    }
+
+    pub fn daemon_generation_socket_path(&self, generation_id: &str) -> PathBuf {
+        self.daemon_generation_dir(generation_id).join("cbth.sock")
+    }
+
+    pub fn daemon_generation_startup_lock_path(&self, generation_id: &str) -> PathBuf {
+        self.daemon_generation_dir(generation_id)
+            .join("startup.lock")
+    }
+
     pub fn artifacts_dir(&self) -> PathBuf {
         self.home.join("artifacts")
     }
@@ -132,6 +149,13 @@ impl FsLayout {
     pub fn ensure_run_dir(&self) -> Result<()> {
         ensure_private_dir(&self.home)?;
         ensure_private_dir(&self.run_dir())
+    }
+
+    pub fn ensure_daemon_generation_dir(&self, generation_id: &str) -> Result<()> {
+        ensure_private_dir(&self.home)?;
+        ensure_private_dir(&self.run_dir())?;
+        ensure_private_dir(&self.daemon_generations_dir())?;
+        ensure_private_dir(&self.daemon_generation_dir(generation_id))
     }
 }
 
