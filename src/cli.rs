@@ -2471,8 +2471,14 @@ fn dispatch_desktop_relay_consume_transcript_via_daemon(
         startup_sweep_now: Some(args.now.unwrap_or(now_epoch_seconds()?)),
         replace_incompatible: false,
     };
-    daemon_ensure(layout, ensure_options)?;
-    daemon_request_payload(layout, "dispatch", json!({ "argv": argv_payload(argv) }))
+    let ensure = daemon_ensure(layout, ensure_options)?;
+    let endpoint = daemon_endpoint_from_response(layout, &ensure)?;
+    daemon_request_payload_at_endpoint(
+        layout,
+        &endpoint,
+        "dispatch",
+        json!({ "argv": argv_payload(argv) }),
+    )
 }
 
 fn dispatch_daemon_task_command(

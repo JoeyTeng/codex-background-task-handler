@@ -116,6 +116,17 @@ fn cbth_daemon_failure(home: &TempDir, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+fn write_function_call_rollout(path: &Path, output: &str) {
+    let record = json!({
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "output": output,
+        }
+    });
+    fs::write(path, serde_json::to_string(&record).unwrap()).expect("write rollout");
+}
+
 fn hold_exclusive_db_lock(home: &TempDir) -> Connection {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1159,6 +1170,160 @@ fn daemon_dispatch_uses_probed_socket_when_ping_omits_socket_path() {
     );
     assert_eq!(submitted["job"]["job_id"], "accepted-via-fallback");
     handle.join().expect("compatible daemon thread");
+}
+
+#[cfg(unix)]
+#[test]
+fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let default_socket_path = run_dir.join("cbth.sock");
+    let default_listener =
+        UnixListener::bind(&default_socket_path).expect("bind incompatible default daemon socket");
+    fs::set_permissions(&default_socket_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod default socket");
+    let cleanup_socket_path = default_socket_path.clone();
+    let default_handle = thread::spawn(move || {
+        let (mut ping_stream, _addr) = default_listener
+            .accept()
+            .expect("accept default ping request");
+        let mut ping_request = String::new();
+        ping_stream
+            .read_to_string(&mut ping_request)
+            .expect("read default ping request");
+        assert!(ping_request.contains("\"ping\""));
+        let ping_response = json!({
+            "ok": true,
+            "response": {
+                "daemon": {
+                    "pid": 6161,
+                    "binary_version": env!("CARGO_PKG_VERSION")
+                },
+                "protocol_version": 1,
+                "capabilities": [
+                    "dispatch",
+                    "attempt-dispatch",
+                    "cli-app-server-lifecycle",
+                    "cli-app-server-probe",
+                    "cli-thread-start-bootstrap",
+                    "cli-thread-start-params",
+                    "cli-foreground-thread-bootstrap",
+                    "cli-session-dispatch",
+                    "cli-session-capability-dispatch",
+                    "cli-session-permission-dispatch",
+                    "cli-session-proof-invalidation-dispatch",
+                    "cli-session-recovery-dispatch",
+                    "cli-turn-observation-dispatch",
+                    "cli-turn-observation-expiry-dispatch",
+                    "cli-auto-delivery-dispatch",
+                    "task-supervisor",
+                    "desktop-bridge-foundation-dispatch",
+                    "desktop-inbox-revisioned-installation-state",
+                    "desktop-writeback-helper-foundation",
+                    "desktop-writeback-live-validation-fixture",
+                    "daemon-handoff-v1"
+                ],
+                "message": "pong"
+            }
+        });
+        writeln!(ping_stream, "{ping_response}").expect("write default ping response");
+        drop(ping_stream);
+
+        default_listener
+            .set_nonblocking(true)
+            .expect("set default listener nonblocking");
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            match default_listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let mut request = String::new();
+                    let _ = stream.read_to_string(&mut request);
+                    panic!("default daemon received unexpected relay dispatch: {request}");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept default request: {error}"),
+            }
+        }
+        drop(default_listener);
+        fs::remove_file(&cleanup_socket_path).expect("remove default socket");
+    });
+
+    let generation_socket_path = run_dir
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let mut generation_daemon = spawn_daemon(&home, "300", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+
+    let fixture = cbth(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "prepare-writeback-fixture",
+            "--source-thread-id",
+            "thread-generation-relay",
+            "--caller-automation-id",
+            "automation-generation-relay",
+            "--bridge-request-id",
+            "bridge-request-generation-relay",
+            "--now",
+            "8120",
+            "--json",
+        ],
+    );
+    let attempt_id = fixture["desktop_writeback_fixture"]["attempt"]["attempt_id"]
+        .as_str()
+        .expect("attempt id");
+    let marker = "CBTH_GENERATION_RELAY_ENDPOINT";
+    let envelope = json!({
+        "schema_version": 1,
+        "channel": "desktop_transcript_writeback",
+        "kind": "arm_pending_requested",
+        "source_thread_id": "thread-generation-relay",
+        "attempt_id": attempt_id,
+        "generation": 1,
+        "bridge_request_id": "bridge-request-generation-relay",
+        "marker": marker,
+        "created_at": 8130,
+    });
+    let rollout = home.path().join("generation-relay-rollout.jsonl");
+    write_function_call_rollout(
+        &rollout,
+        &format!(
+            "CBTH_TRANSCRIPT_WRITEBACK_V1 {}",
+            serde_json::to_string(&envelope).expect("serialize envelope")
+        ),
+    );
+
+    let consumed = cbth_daemon(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            rollout.to_str().unwrap(),
+            "--marker",
+            marker,
+            "--json",
+            "--now",
+            "8140",
+        ],
+    );
+    assert_eq!(
+        consumed["desktop_transcript_relay_consumption"]["record"]["outcome"]["outcome"],
+        "arm_pending"
+    );
+
+    default_handle.join().expect("default daemon thread");
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    generation_daemon.wait().expect("generation daemon exits");
 }
 
 #[cfg(unix)]
