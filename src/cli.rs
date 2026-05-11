@@ -10521,7 +10521,7 @@ fn scan_desktop_transcript_writeback(rollout_path: &Path, marker: &str) -> Resul
     let file =
         fs::File::open(rollout_path).with_context(|| format!("open {}", rollout_path.display()))?;
     let mut reader = io::BufReader::new(file);
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut line_number = 0_i64;
     let mut trusted_auto = Vec::new();
     let mut diagnostic_only = Vec::new();
@@ -10529,24 +10529,23 @@ fn scan_desktop_transcript_writeback(rollout_path: &Path, marker: &str) -> Resul
     let mut rejected = Vec::new();
 
     loop {
-        line.clear();
-        let bytes = reader
-            .read_line(&mut line)
-            .with_context(|| format!("read {}", rollout_path.display()))?;
+        let bytes = read_bounded_desktop_transcript_line(
+            &mut reader,
+            &mut line,
+            line_number + 1,
+            DESKTOP_TRANSCRIPT_SCAN_MAX_LINE_BYTES,
+        )
+        .with_context(|| format!("read {}", rollout_path.display()))?;
         if bytes == 0 {
             break;
         }
         line_number += 1;
-        if line.len() > DESKTOP_TRANSCRIPT_SCAN_MAX_LINE_BYTES {
-            bail!(
-                "rollout line {line_number} exceeds {} bytes",
-                DESKTOP_TRANSCRIPT_SCAN_MAX_LINE_BYTES
-            );
-        }
-        if !line.contains(marker) && !line.contains(DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX) {
+        let line_text = std::str::from_utf8(&line)
+            .with_context(|| format!("decode rollout UTF-8 line {line_number}"))?;
+        if !line_text.contains(marker) && !line_text.contains(DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX) {
             continue;
         }
-        let record: Value = serde_json::from_str(line.trim_end())
+        let record: Value = serde_json::from_str(line_text.trim_end())
             .with_context(|| format!("parse rollout JSON line {line_number}"))?;
         for carrier in desktop_transcript_carriers(&record) {
             if !carrier.text.contains(marker)
@@ -10682,6 +10681,44 @@ fn scan_desktop_transcript_writeback(rollout_path: &Path, marker: &str) -> Resul
         "ignored_prompt": ignored_prompt,
         "rejected": rejected,
     }))
+}
+
+fn read_bounded_desktop_transcript_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    line_number: i64,
+    max_bytes: usize,
+) -> Result<usize> {
+    line.clear();
+    let mut total = 0_usize;
+    loop {
+        let (take, found_newline, overflow_consume) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(total);
+            }
+            let take = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if total + take > max_bytes {
+                let remaining = max_bytes.saturating_sub(total);
+                (0, false, Some((remaining + 1).min(available.len())))
+            } else {
+                line.extend_from_slice(&available[..take]);
+                (take, available[take - 1] == b'\n', None)
+            }
+        };
+        if let Some(consume) = overflow_consume {
+            reader.consume(consume);
+            bail!("rollout line {line_number} exceeds {max_bytes} bytes");
+        }
+        reader.consume(take);
+        total += take;
+        if found_newline {
+            return Ok(total);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -11347,6 +11384,33 @@ mod tests {
             "includePlatformDefaults": false,
             "readableRoots": roots,
         })
+    }
+
+    #[test]
+    fn bounded_desktop_transcript_line_caps_memory_before_newline() {
+        let mut reader = io::BufReader::new(io::Cursor::new(b"abcdef\nnext\n".to_vec()));
+        let mut line = Vec::new();
+
+        let error = read_bounded_desktop_transcript_line(&mut reader, &mut line, 1, 4).unwrap_err();
+        assert!(error.to_string().contains("rollout line 1 exceeds 4 bytes"));
+        assert!(
+            line.len() <= 4,
+            "bounded reader should not retain an oversized line"
+        );
+    }
+
+    #[test]
+    fn bounded_desktop_transcript_line_reads_next_line_after_exact_limit() {
+        let mut reader = io::BufReader::new(io::Cursor::new(b"abc\nnext\n".to_vec()));
+        let mut line = Vec::new();
+
+        let bytes = read_bounded_desktop_transcript_line(&mut reader, &mut line, 1, 4).unwrap();
+        assert_eq!(bytes, 4);
+        assert_eq!(line, b"abc\n");
+
+        let bytes = read_bounded_desktop_transcript_line(&mut reader, &mut line, 2, 8).unwrap();
+        assert_eq!(bytes, 5);
+        assert_eq!(line, b"next\n");
     }
 
     #[test]
