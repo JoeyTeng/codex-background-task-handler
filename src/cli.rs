@@ -87,6 +87,10 @@ const DESKTOP_INBOX_SCHEMA_VERSION: i64 = 1;
 const DESKTOP_INBOX_MAX_JSON_BYTES: u64 = 1024 * 1024;
 const DESKTOP_SNAPSHOT_REVISION_RETENTION: usize = 128;
 const DESKTOP_WRITEBACK_DROPBOX_PROBE_MAX_MARKER_BYTES: usize = 4 * 1024;
+const DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX: &str = "CBTH_TRANSCRIPT_WRITEBACK_V1 ";
+const DESKTOP_TRANSCRIPT_WRITEBACK_CHANNEL: &str = "desktop_transcript_writeback";
+const DESKTOP_TRANSCRIPT_WRITEBACK_MAX_MARKER_BYTES: usize = 4 * 1024;
+const DESKTOP_TRANSCRIPT_SCAN_MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "dispatch",
     "attempt-dispatch",
@@ -398,6 +402,16 @@ struct DesktopBindingRepairArgs {
 #[derive(Debug, Subcommand)]
 enum DesktopValidationCommand {
     #[command(
+        name = "emit-transcript-writeback-probe",
+        about = "Emit a validation-only Desktop transcript writeback envelope"
+    )]
+    EmitTranscriptWritebackProbe(DesktopEmitTranscriptWritebackProbeArgs),
+    #[command(
+        name = "scan-transcript-writeback",
+        about = "Scan a Codex rollout for Desktop transcript writeback envelopes"
+    )]
+    ScanTranscriptWriteback(DesktopScanTranscriptWritebackArgs),
+    #[command(
         name = "prepare-writeback-fixture",
         about = "Create a validation-only Desktop writeback fixture"
     )]
@@ -407,6 +421,36 @@ enum DesktopValidationCommand {
         about = "Write a validation-only Desktop dropbox probe file"
     )]
     WritebackDropboxProbe(DesktopWritebackDropboxProbeArgs),
+}
+
+#[derive(Debug, Args)]
+struct DesktopEmitTranscriptWritebackProbeArgs {
+    #[arg(long, help = "Desktop bridge thread id running the probe")]
+    bridge_thread_id: String,
+
+    #[arg(long, help = "Unique validation probe id")]
+    probe_id: String,
+
+    #[arg(long, help = "Unique marker to emit in the transcript envelope")]
+    marker: String,
+
+    #[arg(long, help = "Emit the prefixed JSON envelope")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopScanTranscriptWritebackArgs {
+    #[arg(long, help = "Codex rollout JSONL path to scan")]
+    rollout_path: PathBuf,
+
+    #[arg(long, help = "Unique marker to find")]
+    marker: String,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2031,6 +2075,15 @@ pub fn run() -> Result<()> {
                 check: args.check,
                 yes: args.yes,
             })?
+        }
+        Commands::Desktop {
+            command:
+                DesktopCommand::Validation {
+                    command: DesktopValidationCommand::EmitTranscriptWritebackProbe(args),
+                },
+        } => {
+            write_desktop_transcript_writeback_probe(args)?;
+            return Ok(());
         }
         command => dispatch(
             command,
@@ -9009,7 +9062,10 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
         Commands::Desktop {
             command:
                 DesktopCommand::Validation {
-                    command: DesktopValidationCommand::WritebackDropboxProbe(_),
+                    command:
+                        DesktopValidationCommand::EmitTranscriptWritebackProbe(_)
+                        | DesktopValidationCommand::ScanTranscriptWriteback(_)
+                        | DesktopValidationCommand::WritebackDropboxProbe(_),
                 },
         } => return Ok(None),
         Commands::Maintenance {
@@ -10307,6 +10363,17 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
             Ok(json!({ "desktop_writeback_fixture": fixture }))
         }
         DesktopCommand::Validation {
+            command: DesktopValidationCommand::EmitTranscriptWritebackProbe(_),
+        } => {
+            bail!("emit-transcript-writeback-probe must execute from the foreground client")
+        }
+        DesktopCommand::Validation {
+            command: DesktopValidationCommand::ScanTranscriptWriteback(args),
+        } => {
+            let scan = scan_desktop_transcript_writeback(&args.rollout_path, &args.marker)?;
+            Ok(json!({ "desktop_transcript_writeback_scan": scan }))
+        }
+        DesktopCommand::Validation {
             command: DesktopValidationCommand::WritebackDropboxProbe(args),
         } => {
             let now = args.now.unwrap_or(now_epoch_seconds()?);
@@ -10759,6 +10826,484 @@ fn desktop_validation_fingerprint(read_transport: &str) -> Result<String> {
         DESKTOP_INBOX_SCHEMA_VERSION,
         read_transport
     ))
+}
+
+fn desktop_transcript_writeback_probe_envelope(
+    bridge_thread_id: &str,
+    probe_id: &str,
+    marker: &str,
+    now: i64,
+) -> Result<Value> {
+    validate_nonempty("bridge_thread_id", bridge_thread_id)?;
+    validate_id_path_component(probe_id, "probe_id")?;
+    validate_nonempty("marker", marker)?;
+    if marker.len() > DESKTOP_TRANSCRIPT_WRITEBACK_MAX_MARKER_BYTES {
+        bail!(
+            "marker exceeds {} bytes",
+            DESKTOP_TRANSCRIPT_WRITEBACK_MAX_MARKER_BYTES
+        );
+    }
+
+    Ok(json!({
+        "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "channel": DESKTOP_TRANSCRIPT_WRITEBACK_CHANNEL,
+        "kind": "validation_probe",
+        "bridge_thread_id": bridge_thread_id,
+        "probe_id": probe_id,
+        "marker": marker,
+        "created_at": now,
+        "cbth_version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+fn write_desktop_transcript_writeback_probe(
+    args: DesktopEmitTranscriptWritebackProbeArgs,
+) -> Result<()> {
+    let now = args.now.unwrap_or(now_epoch_seconds()?);
+    let envelope = desktop_transcript_writeback_probe_envelope(
+        &args.bridge_thread_id,
+        &args.probe_id,
+        &args.marker,
+        now,
+    )?;
+    let envelope = serde_json::to_string(&envelope)?;
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    writeln!(lock, "{DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX}{envelope}")?;
+    Ok(())
+}
+
+fn scan_desktop_transcript_writeback(rollout_path: &Path, marker: &str) -> Result<Value> {
+    validate_nonempty("marker", marker)?;
+    if marker.len() > DESKTOP_TRANSCRIPT_WRITEBACK_MAX_MARKER_BYTES {
+        bail!(
+            "marker exceeds {} bytes",
+            DESKTOP_TRANSCRIPT_WRITEBACK_MAX_MARKER_BYTES
+        );
+    }
+
+    let file =
+        fs::File::open(rollout_path).with_context(|| format!("open {}", rollout_path.display()))?;
+    let mut reader = io::BufReader::new(file);
+    let mut line = Vec::new();
+    let mut line_number = 0_i64;
+    let mut trusted_auto = Vec::new();
+    let mut diagnostic_only = Vec::new();
+    let mut ignored_prompt = Vec::new();
+    let mut rejected = Vec::new();
+
+    loop {
+        let bytes = read_bounded_desktop_transcript_line(
+            &mut reader,
+            &mut line,
+            line_number + 1,
+            DESKTOP_TRANSCRIPT_SCAN_MAX_LINE_BYTES,
+        )
+        .with_context(|| format!("read {}", rollout_path.display()))?;
+        if bytes == 0 {
+            break;
+        }
+        line_number += 1;
+        let line_text = std::str::from_utf8(&line)
+            .with_context(|| format!("decode rollout UTF-8 line {line_number}"))?;
+        if !line_text.contains(marker) && !line_text.contains(DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX) {
+            continue;
+        }
+        let record: Value = serde_json::from_str(line_text.trim_end())
+            .with_context(|| format!("parse rollout JSON line {line_number}"))?;
+        for carrier in desktop_transcript_carriers(&record) {
+            if !carrier.text.contains(marker)
+                && !carrier.text.contains(DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX)
+            {
+                continue;
+            }
+            match carrier.trust {
+                DesktopTranscriptCarrierTrust::IgnoredPrompt => {
+                    if carrier.text.contains(marker) {
+                        ignored_prompt.push(desktop_transcript_marker_entry(
+                            &carrier,
+                            line_number,
+                            "marker_mention",
+                        ));
+                    }
+                }
+                DesktopTranscriptCarrierTrust::DiagnosticOnly => {
+                    let mut matched = false;
+                    for parsed in
+                        extract_desktop_transcript_writeback_envelopes(&carrier.text, marker)
+                    {
+                        match parsed {
+                            Ok(Some(envelope)) => {
+                                matched = true;
+                                diagnostic_only.push(desktop_transcript_envelope_entry(
+                                    &carrier,
+                                    line_number,
+                                    envelope,
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(_) => {
+                                if carrier.text.contains(marker) {
+                                    matched = true;
+                                    diagnostic_only.push(desktop_transcript_marker_entry(
+                                        &carrier,
+                                        line_number,
+                                        "malformed_envelope_text",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if !matched && carrier.text.contains(marker) {
+                        diagnostic_only.push(desktop_transcript_marker_entry(
+                            &carrier,
+                            line_number,
+                            "marker_mention",
+                        ));
+                    }
+                }
+                DesktopTranscriptCarrierTrust::TrustedAuto => {
+                    let mut matched = false;
+                    let mut had_rejected = false;
+                    for parsed in
+                        extract_desktop_transcript_writeback_envelopes(&carrier.text, marker)
+                    {
+                        match parsed {
+                            Ok(Some(envelope)) => {
+                                matched = true;
+                                trusted_auto.push(desktop_transcript_envelope_entry(
+                                    &carrier,
+                                    line_number,
+                                    envelope,
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                if carrier.text.contains(marker) {
+                                    had_rejected = true;
+                                    rejected.push(desktop_transcript_rejected_entry(
+                                        &carrier,
+                                        line_number,
+                                        &error.to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if !matched
+                        && carrier.text.contains(DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX)
+                        && carrier.text.contains(marker)
+                        && !had_rejected
+                    {
+                        rejected.push(desktop_transcript_rejected_entry(
+                            &carrier,
+                            line_number,
+                            "trusted carrier contains marker but no valid envelope",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let auto_decision = if !rejected.is_empty() {
+        json!({
+            "trusted": false,
+            "reason": "rejected_trusted_auto_envelopes",
+        })
+    } else if trusted_auto.len() == 1 {
+        json!({
+            "trusted": true,
+            "reason": "single_trusted_auto_envelope",
+        })
+    } else if trusted_auto.len() > 1 {
+        json!({
+            "trusted": false,
+            "reason": "duplicate_trusted_auto_envelopes",
+        })
+    } else {
+        json!({
+            "trusted": false,
+            "reason": "no_trusted_auto_envelope",
+        })
+    };
+
+    Ok(json!({
+        "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "prefix": DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX.trim_end(),
+        "rollout_path": rollout_path.display().to_string(),
+        "marker": marker,
+        "counts": {
+            "trusted_auto": trusted_auto.len(),
+            "diagnostic_only": diagnostic_only.len(),
+            "ignored_prompt": ignored_prompt.len(),
+            "rejected": rejected.len(),
+        },
+        "auto_decision": auto_decision,
+        "trusted_auto": trusted_auto,
+        "diagnostic_only": diagnostic_only,
+        "ignored_prompt": ignored_prompt,
+        "rejected": rejected,
+    }))
+}
+
+fn read_bounded_desktop_transcript_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    line_number: i64,
+    max_bytes: usize,
+) -> Result<usize> {
+    line.clear();
+    let mut total = 0_usize;
+    loop {
+        let (take, found_newline, overflow_consume) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(total);
+            }
+            let take = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if total + take > max_bytes {
+                let remaining = max_bytes.saturating_sub(total);
+                (0, false, Some((remaining + 1).min(available.len())))
+            } else {
+                line.extend_from_slice(&available[..take]);
+                (take, available[take - 1] == b'\n', None)
+            }
+        };
+        if let Some(consume) = overflow_consume {
+            reader.consume(consume);
+            bail!("rollout line {line_number} exceeds {max_bytes} bytes");
+        }
+        reader.consume(take);
+        total += take;
+        if found_newline {
+            return Ok(total);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DesktopTranscriptCarrierTrust {
+    TrustedAuto,
+    DiagnosticOnly,
+    IgnoredPrompt,
+}
+
+struct DesktopTranscriptCarrier {
+    trust: DesktopTranscriptCarrierTrust,
+    carrier: &'static str,
+    record_type: String,
+    payload_type: String,
+    text: String,
+}
+
+fn desktop_transcript_carriers(record: &Value) -> Vec<DesktopTranscriptCarrier> {
+    let record_type = record["type"].as_str().unwrap_or("").to_owned();
+    let payload = &record["payload"];
+    let payload_type = payload["type"].as_str().unwrap_or("").to_owned();
+    let mut carriers = Vec::new();
+
+    if record_type == "response_item" && payload_type == "function_call_output" {
+        if let Some(output) = payload["output"].as_str() {
+            carriers.push(DesktopTranscriptCarrier {
+                trust: DesktopTranscriptCarrierTrust::TrustedAuto,
+                carrier: "trusted_auto",
+                record_type,
+                payload_type,
+                text: output.to_owned(),
+            });
+        }
+        return carriers;
+    }
+
+    if record_type == "response_item" && payload_type == "message" {
+        let role = payload["role"].as_str().unwrap_or("");
+        let text = response_message_text(payload);
+        if !text.is_empty() {
+            let (trust, carrier) = if role == "user" {
+                (
+                    DesktopTranscriptCarrierTrust::IgnoredPrompt,
+                    "ignored_prompt",
+                )
+            } else {
+                (
+                    DesktopTranscriptCarrierTrust::DiagnosticOnly,
+                    "diagnostic_only",
+                )
+            };
+            carriers.push(DesktopTranscriptCarrier {
+                trust,
+                carrier,
+                record_type,
+                payload_type,
+                text,
+            });
+        }
+        return carriers;
+    }
+
+    if record_type == "event_msg" && payload_type == "user_message" {
+        if let Some(message) = payload["message"].as_str() {
+            carriers.push(DesktopTranscriptCarrier {
+                trust: DesktopTranscriptCarrierTrust::IgnoredPrompt,
+                carrier: "ignored_prompt",
+                record_type,
+                payload_type,
+                text: message.to_owned(),
+            });
+        }
+        return carriers;
+    }
+
+    if record_type == "event_msg" && payload_type == "agent_message" {
+        if let Some(message) = payload["message"].as_str() {
+            carriers.push(DesktopTranscriptCarrier {
+                trust: DesktopTranscriptCarrierTrust::DiagnosticOnly,
+                carrier: "diagnostic_only",
+                record_type,
+                payload_type,
+                text: message.to_owned(),
+            });
+        }
+        return carriers;
+    }
+
+    if record_type == "event_msg"
+        && payload_type == "task_complete"
+        && let Some(message) = payload["last_agent_message"].as_str()
+    {
+        carriers.push(DesktopTranscriptCarrier {
+            trust: DesktopTranscriptCarrierTrust::DiagnosticOnly,
+            carrier: "diagnostic_only",
+            record_type,
+            payload_type,
+            text: message.to_owned(),
+        });
+    }
+
+    carriers
+}
+
+fn response_message_text(payload: &Value) -> String {
+    let Some(content) = payload["content"].as_array() else {
+        return payload["content"].as_str().unwrap_or("").to_owned();
+    };
+    content
+        .iter()
+        .filter_map(|item| {
+            item["text"]
+                .as_str()
+                .or_else(|| item["input_text"].as_str())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn extract_desktop_transcript_writeback_envelopes(
+    text: &str,
+    marker: &str,
+) -> Vec<Result<Option<Value>>> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let envelope = line.strip_prefix(DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX)?;
+            let envelope = envelope.trim();
+            Some(validate_desktop_transcript_writeback_envelope(
+                envelope, marker,
+            ))
+        })
+        .collect()
+}
+
+fn validate_desktop_transcript_writeback_envelope(
+    envelope: &str,
+    expected_marker: &str,
+) -> Result<Option<Value>> {
+    let value: Value = serde_json::from_str(envelope).context("parse transcript envelope JSON")?;
+    let marker = value["marker"]
+        .as_str()
+        .context("transcript envelope missing marker")?;
+    if marker != expected_marker {
+        return Ok(None);
+    }
+    let schema = value["schema_version"]
+        .as_i64()
+        .context("transcript envelope missing schema_version")?;
+    if schema != DESKTOP_INBOX_SCHEMA_VERSION {
+        bail!(
+            "transcript envelope schema_version must be {DESKTOP_INBOX_SCHEMA_VERSION}, got {schema}"
+        );
+    }
+    let channel = value["channel"]
+        .as_str()
+        .context("transcript envelope missing channel")?;
+    if channel != DESKTOP_TRANSCRIPT_WRITEBACK_CHANNEL {
+        bail!("transcript envelope channel must be {DESKTOP_TRANSCRIPT_WRITEBACK_CHANNEL}");
+    }
+    for field in ["kind", "bridge_thread_id", "probe_id", "created_at"] {
+        if value.get(field).is_none_or(Value::is_null) {
+            bail!("transcript envelope missing {field}");
+        }
+    }
+    if value["kind"].as_str() != Some("validation_probe") {
+        bail!("transcript envelope kind must be validation_probe");
+    }
+    if value["bridge_thread_id"].as_str().is_none() {
+        bail!("transcript envelope bridge_thread_id must be a string");
+    }
+    if value["probe_id"].as_str().is_none() {
+        bail!("transcript envelope probe_id must be a string");
+    }
+    if value["created_at"].as_i64().is_none() {
+        bail!("transcript envelope created_at must be an integer");
+    }
+    Ok(Some(value))
+}
+
+fn desktop_transcript_envelope_entry(
+    carrier: &DesktopTranscriptCarrier,
+    line_number: i64,
+    envelope: Value,
+) -> Value {
+    json!({
+        "carrier": carrier.carrier,
+        "record_line": line_number,
+        "record_type": &carrier.record_type,
+        "payload_type": &carrier.payload_type,
+        "kind": "envelope",
+        "envelope": envelope,
+    })
+}
+
+fn desktop_transcript_marker_entry(
+    carrier: &DesktopTranscriptCarrier,
+    line_number: i64,
+    kind: &str,
+) -> Value {
+    json!({
+        "carrier": carrier.carrier,
+        "record_line": line_number,
+        "record_type": &carrier.record_type,
+        "payload_type": &carrier.payload_type,
+        "kind": kind,
+    })
+}
+
+fn desktop_transcript_rejected_entry(
+    carrier: &DesktopTranscriptCarrier,
+    line_number: i64,
+    reason: &str,
+) -> Value {
+    json!({
+        "carrier": carrier.carrier,
+        "record_line": line_number,
+        "record_type": &carrier.record_type,
+        "payload_type": &carrier.payload_type,
+        "reason": reason,
+    })
 }
 
 fn write_desktop_writeback_dropbox_probe(
@@ -11231,6 +11776,33 @@ mod tests {
             "includePlatformDefaults": false,
             "readableRoots": roots,
         })
+    }
+
+    #[test]
+    fn bounded_desktop_transcript_line_caps_memory_before_newline() {
+        let mut reader = io::BufReader::new(io::Cursor::new(b"abcdef\nnext\n".to_vec()));
+        let mut line = Vec::new();
+
+        let error = read_bounded_desktop_transcript_line(&mut reader, &mut line, 1, 4).unwrap_err();
+        assert!(error.to_string().contains("rollout line 1 exceeds 4 bytes"));
+        assert!(
+            line.len() <= 4,
+            "bounded reader should not retain an oversized line"
+        );
+    }
+
+    #[test]
+    fn bounded_desktop_transcript_line_reads_next_line_after_exact_limit() {
+        let mut reader = io::BufReader::new(io::Cursor::new(b"abc\nnext\n".to_vec()));
+        let mut line = Vec::new();
+
+        let bytes = read_bounded_desktop_transcript_line(&mut reader, &mut line, 1, 4).unwrap();
+        assert_eq!(bytes, 4);
+        assert_eq!(line, b"abc\n");
+
+        let bytes = read_bounded_desktop_transcript_line(&mut reader, &mut line, 2, 8).unwrap();
+        assert_eq!(bytes, 5);
+        assert_eq!(line, b"next\n");
     }
 
     #[test]

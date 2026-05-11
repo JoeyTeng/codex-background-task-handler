@@ -142,6 +142,8 @@ cbth desktop note-arm \
 
 真实 Desktop heartbeat 已证明 daemon-routed writeback helper 会在 `note-arm-pending` 前被 `startup.lock` sandbox `EPERM` 阻断。后续 hidden writeback dropbox probe 又证明 heartbeat 不能在 `~/.cbth/inbox/writeback-dropbox` 下创建目录、创建 probe file，或打开预创建的 probe file 追加写入。因此 Desktop v1 不应继续依赖 heartbeat-authored local filesystem writeback；`writeback_capability` 仍保持 `unknown`。
 
+当前首选的下一条 side channel 是 transcript / tool-output relay：heartbeat 只运行一个 pure stdout helper，输出带 `CBTH_TRANSCRIPT_WRITEBACK_V1` 前缀的结构化 envelope；外部 operator / sidecar 从 Codex rollout 的 `function_call_output` carrier 中读取精确 stdout，再在 Desktop sandbox 外执行真实 durable CAS writeback。scanner 必须把 `function_call_output` 视为唯一当前 `trusted_auto` carrier，把 assistant final text 归类为 `diagnostic_only`，把 heartbeat prompt 归类为 `ignored_prompt`，避免 prompt 自触发。该 validation surface 记录在 [Desktop transcript relay validation](DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md)。
+
 ## No-DB Inbox Read Helpers
 
 真实 Desktop heartbeat 可能无法打开 SQLite、daemon socket 或 `startup.lock`。因此 heartbeat v1 可以改用 no-DB read helpers 消费已经发布的 inbox snapshot：

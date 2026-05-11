@@ -1004,6 +1004,346 @@ fn desktop_writeback_validation_fixture_fail_closed_cases_and_help_hidden() {
 }
 
 #[test]
+fn desktop_transcript_writeback_probe_emits_prefixed_envelope_without_store() {
+    let home = temp_home();
+    let output = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "emit-transcript-writeback-probe",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--probe-id",
+            "probe-transcript",
+            "--marker",
+            "CBTH_TRANSCRIPT_WRITEBACK_TEST",
+            "--json",
+            "--now",
+            "6100",
+        ],
+        false,
+    );
+    assert!(
+        output.status.success(),
+        "transcript probe failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let prefix = "CBTH_TRANSCRIPT_WRITEBACK_V1 ";
+    assert!(stdout.starts_with(prefix), "stdout: {stdout}");
+    let envelope: Value =
+        serde_json::from_str(stdout.trim_start_matches(prefix)).expect("valid envelope");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["channel"], "desktop_transcript_writeback");
+    assert_eq!(envelope["kind"], "validation_probe");
+    assert_eq!(envelope["bridge_thread_id"], "bridge-thread");
+    assert_eq!(envelope["probe_id"], "probe-transcript");
+    assert_eq!(envelope["marker"], "CBTH_TRANSCRIPT_WRITEBACK_TEST");
+    assert_eq!(envelope["created_at"], 6100);
+    assert!(!home.path().join("run").join("startup.lock").exists());
+    assert!(!home.path().join("cbth.sqlite3").exists());
+    assert!(!home.path().join("inbox").exists());
+}
+
+#[test]
+fn desktop_transcript_writeback_scan_classifies_rollout_carriers() {
+    let home = temp_home();
+    let rollout_path = home.path().join("rollout.jsonl");
+    let marker = "CBTH_TRANSCRIPT_WRITEBACK_SCAN_TEST";
+    let prefix = "CBTH_TRANSCRIPT_WRITEBACK_V1 ";
+    let envelope = json!({
+        "schema_version": 1,
+        "channel": "desktop_transcript_writeback",
+        "kind": "validation_probe",
+        "bridge_thread_id": "bridge-thread",
+        "probe_id": "probe-scan",
+        "marker": marker,
+        "created_at": 6200,
+    });
+    let trusted_line = format!("{prefix}{}", serde_json::to_string(&envelope).unwrap());
+    let diagnostic_line = format!("{prefix}{}", serde_json::to_string(&envelope).unwrap());
+    let prompt_line = format!("{prefix}{}", serde_json::to_string(&envelope).unwrap());
+    let records = [
+        json!({
+            "timestamp": "2026-05-11T00:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": format!("prompt mentions {marker} and sample {prompt_line}")
+            }
+        }),
+        json!({
+            "timestamp": "2026-05-11T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "output": format!("Chunk ID: abc\nINFO: quoted {trusted_line}\nOutput:\n{trusted_line}\n")
+            }
+        }),
+        json!({
+            "timestamp": "2026-05-11T00:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": diagnostic_line
+            }
+        }),
+        json!({
+            "timestamp": "2026-05-11T00:00:03Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "last_agent_message": format!("{marker} final text mention only")
+            }
+        }),
+    ];
+    fs::write(
+        &rollout_path,
+        records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("write rollout");
+
+    let scan = cbth(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "scan-transcript-writeback",
+            "--rollout-path",
+            rollout_path.to_str().unwrap(),
+            "--marker",
+            marker,
+            "--json",
+        ],
+    );
+    let scan = &scan["desktop_transcript_writeback_scan"];
+    assert_eq!(scan["counts"]["trusted_auto"], 1);
+    assert_eq!(scan["counts"]["diagnostic_only"], 2);
+    assert_eq!(scan["counts"]["ignored_prompt"], 1);
+    assert_eq!(scan["counts"]["rejected"], 0);
+    assert_eq!(scan["auto_decision"]["trusted"], true);
+    assert_eq!(
+        scan["auto_decision"]["reason"],
+        "single_trusted_auto_envelope"
+    );
+    assert_eq!(scan["trusted_auto"][0]["carrier"], "trusted_auto");
+    assert_eq!(
+        scan["trusted_auto"][0]["envelope"]["marker"],
+        "CBTH_TRANSCRIPT_WRITEBACK_SCAN_TEST"
+    );
+    assert_eq!(scan["ignored_prompt"][0]["carrier"], "ignored_prompt");
+    assert!(!home.path().join("run").join("startup.lock").exists());
+    assert!(!home.path().join("cbth.sqlite3").exists());
+}
+
+#[test]
+fn desktop_transcript_writeback_scan_fails_closed_for_unsafe_carriers() {
+    let home = temp_home();
+    let prefix = "CBTH_TRANSCRIPT_WRITEBACK_V1 ";
+    let marker = "CBTH_TRANSCRIPT_WRITEBACK_FAIL_CLOSED";
+    let envelope = json!({
+        "schema_version": 1,
+        "channel": "desktop_transcript_writeback",
+        "kind": "validation_probe",
+        "bridge_thread_id": "bridge-thread",
+        "probe_id": "probe-scan",
+        "marker": marker,
+        "created_at": 6300,
+    });
+    let envelope_line = format!("{prefix}{}", serde_json::to_string(&envelope).unwrap());
+
+    let prompt_only_path = home.path().join("prompt-only.jsonl");
+    fs::write(
+        &prompt_only_path,
+        serde_json::to_string(&json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": envelope_line
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("write prompt-only rollout");
+    let prompt_only = cbth(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "scan-transcript-writeback",
+            "--rollout-path",
+            prompt_only_path.to_str().unwrap(),
+            "--marker",
+            marker,
+            "--json",
+        ],
+    );
+    let prompt_only = &prompt_only["desktop_transcript_writeback_scan"];
+    assert_eq!(prompt_only["counts"]["ignored_prompt"], 1);
+    assert_eq!(prompt_only["counts"]["trusted_auto"], 0);
+    assert_eq!(prompt_only["auto_decision"]["trusted"], false);
+    assert_eq!(
+        prompt_only["auto_decision"]["reason"],
+        "no_trusted_auto_envelope"
+    );
+
+    let duplicate_path = home.path().join("duplicate.jsonl");
+    let duplicate_record = json!({
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "output": format!("{envelope_line}\n{envelope_line}\n")
+        }
+    });
+    fs::write(
+        &duplicate_path,
+        serde_json::to_string(&duplicate_record).unwrap(),
+    )
+    .expect("write duplicate rollout");
+    let duplicate = cbth(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "scan-transcript-writeback",
+            "--rollout-path",
+            duplicate_path.to_str().unwrap(),
+            "--marker",
+            marker,
+            "--json",
+        ],
+    );
+    let duplicate = &duplicate["desktop_transcript_writeback_scan"];
+    assert_eq!(duplicate["counts"]["trusted_auto"], 2);
+    assert_eq!(duplicate["auto_decision"]["trusted"], false);
+    assert_eq!(
+        duplicate["auto_decision"]["reason"],
+        "duplicate_trusted_auto_envelopes"
+    );
+
+    let malformed_path = home.path().join("malformed.jsonl");
+    let malformed_record = json!({
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "output": format!("{prefix}{{\"marker\":\"{marker}\"")
+        }
+    });
+    fs::write(
+        &malformed_path,
+        serde_json::to_string(&malformed_record).unwrap(),
+    )
+    .expect("write malformed rollout");
+    let malformed = cbth(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "scan-transcript-writeback",
+            "--rollout-path",
+            malformed_path.to_str().unwrap(),
+            "--marker",
+            marker,
+            "--json",
+        ],
+    );
+    let malformed = &malformed["desktop_transcript_writeback_scan"];
+    assert_eq!(malformed["counts"]["trusted_auto"], 0);
+    assert_eq!(malformed["counts"]["rejected"], 1);
+    assert_eq!(malformed["auto_decision"]["trusted"], false);
+    assert_eq!(
+        malformed["auto_decision"]["reason"],
+        "rejected_trusted_auto_envelopes"
+    );
+
+    let diagnostic_malformed_path = home.path().join("diagnostic-malformed.jsonl");
+    let diagnostic_malformed_record = json!({
+        "type": "event_msg",
+        "payload": {
+            "type": "agent_message",
+            "message": format!("{prefix}{{\"marker\":\"{marker}\"")
+        }
+    });
+    fs::write(
+        &diagnostic_malformed_path,
+        serde_json::to_string(&diagnostic_malformed_record).unwrap(),
+    )
+    .expect("write diagnostic malformed rollout");
+    let diagnostic_malformed = cbth(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "scan-transcript-writeback",
+            "--rollout-path",
+            diagnostic_malformed_path.to_str().unwrap(),
+            "--marker",
+            marker,
+            "--json",
+        ],
+    );
+    let diagnostic_malformed = &diagnostic_malformed["desktop_transcript_writeback_scan"];
+    assert_eq!(diagnostic_malformed["counts"]["trusted_auto"], 0);
+    assert_eq!(diagnostic_malformed["counts"]["diagnostic_only"], 1);
+    assert_eq!(diagnostic_malformed["counts"]["rejected"], 0);
+    assert_eq!(diagnostic_malformed["auto_decision"]["trusted"], false);
+    assert_eq!(
+        diagnostic_malformed["auto_decision"]["reason"],
+        "no_trusted_auto_envelope"
+    );
+
+    let wrong_marker_path = home.path().join("wrong-marker.jsonl");
+    let wrong_marker = json!({
+        "schema_version": 1,
+        "channel": "desktop_transcript_writeback",
+        "kind": "validation_probe",
+        "bridge_thread_id": "bridge-thread",
+        "probe_id": "probe-scan",
+        "marker": "OTHER_MARKER",
+        "created_at": 6400,
+    });
+    let wrong_marker_record = json!({
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "output": format!("{prefix}{}", serde_json::to_string(&wrong_marker).unwrap())
+        }
+    });
+    fs::write(
+        &wrong_marker_path,
+        serde_json::to_string(&wrong_marker_record).unwrap(),
+    )
+    .expect("write wrong-marker rollout");
+    let wrong_marker = cbth(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "scan-transcript-writeback",
+            "--rollout-path",
+            wrong_marker_path.to_str().unwrap(),
+            "--marker",
+            marker,
+            "--json",
+        ],
+    );
+    let wrong_marker = &wrong_marker["desktop_transcript_writeback_scan"];
+    assert_eq!(wrong_marker["counts"]["trusted_auto"], 0);
+    assert_eq!(wrong_marker["counts"]["rejected"], 0);
+    assert_eq!(wrong_marker["auto_decision"]["trusted"], false);
+    assert_eq!(
+        wrong_marker["auto_decision"]["reason"],
+        "no_trusted_auto_envelope"
+    );
+}
+
+#[test]
 fn desktop_writeback_dropbox_probe_writes_once_without_daemon_or_store() {
     let home = temp_home();
     let output = cbth_output(
