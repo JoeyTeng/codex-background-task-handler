@@ -584,7 +584,7 @@ struct DesktopRelayConsumePreparedTranscriptArgs {
     json: bool,
 
     #[arg(long, hide = true)]
-    now: i64,
+    now: Option<i64>,
 }
 
 #[derive(Debug, Args)]
@@ -2229,9 +2229,14 @@ enum DispatchMode {
         startup_timeout_seconds: u64,
     },
     Direct,
+    Daemon,
 }
 
 fn dispatch(command: Commands, layout: &FsLayout, mode: DispatchMode) -> Result<Value> {
+    if !matches!(mode, DispatchMode::Daemon) && desktop_relay_is_prepared_command(&command) {
+        bail!("desktop relay consume-prepared-transcript is daemon-internal");
+    }
+
     if desktop_bridge_preflight_has_conflicting_helper_modes(&command) {
         bail!(
             "desktop bridge-preflight --helper-direct-store cannot be combined with --require-existing-daemon"
@@ -2353,6 +2358,17 @@ fn desktop_bridge_preflight_has_conflicting_helper_modes(command: &Commands) -> 
     )
 }
 
+fn desktop_relay_is_prepared_command(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Desktop {
+            command: DesktopCommand::Relay {
+                command: DesktopRelayCommand::ConsumePreparedTranscript(_),
+            },
+        }
+    )
+}
+
 fn dispatch_existing_daemon_command(command: Commands, layout: &FsLayout) -> Result<Value> {
     let argv = daemon_argv_for_mutating_command(&command)?
         .context("command cannot be dispatched to an existing daemon")?;
@@ -2394,15 +2410,13 @@ fn dispatch_desktop_relay_consume_transcript_via_daemon(
     layout: &FsLayout,
     startup_timeout_seconds: u64,
 ) -> Result<Value> {
-    let now = args.now.unwrap_or(now_epoch_seconds()?);
-    let prepared =
-        prepare_desktop_transcript_relay_consumption(&args.rollout_path, &args.marker, now)?;
-    let argv = daemon_argv_for_prepared_desktop_transcript_relay(prepared, args.json)?;
+    let prepared = prepare_desktop_transcript_relay_consumption(&args.rollout_path, &args.marker)?;
+    let argv = daemon_argv_for_prepared_desktop_transcript_relay(prepared, args.json, args.now)?;
     validate_daemon_autostart_endpoint(layout)?;
     let ensure_options = DaemonEnsureOptions {
         idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
         startup_timeout_seconds,
-        startup_sweep_now: Some(now),
+        startup_sweep_now: Some(args.now.unwrap_or(now_epoch_seconds()?)),
         replace_incompatible: false,
     };
     daemon_ensure(layout, ensure_options)?;
@@ -2504,7 +2518,7 @@ pub(crate) fn dispatch_daemon_argv(layout: &FsLayout, argv: Vec<Vec<u8>>) -> Res
     match cli.command {
         Commands::Daemon { .. } => bail!("daemon dispatch cannot execute daemon commands"),
         Commands::Self_ { .. } => bail!("daemon dispatch cannot execute self update commands"),
-        command => dispatch(command, layout, DispatchMode::Direct),
+        command => dispatch(command, layout, DispatchMode::Daemon),
     }
 }
 
@@ -8996,6 +9010,7 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
 fn daemon_argv_for_prepared_desktop_transcript_relay(
     prepared: PreparedDesktopTranscriptRelayConsumption,
     json_output: bool,
+    now_override: Option<i64>,
 ) -> Result<Vec<OsString>> {
     let trusted_entry_json = serde_json::to_string(&prepared.trusted_entry)?;
     let mut argv = vec![
@@ -9037,7 +9052,9 @@ fn daemon_argv_for_prepared_desktop_transcript_relay(
     if json_output {
         argv.push(OsString::from("--json"));
     }
-    push_i64_arg(&mut argv, "--now", prepared.request.now);
+    if let Some(now) = now_override {
+        push_i64_arg(&mut argv, "--now", now);
+    }
     Ok(argv)
 }
 
@@ -10226,14 +10243,11 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
         DesktopCommand::Relay {
             command: DesktopRelayCommand::ConsumeTranscript(args),
         } => {
-            let now = args.now.unwrap_or(now_epoch_seconds()?);
-            let prepared = prepare_desktop_transcript_relay_consumption(
-                &args.rollout_path,
-                &args.marker,
-                now,
-            )?;
+            let prepared =
+                prepare_desktop_transcript_relay_consumption(&args.rollout_path, &args.marker)?;
             let mut store = Store::open(layout)?;
-            let consumption = consume_prepared_desktop_transcript_relay(&mut store, prepared)?;
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            let consumption = consume_prepared_desktop_transcript_relay(&mut store, prepared, now)?;
             Ok(json!({ "desktop_transcript_relay_consumption": consumption }))
         }
         DesktopCommand::Relay {
@@ -10241,6 +10255,7 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
         } => {
             let trusted_entry: Value = serde_json::from_str(&args.trusted_entry_json)
                 .context("parse trusted transcript relay entry JSON")?;
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
             let prepared = PreparedDesktopTranscriptRelayConsumption {
                 request: NewDesktopTranscriptRelayConsumption {
                     marker: args.marker.clone(),
@@ -10252,7 +10267,7 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
                     generation: args.generation,
                     bridge_request_id: args.bridge_request_id.clone(),
                     bridge_arm_lease_id: args.bridge_arm_lease_id.clone(),
-                    now: args.now,
+                    now,
                 },
                 rollout_path: args.rollout_path.display().to_string(),
                 marker: args.marker,
@@ -10260,7 +10275,7 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
                 envelope_hash: args.envelope_hash,
             };
             let mut store = Store::open(layout)?;
-            let consumption = consume_prepared_desktop_transcript_relay(&mut store, prepared)?;
+            let consumption = consume_prepared_desktop_transcript_relay(&mut store, prepared, now)?;
             Ok(json!({ "desktop_transcript_relay_consumption": consumption }))
         }
         DesktopCommand::Validation {
@@ -11109,7 +11124,6 @@ struct PreparedDesktopTranscriptRelayConsumption {
 fn prepare_desktop_transcript_relay_consumption(
     rollout_path: &Path,
     marker: &str,
-    now: i64,
 ) -> Result<PreparedDesktopTranscriptRelayConsumption> {
     let scan = scan_desktop_transcript_writeback(rollout_path, marker)?;
     let entry = trusted_desktop_transcript_relay_entry(&scan)?;
@@ -11145,7 +11159,7 @@ fn prepare_desktop_transcript_relay_consumption(
             generation,
             bridge_request_id,
             bridge_arm_lease_id,
-            now,
+            now: 0,
         },
         rollout_path: rollout_path.display().to_string(),
         marker: marker.to_owned(),
@@ -11156,8 +11170,10 @@ fn prepare_desktop_transcript_relay_consumption(
 
 fn consume_prepared_desktop_transcript_relay(
     store: &mut Store,
-    prepared: PreparedDesktopTranscriptRelayConsumption,
+    mut prepared: PreparedDesktopTranscriptRelayConsumption,
+    now: i64,
 ) -> Result<Value> {
+    prepared.request.now = now;
     let record = store.consume_desktop_transcript_relay(prepared.request)?;
     Ok(json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,

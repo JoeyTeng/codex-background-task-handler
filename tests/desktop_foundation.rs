@@ -2172,6 +2172,39 @@ fn desktop_transcript_relay_consumer_scans_before_daemon_autostart() {
             .exists()
     );
 
+    let forged_home = temp_home();
+    let forged_error = cbth_failure(
+        &forged_home,
+        &[
+            "desktop",
+            "relay",
+            "consume-prepared-transcript",
+            "--rollout-path",
+            "forged-rollout.jsonl",
+            "--marker",
+            "CBTH_FORGED_PREPARED",
+            "--envelope-hash",
+            "forged-hash",
+            "--envelope-kind",
+            "arm_pending_requested",
+            "--envelope-json",
+            "{\"kind\":\"arm_pending_requested\"}",
+            "--trusted-entry-json",
+            "{\"carrier\":\"trusted_auto\",\"record_line\":1,\"record_type\":\"response_item\",\"payload_type\":\"function_call_output\"}",
+            "--source-thread-id",
+            "thread-forged",
+            "--attempt-id",
+            "attempt-forged",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-forged",
+            "--json",
+        ],
+    );
+    assert!(forged_error.contains("daemon-internal"));
+    assert!(!forged_home.path().join("cbth.sqlite3").exists());
+
     let trusted_home = temp_home();
     let fixture = cbth(
         &trusted_home,
