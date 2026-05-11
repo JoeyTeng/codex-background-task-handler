@@ -93,6 +93,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-inbox-revisioned-installation-state",
     "desktop-writeback-helper-foundation",
     "desktop-writeback-live-validation-fixture",
+    "desktop-transcript-relay-consumer",
 ];
 const CLI_THREAD_START_BOOTSTRAP_BOUND_THREAD_ID: &str = "__cbth_thread_start_bootstrap__";
 const CLI_FOREGROUND_THREAD_BOOTSTRAP_BOUND_THREAD_ID: &str =

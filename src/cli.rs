@@ -21,6 +21,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use semver::Version;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::artifact::{ingest_result_file, remove_ingest_marker_best_effort};
 use crate::cli_app_server_client::{
@@ -43,8 +44,8 @@ use crate::models::{
     CliManagedSessionProfileRequirement, DEFAULT_MAX_DELIVERY_ATTEMPTS,
     DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, DesktopInstallationStateRecord,
     NewAuditDecision, NewCliAcceptPendingAttempt, NewCliManagedSessionPermissionSnapshot,
-    NewDesktopInstallationRepair, NewDesktopWritebackFixture, NewJob, PartialDeliveryPolicy,
-    SubmitMetadata, SweepReport,
+    NewDesktopInstallationRepair, NewDesktopTranscriptRelayConsumption, NewDesktopWritebackFixture,
+    NewJob, PartialDeliveryPolicy, SubmitMetadata, SweepReport,
 };
 use crate::self_update::{
     SelfUpdateOptions, current_release_target_triple, run_self_update, run_self_update_interactive,
@@ -110,6 +111,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-inbox-revisioned-installation-state",
     "desktop-writeback-helper-foundation",
     "desktop-writeback-live-validation-fixture",
+    "desktop-transcript-relay-consumer",
 ];
 
 #[derive(Debug, Parser)]
@@ -276,6 +278,11 @@ enum DesktopCommand {
         about = "Record that a Desktop caller heartbeat arm was accepted"
     )]
     NoteArm(DesktopNoteArmArgs),
+    #[command(about = "Consume Desktop transcript relay envelopes")]
+    Relay {
+        #[command(subcommand)]
+        command: DesktopRelayCommand,
+    },
     #[command(name = "validation", hide = true)]
     Validation {
         #[command(subcommand)]
@@ -405,6 +412,16 @@ enum DesktopValidationCommand {
     )]
     EmitTranscriptWritebackProbe(DesktopEmitTranscriptWritebackProbeArgs),
     #[command(
+        name = "emit-transcript-arm-pending",
+        about = "Emit a Desktop transcript arm-pending request envelope"
+    )]
+    EmitTranscriptArmPending(DesktopEmitTranscriptArmPendingArgs),
+    #[command(
+        name = "emit-transcript-arm",
+        about = "Emit a Desktop transcript arm request envelope"
+    )]
+    EmitTranscriptArm(DesktopEmitTranscriptArmArgs),
+    #[command(
         name = "scan-transcript-writeback",
         about = "Scan a Codex rollout for Desktop transcript writeback envelopes"
     )]
@@ -419,6 +436,15 @@ enum DesktopValidationCommand {
         about = "Write a validation-only Desktop dropbox probe file"
     )]
     WritebackDropboxProbe(DesktopWritebackDropboxProbeArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum DesktopRelayCommand {
+    #[command(
+        name = "consume-transcript",
+        about = "Consume one trusted Desktop transcript writeback envelope"
+    )]
+    ConsumeTranscript(DesktopRelayConsumeTranscriptArgs),
 }
 
 #[derive(Debug, Args)]
@@ -440,6 +466,57 @@ struct DesktopEmitTranscriptWritebackProbeArgs {
 }
 
 #[derive(Debug, Args)]
+struct DesktopEmitTranscriptArmPendingArgs {
+    #[arg(long)]
+    source_thread_id: String,
+
+    #[arg(long)]
+    attempt_id: String,
+
+    #[arg(long)]
+    generation: i64,
+
+    #[arg(long)]
+    bridge_request_id: String,
+
+    #[arg(long, help = "Unique high-entropy transcript relay marker")]
+    marker: String,
+
+    #[arg(long, help = "Emit the prefixed JSON envelope")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopEmitTranscriptArmArgs {
+    #[arg(long)]
+    source_thread_id: String,
+
+    #[arg(long)]
+    attempt_id: String,
+
+    #[arg(long)]
+    generation: i64,
+
+    #[arg(long)]
+    bridge_request_id: String,
+
+    #[arg(long)]
+    bridge_arm_lease_id: String,
+
+    #[arg(long, help = "Unique high-entropy transcript relay marker")]
+    marker: String,
+
+    #[arg(long, help = "Emit the prefixed JSON envelope")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
 struct DesktopScanTranscriptWritebackArgs {
     #[arg(long, help = "Codex rollout JSONL path to scan")]
     rollout_path: PathBuf,
@@ -449,6 +526,21 @@ struct DesktopScanTranscriptWritebackArgs {
 
     #[arg(long, help = "Emit JSON output")]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct DesktopRelayConsumeTranscriptArgs {
+    #[arg(long, help = "Codex rollout JSONL path to scan")]
+    rollout_path: PathBuf,
+
+    #[arg(long, help = "Unique marker to consume")]
+    marker: String,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
 }
 
 #[derive(Debug, Args)]
@@ -2054,6 +2146,24 @@ pub fn run() -> Result<()> {
                 },
         } => {
             write_desktop_transcript_writeback_probe(args)?;
+            return Ok(());
+        }
+        Commands::Desktop {
+            command:
+                DesktopCommand::Validation {
+                    command: DesktopValidationCommand::EmitTranscriptArmPending(args),
+                },
+        } => {
+            write_desktop_transcript_arm_pending(args)?;
+            return Ok(());
+        }
+        Commands::Desktop {
+            command:
+                DesktopCommand::Validation {
+                    command: DesktopValidationCommand::EmitTranscriptArm(args),
+                },
+        } => {
+            write_desktop_transcript_arm(args)?;
             return Ok(());
         }
         command => dispatch(
@@ -8695,6 +8805,31 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
         }
         Commands::Desktop {
             command:
+                DesktopCommand::Relay {
+                    command: DesktopRelayCommand::ConsumeTranscript(args),
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("desktop"),
+                OsString::from("relay"),
+                OsString::from("consume-transcript"),
+            ];
+            push_path_arg(
+                &mut argv,
+                "--rollout-path",
+                &absolute_cli_path(&args.rollout_path)?,
+            );
+            push_string_arg(&mut argv, "--marker", &args.marker);
+            if args.json {
+                argv.push(OsString::from("--json"));
+            }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Desktop {
+            command:
                 DesktopCommand::Validation {
                     command: DesktopValidationCommand::PrepareWritebackFixture(args),
                 },
@@ -8728,6 +8863,8 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
                 DesktopCommand::Validation {
                     command:
                         DesktopValidationCommand::EmitTranscriptWritebackProbe(_)
+                        | DesktopValidationCommand::EmitTranscriptArmPending(_)
+                        | DesktopValidationCommand::EmitTranscriptArm(_)
                         | DesktopValidationCommand::ScanTranscriptWriteback(_)
                         | DesktopValidationCommand::WritebackDropboxProbe(_),
                 },
@@ -9973,6 +10110,19 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
             )?;
             Ok(json!({ "desktop_arm": record }))
         }
+        DesktopCommand::Relay {
+            command: DesktopRelayCommand::ConsumeTranscript(args),
+        } => {
+            let mut store = Store::open(layout)?;
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            let consumption = consume_desktop_transcript_relay(
+                &mut store,
+                &args.rollout_path,
+                &args.marker,
+                now,
+            )?;
+            Ok(json!({ "desktop_transcript_relay_consumption": consumption }))
+        }
         DesktopCommand::Validation {
             command: DesktopValidationCommand::PrepareWritebackFixture(args),
         } => {
@@ -10003,6 +10153,12 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
         } => {
             bail!("emit-transcript-writeback-probe must execute from the foreground client")
         }
+        DesktopCommand::Validation {
+            command: DesktopValidationCommand::EmitTranscriptArmPending(_),
+        } => bail!("emit-transcript-arm-pending must execute from the foreground client"),
+        DesktopCommand::Validation {
+            command: DesktopValidationCommand::EmitTranscriptArm(_),
+        } => bail!("emit-transcript-arm must execute from the foreground client"),
         DesktopCommand::Validation {
             command: DesktopValidationCommand::ScanTranscriptWriteback(args),
         } => {
@@ -10492,6 +10648,90 @@ fn desktop_transcript_writeback_probe_envelope(
     }))
 }
 
+fn desktop_transcript_arm_pending_envelope(
+    source_thread_id: &str,
+    attempt_id: &str,
+    generation: i64,
+    bridge_request_id: &str,
+    marker: &str,
+    now: i64,
+) -> Result<Value> {
+    validate_desktop_transcript_arm_fields(
+        source_thread_id,
+        attempt_id,
+        generation,
+        bridge_request_id,
+        marker,
+    )?;
+    Ok(json!({
+        "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "channel": DESKTOP_TRANSCRIPT_WRITEBACK_CHANNEL,
+        "kind": "arm_pending_requested",
+        "source_thread_id": source_thread_id,
+        "attempt_id": attempt_id,
+        "generation": generation,
+        "bridge_request_id": bridge_request_id,
+        "marker": marker,
+        "created_at": now,
+        "cbth_version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+fn desktop_transcript_arm_envelope(
+    source_thread_id: &str,
+    attempt_id: &str,
+    generation: i64,
+    bridge_request_id: &str,
+    bridge_arm_lease_id: &str,
+    marker: &str,
+    now: i64,
+) -> Result<Value> {
+    validate_desktop_transcript_arm_fields(
+        source_thread_id,
+        attempt_id,
+        generation,
+        bridge_request_id,
+        marker,
+    )?;
+    validate_nonempty("bridge_arm_lease_id", bridge_arm_lease_id)?;
+    Ok(json!({
+        "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "channel": DESKTOP_TRANSCRIPT_WRITEBACK_CHANNEL,
+        "kind": "arm_requested",
+        "source_thread_id": source_thread_id,
+        "attempt_id": attempt_id,
+        "generation": generation,
+        "bridge_request_id": bridge_request_id,
+        "bridge_arm_lease_id": bridge_arm_lease_id,
+        "marker": marker,
+        "created_at": now,
+        "cbth_version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+fn validate_desktop_transcript_arm_fields(
+    source_thread_id: &str,
+    attempt_id: &str,
+    generation: i64,
+    bridge_request_id: &str,
+    marker: &str,
+) -> Result<()> {
+    validate_nonempty("source_thread_id", source_thread_id)?;
+    validate_nonempty("attempt_id", attempt_id)?;
+    if generation <= 0 {
+        bail!("generation must be positive");
+    }
+    validate_nonempty("bridge_request_id", bridge_request_id)?;
+    validate_nonempty("marker", marker)?;
+    if marker.len() > DESKTOP_TRANSCRIPT_WRITEBACK_MAX_MARKER_BYTES {
+        bail!(
+            "marker exceeds {} bytes",
+            DESKTOP_TRANSCRIPT_WRITEBACK_MAX_MARKER_BYTES
+        );
+    }
+    Ok(())
+}
+
 fn write_desktop_transcript_writeback_probe(
     args: DesktopEmitTranscriptWritebackProbeArgs,
 ) -> Result<()> {
@@ -10503,6 +10743,41 @@ fn write_desktop_transcript_writeback_probe(
         now,
     )?;
     let envelope = serde_json::to_string(&envelope)?;
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    writeln!(lock, "{DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX}{envelope}")?;
+    Ok(())
+}
+
+fn write_desktop_transcript_arm_pending(args: DesktopEmitTranscriptArmPendingArgs) -> Result<()> {
+    let now = args.now.unwrap_or(now_epoch_seconds()?);
+    let envelope = desktop_transcript_arm_pending_envelope(
+        &args.source_thread_id,
+        &args.attempt_id,
+        args.generation,
+        &args.bridge_request_id,
+        &args.marker,
+        now,
+    )?;
+    write_desktop_transcript_writeback_envelope(&envelope)
+}
+
+fn write_desktop_transcript_arm(args: DesktopEmitTranscriptArmArgs) -> Result<()> {
+    let now = args.now.unwrap_or(now_epoch_seconds()?);
+    let envelope = desktop_transcript_arm_envelope(
+        &args.source_thread_id,
+        &args.attempt_id,
+        args.generation,
+        &args.bridge_request_id,
+        &args.bridge_arm_lease_id,
+        &args.marker,
+        now,
+    )?;
+    write_desktop_transcript_writeback_envelope(&envelope)
+}
+
+fn write_desktop_transcript_writeback_envelope(envelope: &Value) -> Result<()> {
+    let envelope = serde_json::to_string(envelope)?;
     let stdout = io::stdout();
     let mut lock = stdout.lock();
     writeln!(lock, "{DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX}{envelope}")?;
@@ -10681,6 +10956,130 @@ fn scan_desktop_transcript_writeback(rollout_path: &Path, marker: &str) -> Resul
         "ignored_prompt": ignored_prompt,
         "rejected": rejected,
     }))
+}
+
+fn consume_desktop_transcript_relay(
+    store: &mut Store,
+    rollout_path: &Path,
+    marker: &str,
+    now: i64,
+) -> Result<Value> {
+    let scan = scan_desktop_transcript_writeback(rollout_path, marker)?;
+    let entry = trusted_desktop_transcript_relay_entry(&scan)?;
+    let envelope = entry
+        .get("envelope")
+        .cloned()
+        .context("trusted transcript entry missing envelope")?;
+    let kind = json_str_field(&envelope, "kind", "transcript envelope")?.to_owned();
+    if kind != "arm_pending_requested" && kind != "arm_requested" {
+        bail!("trusted transcript envelope kind {kind} is not consumable");
+    }
+    let canonical_envelope_json = canonical_json(&envelope)?;
+    let envelope_hash = sha256_hex(canonical_envelope_json.as_bytes());
+    let source_thread_id =
+        json_str_field(&envelope, "source_thread_id", "transcript envelope")?.to_owned();
+    let attempt_id = json_str_field(&envelope, "attempt_id", "transcript envelope")?.to_owned();
+    let generation = json_i64_field(&envelope, "generation", "transcript envelope")?;
+    let bridge_request_id =
+        json_str_field(&envelope, "bridge_request_id", "transcript envelope")?.to_owned();
+    let bridge_arm_lease_id = if kind == "arm_requested" {
+        Some(json_str_field(&envelope, "bridge_arm_lease_id", "transcript envelope")?.to_owned())
+    } else {
+        None
+    };
+    let record = store.consume_desktop_transcript_relay(NewDesktopTranscriptRelayConsumption {
+        marker: marker.to_owned(),
+        envelope_hash: envelope_hash.clone(),
+        envelope_kind: kind.clone(),
+        envelope_json: canonical_envelope_json,
+        source_thread_id,
+        attempt_id,
+        generation,
+        bridge_request_id,
+        bridge_arm_lease_id,
+        now,
+    })?;
+    Ok(json!({
+        "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "rollout_path": rollout_path.display().to_string(),
+        "marker": marker,
+        "trusted_entry": {
+            "carrier": entry["carrier"].clone(),
+            "record_line": entry["record_line"].clone(),
+            "record_type": entry["record_type"].clone(),
+            "payload_type": entry["payload_type"].clone(),
+        },
+        "envelope_hash": envelope_hash,
+        "record": record,
+    }))
+}
+
+fn trusted_desktop_transcript_relay_entry(scan: &Value) -> Result<&Value> {
+    let auto_decision = json_object_field(scan, "auto_decision")?;
+    let trusted = auto_decision
+        .get("trusted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !trusted {
+        let reason = auto_decision
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("untrusted_transcript_scan");
+        bail!("Desktop transcript relay scan is not trusted: {reason}");
+    }
+    let entries = json_array_field(scan, "trusted_auto")?;
+    if entries.len() != 1 {
+        bail!(
+            "Desktop transcript relay requires exactly one trusted_auto envelope, got {}",
+            entries.len()
+        );
+    }
+    Ok(&entries[0])
+}
+
+fn canonical_json(value: &Value) -> Result<String> {
+    let mut output = String::new();
+    write_canonical_json(value, &mut output)?;
+    Ok(output)
+}
+
+fn write_canonical_json(value: &Value, output: &mut String) -> Result<()> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            output.push_str(&serde_json::to_string(value)?);
+        }
+        Value::Array(items) => {
+            output.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                write_canonical_json(item, output)?;
+            }
+            output.push(']');
+        }
+        Value::Object(map) => {
+            output.push('{');
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key)?);
+                output.push(':');
+                write_canonical_json(&map[*key], output)?;
+            }
+            output.push('}');
+        }
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn read_bounded_desktop_transcript_line<R: BufRead>(
@@ -10879,22 +11278,38 @@ fn validate_desktop_transcript_writeback_envelope(
     if channel != DESKTOP_TRANSCRIPT_WRITEBACK_CHANNEL {
         bail!("transcript envelope channel must be {DESKTOP_TRANSCRIPT_WRITEBACK_CHANNEL}");
     }
-    for field in ["kind", "bridge_thread_id", "probe_id", "created_at"] {
-        if value.get(field).is_none_or(Value::is_null) {
-            bail!("transcript envelope missing {field}");
-        }
-    }
-    if value["kind"].as_str() != Some("validation_probe") {
-        bail!("transcript envelope kind must be validation_probe");
-    }
-    if value["bridge_thread_id"].as_str().is_none() {
-        bail!("transcript envelope bridge_thread_id must be a string");
-    }
-    if value["probe_id"].as_str().is_none() {
-        bail!("transcript envelope probe_id must be a string");
-    }
+    let kind = value["kind"]
+        .as_str()
+        .context("transcript envelope missing kind")?;
     if value["created_at"].as_i64().is_none() {
         bail!("transcript envelope created_at must be an integer");
+    }
+    match kind {
+        "validation_probe" => {
+            if value["bridge_thread_id"].as_str().is_none() {
+                bail!("transcript envelope bridge_thread_id must be a string");
+            }
+            if value["probe_id"].as_str().is_none() {
+                bail!("transcript envelope probe_id must be a string");
+            }
+        }
+        "arm_pending_requested" | "arm_requested" => {
+            for field in ["source_thread_id", "attempt_id", "bridge_request_id"] {
+                if value[field].as_str().is_none() {
+                    bail!("transcript envelope {field} must be a string");
+                }
+            }
+            let generation = value["generation"]
+                .as_i64()
+                .context("transcript envelope generation must be an integer")?;
+            if generation <= 0 {
+                bail!("transcript envelope generation must be positive");
+            }
+            if kind == "arm_requested" && value["bridge_arm_lease_id"].as_str().is_none() {
+                bail!("transcript envelope bridge_arm_lease_id must be a string");
+            }
+        }
+        _ => bail!("unsupported transcript envelope kind {kind}"),
     }
     Ok(Some(value))
 }

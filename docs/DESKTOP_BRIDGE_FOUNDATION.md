@@ -41,9 +41,13 @@ cbth desktop note-arm \
   --bridge-request-id <request-id> \
   --bridge-arm-lease-id <lease-id> \
   --json
+cbth desktop relay consume-transcript \
+  --rollout-path <rollout-jsonl> \
+  --marker <marker> \
+  --json
 ```
 
-所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation` 或 validation-only `desktop-writeback-live-validation-fixture` capability 时会按现有 capability gate fail closed 或重启。`read-snapshot` / `list-*` / `claim-next-ready` 是 no-DB read helpers：它们只读取已经发布的 inbox JSON，不打开 SQLite、不连接 daemon、不写文件。
+所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation`、validation-only `desktop-writeback-live-validation-fixture` 或 `desktop-transcript-relay-consumer` capability 时会按现有 capability gate fail closed 或重启。`read-snapshot` / `list-*` / `claim-next-ready` 是 no-DB read helpers：它们只读取已经发布的 inbox JSON，不打开 SQLite、不连接 daemon、不写文件。
 
 另有一个 hidden validation-only probe：`cbth desktop validation writeback-dropbox-probe ...`。它不属于稳定 operator surface，只用于验证真实 Desktop heartbeat 能否在不打开 SQLite、不连接 daemon、不触碰 `startup.lock` 的情况下创建或 append `~/.cbth/inbox/writeback-dropbox/probes/<probe_id>.json`。
 
@@ -142,7 +146,7 @@ cbth desktop note-arm \
 
 真实 Desktop heartbeat 已证明 daemon-routed writeback helper 会在 `note-arm-pending` 前被 `startup.lock` sandbox `EPERM` 阻断。后续 hidden writeback dropbox probe 又证明 heartbeat 不能在 `~/.cbth/inbox/writeback-dropbox` 下创建目录、创建 probe file，或打开预创建的 probe file 追加写入。因此 Desktop v1 不应继续依赖 heartbeat-authored local filesystem writeback；`writeback_capability` 仍保持 `unknown`。
 
-当前首选的下一条 side channel 是 transcript / tool-output relay：heartbeat 只运行一个 pure stdout helper，输出带 `CBTH_TRANSCRIPT_WRITEBACK_V1` 前缀的结构化 envelope；外部 operator / sidecar 从 Codex rollout 的 `function_call_output` carrier 中读取精确 stdout，再在 Desktop sandbox 外执行真实 durable CAS writeback。scanner 必须把 `function_call_output` 视为唯一当前 `trusted_auto` carrier，把 assistant final text 归类为 `diagnostic_only`，把 heartbeat prompt 归类为 `ignored_prompt`，避免 prompt 自触发。该 validation surface 记录在 [Desktop transcript relay validation](DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md)。
+当前首选的 side channel 是 transcript / tool-output relay：heartbeat 只运行 pure stdout helper，输出带 `CBTH_TRANSCRIPT_WRITEBACK_V1` 前缀的结构化 envelope；外部 operator / sidecar 从 Codex rollout 的 `function_call_output` carrier 中读取精确 stdout，再在 Desktop sandbox 外执行真实 durable CAS writeback。scanner 必须把 `function_call_output` 视为唯一当前 `trusted_auto` carrier，把 assistant final text 归类为 `diagnostic_only`，把 heartbeat prompt 归类为 `ignored_prompt`，避免 prompt 自触发。`cbth desktop relay consume-transcript` 现在可以消费单个可信 `arm_pending_requested` / `arm_requested` envelope，并通过 marker + canonical envelope hash 做 durable replay fence 后调用既有 `note-arm-pending` / `note-arm` CAS。该 validation surface 记录在 [Desktop transcript relay validation](DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md)。
 
 ## No-DB Inbox Read Helpers
 
@@ -167,10 +171,11 @@ cbth desktop note-arm \
 
 - 未 validated 的 installation state 不允许 automatic Desktop delivery。
 - `degraded` binding 不允许 automatic Desktop delivery。
-- 默认 daemon-routed preflight / writeback 缺少 daemon capability `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation` 或 validation-only `desktop-writeback-live-validation-fixture` 时不执行 preflight / repair / writeback / fixture setup。
+- 默认 daemon-routed preflight / writeback 缺少 daemon capability `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation`、validation-only `desktop-writeback-live-validation-fixture` 或 `desktop-transcript-relay-consumer` 时不执行 preflight / repair / writeback / fixture setup / relay consume。
 - preflight 失败时 bridge 不得读取旧 snapshot 继续 arm。
 - no-DB read helper 发现 manifest / snapshot 不一致时不得继续 delivery。
 - writeback helper 发现 CAS token、binding、batch、attempt 或 policy 不匹配时不得推进 durable state。
+- transcript relay consumer 只接受单个 trusted `function_call_output` envelope；prompt、assistant text、duplicate trusted、malformed trusted、wrong marker 或 replay hash mismatch 都不得推进 durable state。
 - writeback dropbox probe 只允许 validation-only file creation；它不得绕过 `note-arm-pending` / `note-arm` 的 durable CAS，也不得被解释为 automatic Desktop delivery 已启用。
 - `ready_threads.entries` 为空不是“没有任何未来工作”的最终语义；它只是本阶段尚未实现 ready materialization。
 
