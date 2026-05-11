@@ -1920,6 +1920,12 @@ struct DaemonEnsureArgs {
         help = "How long to wait for startup readiness"
     )]
     startup_timeout_seconds: u64,
+
+    #[arg(
+        long,
+        help = "Explicitly stop and replace an incompatible daemon instead of failing closed"
+    )]
+    replace_incompatible: bool,
 }
 
 pub fn run() -> Result<()> {
@@ -2076,6 +2082,7 @@ fn dispatch(command: Commands, layout: &FsLayout, mode: DispatchMode) -> Result<
             idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
             startup_timeout_seconds,
             startup_sweep_now,
+            replace_incompatible: false,
         };
         daemon_ensure(layout, ensure_options)?;
         return daemon_request_payload(layout, "dispatch", json!({ "argv": argv_payload(argv) }));
@@ -2232,6 +2239,7 @@ fn dispatch_daemon_task_command(
             idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
             startup_timeout_seconds,
             startup_sweep_now: Some(now_epoch_seconds()?),
+            replace_incompatible: false,
         },
     )?;
     daemon_request_payload(layout, daemon_command, payload)
@@ -2312,6 +2320,7 @@ fn run_cli_session(
             idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
             startup_timeout_seconds,
             startup_sweep_now: Some(now_epoch_seconds()?),
+            replace_incompatible: false,
         },
     )?;
     if matches!(&config.target, CliSessionTargetConfig::NewThread) {
@@ -9245,6 +9254,7 @@ fn doctor_check_daemon(layout: &FsLayout, startup_timeout_seconds: u64) -> Resul
             idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
             startup_timeout_seconds,
             startup_sweep_now: Some(now_epoch_seconds()?),
+            replace_incompatible: false,
         },
     )?;
     let status = daemon_request(layout, "status")?;
@@ -10681,6 +10691,7 @@ fn dispatch_daemon(command: DaemonCommand, layout: &FsLayout) -> Result<Value> {
                     idle_timeout_seconds: args.idle_timeout_seconds,
                     startup_timeout_seconds: args.startup_timeout_seconds,
                     startup_sweep_now: Some(now_epoch_seconds()?),
+                    replace_incompatible: args.replace_incompatible,
                 },
             )
         }

@@ -126,6 +126,7 @@ pub struct DaemonEnsureOptions {
     pub idle_timeout_seconds: u64,
     pub startup_timeout_seconds: u64,
     pub startup_sweep_now: Option<i64>,
+    pub replace_incompatible: bool,
 }
 
 struct SocketCleanup<'a> {
@@ -630,7 +631,9 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
 pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<Value> {
     validate_daemon_autostart_endpoint(layout)?;
     let startup_deadline = Instant::now() + Duration::from_secs(options.startup_timeout_seconds);
-    if let Some(response) = probe_existing_daemon_for_ensure(layout, startup_deadline)? {
+    if let Some(response) =
+        probe_existing_daemon_for_ensure(layout, options.replace_incompatible, startup_deadline)?
+    {
         return Ok(json!({
             "started": false,
             "daemon": response["daemon"].clone(),
@@ -639,7 +642,9 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
 
     layout.ensure_run_dir()?;
     let _startup_lock = acquire_startup_lock(layout, remaining_budget(startup_deadline)?)?;
-    if let Some(response) = probe_existing_daemon_for_ensure(layout, startup_deadline)? {
+    if let Some(response) =
+        probe_existing_daemon_for_ensure(layout, options.replace_incompatible, startup_deadline)?
+    {
         return Ok(json!({
             "started": false,
             "daemon": response["daemon"].clone(),
@@ -690,19 +695,27 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
                 Ok(_) => {
                     let _ = child.kill();
                     let _ = child.wait();
+                    if !options.replace_incompatible {
+                        bail!(
+                            "incompatible daemon is already running; use --replace-incompatible to stop and replace it"
+                        );
+                    }
                     if let Some(response) = stop_incompatible_daemon(layout, startup_deadline)? {
                         return Ok(json!({
                             "started": false,
                             "daemon": response["daemon"].clone(),
+                            "replaced_incompatible_daemon": true,
                         }));
                     }
                     break;
                 }
                 Err(last_error) => {
                     if let Some(status) = child.try_wait().context("check daemon child status")? {
-                        if let Some(response) =
-                            probe_existing_daemon_for_ensure(layout, startup_deadline)?
-                        {
+                        if let Some(response) = probe_existing_daemon_for_ensure(
+                            layout,
+                            options.replace_incompatible,
+                            startup_deadline,
+                        )? {
                             return Ok(json!({
                                 "started": false,
                                 "daemon": response["daemon"].clone(),
@@ -1023,13 +1036,19 @@ fn remaining_budget(deadline: Instant) -> Result<Duration> {
 
 fn probe_existing_daemon_for_ensure(
     layout: &FsLayout,
+    replace_incompatible: bool,
     startup_deadline: Instant,
 ) -> Result<Option<Value>> {
     loop {
         match daemon_request_with_timeout(layout, "ping", remaining_budget(startup_deadline)?) {
             Ok(response) if daemon_response_is_compatible(&response) => return Ok(Some(response)),
             Ok(_) => {
-                return stop_incompatible_daemon(layout, startup_deadline);
+                if replace_incompatible {
+                    return stop_incompatible_daemon(layout, startup_deadline);
+                }
+                bail!(
+                    "incompatible daemon is already running; use --replace-incompatible to stop and replace it"
+                );
             }
             Err(error) if error_is_daemon_busy(&error) => {
                 thread::sleep(STARTUP_POLL_INTERVAL);

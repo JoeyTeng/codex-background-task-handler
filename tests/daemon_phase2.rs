@@ -417,6 +417,7 @@ fn daemon_ensure_starts_ping_status_and_stop() {
         &[
             "daemon",
             "ensure",
+            "--replace-incompatible",
             "--idle-timeout-seconds",
             "10",
             "--startup-timeout-seconds",
@@ -543,6 +544,7 @@ fn daemon_ensure_restarts_incompatible_daemon() {
         &[
             "daemon",
             "ensure",
+            "--replace-incompatible",
             "--idle-timeout-seconds",
             "10",
             "--startup-timeout-seconds",
@@ -587,6 +589,53 @@ fn daemon_ensure_restarts_incompatible_daemon() {
 
 #[cfg(unix)]
 #[test]
+fn daemon_ensure_fails_closed_for_incompatible_daemon_without_stop() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind legacy daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    let legacy_socket_path = socket_path.clone();
+    let handle = thread::spawn(move || {
+        let (mut stream, _addr) = listener.accept().expect("accept legacy request");
+        let mut request = String::new();
+        stream
+            .read_to_string(&mut request)
+            .expect("read legacy request");
+        assert!(
+            !request.contains("\"stop\""),
+            "default ensure must not stop incompatible daemon: {request}"
+        );
+        stream
+            .write_all(br#"{"ok":true,"response":{"daemon":{"pid":1},"message":"pong"}}"#)
+            .expect("write response");
+        stream.write_all(b"\n").expect("write response newline");
+        drop(listener);
+        fs::remove_file(&legacy_socket_path).expect("remove legacy socket");
+    });
+
+    let stderr = cbth_failure(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert!(
+        stderr.contains("--replace-incompatible"),
+        "unexpected stderr: {stderr}"
+    );
+    handle.join().expect("legacy daemon thread");
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
     let home = temp_home();
     let run_dir = home.path().join("run");
@@ -626,6 +675,7 @@ fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
         &[
             "daemon",
             "ensure",
+            "--replace-incompatible",
             "--idle-timeout-seconds",
             "10",
             "--startup-timeout-seconds",
@@ -708,6 +758,7 @@ fn daemon_ensure_restarts_daemon_missing_auto_delivery_capability() {
         &[
             "daemon",
             "ensure",
+            "--replace-incompatible",
             "--idle-timeout-seconds",
             "10",
             "--startup-timeout-seconds",
@@ -790,6 +841,7 @@ fn daemon_ensure_restarts_daemon_missing_session_capability_dispatch() {
         &[
             "daemon",
             "ensure",
+            "--replace-incompatible",
             "--idle-timeout-seconds",
             "10",
             "--startup-timeout-seconds",
@@ -922,6 +974,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
         &[
             "daemon",
             "ensure",
+            "--replace-incompatible",
             "--idle-timeout-seconds",
             "10",
             "--startup-timeout-seconds",
