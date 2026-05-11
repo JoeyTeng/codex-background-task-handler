@@ -341,3 +341,70 @@ read_transport_generation=1
 ```
 
 Conclusion: real Desktop heartbeat can execute `cbth`, but the current daemon-routed writeback helpers still hit the same `startup.lock` sandbox boundary before reaching `note-arm-pending`. Do not mark `writeback_capability=validated`. The next design step must avoid heartbeat-owned daemon autostart / startup-lock access for writeback, and should also account for the earlier evidence that heartbeat-owned SQLite WAL setup failed.
+
+## 2026-05-11 Attempt: Writeback Dropbox Local FS Probe Blocked
+
+Result: `VALIDATION_FAILED`
+
+Evidence:
+
+- Code branch: `codex/desktop-writeback-dropbox-probe`
+- Base merge commit: `2b4ea029aa2a665b142947d644ebee53ce5a56e6`
+- Local binary: `/Users/hoteng/.cache/cargo-target/release/cbth`
+- Local binary version: `cbth 0.1.5` built from current branch
+- Bridge thread id: `019db5e6-ba6a-7b80-95d2-a6867163281a`
+- Target rollout file: `/Users/hoteng/.codex/sessions/2026/04/22/rollout-2026-04-22T16-54-50-019db5e6-ba6a-7b80-95d2-a6867163281a.jsonl`
+
+The validation-only hidden command was:
+
+```text
+cbth desktop validation writeback-dropbox-probe --bridge-thread-id <bridge-thread-id> --probe-id <probe-id> --marker <marker> --json
+```
+
+It does not open SQLite, connect to daemon IPC, autostart the daemon, or touch `startup.lock`.
+
+First heartbeat attempt tested create-new mode with no pre-existing dropbox directory:
+
+```text
+automation_id=cbth-desktop-writeback-dropbox-probe-20260511t094529z
+marker=CBTH_DESKTOP_WRITEBACK_DROPBOX_PROBE_20260511T094529Z
+result=VALIDATION_FAILED step1_command_failed:create directory /Users/hoteng/.cbth/inbox/writeback-dropbox: Operation not permitted (os error 1)
+heartbeat_timestamp=2026-05-11T09:46:59.345Z
+```
+
+Second heartbeat attempt tested create-new mode after the operator pre-created the dropbox directory:
+
+```text
+automation_id=cbth-desktop-writeback-dropbox-probe-existing-dir-20260511t094809z
+marker=CBTH_DESKTOP_WRITEBACK_DROPBOX_EXISTING_DIR_20260511T094809Z
+result=VALIDATION_FAILED step1_command_failed:create file /Users/hoteng/.cbth/inbox/writeback-dropbox/probes/cbth_desktop_writeback_dropbox_existing_dir_20260511T094809Z.json: Operation not permitted (os error 1)
+heartbeat_timestamp=2026-05-11T09:49:27.850Z
+```
+
+Third heartbeat attempt tested `--append-existing` after the operator pre-created an empty private probe file:
+
+```text
+automation_id=cbth-desktop-writeback-dropbox-append-existing-20260511t094809z
+marker=CBTH_DESKTOP_WRITEBACK_DROPBOX_APPEND_EXISTING_20260511T094809Z
+result=VALIDATION_FAILED step1_command_failed:open existing probe file /Users/hoteng/.cbth/inbox/writeback-dropbox/probes/cbth_desktop_writeback_dropbox_append_existing_20260511T094809Z.json: Operation not permitted (os error 1)
+heartbeat_timestamp=2026-05-11T09:54:28.433Z
+```
+
+Operator inspection after the append-existing attempt showed the path was present, private, and still empty:
+
+```text
+drwx------ /Users/hoteng/.cbth/inbox
+drwx------ /Users/hoteng/.cbth/inbox/writeback-dropbox
+drwx------ /Users/hoteng/.cbth/inbox/writeback-dropbox/probes
+-rw------- 0 bytes /Users/hoteng/.cbth/inbox/writeback-dropbox/probes/cbth_desktop_writeback_dropbox_append_existing_20260511T094809Z.json
+```
+
+All temporary heartbeat automations were deleted after the attempts. The installation state remains:
+
+```text
+read_transport_capability=validated
+artifact_read_capability=unknown
+writeback_capability=unknown
+```
+
+Conclusion: real Desktop heartbeat can execute no-DB read helpers, but cannot create directories, create files, or open pre-created files for append under `~/.cbth/inbox/writeback-dropbox`. Local filesystem writeback from Desktop heartbeat is not viable for v1. The next writeback design should use a non-filesystem side channel or a Desktop-exposed tool result / automation mechanism instead of heartbeat-authored local files.

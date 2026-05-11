@@ -45,6 +45,8 @@ cbth desktop note-arm \
 
 所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation` 或 validation-only `desktop-writeback-live-validation-fixture` capability 时会按现有 capability gate fail closed 或重启。`read-snapshot` / `list-*` / `claim-next-ready` 是 no-DB read helpers：它们只读取已经发布的 inbox JSON，不打开 SQLite、不连接 daemon、不写文件。
 
+另有一个 hidden validation-only probe：`cbth desktop validation writeback-dropbox-probe ...`。它不属于稳定 operator surface，只用于验证真实 Desktop heartbeat 能否在不打开 SQLite、不连接 daemon、不触碰 `startup.lock` 的情况下创建或 append `~/.cbth/inbox/writeback-dropbox/probes/<probe_id>.json`。
+
 ## Installation State
 
 `desktop_installation_state` 是 Desktop 安装级 capability authority。它负责回答“当前这台机器上的 Desktop bridge 可以用哪一种读取路径，以及这些 capability 结论是否还可信”。
@@ -138,6 +140,8 @@ cbth desktop note-arm \
 
 这些 helper 是 capability validation 的候选面，但 `writeback_capability` 仍只能由 operator 在真实 Desktop heartbeat 验证后通过 `installation-state repair` 写为 `validated`。
 
+真实 Desktop heartbeat 已证明 daemon-routed writeback helper 会在 `note-arm-pending` 前被 `startup.lock` sandbox `EPERM` 阻断。后续 hidden writeback dropbox probe 又证明 heartbeat 不能在 `~/.cbth/inbox/writeback-dropbox` 下创建目录、创建 probe file，或打开预创建的 probe file 追加写入。因此 Desktop v1 不应继续依赖 heartbeat-authored local filesystem writeback；`writeback_capability` 仍保持 `unknown`。
+
 ## No-DB Inbox Read Helpers
 
 真实 Desktop heartbeat 可能无法打开 SQLite、daemon socket 或 `startup.lock`。因此 heartbeat v1 可以改用 no-DB read helpers 消费已经发布的 inbox snapshot：
@@ -165,6 +169,7 @@ cbth desktop note-arm \
 - preflight 失败时 bridge 不得读取旧 snapshot 继续 arm。
 - no-DB read helper 发现 manifest / snapshot 不一致时不得继续 delivery。
 - writeback helper 发现 CAS token、binding、batch、attempt 或 policy 不匹配时不得推进 durable state。
+- writeback dropbox probe 只允许 validation-only file creation；它不得绕过 `note-arm-pending` / `note-arm` 的 durable CAS，也不得被解释为 automatic Desktop delivery 已启用。
 - `ready_threads.entries` 为空不是“没有任何未来工作”的最终语义；它只是本阶段尚未实现 ready materialization。
 
 ## Out Of Scope
@@ -174,7 +179,7 @@ cbth desktop note-arm \
 - caller heartbeat wake / `automation_update` 调用。
 - ready attempt materialization。
 - `note-boundary-crossed`。
-- writeback helper live Desktop heartbeat validation。
+- writeback helper live Desktop heartbeat validation beyond the validation-only dropbox probe.
 - Desktop automatic delivery live validation；preflight/read validation workflow is documented separately in [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](DESKTOP_LIVE_PREFLIGHT_VALIDATION.md).
 - 大 artifact automatic continuation。
 - 外部 Webex / GitHub / PR polling integrations。

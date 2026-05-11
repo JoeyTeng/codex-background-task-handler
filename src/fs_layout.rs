@@ -109,6 +109,19 @@ impl FsLayout {
             .join("desktop-installation-state.json")
     }
 
+    pub fn desktop_writeback_dropbox_dir(&self) -> PathBuf {
+        self.inbox_dir().join("writeback-dropbox")
+    }
+
+    pub fn desktop_writeback_dropbox_probes_dir(&self) -> PathBuf {
+        self.desktop_writeback_dropbox_dir().join("probes")
+    }
+
+    pub fn desktop_writeback_dropbox_probe_path(&self, probe_id: &str) -> PathBuf {
+        self.desktop_writeback_dropbox_probes_dir()
+            .join(format!("{probe_id}.json"))
+    }
+
     pub fn ensure(&self) -> Result<()> {
         ensure_private_dir(&self.home)?;
         ensure_private_dir(&self.artifacts_dir())?;

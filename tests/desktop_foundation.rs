@@ -1004,6 +1004,171 @@ fn desktop_writeback_validation_fixture_fail_closed_cases_and_help_hidden() {
 }
 
 #[test]
+fn desktop_writeback_dropbox_probe_writes_once_without_daemon_or_store() {
+    let home = temp_home();
+    let output = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "writeback-dropbox-probe",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--probe-id",
+            "probe-1",
+            "--marker",
+            "CBTH_DESKTOP_WRITEBACK_DROPBOX_PROBE_TEST",
+            "--json",
+            "--now",
+            "5100",
+        ],
+        false,
+    );
+    assert!(
+        output.status.success(),
+        "dropbox probe failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).expect("valid probe json");
+    let probe = &result["desktop_writeback_dropbox_probe"];
+    assert_eq!(probe["probe_id"], "probe-1");
+    assert_eq!(probe["bridge_thread_id"], "bridge-thread");
+    assert_eq!(probe["marker"], "CBTH_DESKTOP_WRITEBACK_DROPBOX_PROBE_TEST");
+    assert_eq!(probe["created_at"], 5100);
+    assert_eq!(probe["write_mode"], "create_new");
+    let path = probe["path"].as_str().expect("probe path");
+    assert!(path.ends_with("inbox/writeback-dropbox/probes/probe-1.json"));
+    assert!(!home.path().join("run").join("startup.lock").exists());
+    assert!(!home.path().join("cbth.sqlite3").exists());
+
+    let written = read_json_file(path);
+    assert_eq!(written["schema_version"], 1);
+    assert_eq!(written["probe_id"], "probe-1");
+    assert_eq!(written["bridge_thread_id"], "bridge-thread");
+    assert_eq!(
+        written["marker"],
+        "CBTH_DESKTOP_WRITEBACK_DROPBOX_PROBE_TEST"
+    );
+
+    #[cfg(unix)]
+    {
+        let metadata = fs::metadata(path).expect("stat probe file");
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        let dir_metadata = fs::metadata(home.path().join("inbox/writeback-dropbox/probes"))
+            .expect("stat probe dir");
+        assert_eq!(dir_metadata.permissions().mode() & 0o7777, 0o700);
+    }
+
+    let duplicate = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "writeback-dropbox-probe",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--probe-id",
+            "probe-1",
+            "--marker",
+            "duplicate",
+            "--json",
+        ],
+        false,
+    );
+    assert!(!duplicate.status.success());
+    let duplicate_stderr = String::from_utf8_lossy(&duplicate.stderr);
+    assert!(duplicate_stderr.contains("create file"));
+    assert_eq!(
+        read_json_file(path)["marker"],
+        "CBTH_DESKTOP_WRITEBACK_DROPBOX_PROBE_TEST"
+    );
+
+    let invalid_probe = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "writeback-dropbox-probe",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--probe-id",
+            "../escape",
+            "--marker",
+            "marker",
+            "--json",
+        ],
+        false,
+    );
+    assert!(!invalid_probe.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_probe.stderr)
+            .contains("probe_id contains unsupported path characters")
+    );
+
+    let append_path = home
+        .path()
+        .join("inbox/writeback-dropbox/probes/probe-append.json");
+    fs::write(&append_path, "").expect("precreate append probe file");
+    #[cfg(unix)]
+    fs::set_permissions(&append_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod append probe file");
+    let appended = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "writeback-dropbox-probe",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--probe-id",
+            "probe-append",
+            "--marker",
+            "CBTH_DESKTOP_WRITEBACK_DROPBOX_APPEND_TEST",
+            "--append-existing",
+            "--json",
+            "--now",
+            "5110",
+        ],
+        false,
+    );
+    assert!(
+        appended.status.success(),
+        "append probe failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&appended.stdout),
+        String::from_utf8_lossy(&appended.stderr)
+    );
+    let appended: Value = serde_json::from_slice(&appended.stdout).expect("valid append json");
+    let appended = &appended["desktop_writeback_dropbox_probe"];
+    assert_eq!(appended["probe_id"], "probe-append");
+    assert_eq!(appended["write_mode"], "append_existing");
+    assert_eq!(
+        read_json_file(append_path.to_str().unwrap())["marker"],
+        "CBTH_DESKTOP_WRITEBACK_DROPBOX_APPEND_TEST"
+    );
+
+    let missing_append = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "writeback-dropbox-probe",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--probe-id",
+            "probe-missing-append",
+            "--marker",
+            "marker",
+            "--append-existing",
+            "--json",
+        ],
+        false,
+    );
+    assert!(!missing_append.status.success());
+    assert!(String::from_utf8_lossy(&missing_append.stderr).contains("stat"));
+}
+
+#[test]
 fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
     let degraded_home = temp_home();
     cbth(
