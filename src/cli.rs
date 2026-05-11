@@ -11315,8 +11315,19 @@ fn validate_desktop_transcript_writeback_envelope(
         }
         "arm_pending_requested" | "arm_requested" => {
             for field in ["source_thread_id", "attempt_id", "bridge_request_id"] {
-                if value[field].as_str().is_none() {
-                    bail!("transcript envelope {field} must be a string");
+                let field_value = value[field]
+                    .as_str()
+                    .with_context(|| format!("transcript envelope {field} must be a string"))?;
+                if field_value.is_empty() {
+                    bail!("transcript envelope {field} must not be empty");
+                }
+            }
+            if kind == "arm_requested" {
+                let lease_id = value["bridge_arm_lease_id"]
+                    .as_str()
+                    .context("transcript envelope bridge_arm_lease_id must be a string")?;
+                if lease_id.is_empty() {
+                    bail!("transcript envelope bridge_arm_lease_id must not be empty");
                 }
             }
             let generation = value["generation"]
@@ -11324,9 +11335,6 @@ fn validate_desktop_transcript_writeback_envelope(
                 .context("transcript envelope generation must be an integer")?;
             if generation <= 0 {
                 bail!("transcript envelope generation must be positive");
-            }
-            if kind == "arm_requested" && value["bridge_arm_lease_id"].as_str().is_none() {
-                bail!("transcript envelope bridge_arm_lease_id must be a string");
             }
         }
         _ => bail!("unsupported transcript envelope kind {kind}"),

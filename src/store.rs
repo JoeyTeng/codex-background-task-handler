@@ -2265,27 +2265,17 @@ impl Store {
         let outcome = match outcome_result {
             Ok(outcome) => outcome,
             Err(error) => {
+                let error_message = error.to_string();
+                let outcome = serde_json::json!({
+                    "outcome": "cas_failed",
+                    "error": &error_message,
+                });
+                insert_desktop_transcript_relay_consumption_tx(&tx, &consumption, &outcome)?;
                 tx.commit()?;
-                return Err(error);
+                bail!("{error_message}");
             }
         };
-        let outcome_json = serde_json::to_string(&outcome)?;
-        tx.execute(
-            "INSERT INTO desktop_transcript_relay_consumptions (
-                marker, envelope_hash, envelope_kind, envelope_json,
-                source_thread_id, attempt_id, consumed_at, outcome_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                &consumption.marker,
-                &consumption.envelope_hash,
-                &consumption.envelope_kind,
-                &consumption.envelope_json,
-                &consumption.source_thread_id,
-                &consumption.attempt_id,
-                consumption.now,
-                &outcome_json,
-            ],
-        )?;
+        insert_desktop_transcript_relay_consumption_tx(&tx, &consumption, &outcome)?;
         tx.commit()?;
         Ok(DesktopTranscriptRelayConsumptionRecord {
             marker: consumption.marker,
@@ -4333,6 +4323,31 @@ fn rows_to_cli_managed_sessions(
         sessions.push(cli_managed_session_from_row(row)?);
     }
     Ok(sessions)
+}
+
+fn insert_desktop_transcript_relay_consumption_tx(
+    tx: &Transaction<'_>,
+    consumption: &NewDesktopTranscriptRelayConsumption,
+    outcome: &serde_json::Value,
+) -> Result<()> {
+    let outcome_json = serde_json::to_string(outcome)?;
+    tx.execute(
+        "INSERT INTO desktop_transcript_relay_consumptions (
+            marker, envelope_hash, envelope_kind, envelope_json,
+            source_thread_id, attempt_id, consumed_at, outcome_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            &consumption.marker,
+            &consumption.envelope_hash,
+            &consumption.envelope_kind,
+            &consumption.envelope_json,
+            &consumption.source_thread_id,
+            &consumption.attempt_id,
+            consumption.now,
+            &outcome_json,
+        ],
+    )?;
+    Ok(())
 }
 
 fn query_active_delivery_attempt_for_cli_session_tx(

@@ -1682,6 +1682,205 @@ fn desktop_transcript_relay_consumer_drives_arm_cas_and_replay_fence() {
 }
 
 #[test]
+fn desktop_transcript_relay_consumer_records_failed_cas_replay_fence() {
+    let home = temp_home();
+    let fixture = cbth(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "prepare-writeback-fixture",
+            "--source-thread-id",
+            "thread-relay-expired",
+            "--caller-automation-id",
+            "automation-relay-expired",
+            "--bridge-request-id",
+            "bridge-request-relay-expired",
+            "--now",
+            "7300",
+            "--json",
+        ],
+    );
+    let fixture = &fixture["desktop_writeback_fixture"];
+    let attempt_id = fixture["attempt"]["attempt_id"].as_str().unwrap();
+
+    let pending_marker = "CBTH_RELAY_EXPIRED_PENDING";
+    let pending_emit = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "emit-transcript-arm-pending",
+            "--source-thread-id",
+            "thread-relay-expired",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-relay-expired",
+            "--marker",
+            pending_marker,
+            "--json",
+            "--now",
+            "7310",
+        ],
+        false,
+    );
+    assert!(pending_emit.status.success());
+    let pending_rollout = home.path().join("expired-pending-rollout.jsonl");
+    write_function_call_rollout(
+        &pending_rollout,
+        &String::from_utf8(pending_emit.stdout).unwrap(),
+    );
+    let pending = cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            pending_rollout.to_str().unwrap(),
+            "--marker",
+            pending_marker,
+            "--json",
+            "--now",
+            "7320",
+        ],
+    );
+    let pending = &pending["desktop_transcript_relay_consumption"];
+    let lease_id = pending["record"]["outcome"]["bridge_arm_lease_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let lease_deadline = pending["record"]["outcome"]["bridge_arm_lease_deadline"]
+        .as_i64()
+        .unwrap();
+
+    let arm_marker = "CBTH_RELAY_EXPIRED_ARM";
+    let arm_emit = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "emit-transcript-arm",
+            "--source-thread-id",
+            "thread-relay-expired",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-relay-expired",
+            "--bridge-arm-lease-id",
+            &lease_id,
+            "--marker",
+            arm_marker,
+            "--json",
+            "--now",
+            "7330",
+        ],
+        false,
+    );
+    assert!(arm_emit.status.success());
+    let arm_rollout = home.path().join("expired-arm-rollout.jsonl");
+    write_function_call_rollout(&arm_rollout, &String::from_utf8(arm_emit.stdout).unwrap());
+    let expired_now = (lease_deadline + 1).to_string();
+    let expired_error = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            arm_rollout.to_str().unwrap(),
+            "--marker",
+            arm_marker,
+            "--json",
+            "--now",
+            &expired_now,
+        ],
+    );
+    assert!(expired_error.contains("bridge arm lease expired"));
+    let inspected = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
+    assert_eq!(inspected["attempt"]["state"], "abandoned");
+
+    let replay_now = (lease_deadline + 2).to_string();
+    let replay = cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            arm_rollout.to_str().unwrap(),
+            "--marker",
+            arm_marker,
+            "--json",
+            "--now",
+            &replay_now,
+        ],
+    );
+    let replay = &replay["desktop_transcript_relay_consumption"]["record"];
+    assert_eq!(replay["replay_state"], "replayed");
+    assert_eq!(replay["envelope_kind"], "arm_requested");
+    assert_eq!(replay["outcome"]["outcome"], "cas_failed");
+    assert!(
+        replay["outcome"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("bridge arm lease expired")
+    );
+
+    let conflicting_emit = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "emit-transcript-arm",
+            "--source-thread-id",
+            "thread-relay-expired",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-relay-expired",
+            "--bridge-arm-lease-id",
+            &lease_id,
+            "--marker",
+            arm_marker,
+            "--json",
+            "--now",
+            "7331",
+        ],
+        false,
+    );
+    assert!(conflicting_emit.status.success());
+    let conflicting_rollout = home.path().join("expired-arm-conflict-rollout.jsonl");
+    write_function_call_rollout(
+        &conflicting_rollout,
+        &String::from_utf8(conflicting_emit.stdout).unwrap(),
+    );
+    let conflict_error = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            conflicting_rollout.to_str().unwrap(),
+            "--marker",
+            arm_marker,
+            "--json",
+            "--now",
+            &replay_now,
+        ],
+    );
+    assert!(conflict_error.contains("already consumed with another envelope hash"));
+}
+
+#[test]
 fn desktop_transcript_relay_consumer_fails_closed_without_trusted_single_envelope() {
     let home = temp_home();
     let fixture = cbth(
@@ -1887,6 +2086,44 @@ fn desktop_transcript_relay_consumer_rejects_untrusted_without_opening_store() {
     assert!(probe_error.contains("is not consumable"));
     assert!(!probe_home.path().join("cbth.sqlite3").exists());
     assert!(!probe_home.path().join("run").join("startup.lock").exists());
+
+    let empty_home = temp_home();
+    let empty_marker = "CBTH_RELAY_CONSUMER_EMPTY_NO_STORE";
+    let empty_envelope = json!({
+        "schema_version": 1,
+        "channel": "desktop_transcript_writeback",
+        "kind": "arm_pending_requested",
+        "source_thread_id": "",
+        "attempt_id": "attempt-empty-no-store",
+        "generation": 1,
+        "bridge_request_id": "bridge-request-empty-no-store",
+        "marker": empty_marker,
+        "created_at": 7230,
+    });
+    let empty_line = format!(
+        "{prefix}{}",
+        serde_json::to_string(&empty_envelope).unwrap()
+    );
+    let empty_rollout = empty_home.path().join("relay-empty-no-store.jsonl");
+    write_function_call_rollout(&empty_rollout, &empty_line);
+    let empty_error = cbth_failure(
+        &empty_home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            empty_rollout.to_str().unwrap(),
+            "--marker",
+            empty_marker,
+            "--json",
+            "--now",
+            "7231",
+        ],
+    );
+    assert!(empty_error.contains("rejected_trusted_auto_envelopes"));
+    assert!(!empty_home.path().join("cbth.sqlite3").exists());
+    assert!(!empty_home.path().join("run").join("startup.lock").exists());
 }
 
 #[test]
