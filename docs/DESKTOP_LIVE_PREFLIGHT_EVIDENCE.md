@@ -482,3 +482,111 @@ trusted_auto[0].envelope.bridge_thread_id=019db5e6-ba6a-7b80-95d2-a6867163281a
 The prompt copies of the marker appeared as `ignored_prompt`, and assistant / task-complete text appeared as `diagnostic_only`. This is the expected shape: only the exact helper stdout envelope inside `function_call_output` is eligible for future automatic writeback consumption.
 
 Conclusion: the transcript/tool-output side channel is validated for both interactive Desktop tool calls and heartbeat automation runs. `writeback_capability` still remains `unknown`; later consumer-foundation work covers manual marker/hash replay protection and CAS mutation, but production sidecar tailing, replay cursor management, nonce issuance, and live arm-envelope validation remain incomplete.
+
+## 2026-05-11 Attempt: Transcript Relay Consumer Live Validation Succeeded
+
+Result: `VALIDATION_OK` for the Desktop heartbeat transcript relay consumer path. This validates that a Desktop heartbeat can emit trusted arm envelopes, and a normal shell can consume those rollout envelopes to drive durable cbth writeback CAS.
+
+Evidence:
+
+- Code branch: `codex/desktop-transcript-relay-consumer-live-validation`
+- Base merge commit: `0796bf3ec04c130252990a06ce6560d4797fe6e0`
+- Local binary: `/Users/hoteng/.cache/cargo-target/release/cbth`
+- Local binary version: `cbth 0.1.5`
+- Heartbeat thread id: `019db5e6-ba6a-7b80-95d2-a6867163281a`
+- Rollout file: `/Users/hoteng/.codex/sessions/2026/04/22/rollout-2026-04-22T16-54-50-019db5e6-ba6a-7b80-95d2-a6867163281a.jsonl`
+- Source thread id: `cbth-desktop-transcript-relay-consumer-live-20260511T211238Z`
+- Caller automation id: `cbth-desktop-transcript-relay-consumer-live`
+- Bridge request id: `CBTH_DESKTOP_RELAY_CONSUMER_LIVE_20260511T211238Z`
+- Batch id: `019e18e2-baea-7a20-9975-8f1296acd76a`
+- Attempt id: `019e18e2-baea-7a20-9975-8f2262980523`
+- Generation: `1`
+- Temporary pending heartbeat automation id: `cbth-transcript-relay-pending-validation-20260511t211238z`
+- Temporary arm heartbeat automation id: `cbth-transcript-relay-arm-validation-20260511t211238z`
+- Temporary automation cleanup: both deleted after validation
+
+The pending heartbeat emitted marker `CBTH_DESKTOP_RELAY_PENDING_20260511T211238Z`. The scanner found exactly one trusted automatic carrier:
+
+```text
+auto_decision.trusted=true
+auto_decision.reason=single_trusted_auto_envelope
+counts.trusted_auto=1
+counts.diagnostic_only=3
+counts.ignored_prompt=2
+trusted_auto[0].payload_type=function_call_output
+trusted_auto[0].record_line=457
+trusted_auto[0].envelope.kind=arm_pending_requested
+```
+
+The consumer advanced the fixture attempt to `arm_pending` and created lease `019e18e5-83a0-7a03-b125-c4213ab926f5`:
+
+```text
+marker=CBTH_DESKTOP_RELAY_PENDING_20260511T211238Z
+envelope_hash=6718307133e0e26a78c0180186dd13ee657bab0dae63f6802a7ad69503fb409b
+replay_state=fresh
+outcome=arm_pending
+attempt.state=arm_pending
+```
+
+Repeating the same pending consume returned `replay_state=replayed` with the same stored outcome.
+
+The arm heartbeat emitted marker `CBTH_DESKTOP_RELAY_ARM_20260511T211238Z`. The scanner again found exactly one trusted automatic carrier:
+
+```text
+auto_decision.trusted=true
+auto_decision.reason=single_trusted_auto_envelope
+counts.trusted_auto=1
+counts.diagnostic_only=3
+counts.ignored_prompt=2
+trusted_auto[0].payload_type=function_call_output
+trusted_auto[0].record_line=476
+trusted_auto[0].envelope.kind=arm_requested
+trusted_auto[0].envelope.bridge_arm_lease_id=019e18e5-83a0-7a03-b125-c4213ab926f5
+```
+
+The consumer advanced the attempt to `cooldown` and incremented the batch delivery count once:
+
+```text
+marker=CBTH_DESKTOP_RELAY_ARM_20260511T211238Z
+envelope_hash=6feb260ba6ef02180edb4dea604bc15d9d0a8d6b85f9ac52c18ad05904b958c7
+replay_state=fresh
+outcome=armed
+attempt.state=cooldown
+delivery_attempt_count=1
+pause_not_before=1778534402
+pause_deadline=1778534492
+```
+
+Repeating the same arm consume returned `replay_state=replayed` and preserved `delivery_attempt_count=1`.
+
+Durable state inspection after consumption confirmed:
+
+```text
+attempt.state=cooldown
+attempt.desktop_armed_at=1778534312
+batch.delivery_attempt_count=1
+batch.state=open
+```
+
+After `pause_deadline`, a normal-shell `bridge-preflight --helper-direct-store` published snapshot revision `019e18eb-2c6c-7921-9209-80af1cafe2da` with `pause_due_bindings.count=1`, and `list-pause-due` read back the synthetic binding:
+
+```text
+snapshot_revision=019e18eb-2c6c-7921-9209-80af1cafe2da
+pause_due_bindings.count=1
+source_thread_id=cbth-desktop-transcript-relay-consumer-live-20260511T211238Z
+overdue=true
+```
+
+After the successful validation, the local installation state was repaired:
+
+```text
+read_transport_capability=validated
+artifact_read_capability=unknown
+writeback_capability=validated
+read_transport_generation=2
+validation_fingerprint=cbth_version=0.1.5;os=macos;arch=aarch64;exe=/Users/hoteng/.cache/cargo-target/release/cbth;inbox_schema=1;read_transport=direct_file_read
+```
+
+The repair reported `degraded_bindings=2` because the validation fingerprint changed to the current `0.1.5` binary path. The synthetic fixture batch was then closed with `operator_confirmed_delivery`.
+
+Conclusion: the transcript relay writeback side channel is live-validated for heartbeat-emitted arm envelopes plus non-Desktop consumer CAS. Desktop automatic delivery is still not enabled; production work remains for rollout discovery, durable scan cursors, marker issuance, background tailing, ready materialization, caller wake, pause reconcile, continuation boundary handling, and artifact-read validation.
