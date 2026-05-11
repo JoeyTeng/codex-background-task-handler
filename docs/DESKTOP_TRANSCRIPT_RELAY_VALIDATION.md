@@ -90,7 +90,7 @@ An interactive Desktop tool-output probe is useful as a lower-level transport sa
 
 The 2026-05-11 heartbeat automation validation used the same helper and proved that automation-delivered helper stdout also appears as a `response_item.payload.type=function_call_output` carrier. The scanner accepted exactly one `trusted_auto` envelope, treated prompt copies as `ignored_prompt`, and treated assistant / task-complete text as `diagnostic_only`.
 
-This validation does not set `writeback_capability=validated`. The consumer foundation adds one-shot replay protection and CAS mutation, but `writeback_capability` still remains `unknown` until a real Desktop heartbeat emits arm envelopes, a non-Desktop consumer applies them, and an operator explicitly records that evidence with `installation-state repair`.
+The initial transport validation did not set `writeback_capability=validated`. A later live validation completed the missing consumer step: a real Desktop heartbeat emitted arm-pending and arm envelopes, a non-Desktop consumer applied them through durable CAS, and an operator recorded the result with `installation-state repair`. The local installation now has `writeback_capability=validated`; `artifact_read_capability` remains `unknown`.
 
 The remaining production work is durable rollout discovery / scan cursors, marker issuance, background tailing, ready materialization, caller wake, pause reconcile, and continuation-boundary handling.
 
