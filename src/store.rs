@@ -2559,6 +2559,39 @@ impl Store {
         })
     }
 
+    pub fn daemon_lifecycle_status_for_supervisor_generation(
+        &self,
+        supervisor_daemon_generation: &str,
+    ) -> Result<DaemonLifecycleStatus> {
+        let active_jobs = self.conn.query_row(
+            "SELECT COUNT(DISTINCT jobs.job_id)
+             FROM jobs
+             JOIN tasks ON tasks.job_id = jobs.job_id
+             WHERE jobs.status = 'pending'
+               AND tasks.status IN ('queued', 'running')
+               AND tasks.supervisor_daemon_generation = ?",
+            params![supervisor_daemon_generation],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let nonterminal_tasks = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE status IN ('queued', 'running')
+               AND supervisor_daemon_generation = ?",
+            params![supervisor_daemon_generation],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(DaemonLifecycleStatus {
+            active_jobs,
+            nonterminal_tasks,
+            active_cli_acceptances: 0,
+            cli_acceptances_stale_now: 0,
+            active_cli_observations: 0,
+            cli_observations_due_now: 0,
+            open_batches_due_now: 0,
+            open_batches_due_within_idle: 0,
+        })
+    }
+
     pub fn close_head(
         &mut self,
         layout: &FsLayout,

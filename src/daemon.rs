@@ -2070,7 +2070,12 @@ fn refresh_lifecycle_status(
 ) -> Result<DaemonLifecycleStatus> {
     let now = current_epoch_seconds()?;
     let store = Store::open_for_daemon_lifecycle(&state.layout)?;
-    store.daemon_lifecycle_status(now, idle_horizon_at)
+    match &state.task_recovery_scope {
+        TaskRecoveryScope::All => store.daemon_lifecycle_status(now, idle_horizon_at),
+        TaskRecoveryScope::CurrentGeneration => {
+            store.daemon_lifecycle_status_for_supervisor_generation(current_daemon_generation_id())
+        }
+    }
 }
 
 fn maybe_spawn_lifecycle_maintenance(

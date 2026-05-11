@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -829,6 +829,54 @@ fn generation_daemon_startup_recovers_own_lost_task_process_group() {
     replacement
         .wait()
         .expect("replacement generation daemon exits");
+}
+
+#[cfg(unix)]
+#[test]
+fn generation_daemon_ignores_unowned_legacy_tasks_for_idle_exit() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "legacy-thread",
+            "--summary",
+            "legacy pending job",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "INSERT INTO tasks (
+            task_id, job_id, source_thread_id, status, summary, command_json,
+            cwd, max_delivery_attempts, redelivery_window_seconds, created_at
+         ) VALUES (
+            'legacy-unowned-task', ?, 'legacy-thread', 'queued',
+            'legacy unowned task', '[]', '/', 3, 86400, 1
+         )",
+        params![job_id],
+    )
+    .expect("insert legacy unowned task");
+    drop(conn);
+
+    let mut daemon = spawn_daemon(&home, "1", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    daemon.wait().expect("generation daemon exits after idle");
+
+    let task = cbth(
+        &home,
+        &["task", "inspect", "--task-id", "legacy-unowned-task"],
+    );
+    assert_eq!(task["task"]["status"], "queued");
 }
 
 #[cfg(unix)]
