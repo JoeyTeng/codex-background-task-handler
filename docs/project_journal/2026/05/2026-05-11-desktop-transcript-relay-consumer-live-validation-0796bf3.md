@@ -1,7 +1,7 @@
 ---
 id: 20260511-0796bf3-desktop-transcript-relay-consumer-live-validation
 title: Desktop Transcript Relay Consumer Live Validation
-status: active
+status: completed
 created: 2026-05-11
 updated: 2026-05-11
 branch: codex/desktop-transcript-relay-consumer-live-validation
