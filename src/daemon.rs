@@ -400,7 +400,7 @@ struct DaemonState {
     cli_app_server_reservations: Mutex<HashMap<String, CliAppServerReservation>>,
     cli_thread_start_bootstraps: Mutex<HashMap<String, ManagedCliAppServer>>,
     supervised_tasks: Arc<Mutex<HashMap<String, Arc<SupervisedTaskControl>>>>,
-    task_recovery_enabled: bool,
+    task_recovery_scope: TaskRecoveryScope,
 }
 
 #[derive(Default)]
@@ -494,6 +494,12 @@ struct DaemonLifecycleCache {
     status: DaemonLifecycleStatus,
 }
 
+#[derive(Clone, Debug)]
+enum TaskRecoveryScope {
+    All,
+    CurrentGeneration,
+}
+
 impl DaemonLifecycleCache {
     fn has_exit_blockers(&self, maintenance_suppressed: bool) -> bool {
         self.refresh_failed
@@ -527,16 +533,25 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
     listener
         .set_nonblocking(true)
         .with_context(|| format!("set nonblocking {}", socket_path.display()))?;
-    let task_recovery_enabled = matches!(options.socket_kind, DaemonSocketKind::Default);
+    let task_recovery_scope = match options.socket_kind {
+        DaemonSocketKind::Default => TaskRecoveryScope::All,
+        DaemonSocketKind::Generation => TaskRecoveryScope::CurrentGeneration,
+    };
     let recovery_now = match options.startup_sweep_now {
         Some(now) => now,
         None => current_epoch_seconds()?,
     };
     let mut store = Store::open(layout)?;
-    if task_recovery_enabled {
-        recover_lost_task_process_groups(layout)?;
-        let _ = store.fail_lost_tasks(recovery_now)?;
-    }
+    recover_lost_task_process_groups_for_scope(layout, &task_recovery_scope)?;
+    let _ = match &task_recovery_scope {
+        TaskRecoveryScope::All => store.fail_lost_tasks(recovery_now)?,
+        TaskRecoveryScope::CurrentGeneration => store
+            .fail_lost_tasks_for_supervisor_generation_excluding_with(
+                recovery_now,
+                current_daemon_generation_id(),
+                |_| Ok(false),
+            )?,
+    };
     let startup_sweep = if let Some(now) = options.startup_sweep_now {
         store.sweep(layout, now)?
     } else {
@@ -561,7 +576,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         cli_app_server_reservations: Mutex::new(HashMap::new()),
         cli_thread_start_bootstraps: Mutex::new(HashMap::new()),
         supervised_tasks: Arc::new(Mutex::new(HashMap::new())),
-        task_recovery_enabled,
+        task_recovery_scope,
     });
     let mut last_activity = Instant::now();
     let mut last_activity_epoch = started_at;
@@ -1746,9 +1761,22 @@ fn mark_supervised_task_child_exit_observed(control: &SupervisedTaskControl) {
     control.child_exit_observed.store(true, Ordering::Release);
 }
 
+#[cfg(test)]
 fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
+    recover_lost_task_process_groups_for_scope(layout, &TaskRecoveryScope::All)
+}
+
+fn recover_lost_task_process_groups_for_scope(
+    layout: &FsLayout,
+    scope: &TaskRecoveryScope,
+) -> Result<()> {
     let store = Store::open(layout)?;
-    for process in store.lost_pending_task_processes()? {
+    let processes = match scope {
+        TaskRecoveryScope::All => store.lost_pending_task_processes()?,
+        TaskRecoveryScope::CurrentGeneration => store
+            .lost_pending_task_processes_for_supervisor_generation(current_daemon_generation_id())?,
+    };
+    for process in processes {
         let Some(expected_identity) = process.pid_identity.as_deref() else {
             continue;
         };
@@ -2091,18 +2119,22 @@ fn maybe_spawn_lifecycle_maintenance(
 }
 
 fn recover_registryless_lost_tasks(state: &DaemonState) -> Result<usize> {
-    if !state.task_recovery_enabled {
-        return Ok(0);
-    }
     recover_registryless_lost_task_process_groups(state)?;
     let now = current_epoch_seconds()?;
     let mut store = Store::open_for_daemon_lifecycle(&state.layout)?;
-    store.fail_lost_tasks_excluding_with(now, |task_id| supervised_task_is_active(state, task_id))
+    fail_lost_tasks_for_recovery_scope(&mut store, now, &state.task_recovery_scope, |task_id| {
+        supervised_task_is_active(state, task_id)
+    })
 }
 
 fn recover_registryless_lost_task_process_groups(state: &DaemonState) -> Result<()> {
     let store = Store::open_for_daemon_lifecycle(&state.layout)?;
-    for process in store.lost_pending_task_processes()? {
+    let processes = match &state.task_recovery_scope {
+        TaskRecoveryScope::All => store.lost_pending_task_processes()?,
+        TaskRecoveryScope::CurrentGeneration => store
+            .lost_pending_task_processes_for_supervisor_generation(current_daemon_generation_id())?,
+    };
+    for process in processes {
         if supervised_task_is_active(state, &process.task_id)? {
             continue;
         }
@@ -2124,6 +2156,26 @@ fn recover_registryless_lost_task_process_groups(state: &DaemonState) -> Result<
         }
     }
     Ok(())
+}
+
+fn fail_lost_tasks_for_recovery_scope<F>(
+    store: &mut Store,
+    now: i64,
+    scope: &TaskRecoveryScope,
+    is_active_task: F,
+) -> Result<usize>
+where
+    F: FnMut(&str) -> Result<bool>,
+{
+    match scope {
+        TaskRecoveryScope::All => store.fail_lost_tasks_excluding_with(now, is_active_task),
+        TaskRecoveryScope::CurrentGeneration => store
+            .fail_lost_tasks_for_supervisor_generation_excluding_with(
+                now,
+                current_daemon_generation_id(),
+                is_active_task,
+            ),
+    }
 }
 
 fn supervised_task_is_active(state: &DaemonState, task_id: &str) -> Result<bool> {
@@ -2447,7 +2499,11 @@ where
         return Err(error);
     }
     let (_job, task) = match retry_task_store_setup("create supervised task", || {
-        store.create_task_with_job(job.clone(), task.clone())
+        store.create_task_with_job_for_supervisor_generation(
+            job.clone(),
+            task.clone(),
+            Some(current_daemon_generation_id()),
+        )
     }) {
         Ok(created) => created,
         Err(error) => {
@@ -5646,7 +5702,7 @@ mod tests {
                 cli_app_server_reservations: Mutex::new(HashMap::new()),
                 cli_thread_start_bootstraps: Mutex::new(HashMap::new()),
                 supervised_tasks: Arc::new(Mutex::new(HashMap::new())),
-                task_recovery_enabled: true,
+                task_recovery_scope: TaskRecoveryScope::All,
             },
         )
     }

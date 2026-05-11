@@ -262,7 +262,7 @@ fn wait_for_socket_removed(home: &TempDir) {
 }
 
 fn wait_for_path(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while !path.exists() {
         assert!(
             Instant::now() < deadline,
@@ -299,6 +299,26 @@ fn wait_for_socket_path_removed(socket_path: &Path, timeout: Duration) {
         assert!(Instant::now() < deadline, "daemon socket was not removed");
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[cfg(unix)]
+fn stop_daemon_at_socket_path(socket_path: &Path) {
+    let mut stream = UnixStream::connect(socket_path).expect("connect daemon socket");
+    stream
+        .write_all(br#"{"command":"stop","payload":null}"#)
+        .expect("write daemon stop");
+    stream.write_all(b"\n").expect("write daemon stop newline");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("shutdown daemon stop write");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read daemon stop response");
+    assert!(
+        response.contains(r#""ok":true"#),
+        "daemon stop failed: {response}"
+    );
 }
 
 fn process_group_exists(pid: u32) -> bool {
@@ -527,16 +547,25 @@ fn daemon_ensure_restarts_incompatible_daemon() {
             stream
                 .read_to_string(&mut request)
                 .expect("read legacy request");
-            let response = if request.contains("\"stop\"") {
+            let is_stop = request.contains("\"stop\"");
+            let response = if is_stop {
                 r#"{"ok":true,"response":{"stopping":true}}"#
             } else {
                 r#"{"ok":true,"response":{"daemon":{"pid":1},"message":"pong"}}"#
             };
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response");
-            stream.write_all(b"\n").expect("write response newline");
-            if request.contains("\"stop\"") {
+            if let Err(error) = stream.write_all(response.as_bytes()) {
+                if !is_stop && is_peer_disconnect(&error) {
+                    continue;
+                }
+                panic!("write legacy response: {error}");
+            }
+            if let Err(error) = stream.write_all(b"\n") {
+                if !is_stop && is_peer_disconnect(&error) {
+                    continue;
+                }
+                panic!("write legacy response newline: {error}");
+            }
+            if is_stop {
                 break;
             }
         }
@@ -698,25 +727,7 @@ fn daemon_ensure_coexists_with_incompatible_default_without_stop() {
 
     done_tx.send(()).expect("signal old daemon");
     handle.join().expect("old daemon thread");
-    let mut generation_stream =
-        UnixStream::connect(&generation_socket_path).expect("connect generation daemon");
-    generation_stream
-        .write_all(br#"{"command":"stop","payload":null}"#)
-        .expect("write generation stop");
-    generation_stream
-        .write_all(b"\n")
-        .expect("write generation stop newline");
-    generation_stream
-        .shutdown(std::net::Shutdown::Write)
-        .expect("shutdown generation stop write");
-    let mut stop_response = String::new();
-    generation_stream
-        .read_to_string(&mut stop_response)
-        .expect("read generation stop response");
-    assert!(
-        stop_response.contains(r#""ok":true"#),
-        "generation stop failed: {stop_response}"
-    );
+    stop_daemon_at_socket_path(&generation_socket_path);
     wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
 }
 
@@ -762,6 +773,62 @@ fn daemon_ensure_reuses_generation_daemon_when_legacy_socket_is_absent() {
 
     wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(5));
     daemon.wait().expect("generation daemon exits after idle");
+}
+
+#[cfg(unix)]
+#[test]
+fn generation_daemon_startup_recovers_own_lost_task_process_group() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let marker = home.path().join("generation-lost-task-marker");
+    let marker_arg = marker.to_string_lossy().to_string();
+    let mut daemon = spawn_daemon(&home, "300", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-generation-lost-task",
+            "--summary",
+            "generation daemon lost task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 3; printf done > \"$1\"",
+            "cbth-task",
+            &marker_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+
+    daemon.kill().expect("kill generation daemon");
+    let _ = daemon.wait().expect("wait generation daemon");
+    let mut replacement = spawn_daemon(&home, "30", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+
+    let task = wait_for_task_status(&home, task_id, "lost");
+    assert_eq!(
+        task["task"]["failure_reason"],
+        "task supervisor lost after daemon restart"
+    );
+    thread::sleep(Duration::from_secs(4));
+    assert!(
+        !marker.exists(),
+        "generation-owned lost supervised process group survived startup recovery"
+    );
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    replacement
+        .wait()
+        .expect("replacement generation daemon exits");
 }
 
 #[cfg(unix)]

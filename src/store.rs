@@ -63,6 +63,7 @@ struct LostTaskRecovery {
     max_delivery_attempts: i64,
     redelivery_window_seconds: i64,
     cancel_requested_at: Option<i64>,
+    supervisor_daemon_generation: Option<String>,
 }
 
 pub struct TaskFinishUpdate<'a> {
@@ -168,10 +169,20 @@ impl Store {
         Ok(record)
     }
 
+    #[cfg(test)]
     pub fn create_task_with_job(
         &mut self,
         job: NewJob,
         task: NewTask,
+    ) -> Result<(JobRecord, TaskRecord)> {
+        self.create_task_with_job_for_supervisor_generation(job, task, None)
+    }
+
+    pub fn create_task_with_job_for_supervisor_generation(
+        &mut self,
+        job: NewJob,
+        task: NewTask,
+        supervisor_daemon_generation: Option<&str>,
     ) -> Result<(JobRecord, TaskRecord)> {
         if job.job_id != task.job_id {
             bail!("task job_id must match created job");
@@ -204,8 +215,8 @@ impl Store {
             "INSERT INTO tasks (
                 task_id, job_id, source_thread_id, status, summary, command_json,
                 cwd, timeout_seconds, max_delivery_attempts,
-                redelivery_window_seconds, created_at
-            ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)",
+                redelivery_window_seconds, supervisor_daemon_generation, created_at
+            ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 task.task_id,
                 task.job_id,
@@ -216,6 +227,7 @@ impl Store {
                 task.timeout_seconds,
                 task.max_delivery_attempts,
                 task.redelivery_window_seconds,
+                supervisor_daemon_generation,
                 task.created_at,
             ],
         )?;
@@ -473,8 +485,28 @@ impl Store {
     }
 
     pub fn lost_pending_task_processes(&self) -> Result<Vec<LostPendingTaskProcess>> {
+        self.lost_pending_task_processes_matching(|_| true)
+    }
+
+    pub fn lost_pending_task_processes_for_supervisor_generation(
+        &self,
+        supervisor_daemon_generation: &str,
+    ) -> Result<Vec<LostPendingTaskProcess>> {
+        self.lost_pending_task_processes_matching(|task_supervisor_generation| {
+            task_supervisor_generation == Some(supervisor_daemon_generation)
+        })
+    }
+
+    fn lost_pending_task_processes_matching<F>(
+        &self,
+        mut matches_supervisor_generation: F,
+    ) -> Result<Vec<LostPendingTaskProcess>>
+    where
+        F: FnMut(Option<&str>) -> bool,
+    {
         let mut stmt = self.conn.prepare(
-            "SELECT tasks.task_id, tasks.pid, tasks.pid_identity
+            "SELECT tasks.task_id, tasks.pid, tasks.pid_identity,
+                    tasks.supervisor_daemon_generation
              FROM tasks
              JOIN jobs ON jobs.job_id = tasks.job_id
              WHERE tasks.status IN ('queued', 'running')
@@ -487,19 +519,25 @@ impl Store {
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         processes
             .into_iter()
-            .map(|(task_id, pid, pid_identity)| {
-                Ok(LostPendingTaskProcess {
-                    task_id,
-                    pid: u32::try_from(pid)
-                        .with_context(|| format!("stored task pid {pid} is invalid"))?,
-                    pid_identity,
-                })
+            .filter(|(_, _, _, supervisor_daemon_generation)| {
+                matches_supervisor_generation(supervisor_daemon_generation.as_deref())
             })
+            .map(
+                |(task_id, pid, pid_identity, _supervisor_daemon_generation)| {
+                    Ok(LostPendingTaskProcess {
+                        task_id,
+                        pid: u32::try_from(pid)
+                            .with_context(|| format!("stored task pid {pid} is invalid"))?,
+                        pid_identity,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -523,11 +561,43 @@ impl Store {
     where
         F: FnMut(&str) -> Result<bool>,
     {
+        self.fail_lost_tasks_matching_excluding_with(now, |_| true, &mut is_active_task)
+    }
+
+    pub fn fail_lost_tasks_for_supervisor_generation_excluding_with<F>(
+        &mut self,
+        now: i64,
+        supervisor_daemon_generation: &str,
+        mut is_active_task: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> Result<bool>,
+    {
+        self.fail_lost_tasks_matching_excluding_with(
+            now,
+            |task_supervisor_generation| {
+                task_supervisor_generation == Some(supervisor_daemon_generation)
+            },
+            &mut is_active_task,
+        )
+    }
+
+    fn fail_lost_tasks_matching_excluding_with<F, G>(
+        &mut self,
+        now: i64,
+        mut matches_supervisor_generation: G,
+        is_active_task: &mut F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> Result<bool>,
+        G: FnMut(Option<&str>) -> bool,
+    {
         let tasks = {
             let mut stmt = self.conn.prepare(
                 "SELECT tasks.task_id, tasks.job_id, jobs.status, jobs.completed_at,
                         jobs.failed_at, jobs.failure_reason, tasks.max_delivery_attempts,
-                        tasks.redelivery_window_seconds, tasks.cancel_requested_at
+                        tasks.redelivery_window_seconds, tasks.cancel_requested_at,
+                        tasks.supervisor_daemon_generation
                  FROM tasks
                  JOIN jobs ON jobs.job_id = tasks.job_id
                  WHERE tasks.status IN ('queued', 'running')
@@ -545,12 +615,16 @@ impl Store {
                     max_delivery_attempts: row.get(6)?,
                     redelivery_window_seconds: row.get(7)?,
                     cancel_requested_at: row.get(8)?,
+                    supervisor_daemon_generation: row.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut recovered = 0;
         for task in &tasks {
+            if !matches_supervisor_generation(task.supervisor_daemon_generation.as_deref()) {
+                continue;
+            }
             if is_active_task(&task.task_id)? {
                 continue;
             }
@@ -2914,6 +2988,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             redelivery_window_seconds INTEGER NOT NULL DEFAULT 86400,
             pid INTEGER,
             pid_identity TEXT,
+            supervisor_daemon_generation TEXT,
             created_at INTEGER NOT NULL,
             started_at INTEGER,
             completed_at INTEGER,
@@ -3352,6 +3427,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         "tasks",
         "pid_identity",
         "ALTER TABLE tasks ADD COLUMN pid_identity TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "tasks",
+        "supervisor_daemon_generation",
+        "ALTER TABLE tasks ADD COLUMN supervisor_daemon_generation TEXT",
     )?;
     Ok(())
 }
