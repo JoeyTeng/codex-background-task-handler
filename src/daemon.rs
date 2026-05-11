@@ -807,12 +807,50 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
                 "using_generation_daemon": true,
             }));
         }
-        DaemonEnsureProbe::Incompatible(response) => {
-            bail!(
-                "generation daemon at {} is incompatible with this cbth binary: {}",
-                generation_endpoint.socket_path().display(),
-                incompatible_daemon_summary(&response)
-            );
+        DaemonEnsureProbe::Incompatible(_) => {
+            let mut replaced_incompatible_generation_daemon = false;
+            let _generation_startup_lock = acquire_generation_startup_lock(
+                layout,
+                current_daemon_generation_id(),
+                remaining_budget(startup_deadline)?,
+            )?;
+            match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)?
+            {
+                DaemonEnsureProbe::Compatible(response) => {
+                    return Ok(json!({
+                        "started": false,
+                        "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
+                        "using_generation_daemon": true,
+                    }));
+                }
+                DaemonEnsureProbe::Incompatible(_) => {
+                    // The generation socket belongs to this binary-version namespace. A
+                    // stale incompatible process here blocks clients, unlike a legacy
+                    // default daemon that must keep serving older sessions.
+                    if let Some(response) =
+                        stop_incompatible_daemon(layout, &generation_endpoint, startup_deadline)?
+                    {
+                        return Ok(json!({
+                            "started": false,
+                            "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
+                            "using_generation_daemon": true,
+                            "replaced_incompatible_generation_daemon": true,
+                        }));
+                    }
+                    replaced_incompatible_generation_daemon = true;
+                }
+                DaemonEnsureProbe::Unavailable => {}
+            }
+            let mut ensured = spawn_daemon_until_ready(
+                layout,
+                DaemonSocketKind::Default,
+                options,
+                startup_deadline,
+            )?;
+            if replaced_incompatible_generation_daemon {
+                ensured["replaced_incompatible_generation_daemon"] = Value::Bool(true);
+            }
+            return Ok(ensured);
         }
         DaemonEnsureProbe::Unavailable => {}
     }
@@ -872,12 +910,13 @@ fn spawn_daemon_until_ready(
                     "daemon": daemon_info_from_response_or_endpoint(&response, &endpoint),
                 }));
             }
-            Ok(_) => {
+            Ok(response) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 bail!(
-                    "started daemon at {} is incompatible with this cbth binary",
-                    endpoint.socket_path().display()
+                    "started daemon at {} is incompatible with this cbth binary: {}",
+                    endpoint.socket_path().display(),
+                    incompatible_daemon_summary(&response)
                 );
             }
             Err(last_error) => {

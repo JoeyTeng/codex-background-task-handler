@@ -855,6 +855,86 @@ fn daemon_ensure_replaces_stale_incompatible_generation_daemon() {
 
 #[cfg(unix)]
 #[test]
+fn daemon_ensure_replaces_stale_generation_daemon_without_legacy_default() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let generation_dir = run_dir.join("daemons").join(env!("CARGO_PKG_VERSION"));
+    fs::create_dir_all(&generation_dir).expect("create generation dir");
+    fs::set_permissions(run_dir.join("daemons"), fs::Permissions::from_mode(0o700))
+        .expect("chmod daemons dir");
+    fs::set_permissions(&generation_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod generation dir");
+    let generation_socket_path = generation_dir.join("cbth.sock");
+
+    let generation_listener =
+        UnixListener::bind(&generation_socket_path).expect("bind stale generation daemon socket");
+    fs::set_permissions(&generation_socket_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod generation socket");
+    let stale_generation_socket_path = generation_socket_path.clone();
+    let generation_handle = thread::spawn(move || {
+        let mut stopped = false;
+        for _ in 0..3 {
+            let (mut stream, _addr) = generation_listener
+                .accept()
+                .expect("accept stale generation request");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("read stale generation request");
+            if request.contains("\"stop\"") {
+                stopped = true;
+                stream
+                    .write_all(br#"{"ok":true,"response":{"stopping":true}}"#)
+                    .expect("write stale generation stop response");
+                stream
+                    .write_all(b"\n")
+                    .expect("write stale generation stop response newline");
+                break;
+            }
+            assert!(request.contains("\"ping\""));
+            stream
+                .write_all(
+                    br#"{"ok":true,"response":{"daemon":{"pid":5151,"binary_version":"0.1.5"},"protocol_version":1,"capabilities":["dispatch"],"message":"pong"}}"#,
+                )
+                .expect("write stale generation ping response");
+            stream
+                .write_all(b"\n")
+                .expect("write stale generation ping response newline");
+        }
+        assert!(stopped, "stale generation daemon was not stopped");
+        drop(generation_listener);
+        fs::remove_file(&stale_generation_socket_path)
+            .expect("remove stale generation daemon socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert_eq!(ensured["started"], true);
+    assert_eq!(ensured["replaced_incompatible_generation_daemon"], true);
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        socket_path.display().to_string()
+    );
+
+    generation_handle.join().expect("stale generation thread");
+    stop_daemon_at_socket_path(&socket_path);
+    wait_for_socket_path_removed(&socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_dispatch_uses_probed_socket_when_ping_omits_socket_path() {
     let home = temp_home();
     let run_dir = home.path().join("run");
