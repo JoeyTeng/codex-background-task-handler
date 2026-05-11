@@ -5,7 +5,7 @@ status: active
 created: 2026-05-11
 updated: 2026-05-11
 branch: codex/daemon-handoff-skeleton
-pr:
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/64
 supersedes: []
 superseded_by:
 ---
@@ -31,6 +31,7 @@ superseded_by:
 
 ## Evidence
 - Design: [DAEMON_UPGRADE_SAFETY.md](../../../DAEMON_UPGRADE_SAFETY.md)
+- PR3: https://github.com/JoeyTeng/codex-background-task-handler/pull/64
 - Local PR3 validation: `cargo fmt --all -- --check`
 - Local PR3 validation: `git diff --check`
 - Local PR3 validation: `uv run python /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /private/tmp/cbth-daemon-upgrade-stack`
