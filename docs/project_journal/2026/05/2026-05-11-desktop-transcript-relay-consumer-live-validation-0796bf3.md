@@ -5,7 +5,7 @@ status: completed
 created: 2026-05-11
 updated: 2026-05-11
 branch: codex/desktop-transcript-relay-consumer-live-validation
-pr:
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/65
 supersedes:
   - 20260511-00afcf6-desktop-transcript-relay-consumer
 superseded_by:
