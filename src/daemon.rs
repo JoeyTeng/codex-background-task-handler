@@ -2143,9 +2143,12 @@ fn refresh_lifecycle_status(
     let store = Store::open_for_daemon_lifecycle(&state.layout)?;
     match &state.task_recovery_scope {
         TaskRecoveryScope::All => store.daemon_lifecycle_status(now, idle_horizon_at),
-        TaskRecoveryScope::CurrentGeneration => {
-            store.daemon_lifecycle_status_for_supervisor_generation(current_daemon_generation_id())
-        }
+        TaskRecoveryScope::CurrentGeneration => store
+            .daemon_lifecycle_status_for_supervisor_generation(
+                current_daemon_generation_id(),
+                now,
+                idle_horizon_at,
+            ),
     }
 }
 

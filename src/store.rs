@@ -2572,6 +2572,8 @@ impl Store {
     pub fn daemon_lifecycle_status_for_supervisor_generation(
         &self,
         supervisor_daemon_generation: &str,
+        now: i64,
+        idle_horizon_at: i64,
     ) -> Result<DaemonLifecycleStatus> {
         let active_jobs = self.conn.query_row(
             "SELECT COUNT(*) FROM jobs
@@ -2587,15 +2589,21 @@ impl Store {
             params![supervisor_daemon_generation],
             |row| row.get::<_, i64>(0),
         )?;
+        let active_cli_acceptances = count_active_cli_acceptances(&self.conn, now)?;
+        let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
+        let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
+        let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
+        let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
         Ok(DaemonLifecycleStatus {
             active_jobs,
             nonterminal_tasks,
-            active_cli_acceptances: 0,
-            cli_acceptances_stale_now: 0,
-            active_cli_observations: 0,
-            cli_observations_due_now: 0,
-            open_batches_due_now: 0,
-            open_batches_due_within_idle: 0,
+            active_cli_acceptances,
+            cli_acceptances_stale_now,
+            active_cli_observations,
+            cli_observations_due_now,
+            open_batches_due_now,
+            open_batches_due_within_idle,
         })
     }
 
@@ -6566,11 +6574,31 @@ mod tests {
         assert_eq!(active.open_batches_due_now, 0);
         assert!(!active.has_due_maintenance());
 
+        let generation_active = store
+            .daemon_lifecycle_status_for_supervisor_generation("generation-a", 399, 400)
+            .expect("generation active");
+        assert_eq!(generation_active.active_jobs, 0);
+        assert_eq!(generation_active.nonterminal_tasks, 0);
+        assert_eq!(generation_active.active_cli_acceptances, 1);
+        assert_eq!(generation_active.cli_acceptances_stale_now, 0);
+        assert_eq!(generation_active.open_batches_due_now, 0);
+        assert!(!generation_active.has_due_maintenance());
+
         let stale = store.daemon_lifecycle_status(400, 401).expect("stale");
         assert_eq!(stale.active_cli_acceptances, 0);
         assert_eq!(stale.cli_acceptances_stale_now, 1);
         assert_eq!(stale.open_batches_due_now, 0);
         assert!(stale.has_due_maintenance());
+
+        let generation_stale = store
+            .daemon_lifecycle_status_for_supervisor_generation("generation-a", 400, 401)
+            .expect("generation stale");
+        assert_eq!(generation_stale.active_jobs, 0);
+        assert_eq!(generation_stale.nonterminal_tasks, 0);
+        assert_eq!(generation_stale.active_cli_acceptances, 0);
+        assert_eq!(generation_stale.cli_acceptances_stale_now, 1);
+        assert_eq!(generation_stale.open_batches_due_now, 0);
+        assert!(generation_stale.has_due_maintenance());
     }
 
     #[test]
