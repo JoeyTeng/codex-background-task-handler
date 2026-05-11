@@ -1814,6 +1814,82 @@ fn desktop_transcript_relay_consumer_fails_closed_without_trusted_single_envelop
 }
 
 #[test]
+fn desktop_transcript_relay_consumer_rejects_untrusted_without_opening_store() {
+    let marker = "CBTH_RELAY_CONSUMER_NO_STORE";
+    let prefix = "CBTH_TRANSCRIPT_WRITEBACK_V1 ";
+    let envelope = json!({
+        "schema_version": 1,
+        "channel": "desktop_transcript_writeback",
+        "kind": "arm_pending_requested",
+        "source_thread_id": "thread-no-store",
+        "attempt_id": "attempt-no-store",
+        "generation": 1,
+        "bridge_request_id": "bridge-request-no-store",
+        "marker": marker,
+        "created_at": 7200,
+    });
+    let line = format!("{prefix}{}", serde_json::to_string(&envelope).unwrap());
+
+    let prompt_home = temp_home();
+    let prompt_only = prompt_home.path().join("relay-prompt-only-no-store.jsonl");
+    write_user_prompt_rollout(&prompt_only, &line);
+    let prompt_error = cbth_failure(
+        &prompt_home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            prompt_only.to_str().unwrap(),
+            "--marker",
+            marker,
+            "--json",
+            "--now",
+            "7210",
+        ],
+    );
+    assert!(prompt_error.contains("no_trusted_auto_envelope"));
+    assert!(!prompt_home.path().join("cbth.sqlite3").exists());
+    assert!(!prompt_home.path().join("run").join("startup.lock").exists());
+
+    let probe_home = temp_home();
+    let probe_marker = "CBTH_RELAY_CONSUMER_PROBE_NO_STORE";
+    let probe_envelope = json!({
+        "schema_version": 1,
+        "channel": "desktop_transcript_writeback",
+        "kind": "validation_probe",
+        "bridge_thread_id": "bridge-thread-no-store",
+        "probe_id": "probe-no-store",
+        "marker": probe_marker,
+        "created_at": 7220,
+    });
+    let probe_line = format!(
+        "{prefix}{}",
+        serde_json::to_string(&probe_envelope).unwrap()
+    );
+    let probe_rollout = probe_home.path().join("relay-probe-no-store.jsonl");
+    write_function_call_rollout(&probe_rollout, &probe_line);
+    let probe_error = cbth_failure(
+        &probe_home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            probe_rollout.to_str().unwrap(),
+            "--marker",
+            probe_marker,
+            "--json",
+            "--now",
+            "7221",
+        ],
+    );
+    assert!(probe_error.contains("is not consumable"));
+    assert!(!probe_home.path().join("cbth.sqlite3").exists());
+    assert!(!probe_home.path().join("run").join("startup.lock").exists());
+}
+
+#[test]
 fn desktop_writeback_dropbox_probe_writes_once_without_daemon_or_store() {
     let home = temp_home();
     let output = cbth_output(

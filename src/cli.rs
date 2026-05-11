@@ -10113,14 +10113,14 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
         DesktopCommand::Relay {
             command: DesktopRelayCommand::ConsumeTranscript(args),
         } => {
-            let mut store = Store::open(layout)?;
             let now = args.now.unwrap_or(now_epoch_seconds()?);
-            let consumption = consume_desktop_transcript_relay(
-                &mut store,
+            let prepared = prepare_desktop_transcript_relay_consumption(
                 &args.rollout_path,
                 &args.marker,
                 now,
             )?;
+            let mut store = Store::open(layout)?;
+            let consumption = consume_prepared_desktop_transcript_relay(&mut store, prepared)?;
             Ok(json!({ "desktop_transcript_relay_consumption": consumption }))
         }
         DesktopCommand::Validation {
@@ -10958,12 +10958,19 @@ fn scan_desktop_transcript_writeback(rollout_path: &Path, marker: &str) -> Resul
     }))
 }
 
-fn consume_desktop_transcript_relay(
-    store: &mut Store,
+struct PreparedDesktopTranscriptRelayConsumption {
+    request: NewDesktopTranscriptRelayConsumption,
+    rollout_path: String,
+    marker: String,
+    trusted_entry: Value,
+    envelope_hash: String,
+}
+
+fn prepare_desktop_transcript_relay_consumption(
     rollout_path: &Path,
     marker: &str,
     now: i64,
-) -> Result<Value> {
+) -> Result<PreparedDesktopTranscriptRelayConsumption> {
     let scan = scan_desktop_transcript_writeback(rollout_path, marker)?;
     let entry = trusted_desktop_transcript_relay_entry(&scan)?;
     let envelope = entry
@@ -10987,29 +10994,42 @@ fn consume_desktop_transcript_relay(
     } else {
         None
     };
-    let record = store.consume_desktop_transcript_relay(NewDesktopTranscriptRelayConsumption {
+    Ok(PreparedDesktopTranscriptRelayConsumption {
+        request: NewDesktopTranscriptRelayConsumption {
+            marker: marker.to_owned(),
+            envelope_hash: envelope_hash.clone(),
+            envelope_kind: kind,
+            envelope_json: canonical_envelope_json,
+            source_thread_id,
+            attempt_id,
+            generation,
+            bridge_request_id,
+            bridge_arm_lease_id,
+            now,
+        },
+        rollout_path: rollout_path.display().to_string(),
         marker: marker.to_owned(),
-        envelope_hash: envelope_hash.clone(),
-        envelope_kind: kind.clone(),
-        envelope_json: canonical_envelope_json,
-        source_thread_id,
-        attempt_id,
-        generation,
-        bridge_request_id,
-        bridge_arm_lease_id,
-        now,
-    })?;
+        trusted_entry: entry.clone(),
+        envelope_hash,
+    })
+}
+
+fn consume_prepared_desktop_transcript_relay(
+    store: &mut Store,
+    prepared: PreparedDesktopTranscriptRelayConsumption,
+) -> Result<Value> {
+    let record = store.consume_desktop_transcript_relay(prepared.request)?;
     Ok(json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-        "rollout_path": rollout_path.display().to_string(),
-        "marker": marker,
+        "rollout_path": prepared.rollout_path,
+        "marker": prepared.marker,
         "trusted_entry": {
-            "carrier": entry["carrier"].clone(),
-            "record_line": entry["record_line"].clone(),
-            "record_type": entry["record_type"].clone(),
-            "payload_type": entry["payload_type"].clone(),
+            "carrier": prepared.trusted_entry["carrier"].clone(),
+            "record_line": prepared.trusted_entry["record_line"].clone(),
+            "record_type": prepared.trusted_entry["record_type"].clone(),
+            "payload_type": prepared.trusted_entry["payload_type"].clone(),
         },
-        "envelope_hash": envelope_hash,
+        "envelope_hash": prepared.envelope_hash,
         "record": record,
     }))
 }
