@@ -112,6 +112,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-inbox-revisioned-installation-state",
     "desktop-writeback-helper-foundation",
     "desktop-writeback-live-validation-fixture",
+    "daemon-handoff-v1",
 ];
 
 #[derive(Debug, Parser)]
@@ -1933,6 +1934,8 @@ enum DaemonCommand {
     Status(DaemonStatusArgs),
     #[command(about = "Ask the daemon to stop cleanly")]
     Stop,
+    #[command(name = "handoff-quiesce", hide = true)]
+    HandoffQuiesce,
 }
 
 #[derive(Debug, Args)]
@@ -11614,6 +11617,7 @@ fn dispatch_daemon(command: DaemonCommand, layout: &FsLayout) -> Result<Value> {
             }
         }
         DaemonCommand::Stop => daemon_request(layout, "stop"),
+        DaemonCommand::HandoffQuiesce => daemon_request(layout, "handoff_quiesce"),
     }
 }
 

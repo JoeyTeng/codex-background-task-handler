@@ -19,6 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::ErrorCode;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -72,6 +73,8 @@ const MAX_TASK_ENV_VARS: usize = 4096;
 const MAX_TASK_ENV_BYTES: usize = 1024 * 1024;
 const DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS: u64 = 60;
 const DAEMON_PROTOCOL_VERSION: u64 = 1;
+const DAEMON_HANDOFF_CAPABILITY: &str = "daemon-handoff-v1";
+const DAEMON_HANDOFF_MIN_BINARY_VERSION: &str = "0.2.0";
 const DAEMON_CAPABILITIES: &[&str] = &[
     "dispatch",
     "attempt-dispatch",
@@ -93,6 +96,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-inbox-revisioned-installation-state",
     "desktop-writeback-helper-foundation",
     "desktop-writeback-live-validation-fixture",
+    DAEMON_HANDOFF_CAPABILITY,
 ];
 const CLI_THREAD_START_BOOTSTRAP_BOUND_THREAD_ID: &str = "__cbth_thread_start_bootstrap__";
 const CLI_FOREGROUND_THREAD_BOOTSTRAP_BOUND_THREAD_ID: &str =
@@ -365,14 +369,26 @@ struct CliThreadStartAbortPayload {
     lease_id: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct HandoffQuiescePayload {
+    #[serde(default)]
+    expected_pid: Option<u32>,
+    #[serde(default)]
+    expected_binary_version: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct DaemonInfo {
     pid: u32,
+    binary_version: &'static str,
     started_at: i64,
     uptime_seconds: u64,
     socket_path: String,
     idle_timeout_seconds: u64,
     stop_requested: bool,
+    quiescing: bool,
+    handoff_minimum_binary_version: &'static str,
+    handoff_eligible: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -412,6 +428,7 @@ struct DaemonState {
     idle_timeout: Duration,
     startup_sweep: SweepReport,
     stop_requested: AtomicBool,
+    quiescing: AtomicBool,
     lifecycle_maintenance_suppressed: AtomicBool,
     activity_generation: AtomicU64,
     active_clients: AtomicUsize,
@@ -595,6 +612,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         idle_timeout: Duration::from_secs(options.idle_timeout_seconds),
         startup_sweep,
         stop_requested: AtomicBool::new(false),
+        quiescing: AtomicBool::new(false),
         lifecycle_maintenance_suppressed: AtomicBool::new(options.startup_sweep_now.is_none()),
         activity_generation: AtomicU64::new(0),
         active_clients: AtomicUsize::new(0),
@@ -963,15 +981,19 @@ fn ensure_generation_daemon_for_incompatible_default(
     legacy_response: Value,
 ) -> Result<Value> {
     let generation_endpoint = DaemonEndpoint::generation(layout);
+    let legacy_handoff_quiesce =
+        maybe_quiesce_handoff_eligible_legacy_daemon(layout, &legacy_response, startup_deadline)?;
     let mut replaced_incompatible_generation_daemon = false;
     match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)? {
         DaemonEnsureProbe::Compatible(response) => {
-            return Ok(json!({
+            let mut ensured = json!({
                 "started": false,
                 "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
                 "coexisting_with_incompatible_daemon": true,
                 "legacy_daemon": legacy_response["daemon"].clone(),
-            }));
+            });
+            annotate_legacy_handoff_quiesce(&mut ensured, &legacy_handoff_quiesce);
+            return Ok(ensured);
         }
         DaemonEnsureProbe::Incompatible(_) => {}
         DaemonEnsureProbe::Unavailable => {}
@@ -984,12 +1006,14 @@ fn ensure_generation_daemon_for_incompatible_default(
     )?;
     match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)? {
         DaemonEnsureProbe::Compatible(response) => {
-            return Ok(json!({
+            let mut ensured = json!({
                 "started": false,
                 "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
                 "coexisting_with_incompatible_daemon": true,
                 "legacy_daemon": legacy_response["daemon"].clone(),
-            }));
+            });
+            annotate_legacy_handoff_quiesce(&mut ensured, &legacy_handoff_quiesce);
+            return Ok(ensured);
         }
         DaemonEnsureProbe::Incompatible(_response) => {
             // The generation socket belongs to this binary-version namespace. A
@@ -998,13 +1022,15 @@ fn ensure_generation_daemon_for_incompatible_default(
             if let Some(response) =
                 stop_incompatible_daemon(layout, &generation_endpoint, startup_deadline)?
             {
-                return Ok(json!({
+                let mut ensured = json!({
                     "started": false,
                     "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
                     "coexisting_with_incompatible_daemon": true,
                     "legacy_daemon": legacy_response["daemon"].clone(),
                     "replaced_incompatible_generation_daemon": true,
-                }));
+                });
+                annotate_legacy_handoff_quiesce(&mut ensured, &legacy_handoff_quiesce);
+                return Ok(ensured);
             }
             replaced_incompatible_generation_daemon = true;
         }
@@ -1022,7 +1048,57 @@ fn ensure_generation_daemon_for_incompatible_default(
     if replaced_incompatible_generation_daemon {
         ensured["replaced_incompatible_generation_daemon"] = Value::Bool(true);
     }
+    annotate_legacy_handoff_quiesce(&mut ensured, &legacy_handoff_quiesce);
     Ok(ensured)
+}
+
+fn maybe_quiesce_handoff_eligible_legacy_daemon(
+    layout: &FsLayout,
+    legacy_response: &Value,
+    startup_deadline: Instant,
+) -> Result<Option<Value>> {
+    let gate = daemon_handoff_gate(legacy_response);
+    if gate != DaemonHandoffGate::Eligible {
+        return Ok(None);
+    }
+    let endpoint = DaemonEndpoint::default(layout);
+    let response = daemon_request_payload_with_timeout_at_endpoint(
+        layout,
+        &endpoint,
+        "handoff_quiesce",
+        json!({
+            "expected_pid": legacy_response["daemon"]["pid"].as_u64(),
+            "expected_binary_version": legacy_response["daemon"]["binary_version"].as_str(),
+        }),
+        remaining_budget(startup_deadline)?,
+    )
+    .with_context(|| {
+        format!(
+            "quiesce handoff-capable daemon at {}",
+            endpoint.socket_path().display()
+        )
+    })
+    .and_then(|response| {
+        let confirmed = response.get("quiescing").and_then(Value::as_bool) == Some(true)
+            || response
+                .get("daemon")
+                .and_then(|daemon| daemon.get("quiescing"))
+                .and_then(Value::as_bool)
+                == Some(true);
+        if !confirmed {
+            bail!("handoff-capable daemon did not confirm quiesce");
+        }
+        Ok(response)
+    })?;
+    Ok(Some(response))
+}
+
+fn annotate_legacy_handoff_quiesce(ensured: &mut Value, quiesce_response: &Option<Value>) {
+    if let Some(response) = quiesce_response {
+        ensured["legacy_daemon_quiesced"] = Value::Bool(true);
+        ensured["legacy_handoff_gate"] = Value::String(DaemonHandoffGate::Eligible.as_str().into());
+        ensured["legacy_handoff_quiesce"] = response.clone();
+    }
 }
 
 fn acquire_startup_lock(layout: &FsLayout, timeout: Duration) -> Result<StartupLock> {
@@ -1459,6 +1535,87 @@ fn daemon_response_is_compatible(response: &Value) -> bool {
                 })
             });
     has_protocol && has_capabilities
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonHandoffGate {
+    Eligible,
+    UnsupportedProtocol,
+    MissingCapability,
+    MissingBinaryVersion,
+    InvalidBinaryVersion,
+    BinaryVersionBelowMinimum,
+    MissingPid,
+    InvalidPid,
+}
+
+impl DaemonHandoffGate {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::UnsupportedProtocol => "unsupported_protocol",
+            Self::MissingCapability => "missing_capability",
+            Self::MissingBinaryVersion => "missing_binary_version",
+            Self::InvalidBinaryVersion => "invalid_binary_version",
+            Self::BinaryVersionBelowMinimum => "binary_version_below_minimum",
+            Self::MissingPid => "missing_pid",
+            Self::InvalidPid => "invalid_pid",
+        }
+    }
+}
+
+fn daemon_handoff_gate(response: &Value) -> DaemonHandoffGate {
+    if response["protocol_version"].as_u64() != Some(DAEMON_PROTOCOL_VERSION) {
+        return DaemonHandoffGate::UnsupportedProtocol;
+    }
+    let has_handoff_capability = response
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .is_some_and(|reported| {
+            reported
+                .iter()
+                .any(|capability| capability.as_str() == Some(DAEMON_HANDOFF_CAPABILITY))
+        });
+    if !has_handoff_capability {
+        return DaemonHandoffGate::MissingCapability;
+    }
+    let Some(binary_version) = response
+        .get("daemon")
+        .and_then(|daemon| daemon.get("binary_version"))
+        .and_then(Value::as_str)
+    else {
+        return DaemonHandoffGate::MissingBinaryVersion;
+    };
+    match daemon_binary_version_supports_handoff(binary_version) {
+        Some(true) => {}
+        Some(false) => return DaemonHandoffGate::BinaryVersionBelowMinimum,
+        None => return DaemonHandoffGate::InvalidBinaryVersion,
+    }
+    let Some(pid) = response
+        .get("daemon")
+        .and_then(|daemon| daemon.get("pid"))
+        .and_then(Value::as_u64)
+    else {
+        return DaemonHandoffGate::MissingPid;
+    };
+    if u32::try_from(pid).is_err() {
+        return DaemonHandoffGate::InvalidPid;
+    }
+    DaemonHandoffGate::Eligible
+}
+
+fn daemon_binary_version_supports_handoff(binary_version: &str) -> Option<bool> {
+    let version = Version::parse(binary_version.trim_start_matches('v')).ok()?;
+    Some(version >= daemon_handoff_min_binary_version())
+}
+
+fn daemon_handoff_min_binary_version() -> Version {
+    Version::parse(DAEMON_HANDOFF_MIN_BINARY_VERSION)
+        .expect("daemon handoff minimum version is valid semver")
+}
+
+fn current_daemon_binary_supports_handoff() -> bool {
+    daemon_binary_version_supports_handoff(env!("CARGO_PKG_VERSION")).unwrap_or(false)
 }
 
 fn incompatible_daemon_summary(response: &Value) -> String {
@@ -2397,7 +2554,20 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
                 "cli_app_servers": cli_app_server_infos(state),
             })
         }
+        "handoff_quiesce" => {
+            let payload = if request.payload.is_null() {
+                HandoffQuiescePayload::default()
+            } else {
+                serde_json::from_value(request.payload).context("parse handoff quiesce payload")?
+            };
+            quiesce_for_handoff(state, payload)?;
+            json!({
+                "daemon": daemon_info(state),
+                "quiescing": true,
+            })
+        }
         "cli_app_server_reserve" => {
+            ensure_daemon_accepts_new_work(state)?;
             let payload: CliAppServerReservePayload = serde_json::from_value(request.payload)
                 .context("parse cli app-server reservation payload")?;
             json!({
@@ -2405,6 +2575,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "cli_app_server_ensure" => {
+            ensure_daemon_accepts_new_work(state)?;
             let payload: CliAppServerEnsurePayload =
                 serde_json::from_value(request.payload).context("parse cli app-server payload")?;
             json!({
@@ -2412,6 +2583,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "cli_app_server_probe" => {
+            ensure_daemon_accepts_new_work(state)?;
             let payload: CliAppServerProbePayload = serde_json::from_value(request.payload)
                 .context("parse cli app-server probe payload")?;
             json!({
@@ -2440,6 +2612,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "cli_thread_start" => {
+            ensure_daemon_accepts_new_work(state)?;
             let payload: CliThreadStartPayload = serde_json::from_value(request.payload)
                 .context("parse cli thread/start bootstrap payload")?;
             json!({
@@ -2447,6 +2620,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "cli_foreground_thread_start" => {
+            ensure_daemon_accepts_new_work(state)?;
             let payload: CliForegroundThreadStartPayload = serde_json::from_value(request.payload)
                 .context("parse cli foreground thread bootstrap payload")?;
             json!({
@@ -2454,6 +2628,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "cli_thread_start_promote" => {
+            ensure_daemon_accepts_new_work(state)?;
             let payload: CliThreadStartPromotePayload = serde_json::from_value(request.payload)
                 .context("parse cli thread/start promote payload")?;
             json!({
@@ -2475,6 +2650,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             })
         }
         "dispatch" => {
+            ensure_daemon_accepts_new_work(state)?;
             state
                 .lifecycle_maintenance_suppressed
                 .store(false, Ordering::Release);
@@ -2488,6 +2664,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             )?
         }
         "task_run" => {
+            ensure_daemon_accepts_new_work(state)?;
             state
                 .lifecycle_maintenance_suppressed
                 .store(false, Ordering::Release);
@@ -2517,11 +2694,15 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
 fn daemon_info(state: &DaemonState) -> DaemonInfo {
     DaemonInfo {
         pid: std::process::id(),
+        binary_version: env!("CARGO_PKG_VERSION"),
         started_at: state.started_at,
         uptime_seconds: state.started_instant.elapsed().as_secs(),
         socket_path: state.socket_path.display().to_string(),
         idle_timeout_seconds: state.idle_timeout.as_secs(),
         stop_requested: state.stop_requested.load(Ordering::Acquire),
+        quiescing: state.quiescing.load(Ordering::Acquire),
+        handoff_minimum_binary_version: DAEMON_HANDOFF_MIN_BINARY_VERSION,
+        handoff_eligible: current_daemon_binary_supports_handoff(),
     }
 }
 
@@ -2529,6 +2710,36 @@ fn ensure_daemon_not_stopping(state: &DaemonState) -> Result<()> {
     if state.stop_requested.load(Ordering::Acquire) {
         bail!("daemon is stopping");
     }
+    Ok(())
+}
+
+fn ensure_daemon_accepts_new_work(state: &DaemonState) -> Result<()> {
+    ensure_daemon_not_stopping(state)?;
+    if state.quiescing.load(Ordering::Acquire) {
+        bail!("daemon is quiescing for handoff");
+    }
+    Ok(())
+}
+
+fn quiesce_for_handoff(state: &DaemonState, payload: HandoffQuiescePayload) -> Result<()> {
+    ensure_daemon_not_stopping(state)?;
+    if let Some(expected_pid) = payload.expected_pid
+        && expected_pid != std::process::id()
+    {
+        bail!(
+            "handoff quiesce target pid mismatch: expected {expected_pid}, got {}",
+            std::process::id()
+        );
+    }
+    if let Some(expected_binary_version) = payload.expected_binary_version
+        && expected_binary_version != env!("CARGO_PKG_VERSION")
+    {
+        bail!(
+            "handoff quiesce target binary_version mismatch: expected {expected_binary_version}, got {}",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    state.quiescing.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -5862,6 +6073,7 @@ mod tests {
                 idle_timeout: Duration::from_secs(60),
                 startup_sweep: SweepReport::default(),
                 stop_requested: AtomicBool::new(false),
+                quiescing: AtomicBool::new(false),
                 lifecycle_maintenance_suppressed: AtomicBool::new(false),
                 activity_generation: AtomicU64::new(0),
                 active_clients: AtomicUsize::new(0),
@@ -6093,6 +6305,125 @@ mod tests {
 
         drop(dispatch_slots);
         let _slot = try_acquire_dispatch_slot(&state).expect("released dispatch slot");
+    }
+
+    #[test]
+    fn handoff_gate_requires_capability_and_minimum_version() {
+        let response = json!({
+            "daemon": {
+                "pid": 1,
+                "binary_version": "0.2.0"
+            },
+            "protocol_version": DAEMON_PROTOCOL_VERSION,
+            "capabilities": [DAEMON_HANDOFF_CAPABILITY],
+        });
+        assert_eq!(daemon_handoff_gate(&response), DaemonHandoffGate::Eligible);
+
+        let below_minimum = json!({
+            "daemon": {
+                "pid": 1,
+                "binary_version": "0.1.5"
+            },
+            "protocol_version": DAEMON_PROTOCOL_VERSION,
+            "capabilities": [DAEMON_HANDOFF_CAPABILITY],
+        });
+        assert_eq!(
+            daemon_handoff_gate(&below_minimum),
+            DaemonHandoffGate::BinaryVersionBelowMinimum
+        );
+
+        let missing_capability = json!({
+            "daemon": {
+                "pid": 1,
+                "binary_version": "0.2.0"
+            },
+            "protocol_version": DAEMON_PROTOCOL_VERSION,
+            "capabilities": ["dispatch"],
+        });
+        assert_eq!(
+            daemon_handoff_gate(&missing_capability),
+            DaemonHandoffGate::MissingCapability
+        );
+
+        let missing_pid = json!({
+            "daemon": {
+                "binary_version": "0.2.0"
+            },
+            "protocol_version": DAEMON_PROTOCOL_VERSION,
+            "capabilities": [DAEMON_HANDOFF_CAPABILITY],
+        });
+        assert_eq!(
+            daemon_handoff_gate(&missing_pid),
+            DaemonHandoffGate::MissingPid
+        );
+    }
+
+    #[test]
+    fn handoff_quiesce_refuses_new_work_but_keeps_control_requests() {
+        let (_home, state) = test_state();
+
+        let quiesce = handle_test_request(&state, "handoff_quiesce", Value::Null);
+        assert_eq!(quiesce["ok"], true);
+        assert_eq!(quiesce["response"]["quiescing"], true);
+        assert_eq!(quiesce["response"]["daemon"]["quiescing"], true);
+
+        let ping = handle_test_request(&state, "ping", Value::Null);
+        assert_eq!(ping["ok"], true);
+        assert_eq!(ping["response"]["daemon"]["quiescing"], true);
+
+        let dispatch = handle_test_request(&state, "dispatch", Value::Null);
+        assert_eq!(dispatch["ok"], false);
+        assert_eq!(dispatch["error"], "daemon is quiescing for handoff");
+
+        let task_run = handle_test_request(&state, "task_run", Value::Null);
+        assert_eq!(task_run["ok"], false);
+        assert_eq!(task_run["error"], "daemon is quiescing for handoff");
+
+        let stop = handle_test_request(&state, "stop", Value::Null);
+        assert_eq!(stop["ok"], true);
+        assert_eq!(stop["response"]["stopping"], true);
+    }
+
+    #[test]
+    fn handoff_quiesce_rejects_pid_and_version_mismatch() {
+        let (_home, state) = test_state();
+
+        let wrong_pid = handle_test_request(
+            &state,
+            "handoff_quiesce",
+            json!({
+                "expected_pid": std::process::id().saturating_add(1),
+                "expected_binary_version": env!("CARGO_PKG_VERSION"),
+            }),
+        );
+        assert_eq!(wrong_pid["ok"], false);
+        assert!(
+            wrong_pid["error"]
+                .as_str()
+                .expect("pid mismatch error")
+                .contains("target pid mismatch"),
+            "{wrong_pid}"
+        );
+
+        let wrong_version = handle_test_request(
+            &state,
+            "handoff_quiesce",
+            json!({
+                "expected_pid": std::process::id(),
+                "expected_binary_version": "99.0.0",
+            }),
+        );
+        assert_eq!(wrong_version["ok"], false);
+        assert!(
+            wrong_version["error"]
+                .as_str()
+                .expect("version mismatch error")
+                .contains("target binary_version mismatch"),
+            "{wrong_version}"
+        );
+
+        let ping = handle_test_request(&state, "ping", Value::Null);
+        assert_eq!(ping["response"]["daemon"]["quiescing"], false);
     }
 
     #[test]
