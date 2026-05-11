@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -44,6 +45,31 @@ const SQLITE_DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(100);
 const SQLITE_TASK_SUPERVISOR_SETUP_TIMEOUT: Duration = Duration::from_millis(100);
 const SQLITE_OPEN_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const SQLITE_OPEN_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
+
+#[derive(Debug)]
+struct DurableDesktopArmFailure {
+    message: String,
+}
+
+impl fmt::Display for DurableDesktopArmFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DurableDesktopArmFailure {}
+
+fn desktop_arm_lease_expired_error(attempt_id: &str, lease_deadline: i64) -> anyhow::Error {
+    anyhow::Error::new(DurableDesktopArmFailure {
+        message: format!(
+            "delivery attempt {attempt_id} bridge arm lease expired at {lease_deadline}"
+        ),
+    })
+}
+
+fn is_durable_desktop_arm_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DurableDesktopArmFailure>().is_some()
+}
 
 pub struct Store {
     conn: Connection,
@@ -2120,10 +2146,11 @@ impl Store {
                 tx.commit()?;
                 Ok(record)
             }
-            Err(error) => {
+            Err(error) if is_durable_desktop_arm_failure(&error) => {
                 tx.commit()?;
                 Err(error)
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -2158,10 +2185,11 @@ impl Store {
                 tx.commit()?;
                 Ok(record)
             }
-            Err(error) => {
+            Err(error) if is_durable_desktop_arm_failure(&error) => {
                 tx.commit()?;
                 Err(error)
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -2264,7 +2292,7 @@ impl Store {
         };
         let outcome = match outcome_result {
             Ok(outcome) => outcome,
-            Err(error) => {
+            Err(error) if is_durable_desktop_arm_failure(&error) => {
                 let error_message = error.to_string();
                 let outcome = serde_json::json!({
                     "outcome": "cas_failed",
@@ -2274,6 +2302,7 @@ impl Store {
                 tx.commit()?;
                 bail!("{error_message}");
             }
+            Err(error) => return Err(error),
         };
         insert_desktop_transcript_relay_consumption_tx(&tx, &consumption, &outcome)?;
         tx.commit()?;
@@ -4512,11 +4541,10 @@ fn note_desktop_arm_pending_tx(
             .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
         if lease_deadline <= now {
             abandon_desktop_arm_pending_tx(tx, &attempt.attempt_id, now)?;
-            bail!(
-                "delivery attempt {} bridge arm lease expired at {}",
-                attempt.attempt_id,
-                lease_deadline
-            );
+            return Err(desktop_arm_lease_expired_error(
+                &attempt.attempt_id,
+                lease_deadline,
+            ));
         }
         let lease_id = attempt
             .bridge_arm_lease_id
@@ -4665,11 +4693,10 @@ fn note_desktop_arm_tx(
         .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
     if lease_deadline <= now {
         abandon_desktop_arm_pending_tx(tx, &attempt.attempt_id, now)?;
-        bail!(
-            "delivery attempt {} bridge arm lease expired at {}",
-            attempt.attempt_id,
-            lease_deadline
-        );
+        return Err(desktop_arm_lease_expired_error(
+            &attempt.attempt_id,
+            lease_deadline,
+        ));
     }
     ensure_attempt_budget_remaining(&batch)?;
     let pause_not_before =

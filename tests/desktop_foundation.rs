@@ -1881,6 +1881,180 @@ fn desktop_transcript_relay_consumer_records_failed_cas_replay_fence() {
 }
 
 #[test]
+fn desktop_transcript_relay_consumer_rolls_back_non_durable_cas_failure() {
+    let home = temp_home();
+    let fixture = cbth(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "prepare-writeback-fixture",
+            "--source-thread-id",
+            "thread-relay-rollback",
+            "--caller-automation-id",
+            "automation-relay-rollback",
+            "--bridge-request-id",
+            "bridge-request-relay-rollback",
+            "--now",
+            "7400",
+            "--json",
+        ],
+    );
+    let fixture = &fixture["desktop_writeback_fixture"];
+    let attempt_id = fixture["attempt"]["attempt_id"].as_str().unwrap();
+
+    let pending_marker = "CBTH_RELAY_ROLLBACK_PENDING";
+    let pending_emit = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "emit-transcript-arm-pending",
+            "--source-thread-id",
+            "thread-relay-rollback",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-relay-rollback",
+            "--marker",
+            pending_marker,
+            "--json",
+            "--now",
+            "7410",
+        ],
+        false,
+    );
+    assert!(pending_emit.status.success());
+    let pending_rollout = home.path().join("rollback-pending-rollout.jsonl");
+    write_function_call_rollout(
+        &pending_rollout,
+        &String::from_utf8(pending_emit.stdout).unwrap(),
+    );
+    let pending = cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            pending_rollout.to_str().unwrap(),
+            "--marker",
+            pending_marker,
+            "--json",
+            "--now",
+            "7420",
+        ],
+    );
+    let lease_id =
+        pending["desktop_transcript_relay_consumption"]["record"]["outcome"]["bridge_arm_lease_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+    let arm_marker = "CBTH_RELAY_ROLLBACK_ARM";
+    let wrong_arm_emit = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "emit-transcript-arm",
+            "--source-thread-id",
+            "thread-relay-rollback",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-relay-rollback",
+            "--bridge-arm-lease-id",
+            "wrong-lease",
+            "--marker",
+            arm_marker,
+            "--json",
+            "--now",
+            "7430",
+        ],
+        false,
+    );
+    assert!(wrong_arm_emit.status.success());
+    let wrong_arm_rollout = home.path().join("rollback-wrong-arm-rollout.jsonl");
+    write_function_call_rollout(
+        &wrong_arm_rollout,
+        &String::from_utf8(wrong_arm_emit.stdout).unwrap(),
+    );
+    let wrong_error = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            wrong_arm_rollout.to_str().unwrap(),
+            "--marker",
+            arm_marker,
+            "--json",
+            "--now",
+            "7440",
+        ],
+    );
+    assert!(wrong_error.contains("bridge_arm_lease_id does not match"));
+    let inspected_after_error = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
+    assert_eq!(inspected_after_error["attempt"]["state"], "arm_pending");
+
+    let correct_arm_emit = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "emit-transcript-arm",
+            "--source-thread-id",
+            "thread-relay-rollback",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-relay-rollback",
+            "--bridge-arm-lease-id",
+            &lease_id,
+            "--marker",
+            arm_marker,
+            "--json",
+            "--now",
+            "7450",
+        ],
+        false,
+    );
+    assert!(correct_arm_emit.status.success());
+    let correct_arm_rollout = home.path().join("rollback-correct-arm-rollout.jsonl");
+    write_function_call_rollout(
+        &correct_arm_rollout,
+        &String::from_utf8(correct_arm_emit.stdout).unwrap(),
+    );
+    let armed = cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            correct_arm_rollout.to_str().unwrap(),
+            "--marker",
+            arm_marker,
+            "--json",
+            "--now",
+            "7460",
+        ],
+    );
+    let armed = &armed["desktop_transcript_relay_consumption"]["record"];
+    assert_eq!(armed["replay_state"], "fresh");
+    assert_eq!(armed["outcome"]["outcome"], "armed");
+    assert_eq!(armed["outcome"]["delivery_attempt_count"], 1);
+}
+
+#[test]
 fn desktop_transcript_relay_consumer_fails_closed_without_trusted_single_envelope() {
     let home = temp_home();
     let fixture = cbth(
