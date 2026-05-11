@@ -445,6 +445,8 @@ enum DesktopRelayCommand {
         about = "Consume one trusted Desktop transcript writeback envelope"
     )]
     ConsumeTranscript(DesktopRelayConsumeTranscriptArgs),
+    #[command(name = "consume-prepared-transcript", hide = true)]
+    ConsumePreparedTranscript(DesktopRelayConsumePreparedTranscriptArgs),
 }
 
 #[derive(Debug, Args)]
@@ -541,6 +543,48 @@ struct DesktopRelayConsumeTranscriptArgs {
 
     #[arg(long, hide = true)]
     now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopRelayConsumePreparedTranscriptArgs {
+    #[arg(long, hide = true)]
+    rollout_path: PathBuf,
+
+    #[arg(long, hide = true)]
+    marker: String,
+
+    #[arg(long, hide = true)]
+    envelope_hash: String,
+
+    #[arg(long, hide = true)]
+    envelope_kind: String,
+
+    #[arg(long, hide = true)]
+    envelope_json: String,
+
+    #[arg(long, hide = true)]
+    trusted_entry_json: String,
+
+    #[arg(long, hide = true)]
+    source_thread_id: String,
+
+    #[arg(long, hide = true)]
+    attempt_id: String,
+
+    #[arg(long, hide = true)]
+    generation: i64,
+
+    #[arg(long, hide = true)]
+    bridge_request_id: String,
+
+    #[arg(long, hide = true)]
+    bridge_arm_lease_id: Option<String>,
+
+    #[arg(long, hide = true)]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: i64,
 }
 
 #[derive(Debug, Args)]
@@ -2237,6 +2281,24 @@ fn dispatch(command: Commands, layout: &FsLayout, mode: DispatchMode) -> Result<
         direct_store: false,
         startup_timeout_seconds,
     } = mode
+        && let Commands::Desktop {
+            command:
+                DesktopCommand::Relay {
+                    command: DesktopRelayCommand::ConsumeTranscript(args),
+                },
+        } = &command
+    {
+        return dispatch_desktop_relay_consume_transcript_via_daemon(
+            args,
+            layout,
+            startup_timeout_seconds,
+        );
+    }
+
+    if let DispatchMode::Client {
+        direct_store: false,
+        startup_timeout_seconds,
+    } = mode
         && let Some(argv) = daemon_argv_for_mutating_command(&command)?
     {
         let startup_sweep_now = daemon_startup_sweep_for_command(&command)?;
@@ -2325,6 +2387,26 @@ fn validate_existing_daemon_compatible(response: &Value) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn dispatch_desktop_relay_consume_transcript_via_daemon(
+    args: &DesktopRelayConsumeTranscriptArgs,
+    layout: &FsLayout,
+    startup_timeout_seconds: u64,
+) -> Result<Value> {
+    let now = args.now.unwrap_or(now_epoch_seconds()?);
+    let prepared =
+        prepare_desktop_transcript_relay_consumption(&args.rollout_path, &args.marker, now)?;
+    let argv = daemon_argv_for_prepared_desktop_transcript_relay(prepared, args.json)?;
+    validate_daemon_autostart_endpoint(layout)?;
+    let ensure_options = DaemonEnsureOptions {
+        idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
+        startup_timeout_seconds,
+        startup_sweep_now: Some(now),
+        replace_incompatible: false,
+    };
+    daemon_ensure(layout, ensure_options)?;
+    daemon_request_payload(layout, "dispatch", json!({ "argv": argv_payload(argv) }))
 }
 
 fn dispatch_daemon_task_command(
@@ -8805,31 +8887,6 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
         }
         Commands::Desktop {
             command:
-                DesktopCommand::Relay {
-                    command: DesktopRelayCommand::ConsumeTranscript(args),
-                },
-        } => {
-            let mut argv = vec![
-                OsString::from("desktop"),
-                OsString::from("relay"),
-                OsString::from("consume-transcript"),
-            ];
-            push_path_arg(
-                &mut argv,
-                "--rollout-path",
-                &absolute_cli_path(&args.rollout_path)?,
-            );
-            push_string_arg(&mut argv, "--marker", &args.marker);
-            if args.json {
-                argv.push(OsString::from("--json"));
-            }
-            if let Some(now) = args.now {
-                push_i64_arg(&mut argv, "--now", now);
-            }
-            argv
-        }
-        Commands::Desktop {
-            command:
                 DesktopCommand::Validation {
                     command: DesktopValidationCommand::PrepareWritebackFixture(args),
                 },
@@ -8922,10 +8979,66 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
                 | DesktopCommand::ListPauseDue(_)
                 | DesktopCommand::ClaimNextReady(_),
         }
+        | Commands::Desktop {
+            command:
+                DesktopCommand::Relay {
+                    command:
+                        DesktopRelayCommand::ConsumeTranscript(_)
+                        | DesktopRelayCommand::ConsumePreparedTranscript(_),
+                },
+        }
         | Commands::Doctor { .. }
         | Commands::Daemon { .. } => return Ok(None),
     };
     Ok(Some(argv))
+}
+
+fn daemon_argv_for_prepared_desktop_transcript_relay(
+    prepared: PreparedDesktopTranscriptRelayConsumption,
+    json_output: bool,
+) -> Result<Vec<OsString>> {
+    let trusted_entry_json = serde_json::to_string(&prepared.trusted_entry)?;
+    let mut argv = vec![
+        OsString::from("desktop"),
+        OsString::from("relay"),
+        OsString::from("consume-prepared-transcript"),
+    ];
+    push_string_arg(&mut argv, "--rollout-path", &prepared.rollout_path);
+    push_string_arg(&mut argv, "--marker", &prepared.marker);
+    push_string_arg(&mut argv, "--envelope-hash", &prepared.envelope_hash);
+    push_string_arg(
+        &mut argv,
+        "--envelope-kind",
+        &prepared.request.envelope_kind,
+    );
+    push_string_arg(
+        &mut argv,
+        "--envelope-json",
+        &prepared.request.envelope_json,
+    );
+    push_string_arg(&mut argv, "--trusted-entry-json", &trusted_entry_json);
+    push_string_arg(
+        &mut argv,
+        "--source-thread-id",
+        &prepared.request.source_thread_id,
+    );
+    push_string_arg(&mut argv, "--attempt-id", &prepared.request.attempt_id);
+    push_i64_arg(&mut argv, "--generation", prepared.request.generation);
+    push_string_arg(
+        &mut argv,
+        "--bridge-request-id",
+        &prepared.request.bridge_request_id,
+    );
+    push_optional_string_arg(
+        &mut argv,
+        "--bridge-arm-lease-id",
+        prepared.request.bridge_arm_lease_id.as_deref(),
+    );
+    if json_output {
+        argv.push(OsString::from("--json"));
+    }
+    push_i64_arg(&mut argv, "--now", prepared.request.now);
+    Ok(argv)
 }
 
 fn daemon_startup_sweep_for_command(command: &Commands) -> Result<Option<i64>> {
@@ -10119,6 +10232,33 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
                 &args.marker,
                 now,
             )?;
+            let mut store = Store::open(layout)?;
+            let consumption = consume_prepared_desktop_transcript_relay(&mut store, prepared)?;
+            Ok(json!({ "desktop_transcript_relay_consumption": consumption }))
+        }
+        DesktopCommand::Relay {
+            command: DesktopRelayCommand::ConsumePreparedTranscript(args),
+        } => {
+            let trusted_entry: Value = serde_json::from_str(&args.trusted_entry_json)
+                .context("parse trusted transcript relay entry JSON")?;
+            let prepared = PreparedDesktopTranscriptRelayConsumption {
+                request: NewDesktopTranscriptRelayConsumption {
+                    marker: args.marker.clone(),
+                    envelope_hash: args.envelope_hash.clone(),
+                    envelope_kind: args.envelope_kind.clone(),
+                    envelope_json: args.envelope_json.clone(),
+                    source_thread_id: args.source_thread_id.clone(),
+                    attempt_id: args.attempt_id.clone(),
+                    generation: args.generation,
+                    bridge_request_id: args.bridge_request_id.clone(),
+                    bridge_arm_lease_id: args.bridge_arm_lease_id.clone(),
+                    now: args.now,
+                },
+                rollout_path: args.rollout_path.display().to_string(),
+                marker: args.marker,
+                trusted_entry,
+                envelope_hash: args.envelope_hash,
+            };
             let mut store = Store::open(layout)?;
             let consumption = consume_prepared_desktop_transcript_relay(&mut store, prepared)?;
             Ok(json!({ "desktop_transcript_relay_consumption": consumption }))

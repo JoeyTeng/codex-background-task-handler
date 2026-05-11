@@ -2127,6 +2127,121 @@ fn desktop_transcript_relay_consumer_rejects_untrusted_without_opening_store() {
 }
 
 #[test]
+fn desktop_transcript_relay_consumer_scans_before_daemon_autostart() {
+    let marker = "CBTH_RELAY_DAEMON_NO_STORE";
+    let prefix = "CBTH_TRANSCRIPT_WRITEBACK_V1 ";
+    let envelope = json!({
+        "schema_version": 1,
+        "channel": "desktop_transcript_writeback",
+        "kind": "arm_pending_requested",
+        "source_thread_id": "thread-daemon-no-store",
+        "attempt_id": "attempt-daemon-no-store",
+        "generation": 1,
+        "bridge_request_id": "bridge-request-daemon-no-store",
+        "marker": marker,
+        "created_at": 7240,
+    });
+    let line = format!("{prefix}{}", serde_json::to_string(&envelope).unwrap());
+    let untrusted_home = temp_home();
+    let prompt_only = untrusted_home
+        .path()
+        .join("relay-daemon-prompt-only-no-store.jsonl");
+    write_user_prompt_rollout(&prompt_only, &line);
+    let prompt_error = cbth_daemon_failure(
+        &untrusted_home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            prompt_only.to_str().unwrap(),
+            "--marker",
+            marker,
+            "--json",
+            "--now",
+            "7241",
+        ],
+    );
+    assert!(prompt_error.contains("no_trusted_auto_envelope"));
+    assert!(!untrusted_home.path().join("cbth.sqlite3").exists());
+    assert!(
+        !untrusted_home
+            .path()
+            .join("run")
+            .join("startup.lock")
+            .exists()
+    );
+
+    let trusted_home = temp_home();
+    let fixture = cbth(
+        &trusted_home,
+        &[
+            "desktop",
+            "validation",
+            "prepare-writeback-fixture",
+            "--source-thread-id",
+            "thread-relay-daemon",
+            "--caller-automation-id",
+            "automation-relay-daemon",
+            "--bridge-request-id",
+            "bridge-request-relay-daemon",
+            "--now",
+            "7250",
+            "--json",
+        ],
+    );
+    let attempt_id = fixture["desktop_writeback_fixture"]["attempt"]["attempt_id"]
+        .as_str()
+        .unwrap();
+    let trusted_marker = "CBTH_RELAY_DAEMON_TRUSTED";
+    let emit = cbth_output(
+        &trusted_home,
+        &[
+            "desktop",
+            "validation",
+            "emit-transcript-arm-pending",
+            "--source-thread-id",
+            "thread-relay-daemon",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-relay-daemon",
+            "--marker",
+            trusted_marker,
+            "--json",
+            "--now",
+            "7260",
+        ],
+        false,
+    );
+    assert!(emit.status.success());
+    let rollout = trusted_home.path().join("relay-daemon-trusted.jsonl");
+    write_function_call_rollout(&rollout, &String::from_utf8(emit.stdout).unwrap());
+    let consumed = cbth_daemon(
+        &trusted_home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            rollout.to_str().unwrap(),
+            "--marker",
+            trusted_marker,
+            "--json",
+            "--now",
+            "7270",
+        ],
+    );
+    assert_eq!(
+        consumed["desktop_transcript_relay_consumption"]["record"]["outcome"]["outcome"],
+        "arm_pending"
+    );
+    stop_daemon(&trusted_home);
+}
+
+#[test]
 fn desktop_writeback_dropbox_probe_writes_once_without_daemon_or_store() {
     let home = temp_home();
     let output = cbth_output(
