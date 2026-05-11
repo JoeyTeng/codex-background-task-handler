@@ -1079,7 +1079,7 @@ fn desktop_transcript_writeback_scan_classifies_rollout_carriers() {
             "type": "response_item",
             "payload": {
                 "type": "function_call_output",
-                "output": format!("Chunk ID: abc\nOutput:\n{trusted_line}\n")
+                "output": format!("Chunk ID: abc\nINFO: quoted {trusted_line}\nOutput:\n{trusted_line}\n")
             }
         }),
         json!({

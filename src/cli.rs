@@ -10807,8 +10807,9 @@ fn extract_desktop_transcript_writeback_envelopes(
 ) -> Vec<Result<Option<Value>>> {
     text.lines()
         .filter_map(|line| {
-            let index = line.find(DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX)?;
-            let envelope = line[index + DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX.len()..].trim();
+            let line = line.trim_start();
+            let envelope = line.strip_prefix(DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX)?;
+            let envelope = envelope.trim();
             Some(validate_desktop_transcript_writeback_envelope(
                 envelope, marker,
             ))
