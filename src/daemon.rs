@@ -801,11 +801,13 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
     let generation_endpoint = DaemonEndpoint::generation(layout);
     match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)? {
         DaemonEnsureProbe::Compatible(response) => {
-            return Ok(json!({
-                "started": false,
-                "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
-                "using_generation_daemon": true,
-            }));
+            if !options.replace_incompatible {
+                return Ok(json!({
+                    "started": false,
+                    "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
+                    "using_generation_daemon": true,
+                }));
+            }
         }
         DaemonEnsureProbe::Incompatible(_) => {
             let mut replaced_incompatible_generation_daemon = false;
@@ -817,11 +819,13 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
             match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)?
             {
                 DaemonEnsureProbe::Compatible(response) => {
-                    return Ok(json!({
-                        "started": false,
-                        "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
-                        "using_generation_daemon": true,
-                    }));
+                    if !options.replace_incompatible {
+                        return Ok(json!({
+                            "started": false,
+                            "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
+                            "using_generation_daemon": true,
+                        }));
+                    }
                 }
                 DaemonEnsureProbe::Incompatible(_) => {
                     // The generation socket belongs to this binary-version namespace. A

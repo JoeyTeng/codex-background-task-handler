@@ -1069,6 +1069,89 @@ fn daemon_ensure_reuses_generation_daemon_when_legacy_socket_is_absent() {
 
 #[cfg(unix)]
 #[test]
+fn daemon_ensure_replace_incompatible_starts_default_instead_of_reusing_generation() {
+    let home = temp_home();
+    let socket_path = home.path().join("run").join("cbth.sock");
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let mut generation_daemon = spawn_daemon(
+        &home,
+        "30",
+        &["--socket-kind", "generation", "--skip-startup-sweep"],
+    );
+    wait_for_path(&generation_socket_path);
+
+    let legacy_listener =
+        UnixListener::bind(&socket_path).expect("bind incompatible default daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod default socket");
+    let legacy_socket_path = socket_path.clone();
+    let legacy_handle = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _addr) = legacy_listener
+                .accept()
+                .expect("accept incompatible default request");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("read incompatible default request");
+            let is_stop = request.contains("\"stop\"");
+            let response = if is_stop {
+                r#"{"ok":true,"response":{"stopping":true}}"#
+            } else {
+                r#"{"ok":true,"response":{"daemon":{"pid":4242,"binary_version":"0.1.5"},"message":"pong"}}"#
+            };
+            stream
+                .write_all(response.as_bytes())
+                .expect("write incompatible default response");
+            stream
+                .write_all(b"\n")
+                .expect("write incompatible default response newline");
+            if is_stop {
+                break;
+            }
+        }
+        drop(legacy_listener);
+        fs::remove_file(&legacy_socket_path).expect("remove incompatible default socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--replace-incompatible",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    assert_eq!(ensured["started"], true);
+    assert!(ensured.get("using_generation_daemon").is_none());
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        socket_path.display().to_string()
+    );
+    assert!(generation_socket_path.exists());
+
+    legacy_handle.join().expect("incompatible default thread");
+    let ping = cbth(&home, &["daemon", "ping"]);
+    assert_eq!(ping["protocol_version"], 1);
+
+    cbth(&home, &["daemon", "stop"]);
+    wait_for_socket_path_removed(&socket_path, Duration::from_secs(10));
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    generation_daemon.wait().expect("generation daemon exits");
+}
+
+#[cfg(unix)]
+#[test]
 fn generation_daemon_startup_recovers_own_lost_task_process_group() {
     let home = temp_home();
     let generation_socket_path = home
