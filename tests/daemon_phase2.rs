@@ -1208,6 +1208,165 @@ fn generation_daemon_startup_recovers_own_lost_task_process_group() {
 
 #[cfg(unix)]
 #[test]
+fn generation_daemon_startup_recovers_stale_previous_generation_task_process_group() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let marker = home.path().join("stale-generation-lost-task-marker");
+    let marker_arg = marker.to_string_lossy().to_string();
+    let mut daemon = spawn_daemon(&home, "300", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-stale-generation-lost-task",
+            "--summary",
+            "stale generation daemon lost task",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 3; printf done > \"$1\"",
+            "cbth-task",
+            &marker_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+
+    daemon.kill().expect("kill generation daemon");
+    let _ = daemon.wait().expect("wait generation daemon");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE jobs
+         SET supervisor_daemon_generation = '0.1.4'
+         WHERE job_id = (SELECT job_id FROM tasks WHERE task_id = ?)",
+        params![task_id],
+    )
+    .expect("retag stale generation job");
+    conn.execute(
+        "UPDATE tasks
+         SET supervisor_daemon_generation = '0.1.4'
+         WHERE task_id = ?",
+        params![task_id],
+    )
+    .expect("retag stale generation task");
+    drop(conn);
+
+    let mut replacement = spawn_daemon(&home, "30", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+
+    let task = wait_for_task_status(&home, task_id, "lost");
+    assert_eq!(
+        task["task"]["failure_reason"],
+        "task supervisor lost after daemon restart"
+    );
+    thread::sleep(Duration::from_secs(4));
+    assert!(
+        !marker.exists(),
+        "stale generation lost supervised process group survived startup recovery"
+    );
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    replacement
+        .wait()
+        .expect("replacement generation daemon exits");
+}
+
+#[cfg(unix)]
+#[test]
+fn generation_daemon_ignores_live_previous_generation_tasks_for_idle_exit() {
+    let home = temp_home();
+    let current_generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let previous_generation_dir = home.path().join("run").join("daemons").join("0.1.4");
+    fs::create_dir_all(&previous_generation_dir).expect("create previous generation dir");
+    fs::set_permissions(home.path().join("run"), fs::Permissions::from_mode(0o700))
+        .expect("chmod run dir");
+    fs::set_permissions(
+        home.path().join("run").join("daemons"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("chmod daemons dir");
+    fs::set_permissions(&previous_generation_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod previous generation dir");
+    let previous_generation_socket_path = previous_generation_dir.join("cbth.sock");
+    let previous_listener =
+        UnixListener::bind(&previous_generation_socket_path).expect("bind previous generation");
+    fs::set_permissions(
+        &previous_generation_socket_path,
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("chmod previous generation socket");
+
+    let submitted = cbth(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "previous-generation-thread",
+            "--summary",
+            "previous generation pending job",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE jobs
+         SET supervisor_daemon_generation = '0.1.4'
+         WHERE job_id = ?",
+        params![job_id],
+    )
+    .expect("retag previous generation job");
+    conn.execute(
+        "INSERT INTO tasks (
+            task_id, job_id, source_thread_id, status, summary, command_json,
+            cwd, max_delivery_attempts, redelivery_window_seconds,
+            supervisor_daemon_generation, created_at
+         ) VALUES (
+            'previous-generation-live-task', ?, 'previous-generation-thread',
+            'queued', 'previous generation live task', '[]', '/', 3, 86400,
+            '0.1.4', 1
+         )",
+        params![job_id],
+    )
+    .expect("insert previous generation task");
+    drop(conn);
+
+    let mut daemon = spawn_daemon(&home, "1", &["--socket-kind", "generation"]);
+    wait_for_path(&current_generation_socket_path);
+    wait_for_socket_path_removed(&current_generation_socket_path, Duration::from_secs(10));
+    daemon
+        .wait()
+        .expect("current generation daemon exits after idle");
+
+    let task = cbth(
+        &home,
+        &[
+            "task",
+            "inspect",
+            "--task-id",
+            "previous-generation-live-task",
+        ],
+    );
+    assert_eq!(task["task"]["status"], "queued");
+    drop(previous_listener);
+    let _ = fs::remove_file(previous_generation_socket_path);
+}
+
+#[cfg(unix)]
+#[test]
 fn generation_daemon_ignores_unowned_legacy_tasks_for_idle_exit() {
     let home = temp_home();
     let generation_socket_path = home

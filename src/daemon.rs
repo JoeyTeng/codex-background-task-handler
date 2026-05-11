@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -521,6 +521,11 @@ enum TaskRecoveryScope {
     CurrentGeneration,
 }
 
+struct TaskRecoveryOwners {
+    include_unowned: bool,
+    supervisor_daemon_generations: HashSet<String>,
+}
+
 impl DaemonLifecycleCache {
     fn has_exit_blockers(&self, maintenance_suppressed: bool) -> bool {
         self.refresh_failed
@@ -566,19 +571,14 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         None => current_epoch_seconds()?,
     };
     let mut store = Store::open(layout)?;
-    recover_lost_task_process_groups_for_scope(layout, &task_recovery_scope)?;
-    let _ = match &task_recovery_scope {
-        TaskRecoveryScope::Unowned => store
-            .fail_lost_tasks_without_supervisor_generation_excluding_with(recovery_now, |_| {
-                Ok(false)
-            })?,
-        TaskRecoveryScope::CurrentGeneration => store
-            .fail_lost_tasks_for_supervisor_generation_excluding_with(
-                recovery_now,
-                current_daemon_generation_id(),
-                |_| Ok(false),
-            )?,
-    };
+    let recovery_owners = task_recovery_owners_for_scope(layout, &store, &task_recovery_scope)?;
+    recover_lost_task_process_groups_for_owners(&store, &recovery_owners)?;
+    let _ = store.fail_lost_tasks_for_recovery_owners_excluding_with(
+        recovery_now,
+        recovery_owners.include_unowned,
+        &recovery_owners.supervisor_daemon_generations,
+        |_| Ok(false),
+    )?;
     let startup_sweep = if let Some(now) = options.startup_sweep_now {
         store.sweep(layout, now)?
     } else {
@@ -1845,18 +1845,24 @@ fn recover_lost_task_process_groups(layout: &FsLayout) -> Result<()> {
     recover_lost_task_process_groups_for_scope(layout, &TaskRecoveryScope::Unowned)
 }
 
+#[cfg(test)]
 fn recover_lost_task_process_groups_for_scope(
     layout: &FsLayout,
     scope: &TaskRecoveryScope,
 ) -> Result<()> {
     let store = Store::open(layout)?;
-    let processes = match scope {
-        TaskRecoveryScope::Unowned => {
-            store.lost_pending_task_processes_without_supervisor_generation()?
-        }
-        TaskRecoveryScope::CurrentGeneration => store
-            .lost_pending_task_processes_for_supervisor_generation(current_daemon_generation_id())?,
-    };
+    let recovery_owners = task_recovery_owners_for_scope(layout, &store, scope)?;
+    recover_lost_task_process_groups_for_owners(&store, &recovery_owners)
+}
+
+fn recover_lost_task_process_groups_for_owners(
+    store: &Store,
+    recovery_owners: &TaskRecoveryOwners,
+) -> Result<()> {
+    let processes = store.lost_pending_task_processes_for_recovery_owners(
+        recovery_owners.include_unowned,
+        &recovery_owners.supervisor_daemon_generations,
+    )?;
     for process in processes {
         let Some(expected_identity) = process.pid_identity.as_deref() else {
             continue;
@@ -1871,6 +1877,72 @@ fn recover_lost_task_process_groups_for_scope(
         }
     }
     Ok(())
+}
+
+fn task_recovery_owners_for_scope(
+    layout: &FsLayout,
+    store: &Store,
+    scope: &TaskRecoveryScope,
+) -> Result<TaskRecoveryOwners> {
+    let mut recovery_owners = match scope {
+        TaskRecoveryScope::Unowned => TaskRecoveryOwners {
+            include_unowned: true,
+            supervisor_daemon_generations: HashSet::new(),
+        },
+        TaskRecoveryScope::CurrentGeneration => {
+            let mut supervisor_daemon_generations = HashSet::new();
+            supervisor_daemon_generations.insert(current_daemon_generation_id().to_owned());
+            TaskRecoveryOwners {
+                include_unowned: false,
+                supervisor_daemon_generations,
+            }
+        }
+    };
+
+    for generation in store.nonterminal_task_supervisor_generations()? {
+        if generation == current_daemon_generation_id() {
+            continue;
+        }
+        if !daemon_generation_id_is_path_safe(&generation) {
+            continue;
+        }
+        if !daemon_generation_endpoint_has_listener(layout, &generation) {
+            recovery_owners
+                .supervisor_daemon_generations
+                .insert(generation);
+        }
+    }
+
+    Ok(recovery_owners)
+}
+
+fn daemon_generation_id_is_path_safe(generation_id: &str) -> bool {
+    !generation_id.is_empty()
+        && generation_id != "."
+        && generation_id != ".."
+        && !generation_id.contains('/')
+}
+
+fn daemon_generation_endpoint_has_listener(layout: &FsLayout, generation_id: &str) -> bool {
+    let socket_path = layout.daemon_generation_socket_path(generation_id);
+    if !socket_path.exists() {
+        return false;
+    }
+    if validate_socket_endpoint_path(layout, &socket_path).is_err() {
+        return true;
+    }
+    match UnixStream::connect(&socket_path) {
+        Ok(_) => true,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            false
+        }
+        Err(_) => true,
+    }
 }
 
 fn lost_task_process_leader_identity_matches(pid: u32, expected_identity: &str) -> bool {
@@ -2151,17 +2223,14 @@ fn refresh_lifecycle_status(
 ) -> Result<DaemonLifecycleStatus> {
     let now = current_epoch_seconds()?;
     let store = Store::open_for_daemon_lifecycle(&state.layout)?;
-    match &state.task_recovery_scope {
-        TaskRecoveryScope::Unowned => {
-            store.daemon_lifecycle_status_without_supervisor_generation(now, idle_horizon_at)
-        }
-        TaskRecoveryScope::CurrentGeneration => store
-            .daemon_lifecycle_status_for_supervisor_generation(
-                current_daemon_generation_id(),
-                now,
-                idle_horizon_at,
-            ),
-    }
+    let recovery_owners =
+        task_recovery_owners_for_scope(&state.layout, &store, &state.task_recovery_scope)?;
+    store.daemon_lifecycle_status_for_recovery_owners(
+        now,
+        idle_horizon_at,
+        recovery_owners.include_unowned,
+        &recovery_owners.supervisor_daemon_generations,
+    )
 }
 
 fn maybe_spawn_lifecycle_maintenance(
@@ -2213,20 +2282,23 @@ fn recover_registryless_lost_tasks(state: &DaemonState) -> Result<usize> {
     recover_registryless_lost_task_process_groups(state)?;
     let now = current_epoch_seconds()?;
     let mut store = Store::open_for_daemon_lifecycle(&state.layout)?;
-    fail_lost_tasks_for_recovery_scope(&mut store, now, &state.task_recovery_scope, |task_id| {
-        supervised_task_is_active(state, task_id)
-    })
+    fail_lost_tasks_for_recovery_scope(
+        &state.layout,
+        &mut store,
+        now,
+        &state.task_recovery_scope,
+        |task_id| supervised_task_is_active(state, task_id),
+    )
 }
 
 fn recover_registryless_lost_task_process_groups(state: &DaemonState) -> Result<()> {
     let store = Store::open_for_daemon_lifecycle(&state.layout)?;
-    let processes = match &state.task_recovery_scope {
-        TaskRecoveryScope::Unowned => {
-            store.lost_pending_task_processes_without_supervisor_generation()?
-        }
-        TaskRecoveryScope::CurrentGeneration => store
-            .lost_pending_task_processes_for_supervisor_generation(current_daemon_generation_id())?,
-    };
+    let recovery_owners =
+        task_recovery_owners_for_scope(&state.layout, &store, &state.task_recovery_scope)?;
+    let processes = store.lost_pending_task_processes_for_recovery_owners(
+        recovery_owners.include_unowned,
+        &recovery_owners.supervisor_daemon_generations,
+    )?;
     for process in processes {
         if supervised_task_is_active(state, &process.task_id)? {
             continue;
@@ -2252,6 +2324,7 @@ fn recover_registryless_lost_task_process_groups(state: &DaemonState) -> Result<
 }
 
 fn fail_lost_tasks_for_recovery_scope<F>(
+    layout: &FsLayout,
     store: &mut Store,
     now: i64,
     scope: &TaskRecoveryScope,
@@ -2260,17 +2333,13 @@ fn fail_lost_tasks_for_recovery_scope<F>(
 where
     F: FnMut(&str) -> Result<bool>,
 {
-    match scope {
-        TaskRecoveryScope::Unowned => {
-            store.fail_lost_tasks_without_supervisor_generation_excluding_with(now, is_active_task)
-        }
-        TaskRecoveryScope::CurrentGeneration => store
-            .fail_lost_tasks_for_supervisor_generation_excluding_with(
-                now,
-                current_daemon_generation_id(),
-                is_active_task,
-            ),
-    }
+    let recovery_owners = task_recovery_owners_for_scope(layout, store, scope)?;
+    store.fail_lost_tasks_for_recovery_owners_excluding_with(
+        now,
+        recovery_owners.include_unowned,
+        &recovery_owners.supervisor_daemon_generations,
+        is_active_task,
+    )
 }
 
 fn supervised_task_is_active(state: &DaemonState, task_id: &str) -> Result<bool> {

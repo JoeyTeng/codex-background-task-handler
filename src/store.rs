@@ -66,6 +66,17 @@ struct LostTaskRecovery {
     supervisor_daemon_generation: Option<String>,
 }
 
+fn supervisor_generation_matches_recovery_owners(
+    supervisor_daemon_generation: Option<&str>,
+    include_unowned: bool,
+    supervisor_daemon_generations: &HashSet<String>,
+) -> bool {
+    match supervisor_daemon_generation {
+        Some(generation) => supervisor_daemon_generations.contains(generation),
+        None => include_unowned,
+    }
+}
+
 pub struct TaskFinishUpdate<'a> {
     pub task_id: &'a str,
     pub status: &'a str,
@@ -499,6 +510,7 @@ impl Store {
         self.lost_pending_task_processes_matching(|_| true)
     }
 
+    #[allow(dead_code)]
     pub fn lost_pending_task_processes_without_supervisor_generation(
         &self,
     ) -> Result<Vec<LostPendingTaskProcess>> {
@@ -507,12 +519,27 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn lost_pending_task_processes_for_supervisor_generation(
         &self,
         supervisor_daemon_generation: &str,
     ) -> Result<Vec<LostPendingTaskProcess>> {
         self.lost_pending_task_processes_matching(|task_supervisor_generation| {
             task_supervisor_generation == Some(supervisor_daemon_generation)
+        })
+    }
+
+    pub fn lost_pending_task_processes_for_recovery_owners(
+        &self,
+        include_unowned: bool,
+        supervisor_daemon_generations: &HashSet<String>,
+    ) -> Result<Vec<LostPendingTaskProcess>> {
+        self.lost_pending_task_processes_matching(|task_supervisor_generation| {
+            supervisor_generation_matches_recovery_owners(
+                task_supervisor_generation,
+                include_unowned,
+                supervisor_daemon_generations,
+            )
         })
     }
 
@@ -586,6 +613,7 @@ impl Store {
         self.fail_lost_tasks_matching_excluding_with(now, |_| true, &mut is_active_task)
     }
 
+    #[allow(dead_code)]
     pub fn fail_lost_tasks_without_supervisor_generation_excluding_with<F>(
         &mut self,
         now: i64,
@@ -601,6 +629,7 @@ impl Store {
         )
     }
 
+    #[allow(dead_code)]
     pub fn fail_lost_tasks_for_supervisor_generation_excluding_with<F>(
         &mut self,
         now: i64,
@@ -614,6 +643,29 @@ impl Store {
             now,
             |task_supervisor_generation| {
                 task_supervisor_generation == Some(supervisor_daemon_generation)
+            },
+            &mut is_active_task,
+        )
+    }
+
+    pub fn fail_lost_tasks_for_recovery_owners_excluding_with<F>(
+        &mut self,
+        now: i64,
+        include_unowned: bool,
+        supervisor_daemon_generations: &HashSet<String>,
+        mut is_active_task: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&str) -> Result<bool>,
+    {
+        self.fail_lost_tasks_matching_excluding_with(
+            now,
+            |task_supervisor_generation| {
+                supervisor_generation_matches_recovery_owners(
+                    task_supervisor_generation,
+                    include_unowned,
+                    supervisor_daemon_generations,
+                )
             },
             &mut is_active_task,
         )
@@ -2597,6 +2649,7 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn daemon_lifecycle_status_without_supervisor_generation(
         &self,
         now: i64,
@@ -2634,6 +2687,68 @@ impl Store {
         })
     }
 
+    pub fn daemon_lifecycle_status_for_recovery_owners(
+        &self,
+        now: i64,
+        idle_horizon_at: i64,
+        include_unowned: bool,
+        supervisor_daemon_generations: &HashSet<String>,
+    ) -> Result<DaemonLifecycleStatus> {
+        let active_jobs = self.count_recovery_owner_rows(
+            "SELECT supervisor_daemon_generation FROM jobs
+             WHERE status = 'pending'",
+            include_unowned,
+            supervisor_daemon_generations,
+        )?;
+        let nonterminal_tasks = self.count_recovery_owner_rows(
+            "SELECT supervisor_daemon_generation FROM tasks
+             WHERE status IN ('queued', 'running')",
+            include_unowned,
+            supervisor_daemon_generations,
+        )?;
+        let active_cli_acceptances = count_active_cli_acceptances(&self.conn, now)?;
+        let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
+        let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
+        let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
+        let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
+        Ok(DaemonLifecycleStatus {
+            active_jobs,
+            nonterminal_tasks,
+            active_cli_acceptances,
+            cli_acceptances_stale_now,
+            active_cli_observations,
+            cli_observations_due_now,
+            open_batches_due_now,
+            open_batches_due_within_idle,
+        })
+    }
+
+    fn count_recovery_owner_rows(
+        &self,
+        sql: &str,
+        include_unowned: bool,
+        supervisor_daemon_generations: &HashSet<String>,
+    ) -> Result<i64> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Option<String>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|supervisor_daemon_generation| {
+                supervisor_generation_matches_recovery_owners(
+                    supervisor_daemon_generation.as_deref(),
+                    include_unowned,
+                    supervisor_daemon_generations,
+                )
+            })
+            .count()
+            .try_into()
+            .expect("matching recovery owner row count fits i64"))
+    }
+
+    #[allow(dead_code)]
     pub fn daemon_lifecycle_status_for_supervisor_generation(
         &self,
         supervisor_daemon_generation: &str,
@@ -2670,6 +2785,19 @@ impl Store {
             open_batches_due_now,
             open_batches_due_within_idle,
         })
+    }
+
+    pub fn nonterminal_task_supervisor_generations(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT supervisor_daemon_generation
+             FROM tasks
+             WHERE status IN ('queued', 'running')
+               AND supervisor_daemon_generation IS NOT NULL
+             ORDER BY supervisor_daemon_generation ASC",
+        )?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn close_head(
