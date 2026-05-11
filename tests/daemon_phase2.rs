@@ -733,6 +733,96 @@ fn daemon_ensure_coexists_with_incompatible_default_without_stop() {
 
 #[cfg(unix)]
 #[test]
+fn daemon_dispatch_uses_probed_socket_when_ping_omits_socket_path() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind compatible daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    let cleanup_socket_path = socket_path.clone();
+    let handle = thread::spawn(move || {
+        let (mut ping_stream, _addr) = listener.accept().expect("accept ping request");
+        let mut ping_request = String::new();
+        ping_stream
+            .read_to_string(&mut ping_request)
+            .expect("read ping request");
+        assert!(ping_request.contains("\"ping\""));
+        let ping_response = json!({
+            "ok": true,
+            "response": {
+                "daemon": {
+                    "pid": 5151,
+                    "binary_version": env!("CARGO_PKG_VERSION")
+                },
+                "protocol_version": 1,
+                "capabilities": [
+                    "dispatch",
+                    "attempt-dispatch",
+                    "cli-app-server-lifecycle",
+                    "cli-app-server-probe",
+                    "cli-thread-start-bootstrap",
+                    "cli-thread-start-params",
+                    "cli-foreground-thread-bootstrap",
+                    "cli-session-dispatch",
+                    "cli-session-capability-dispatch",
+                    "cli-session-permission-dispatch",
+                    "cli-session-proof-invalidation-dispatch",
+                    "cli-session-recovery-dispatch",
+                    "cli-turn-observation-dispatch",
+                    "cli-turn-observation-expiry-dispatch",
+                    "cli-auto-delivery-dispatch",
+                    "task-supervisor",
+                    "desktop-bridge-foundation-dispatch",
+                    "desktop-inbox-revisioned-installation-state",
+                    "desktop-writeback-helper-foundation",
+                    "desktop-writeback-live-validation-fixture"
+                ],
+                "message": "pong"
+            }
+        });
+        writeln!(ping_stream, "{ping_response}").expect("write ping response");
+        drop(ping_stream);
+
+        let (mut dispatch_stream, _addr) = listener.accept().expect("accept dispatch request");
+        let mut dispatch_request = String::new();
+        dispatch_stream
+            .read_to_string(&mut dispatch_request)
+            .expect("read dispatch request");
+        assert!(dispatch_request.contains("\"dispatch\""));
+        let dispatch_response = json!({
+            "ok": true,
+            "response": {
+                "job": {
+                    "job_id": "accepted-via-fallback",
+                    "status": "pending"
+                }
+            }
+        });
+        writeln!(dispatch_stream, "{dispatch_response}").expect("write dispatch response");
+        drop(dispatch_stream);
+        drop(listener);
+        fs::remove_file(&cleanup_socket_path).expect("remove compatible daemon socket");
+    });
+
+    let submitted = cbth_daemon(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "socket-path-fallback",
+            "--summary",
+            "socket path fallback",
+        ],
+    );
+    assert_eq!(submitted["job"]["job_id"], "accepted-via-fallback");
+    handle.join().expect("compatible daemon thread");
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_ensure_reuses_generation_daemon_when_legacy_socket_is_absent() {
     let home = temp_home();
     let generation_socket_path = home

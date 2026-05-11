@@ -179,6 +179,26 @@ pub fn daemon_endpoint_from_response(
     Ok(endpoint)
 }
 
+fn daemon_info_from_response_or_endpoint(response: &Value, endpoint: &DaemonEndpoint) -> Value {
+    let mut daemon = response
+        .get("daemon")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    match &mut daemon {
+        Value::Object(daemon) => {
+            daemon
+                .entry("socket_path".to_owned())
+                .or_insert_with(|| Value::String(endpoint.socket_path().display().to_string()));
+        }
+        _ => {
+            daemon = json!({
+                "socket_path": endpoint.socket_path().display().to_string(),
+            });
+        }
+    }
+    daemon
+}
+
 pub fn current_daemon_generation_id() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -720,7 +740,7 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
         DaemonEnsureProbe::Compatible(response) => {
             return Ok(json!({
                 "started": false,
-                "daemon": response["daemon"].clone(),
+                "daemon": daemon_info_from_response_or_endpoint(&response, &default_endpoint),
             }));
         }
         DaemonEnsureProbe::Incompatible(response) => {
@@ -730,7 +750,7 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
                 {
                     return Ok(json!({
                         "started": false,
-                        "daemon": response["daemon"].clone(),
+                        "daemon": daemon_info_from_response_or_endpoint(&response, &default_endpoint),
                         "replaced_incompatible_daemon": true,
                     }));
                 }
@@ -752,7 +772,7 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
         DaemonEnsureProbe::Compatible(response) => {
             return Ok(json!({
                 "started": false,
-                "daemon": response["daemon"].clone(),
+                "daemon": daemon_info_from_response_or_endpoint(&response, &default_endpoint),
             }));
         }
         DaemonEnsureProbe::Incompatible(response) => {
@@ -762,7 +782,7 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
                 {
                     return Ok(json!({
                         "started": false,
-                        "daemon": response["daemon"].clone(),
+                        "daemon": daemon_info_from_response_or_endpoint(&response, &default_endpoint),
                         "replaced_incompatible_daemon": true,
                     }));
                 }
@@ -783,7 +803,7 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
         DaemonEnsureProbe::Compatible(response) => {
             return Ok(json!({
                 "started": false,
-                "daemon": response["daemon"].clone(),
+                "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
                 "using_generation_daemon": true,
             }));
         }
@@ -849,7 +869,7 @@ fn spawn_daemon_until_ready(
                 return Ok(json!({
                     "started": true,
                     "spawned_pid": child_pid,
-                    "daemon": response["daemon"].clone(),
+                    "daemon": daemon_info_from_response_or_endpoint(&response, &endpoint),
                 }));
             }
             Ok(_) => {
@@ -867,7 +887,7 @@ fn spawn_daemon_until_ready(
                     {
                         return Ok(json!({
                             "started": false,
-                            "daemon": response["daemon"].clone(),
+                            "daemon": daemon_info_from_response_or_endpoint(&response, &endpoint),
                         }));
                     }
                     cleanup_stale_socket_best_effort(endpoint.socket_path());
@@ -896,7 +916,7 @@ fn ensure_generation_daemon_for_incompatible_default(
         DaemonEnsureProbe::Compatible(response) => {
             return Ok(json!({
                 "started": false,
-                "daemon": response["daemon"].clone(),
+                "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
                 "coexisting_with_incompatible_daemon": true,
                 "legacy_daemon": legacy_response["daemon"].clone(),
             }));
@@ -920,7 +940,7 @@ fn ensure_generation_daemon_for_incompatible_default(
         DaemonEnsureProbe::Compatible(response) => {
             return Ok(json!({
                 "started": false,
-                "daemon": response["daemon"].clone(),
+                "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
                 "coexisting_with_incompatible_daemon": true,
                 "legacy_daemon": legacy_response["daemon"].clone(),
             }));
