@@ -80,6 +80,47 @@ Quiesce mode 的 PR3 语义：
 - `handoff_quiesce` idempotently sets in-memory quiescing state and returns daemon info with `quiescing=true`。
 - Quiescing daemon refuses new work: `dispatch`、`task_run`、CLI app-server reserve/ensure/probe、thread-start/bootstrap/promote。
 - Quiescing daemon keeps control/maintenance paths available: `ping`、`status`、`stop`、app-server lease refresh/release/stop、thread-start abort、`task_cancel`。
+- Handoff quiesce fencing must not cover long app-server spawn or `thread/start` RPC work. It only protects registry transitions; if quiesce wins before a CLI app-server or bootstrap candidate is registered, the candidate is rejected and stopped, and if quiesce observes an already registered bootstrap, `daemon ensure` falls back to coexistence.
 - PR3 不导出 app-server registry，不 adopt app-server，不迁移或 drain live jobs。PR4/PR5 才实现这些资源面的行为。
 
 当 incompatible legacy default daemon 通过 handoff gate 时，`daemon ensure` 会先 quiesce legacy daemon，再启动或复用 generation daemon，并在 ensure response 中标注 `legacy_daemon_quiesced` 和 `legacy_handoff_quiesce`。如果 eligible daemon 未确认 quiesce，ensure fail closed，避免后续 PR 在未 quiesce 的 peer 上做资源接管。
+
+## PR4 App-Server Handoff
+
+PR4 接管 daemon-owned CLI app-server，但不改变 foreground Codex 已连接的 websocket listener。
+
+Registry ownership 扩展为三类：
+
+- `owned`: 当前 daemon 直接 spawn 的 app-server child，继续拥有 child handle、stdout/stderr drain worker、lease expiry 和 proof cleanup。
+- `adopted`: 新 daemon 从 quiesced legacy daemon 接管的 app-server。它没有 child handle，但记录 `pid`、`pid_identity`、原 daemon socket、thread、epoch、lease、ws url，并用 pid identity fencing 做 refresh/stop/reap。
+- `handed_off`: legacy daemon 已把 app-server 交给新 daemon。legacy daemon 保留短期 redirect/drain 记录，不再 stop 或 invalidate 该 app-server；旧 foreground wrapper 下次 lease refresh 会收到 `handoff_daemon_socket_path` 并切到新 daemon。
+
+Handoff flow:
+
+1. 新 CLI 对 handoff-eligible legacy default daemon 发送 fenced `handoff_quiesce`。
+2. Legacy daemon 进入 quiesce，先 fence 已经进入的 app-server mutation，再导出仍存活的 `owned` app-server：`managed_session_id`、`bound_thread_id`、`session_epoch`、`lease_id`、remaining lease、`ws url`、`pid`、`pid_identity`、`started_at`。如果 export 失败，daemon 必须回滚本次 quiesce，避免 legacy daemon 留在拒绝新 work 的半切换状态；active foreground/thread-start bootstrap 会让本次 handoff fail closed，`daemon ensure` 继续启动或复用 generation daemon，只并存不迁移。
+3. 新 CLI 启动或复用 generation daemon，并发送 hidden `handoff_cli_app_servers_adopt`。
+4. 新 daemon 先验证整批 export 的 loopback url、active lease、pid identity、leader 进程仍存活且非 zombie、process group 和 registry conflict，再 all-or-nothing 注册 `adopted` app-server；refresh 返回同一个 `pid` / `url`。
+5. 新 CLI 对 legacy daemon 发送 hidden `handoff_cli_app_servers_release`；legacy daemon 先验证整批 export 仍匹配当前 registry，再 all-or-nothing 将对应 registry entry 转为 `handed_off`，后续 matching refresh 只返回 redirect，不延长 legacy ownership。
+6. 如果 release 失败，新 CLI 会先向 legacy daemon 查询 release status：确认 legacy 仍是 `owned` 或 export 后已 `missing` 时才请求 generation daemon 撤销刚 adopt 的 entries，然后 fenced `handoff_unquiesce` legacy daemon 并降级为 generation coexistence；如果 legacy 已经是同一 generation socket 的 `handed_off`，则把丢失的 release response 视为已提交；如果 legacy 已经 `handed_off` 给别的 generation，则撤销本 generation 的 losing adoption；状态不明时 fail closed 而不盲目撤销。撤销只移除 generation registry，不 signal app-server，因为 legacy daemon 仍是 owner 或已经负责了 pre-release stop/proof cleanup。Adopt/release/status/rollback/unquiesce 都使用独立的最小超时预算，不再因为 startup deadline 边缘耗尽而跳过 rollback。
+7. 如果 generation adopt 因 stale export 或 transport error 失败，新 CLI 先请求 generation daemon 撤销可能已注册的 adopted entries，再对 legacy daemon 发送 fenced `handoff_unquiesce`；两步都成功时，`daemon ensure` 降级为 generation coexistence，不迁移 app-server。任一步状态不明时 fail closed，避免 legacy quiescing 与 generation adopted split-brain。
+
+Fail-closed rules:
+
+- 缺 pid identity、pid identity mismatch、process group 不存在、url 非 loopback、lease 已过期或 registry entry 已变化时，handoff 不继续。
+- Adopt preflight 必须拒绝已经退出或 zombie 的 app-server leader；即使 process group 仍可 signal，也不能把没有 live websocket listener 的 export 注册为 `adopted`。
+- Legacy export must also protect the owned registry entry until release by extending or freezing its lease for the handoff floor; otherwise the legacy reaper could kill a near-expired app-server after export but before release.
+- 一旦 generation daemon 已经 adopt，后续 release/rollback 不能再直接继承可能接近 0 的 startup budget；否则失败路径会留下 generation `adopted`、legacy `owned` 的 split-brain registry。
+- New `adopted` entries must get a lease floor long enough for old foreground wrappers to discover the legacy redirect and refresh against the generation daemon; short remaining legacy leases are not inherited verbatim.
+- 旧 wrapper 收到 `handoff_daemon_socket_path` redirect 后必须立即向新 daemon 刷新同一 lease，不能等下一次周期性 refresh，否则短剩余 lease 可能在切换间隙过期。
+- 旧 wrapper 的 passive adapter daemon-routed writes 如果先打到 quiesced legacy daemon，必须主动用 app-server lease refresh 发现 redirect 并立即重试到 generation daemon，不能等周期性 lease refresher 更新共享 endpoint。
+- 旧 wrapper 对 legacy `handed_off` entry 发送 stop 时，也必须收到可跟随的 `handoff_daemon_socket_path`，并立即把 stop 转发到新 daemon，避免用户退出后只能等待 adopted lease 过期。
+- Legacy `handed_off` release is idempotent only for the same generation socket. A different generation socket must fail and roll back its losing `adopted` entries instead of retargeting the redirect.
+- Legacy `handed_off` entry 的 stop/shutdown 不 kill app-server，也不 invalidate proof；new `adopted` daemon 才负责后续 lease refresh、proof cleanup 和 stop。`adopted` cleanup 需要同时处理 leader 仍匹配 pid identity 和 leader 已退出但 process group 仍有 live members 两种情况；leader 已退出且没有 live group member 时必须视为 stopped，不能继续 refresh adopted lease。
+- Legacy `handed_off` entry 即使旧 lease 到期，也必须保留 child handle / drain owner，直到 child 已可 reap 后才从 registry 移除；这样 legacy daemon 不会在仍作为 parent 时丢掉 reaping responsibility。
+- Old daemon 仍可能作为短期 stdout/stderr drain 和 redirect shim 存活到旧 lease 窗口结束；PR4 不承诺迁移 stdout/stderr pipe ownership。
+
+Non-goals:
+
+- PR4 不迁移 live jobs，也不迁移 worker 内存状态。
+- PR4 不承诺 app-server stdout/stderr drain 无损迁移；只承诺 foreground websocket url/pid 不变且不会因为 legacy daemon handoff 被 reset。

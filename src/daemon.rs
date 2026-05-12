@@ -34,6 +34,7 @@ use crate::store::{Store, TaskFinishUpdate, new_id};
 pub(crate) const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDOFF_POST_ADOPT_TIMEOUT: Duration = CLIENT_READ_TIMEOUT;
 const DOMAIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const READ_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -72,9 +73,13 @@ const MAX_SUPERVISED_TASKS: usize = 16;
 const MAX_TASK_ENV_VARS: usize = 4096;
 const MAX_TASK_ENV_BYTES: usize = 1024 * 1024;
 const DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS: u64 = 60;
+const HANDOFF_ADOPTED_CLI_APP_SERVER_LEASE_FLOOR_SECONDS: u64 =
+    DEFAULT_CLI_APP_SERVER_LEASE_TTL_SECONDS;
 const DAEMON_PROTOCOL_VERSION: u64 = 1;
 const DAEMON_HANDOFF_CAPABILITY: &str = "daemon-handoff-v1";
 const DAEMON_HANDOFF_MIN_BINARY_VERSION: &str = "0.2.0";
+const DAEMON_HANDOFF_ACTIVE_BOOTSTRAP_ERROR: &str =
+    "cannot handoff while CLI thread/start bootstrap app-servers are active";
 const DAEMON_CAPABILITIES: &[&str] = &[
     "dispatch",
     "attempt-dispatch",
@@ -336,6 +341,13 @@ struct CliAppServerStopPayload {
     lease_id: String,
 }
 
+#[derive(Debug, Serialize)]
+struct CliAppServerStopInfo {
+    stopped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handoff_daemon_socket_path: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CliThreadStartPayload {
     codex_binary: Vec<u8>,
@@ -378,6 +390,31 @@ struct HandoffQuiescePayload {
     expected_binary_version: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HandoffCliAppServerExport {
+    managed_session_id: String,
+    bound_thread_id: String,
+    session_epoch: i64,
+    url: String,
+    pid: u32,
+    pid_identity: String,
+    started_at: i64,
+    lease_id: String,
+    lease_millis_remaining: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct HandoffCliAppServersAdoptPayload {
+    source_daemon_socket_path: String,
+    cli_app_servers: Vec<HandoffCliAppServerExport>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HandoffCliAppServersReleasePayload {
+    handoff_daemon_socket_path: String,
+    cli_app_servers: Vec<HandoffCliAppServerExport>,
+}
+
 #[derive(Debug, Serialize)]
 struct DaemonInfo {
     pid: u32,
@@ -399,8 +436,14 @@ struct CliAppServerInfo {
     session_epoch: i64,
     url: String,
     pid: u32,
+    pid_identity: Option<String>,
     started_at: i64,
     lease_seconds_remaining: u64,
+    ownership: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_daemon_socket_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handoff_daemon_socket_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -430,6 +473,7 @@ struct DaemonState {
     startup_sweep: SweepReport,
     stop_requested: AtomicBool,
     quiescing: AtomicBool,
+    handoff_quiesce_lock: Mutex<()>,
     lifecycle_maintenance_suppressed: AtomicBool,
     activity_generation: AtomicU64,
     active_clients: AtomicUsize,
@@ -473,13 +517,86 @@ struct ManagedCliAppServer {
     bound_thread_id: String,
     session_epoch: i64,
     url: String,
-    child: Child,
+    process: ManagedCliAppServerProcess,
     started_at: i64,
     lease_id: String,
     lease_expires_at: Instant,
+}
+
+enum ManagedCliAppServerProcess {
+    Owned(OwnedCliAppServerProcess),
+    Adopted(AdoptedCliAppServerProcess),
+    HandedOff(HandedOffCliAppServerProcess),
+}
+
+struct OwnedCliAppServerProcess {
+    child: Child,
     drain_running: Arc<AtomicBool>,
     stdout_worker: Option<thread::JoinHandle<()>>,
     stderr_worker: Option<thread::JoinHandle<()>>,
+}
+
+struct AdoptedCliAppServerProcess {
+    pid: u32,
+    pid_identity: String,
+    source_daemon_socket_path: String,
+}
+
+struct HandedOffCliAppServerProcess {
+    child: Child,
+    pid_identity: String,
+    handoff_daemon_socket_path: String,
+    drain_running: Arc<AtomicBool>,
+    stdout_worker: Option<thread::JoinHandle<()>>,
+    stderr_worker: Option<thread::JoinHandle<()>>,
+}
+
+impl ManagedCliAppServer {
+    fn pid(&self) -> u32 {
+        match &self.process {
+            ManagedCliAppServerProcess::Owned(process) => process.child.id(),
+            ManagedCliAppServerProcess::Adopted(process) => process.pid,
+            ManagedCliAppServerProcess::HandedOff(process) => process.child.id(),
+        }
+    }
+
+    fn pid_identity(&self) -> Option<&str> {
+        match &self.process {
+            ManagedCliAppServerProcess::Owned(_) => None,
+            ManagedCliAppServerProcess::Adopted(process) => Some(&process.pid_identity),
+            ManagedCliAppServerProcess::HandedOff(process) => Some(&process.pid_identity),
+        }
+    }
+
+    fn ownership(&self) -> &'static str {
+        match &self.process {
+            ManagedCliAppServerProcess::Owned(_) => "owned",
+            ManagedCliAppServerProcess::Adopted(_) => "adopted",
+            ManagedCliAppServerProcess::HandedOff(_) => "handed_off",
+        }
+    }
+
+    fn handoff_daemon_socket_path(&self) -> Option<&str> {
+        match &self.process {
+            ManagedCliAppServerProcess::Owned(_) | ManagedCliAppServerProcess::Adopted(_) => None,
+            ManagedCliAppServerProcess::HandedOff(process) => {
+                Some(&process.handoff_daemon_socket_path)
+            }
+        }
+    }
+
+    fn source_daemon_socket_path(&self) -> Option<&str> {
+        match &self.process {
+            ManagedCliAppServerProcess::Adopted(process) => {
+                Some(&process.source_daemon_socket_path)
+            }
+            ManagedCliAppServerProcess::Owned(_) | ManagedCliAppServerProcess::HandedOff(_) => None,
+        }
+    }
+
+    fn is_handed_off(&self) -> bool {
+        matches!(&self.process, ManagedCliAppServerProcess::HandedOff(_))
+    }
 }
 
 #[derive(Clone)]
@@ -614,6 +731,7 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
         startup_sweep,
         stop_requested: AtomicBool::new(false),
         quiescing: AtomicBool::new(false),
+        handoff_quiesce_lock: Mutex::new(()),
         lifecycle_maintenance_suppressed: AtomicBool::new(options.startup_sweep_now.is_none()),
         activity_generation: AtomicU64::new(0),
         active_clients: AtomicUsize::new(0),
@@ -987,14 +1105,19 @@ fn ensure_generation_daemon_for_incompatible_default(
     let mut replaced_incompatible_generation_daemon = false;
     match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)? {
         DaemonEnsureProbe::Compatible(response) => {
-            let mut ensured = json!({
+            let ensured = json!({
                 "started": false,
                 "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
                 "coexisting_with_incompatible_daemon": true,
                 "legacy_daemon": legacy_response["daemon"].clone(),
             });
-            annotate_legacy_handoff_quiesce(&mut ensured, &legacy_handoff_quiesce);
-            return Ok(ensured);
+            return finalize_legacy_handoff_cli_app_servers(
+                layout,
+                &generation_endpoint,
+                ensured,
+                &legacy_handoff_quiesce,
+                startup_deadline,
+            );
         }
         DaemonEnsureProbe::Incompatible(_) => {}
         DaemonEnsureProbe::Unavailable => {}
@@ -1007,14 +1130,19 @@ fn ensure_generation_daemon_for_incompatible_default(
     )?;
     match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)? {
         DaemonEnsureProbe::Compatible(response) => {
-            let mut ensured = json!({
+            let ensured = json!({
                 "started": false,
                 "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
                 "coexisting_with_incompatible_daemon": true,
                 "legacy_daemon": legacy_response["daemon"].clone(),
             });
-            annotate_legacy_handoff_quiesce(&mut ensured, &legacy_handoff_quiesce);
-            return Ok(ensured);
+            return finalize_legacy_handoff_cli_app_servers(
+                layout,
+                &generation_endpoint,
+                ensured,
+                &legacy_handoff_quiesce,
+                startup_deadline,
+            );
         }
         DaemonEnsureProbe::Incompatible(_response) => {
             // The generation socket belongs to this binary-version namespace. A
@@ -1023,15 +1151,20 @@ fn ensure_generation_daemon_for_incompatible_default(
             if let Some(response) =
                 stop_incompatible_daemon(layout, &generation_endpoint, startup_deadline)?
             {
-                let mut ensured = json!({
+                let ensured = json!({
                     "started": false,
                     "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
                     "coexisting_with_incompatible_daemon": true,
                     "legacy_daemon": legacy_response["daemon"].clone(),
                     "replaced_incompatible_generation_daemon": true,
                 });
-                annotate_legacy_handoff_quiesce(&mut ensured, &legacy_handoff_quiesce);
-                return Ok(ensured);
+                return finalize_legacy_handoff_cli_app_servers(
+                    layout,
+                    &generation_endpoint,
+                    ensured,
+                    &legacy_handoff_quiesce,
+                    startup_deadline,
+                );
             }
             replaced_incompatible_generation_daemon = true;
         }
@@ -1049,8 +1182,13 @@ fn ensure_generation_daemon_for_incompatible_default(
     if replaced_incompatible_generation_daemon {
         ensured["replaced_incompatible_generation_daemon"] = Value::Bool(true);
     }
-    annotate_legacy_handoff_quiesce(&mut ensured, &legacy_handoff_quiesce);
-    Ok(ensured)
+    finalize_legacy_handoff_cli_app_servers(
+        layout,
+        &generation_endpoint,
+        ensured,
+        &legacy_handoff_quiesce,
+        startup_deadline,
+    )
 }
 
 fn maybe_quiesce_handoff_eligible_legacy_daemon(
@@ -1063,7 +1201,7 @@ fn maybe_quiesce_handoff_eligible_legacy_daemon(
         return Ok(None);
     }
     let endpoint = DaemonEndpoint::default(layout);
-    let response = daemon_request_payload_with_timeout_at_endpoint(
+    let response = match daemon_request_payload_with_timeout_at_endpoint(
         layout,
         &endpoint,
         "handoff_quiesce",
@@ -1072,26 +1210,350 @@ fn maybe_quiesce_handoff_eligible_legacy_daemon(
             "expected_binary_version": legacy_response["daemon"]["binary_version"].as_str(),
         }),
         remaining_budget(startup_deadline)?,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            if format!("{error:#}").contains(DAEMON_HANDOFF_ACTIVE_BOOTSTRAP_ERROR) {
+                return Ok(None);
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "quiesce handoff-capable daemon at {}",
+                    endpoint.socket_path().display()
+                )
+            });
+        }
+    };
+    let confirmed = response.get("quiescing").and_then(Value::as_bool) == Some(true)
+        || response
+            .get("daemon")
+            .and_then(|daemon| daemon.get("quiescing"))
+            .and_then(Value::as_bool)
+            == Some(true);
+    if !confirmed {
+        bail!("handoff-capable daemon did not confirm quiesce");
+    }
+    Ok(Some(response))
+}
+
+fn finalize_legacy_handoff_cli_app_servers(
+    layout: &FsLayout,
+    generation_endpoint: &DaemonEndpoint,
+    mut ensured: Value,
+    quiesce_response: &Option<Value>,
+    startup_deadline: Instant,
+) -> Result<Value> {
+    annotate_legacy_handoff_quiesce(&mut ensured, quiesce_response);
+    let exports = handoff_cli_app_server_exports_from_quiesce(quiesce_response)?;
+    if exports.is_empty() {
+        return Ok(ensured);
+    }
+    let source_daemon_socket_path = DaemonEndpoint::default(layout)
+        .socket_path()
+        .display()
+        .to_string();
+    let handoff_daemon_socket_path = generation_endpoint.socket_path().display().to_string();
+    let release_payload = json!({
+        "handoff_daemon_socket_path": handoff_daemon_socket_path,
+        "cli_app_servers": exports.clone(),
+    });
+    let adopt_response = match daemon_request_payload_with_timeout_at_endpoint(
+        layout,
+        generation_endpoint,
+        "handoff_cli_app_servers_adopt",
+        json!({
+            "source_daemon_socket_path": source_daemon_socket_path,
+            "cli_app_servers": exports.clone(),
+        }),
+        handoff_post_adopt_timeout(startup_deadline),
+    ) {
+        Ok(response) => response,
+        Err(adopt_error) => {
+            rollback_adopted_cli_app_servers_after_failed_adopt(
+                layout,
+                generation_endpoint,
+                &source_daemon_socket_path,
+                &exports,
+                startup_deadline,
+                &adopt_error,
+            )?;
+            let unquiesce_response = unquiesce_legacy_daemon_after_failed_adopt(
+                layout,
+                quiesce_response,
+                startup_deadline,
+                &adopt_error,
+            )?;
+            ensured["legacy_daemon_quiesced"] = Value::Bool(false);
+            ensured["legacy_handoff_unquiesce"] = unquiesce_response;
+            ensured["legacy_cli_app_server_handoff_skipped"] = json!({
+                "reason": "adopt_failed",
+                "error": format!("{adopt_error:#}"),
+            });
+            return Ok(ensured);
+        }
+    };
+    let release_response = match daemon_request_payload_with_timeout_at_endpoint(
+        layout,
+        &DaemonEndpoint::default(layout),
+        "handoff_cli_app_servers_release",
+        release_payload.clone(),
+        handoff_post_adopt_timeout(startup_deadline),
+    ) {
+        Ok(response) => response,
+        Err(release_error) => {
+            let release_status = daemon_request_payload_with_timeout_at_endpoint(
+                layout,
+                &DaemonEndpoint::default(layout),
+                "handoff_cli_app_servers_release_status",
+                release_payload,
+                handoff_post_adopt_timeout(startup_deadline),
+            )
+            .context("confirm legacy CLI app-server handoff release state");
+            match release_status {
+                Ok(status) => {
+                    match handoff_post_adopt_release_decision(&status, &handoff_daemon_socket_path)?
+                    {
+                        HandoffPostAdoptReleaseDecision::CommittedToThisDaemon => {
+                            json!({
+                                "released_cli_app_servers": status["cli_app_servers"].clone(),
+                            })
+                        }
+                        HandoffPostAdoptReleaseDecision::RollbackLegacyUnreleased => {
+                            rollback_adopted_cli_app_servers_after_failed_release(
+                                layout,
+                                generation_endpoint,
+                                &source_daemon_socket_path,
+                                &exports,
+                                startup_deadline,
+                                &release_error,
+                            )?;
+                            let unquiesce_response =
+                                unquiesce_legacy_daemon_after_failed_app_server_handoff(
+                                    layout,
+                                    quiesce_response,
+                                    startup_deadline,
+                                    "release",
+                                    &release_error,
+                                )?;
+                            ensured["legacy_daemon_quiesced"] = Value::Bool(false);
+                            ensured["legacy_handoff_unquiesce"] = unquiesce_response;
+                            ensured["legacy_cli_app_server_handoff_skipped"] = json!({
+                                "reason": "release_failed",
+                                "error": format!("{release_error:#}"),
+                            });
+                            return Ok(ensured);
+                        }
+                        HandoffPostAdoptReleaseDecision::RollbackHandedOffElsewhere => {
+                            rollback_adopted_cli_app_servers_after_failed_release(
+                                layout,
+                                generation_endpoint,
+                                &source_daemon_socket_path,
+                                &exports,
+                                startup_deadline,
+                                &release_error,
+                            )?;
+                            return Err(release_error).context(
+                            "release legacy CLI app-servers after handoff adoption: already handed off to a different daemon",
+                        );
+                        }
+                        HandoffPostAdoptReleaseDecision::Ambiguous => bail!(
+                            "release legacy CLI app-servers after handoff adoption: {release_error:#}; \
+                         legacy release state is ambiguous: {status}"
+                        ),
+                    }
+                }
+                Err(status_error) => bail!(
+                    "release legacy CLI app-servers after handoff adoption: {release_error:#}; \
+                     could not confirm legacy release state before rollback: {status_error:#}"
+                ),
+            }
+        }
+    };
+    ensured["legacy_cli_app_servers_adopted"] = adopt_response["cli_app_servers"].clone();
+    ensured["legacy_cli_app_servers_released"] =
+        release_response["released_cli_app_servers"].clone();
+    ensured["legacy_cli_app_servers_adopted_count"] = Value::from(
+        adopt_response["cli_app_servers"]
+            .as_array()
+            .map_or(0, Vec::len),
+    );
+    Ok(ensured)
+}
+
+fn rollback_adopted_cli_app_servers_after_failed_release(
+    layout: &FsLayout,
+    generation_endpoint: &DaemonEndpoint,
+    source_daemon_socket_path: &str,
+    exports: &[HandoffCliAppServerExport],
+    startup_deadline: Instant,
+    release_error: &anyhow::Error,
+) -> Result<()> {
+    let rollback = daemon_request_payload_with_timeout_at_endpoint(
+        layout,
+        generation_endpoint,
+        "handoff_cli_app_servers_unadopt",
+        json!({
+            "source_daemon_socket_path": source_daemon_socket_path,
+            "cli_app_servers": exports,
+        }),
+        handoff_post_adopt_timeout(startup_deadline),
+    );
+    if let Err(rollback_error) = rollback {
+        bail!(
+            "release legacy CLI app-servers after handoff adoption: {release_error:#}; \
+             rollback adopted CLI app-servers failed: {rollback_error:#}"
+        );
+    }
+    Ok(())
+}
+
+fn rollback_adopted_cli_app_servers_after_failed_adopt(
+    layout: &FsLayout,
+    generation_endpoint: &DaemonEndpoint,
+    source_daemon_socket_path: &str,
+    exports: &[HandoffCliAppServerExport],
+    startup_deadline: Instant,
+    adopt_error: &anyhow::Error,
+) -> Result<()> {
+    let rollback = daemon_request_payload_with_timeout_at_endpoint(
+        layout,
+        generation_endpoint,
+        "handoff_cli_app_servers_unadopt",
+        json!({
+            "source_daemon_socket_path": source_daemon_socket_path,
+            "cli_app_servers": exports,
+        }),
+        handoff_post_adopt_timeout(startup_deadline),
+    );
+    if let Err(rollback_error) = rollback {
+        bail!(
+            "adopt CLI app-servers into daemon at {}: {adopt_error:#}; \
+             rollback adopted CLI app-servers failed: {rollback_error:#}",
+            generation_endpoint.socket_path().display()
+        );
+    }
+    Ok(())
+}
+
+fn unquiesce_legacy_daemon_after_failed_adopt(
+    layout: &FsLayout,
+    quiesce_response: &Option<Value>,
+    startup_deadline: Instant,
+    adopt_error: &anyhow::Error,
+) -> Result<Value> {
+    unquiesce_legacy_daemon_after_failed_app_server_handoff(
+        layout,
+        quiesce_response,
+        startup_deadline,
+        "adopt",
+        adopt_error,
     )
-    .with_context(|| {
+}
+
+fn unquiesce_legacy_daemon_after_failed_app_server_handoff(
+    layout: &FsLayout,
+    quiesce_response: &Option<Value>,
+    startup_deadline: Instant,
+    phase: &str,
+    handoff_error: &anyhow::Error,
+) -> Result<Value> {
+    let Some(response) = quiesce_response else {
+        bail!("{phase} CLI app-servers failed before legacy quiesce metadata: {handoff_error:#}");
+    };
+    let unquiesce = daemon_request_payload_with_timeout_at_endpoint(
+        layout,
+        &DaemonEndpoint::default(layout),
+        "handoff_unquiesce",
+        json!({
+            "expected_pid": response["daemon"]["pid"].as_u64(),
+            "expected_binary_version": response["daemon"]["binary_version"].as_str(),
+        }),
+        handoff_post_adopt_timeout(startup_deadline),
+    );
+    unquiesce.with_context(|| {
         format!(
-            "quiesce handoff-capable daemon at {}",
-            endpoint.socket_path().display()
+            "unquiesce legacy daemon after failed app-server handoff {phase}: {handoff_error:#}"
         )
     })
-    .and_then(|response| {
-        let confirmed = response.get("quiescing").and_then(Value::as_bool) == Some(true)
-            || response
-                .get("daemon")
-                .and_then(|daemon| daemon.get("quiescing"))
-                .and_then(Value::as_bool)
-                == Some(true);
-        if !confirmed {
-            bail!("handoff-capable daemon did not confirm quiesce");
-        }
-        Ok(response)
-    })?;
-    Ok(Some(response))
+}
+
+fn handoff_post_adopt_timeout(startup_deadline: Instant) -> Duration {
+    match remaining_budget(startup_deadline) {
+        Ok(budget) => budget.max(HANDOFF_POST_ADOPT_TIMEOUT),
+        Err(_) => HANDOFF_POST_ADOPT_TIMEOUT,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandoffPostAdoptReleaseDecision {
+    CommittedToThisDaemon,
+    RollbackLegacyUnreleased,
+    RollbackHandedOffElsewhere,
+    Ambiguous,
+}
+
+fn handoff_post_adopt_release_decision(
+    response: &Value,
+    handoff_socket: &str,
+) -> Result<HandoffPostAdoptReleaseDecision> {
+    if handoff_release_status_all_handed_off_to(response, handoff_socket)? {
+        return Ok(HandoffPostAdoptReleaseDecision::CommittedToThisDaemon);
+    }
+    if handoff_release_status_all_ownership_in(response, &["owned", "missing"])? {
+        return Ok(HandoffPostAdoptReleaseDecision::RollbackLegacyUnreleased);
+    }
+    if handoff_release_status_all_ownership(response, "handed_off")? {
+        return Ok(HandoffPostAdoptReleaseDecision::RollbackHandedOffElsewhere);
+    }
+    Ok(HandoffPostAdoptReleaseDecision::Ambiguous)
+}
+
+fn handoff_release_status_all_ownership(response: &Value, ownership: &str) -> Result<bool> {
+    handoff_release_status_all_ownership_in(response, &[ownership])
+}
+
+fn handoff_release_status_all_ownership_in(response: &Value, ownerships: &[&str]) -> Result<bool> {
+    let servers = response
+        .get("cli_app_servers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("handoff release status missing cli_app_servers"))?;
+    Ok(!servers.is_empty()
+        && servers.iter().all(
+            |server| match server.get("ownership").and_then(Value::as_str) {
+                Some(ownership) => ownerships.contains(&ownership),
+                None => false,
+            },
+        ))
+}
+
+fn handoff_release_status_all_handed_off_to(
+    response: &Value,
+    handoff_socket: &str,
+) -> Result<bool> {
+    let servers = response
+        .get("cli_app_servers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("handoff release status missing cli_app_servers"))?;
+    Ok(!servers.is_empty()
+        && servers.iter().all(|server| {
+            server.get("ownership").and_then(Value::as_str) == Some("handed_off")
+                && server
+                    .get("handoff_daemon_socket_path")
+                    .and_then(Value::as_str)
+                    == Some(handoff_socket)
+        }))
+}
+
+fn handoff_cli_app_server_exports_from_quiesce(
+    quiesce_response: &Option<Value>,
+) -> Result<Vec<HandoffCliAppServerExport>> {
+    let Some(response) = quiesce_response else {
+        return Ok(Vec::new());
+    };
+    let Some(exports) = response.get("cli_app_servers") else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(exports.clone()).context("parse handoff cli app-server exports")
 }
 
 fn annotate_legacy_handoff_quiesce(ensured: &mut Value, quiesce_response: &Option<Value>) {
@@ -1960,6 +2422,13 @@ fn supervised_task_process_identity_matches(pid: u32, expected_identity: &str) -
     )
 }
 
+fn app_server_process_identity_matches(pid: u32, expected_identity: &str) -> Result<bool> {
+    Ok(matches!(
+        process_start_identity(pid)?,
+        Some(current_identity) if current_identity == expected_identity
+    ))
+}
+
 fn set_supervised_task_process(
     control: &SupervisedTaskControl,
     pid: u32,
@@ -2561,10 +3030,55 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
             } else {
                 serde_json::from_value(request.payload).context("parse handoff quiesce payload")?
             };
-            quiesce_for_handoff(state, payload)?;
+            let cli_app_servers = quiesce_for_handoff_and_export_cli_app_servers(state, payload)?;
             json!({
                 "daemon": daemon_info(state),
                 "quiescing": true,
+                "cli_app_servers": cli_app_servers,
+            })
+        }
+        "handoff_unquiesce" => {
+            let payload = if request.payload.is_null() {
+                HandoffQuiescePayload::default()
+            } else {
+                serde_json::from_value(request.payload)
+                    .context("parse handoff unquiesce payload")?
+            };
+            unquiesce_for_handoff(state, payload)?;
+            json!({
+                "daemon": daemon_info(state),
+                "quiescing": false,
+            })
+        }
+        "handoff_cli_app_servers_adopt" => {
+            ensure_daemon_accepts_new_work(state)?;
+            let payload: HandoffCliAppServersAdoptPayload = serde_json::from_value(request.payload)
+                .context("parse handoff cli app-server adopt payload")?;
+            json!({
+                "cli_app_servers": adopt_handoff_cli_app_servers(state, payload)?,
+            })
+        }
+        "handoff_cli_app_servers_release" => {
+            let payload: HandoffCliAppServersReleasePayload =
+                serde_json::from_value(request.payload)
+                    .context("parse handoff cli app-server release payload")?;
+            json!({
+                "released_cli_app_servers": release_handoff_cli_app_servers(state, payload)?,
+            })
+        }
+        "handoff_cli_app_servers_release_status" => {
+            let payload: HandoffCliAppServersReleasePayload =
+                serde_json::from_value(request.payload)
+                    .context("parse handoff cli app-server release status payload")?;
+            json!({
+                "cli_app_servers": handoff_cli_app_server_release_status(state, payload)?,
+            })
+        }
+        "handoff_cli_app_servers_unadopt" => {
+            let payload: HandoffCliAppServersAdoptPayload = serde_json::from_value(request.payload)
+                .context("parse handoff cli app-server unadopt payload")?;
+            json!({
+                "unadopted_cli_app_servers": unadopt_handoff_cli_app_servers(state, payload)?,
             })
         }
         "cli_app_server_reserve" => {
@@ -2608,9 +3122,7 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
         "cli_app_server_stop" => {
             let payload: CliAppServerStopPayload = serde_json::from_value(request.payload)
                 .context("parse cli app-server stop payload")?;
-            json!({
-                "stopped": stop_cli_app_server(state, payload)?,
-            })
+            json!(stop_cli_app_server(state, payload)?)
         }
         "cli_thread_start" => {
             ensure_daemon_accepts_new_work(state)?;
@@ -2724,6 +3236,20 @@ fn ensure_daemon_accepts_new_work(state: &DaemonState) -> Result<()> {
 
 fn quiesce_for_handoff(state: &DaemonState, payload: HandoffQuiescePayload) -> Result<()> {
     ensure_daemon_not_stopping(state)?;
+    ensure_handoff_quiesce_target(&payload)?;
+    state.quiescing.store(true, Ordering::Release);
+    Ok(())
+}
+
+fn unquiesce_for_handoff(state: &DaemonState, payload: HandoffQuiescePayload) -> Result<()> {
+    let _guard = acquire_handoff_quiesce_lock(state)?;
+    ensure_daemon_not_stopping(state)?;
+    ensure_handoff_quiesce_target(&payload)?;
+    state.quiescing.store(false, Ordering::Release);
+    Ok(())
+}
+
+fn ensure_handoff_quiesce_target(payload: &HandoffQuiescePayload) -> Result<()> {
     if let Some(expected_pid) = payload.expected_pid
         && expected_pid != std::process::id()
     {
@@ -2732,7 +3258,7 @@ fn quiesce_for_handoff(state: &DaemonState, payload: HandoffQuiescePayload) -> R
             std::process::id()
         );
     }
-    if let Some(expected_binary_version) = payload.expected_binary_version
+    if let Some(expected_binary_version) = &payload.expected_binary_version
         && expected_binary_version != env!("CARGO_PKG_VERSION")
     {
         bail!(
@@ -2740,8 +3266,47 @@ fn quiesce_for_handoff(state: &DaemonState, payload: HandoffQuiescePayload) -> R
             env!("CARGO_PKG_VERSION")
         );
     }
-    state.quiescing.store(true, Ordering::Release);
     Ok(())
+}
+
+fn quiesce_for_handoff_and_export_cli_app_servers(
+    state: &DaemonState,
+    payload: HandoffQuiescePayload,
+) -> Result<Vec<HandoffCliAppServerExport>> {
+    quiesce_for_handoff_and_export_cli_app_servers_with(
+        state,
+        payload,
+        export_cli_app_servers_for_handoff,
+    )
+}
+
+fn quiesce_for_handoff_and_export_cli_app_servers_with<F>(
+    state: &DaemonState,
+    payload: HandoffQuiescePayload,
+    export: F,
+) -> Result<Vec<HandoffCliAppServerExport>>
+where
+    F: FnOnce(&DaemonState) -> Result<Vec<HandoffCliAppServerExport>>,
+{
+    let _guard = acquire_handoff_quiesce_lock(state)?;
+    let was_quiescing = state.quiescing.load(Ordering::Acquire);
+    quiesce_for_handoff(state, payload)?;
+    match export(state) {
+        Ok(exports) => Ok(exports),
+        Err(error) => {
+            if !was_quiescing {
+                state.quiescing.store(false, Ordering::Release);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn acquire_handoff_quiesce_lock(state: &DaemonState) -> Result<std::sync::MutexGuard<'_, ()>> {
+    state
+        .handoff_quiesce_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("handoff quiesce lock is poisoned"))
 }
 
 type SupervisedTaskWorker = Box<dyn FnOnce() + Send + 'static>;
@@ -4057,6 +4622,371 @@ fn build_task_delivery_summary(input: TaskDeliverySummaryInput<'_>) -> String {
     )
 }
 
+fn export_cli_app_servers_for_handoff(
+    state: &DaemonState,
+) -> Result<Vec<HandoffCliAppServerExport>> {
+    {
+        let bootstraps = state
+            .cli_thread_start_bootstraps
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CLI thread/start bootstrap registry lock is poisoned"))?;
+        if !bootstraps.is_empty() {
+            bail!("{}", DAEMON_HANDOFF_ACTIVE_BOOTSTRAP_ERROR);
+        }
+    }
+    let mut servers = state
+        .cli_app_servers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+    let mut exports = Vec::new();
+    for server in servers.values_mut() {
+        if !matches!(&server.process, ManagedCliAppServerProcess::Owned(_)) {
+            continue;
+        }
+        if !cli_app_server_child_is_running(server)? {
+            continue;
+        }
+        let pid = server.pid();
+        let pid_identity = process_start_identity(pid)?
+            .ok_or_else(|| anyhow::anyhow!("cannot identify CLI app-server pid {pid}"))?;
+        let lease_millis_remaining = duration_millis_u64(
+            server
+                .lease_expires_at
+                .saturating_duration_since(Instant::now()),
+        );
+        if lease_millis_remaining == 0 {
+            continue;
+        }
+        let export = HandoffCliAppServerExport {
+            managed_session_id: server.managed_session_id.clone(),
+            bound_thread_id: server.bound_thread_id.clone(),
+            session_epoch: server.session_epoch,
+            url: server.url.clone(),
+            pid,
+            pid_identity,
+            started_at: server.started_at,
+            lease_id: server.lease_id.clone(),
+            lease_millis_remaining,
+        };
+        server.lease_expires_at = Instant::now() + handoff_export_lease_duration(&export);
+        exports.push(export);
+    }
+    Ok(exports)
+}
+
+fn adopt_handoff_cli_app_servers(
+    state: &DaemonState,
+    payload: HandoffCliAppServersAdoptPayload,
+) -> Result<Vec<CliAppServerInfo>> {
+    validate_daemon_nonempty(
+        "source_daemon_socket_path",
+        &payload.source_daemon_socket_path,
+    )?;
+    ensure_daemon_not_stopping(state)?;
+    validate_handoff_cli_app_server_exports(&payload.cli_app_servers)?;
+    for export in &payload.cli_app_servers {
+        if !app_server_process_identity_matches(export.pid, &export.pid_identity)? {
+            bail!(
+                "CLI app-server {} pid identity no longer matches for handoff",
+                export.managed_session_id
+            );
+        }
+        let process = AdoptedCliAppServerProcess {
+            pid: export.pid,
+            pid_identity: export.pid_identity.clone(),
+            source_daemon_socket_path: payload.source_daemon_socket_path.clone(),
+        };
+        if !adopted_cli_app_server_leader_is_running(&process)? {
+            bail!(
+                "CLI app-server {} process is not running for handoff",
+                export.managed_session_id
+            );
+        }
+    }
+    let mut servers = state
+        .cli_app_servers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+    ensure_daemon_not_stopping(state)?;
+    for export in &payload.cli_app_servers {
+        if let Some(existing) = servers.get(&export.managed_session_id)
+            && (!cli_app_server_matches_export(existing, export)
+                || !matches!(&existing.process, ManagedCliAppServerProcess::Adopted(_)))
+        {
+            bail!(
+                "managed session {} already has a registered CLI app-server",
+                export.managed_session_id
+            );
+        }
+    }
+    let mut adopted = Vec::new();
+    for export in payload.cli_app_servers {
+        if let Some(existing) = servers.get_mut(&export.managed_session_id) {
+            existing.lease_expires_at = Instant::now() + handoff_export_lease_duration(&export);
+            adopted.push(cli_app_server_info(existing));
+            continue;
+        }
+        let server = ManagedCliAppServer {
+            managed_session_id: export.managed_session_id.clone(),
+            bound_thread_id: export.bound_thread_id.clone(),
+            session_epoch: export.session_epoch,
+            url: export.url.clone(),
+            process: ManagedCliAppServerProcess::Adopted(AdoptedCliAppServerProcess {
+                pid: export.pid,
+                pid_identity: export.pid_identity.clone(),
+                source_daemon_socket_path: payload.source_daemon_socket_path.clone(),
+            }),
+            started_at: export.started_at,
+            lease_id: export.lease_id.clone(),
+            lease_expires_at: Instant::now() + handoff_export_lease_duration(&export),
+        };
+        let info = cli_app_server_info(&server);
+        servers.insert(export.managed_session_id, server);
+        adopted.push(info);
+    }
+    Ok(adopted)
+}
+
+fn unadopt_handoff_cli_app_servers(
+    state: &DaemonState,
+    payload: HandoffCliAppServersAdoptPayload,
+) -> Result<Vec<CliAppServerInfo>> {
+    validate_daemon_nonempty(
+        "source_daemon_socket_path",
+        &payload.source_daemon_socket_path,
+    )?;
+    validate_handoff_cli_app_server_exports(&payload.cli_app_servers)?;
+    let mut servers = state
+        .cli_app_servers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+    let mut infos = Vec::new();
+    for export in &payload.cli_app_servers {
+        let Some(existing) = servers.get(&export.managed_session_id) else {
+            continue;
+        };
+        if !cli_app_server_matches_export(existing, export) {
+            bail!(
+                "CLI app-server {} changed before handoff unadopt",
+                export.managed_session_id
+            );
+        }
+        let ManagedCliAppServerProcess::Adopted(process) = &existing.process else {
+            bail!(
+                "CLI app-server {} is not adopted and cannot be unadopted",
+                export.managed_session_id
+            );
+        };
+        if process.source_daemon_socket_path != payload.source_daemon_socket_path {
+            bail!(
+                "CLI app-server {} source daemon changed before handoff unadopt",
+                export.managed_session_id
+            );
+        }
+    }
+    for export in payload.cli_app_servers {
+        if let Some(server) = servers.remove(&export.managed_session_id) {
+            infos.push(cli_app_server_info(&server));
+        }
+    }
+    Ok(infos)
+}
+
+fn release_handoff_cli_app_servers(
+    state: &DaemonState,
+    payload: HandoffCliAppServersReleasePayload,
+) -> Result<Vec<CliAppServerInfo>> {
+    validate_daemon_nonempty(
+        "handoff_daemon_socket_path",
+        &payload.handoff_daemon_socket_path,
+    )?;
+    ensure_daemon_not_stopping(state)?;
+    if !state.quiescing.load(Ordering::Acquire) {
+        bail!("daemon must be quiescing before releasing CLI app-servers for handoff");
+    }
+    validate_handoff_cli_app_server_exports(&payload.cli_app_servers)?;
+    let mut servers = state
+        .cli_app_servers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+    for export in &payload.cli_app_servers {
+        let Some(existing) = servers.get(&export.managed_session_id) else {
+            bail!(
+                "CLI app-server for managed session {} is not running",
+                export.managed_session_id
+            );
+        };
+        if !cli_app_server_matches_export(existing, export) {
+            bail!(
+                "CLI app-server {} changed before handoff release",
+                export.managed_session_id
+            );
+        }
+        match &existing.process {
+            ManagedCliAppServerProcess::Owned(_) => {}
+            ManagedCliAppServerProcess::HandedOff(process)
+                if process.handoff_daemon_socket_path == payload.handoff_daemon_socket_path => {}
+            ManagedCliAppServerProcess::HandedOff(_) => {
+                bail!(
+                    "CLI app-server {} is already handed off to another daemon",
+                    export.managed_session_id
+                );
+            }
+            ManagedCliAppServerProcess::Adopted(_) => {
+                bail!(
+                    "CLI app-server {} is already adopted and cannot be released",
+                    export.managed_session_id
+                );
+            }
+        }
+    }
+    let mut released = Vec::new();
+    for export in payload.cli_app_servers {
+        let mut server = servers
+            .remove(&export.managed_session_id)
+            .expect("server exists");
+        match server.process {
+            ManagedCliAppServerProcess::Owned(process) => {
+                server.process =
+                    ManagedCliAppServerProcess::HandedOff(HandedOffCliAppServerProcess {
+                        child: process.child,
+                        pid_identity: export.pid_identity.clone(),
+                        handoff_daemon_socket_path: payload.handoff_daemon_socket_path.clone(),
+                        drain_running: process.drain_running,
+                        stdout_worker: process.stdout_worker,
+                        stderr_worker: process.stderr_worker,
+                    });
+                server.lease_expires_at = Instant::now() + handoff_export_lease_duration(&export);
+                let info = cli_app_server_info(&server);
+                servers.insert(export.managed_session_id, server);
+                released.push(info);
+            }
+            ManagedCliAppServerProcess::HandedOff(process) => {
+                server.process = ManagedCliAppServerProcess::HandedOff(process);
+                server.lease_expires_at = Instant::now() + handoff_export_lease_duration(&export);
+                let info = cli_app_server_info(&server);
+                servers.insert(export.managed_session_id, server);
+                released.push(info);
+            }
+            ManagedCliAppServerProcess::Adopted(_) => unreachable!("adopted release preflighted"),
+        }
+    }
+    Ok(released)
+}
+
+fn handoff_cli_app_server_release_status(
+    state: &DaemonState,
+    payload: HandoffCliAppServersReleasePayload,
+) -> Result<Vec<CliAppServerInfo>> {
+    validate_daemon_nonempty(
+        "handoff_daemon_socket_path",
+        &payload.handoff_daemon_socket_path,
+    )?;
+    validate_handoff_cli_app_server_exports(&payload.cli_app_servers)?;
+    let servers = state
+        .cli_app_servers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+    let mut infos = Vec::new();
+    for export in &payload.cli_app_servers {
+        let Some(existing) = servers.get(&export.managed_session_id) else {
+            infos.push(missing_cli_app_server_info_from_handoff_export(export));
+            continue;
+        };
+        if !cli_app_server_matches_export(existing, export) {
+            bail!(
+                "CLI app-server {} changed before handoff release status",
+                export.managed_session_id
+            );
+        }
+        match &existing.process {
+            ManagedCliAppServerProcess::Owned(_) => {}
+            ManagedCliAppServerProcess::HandedOff(_) => {}
+            ManagedCliAppServerProcess::Adopted(_) => {
+                bail!(
+                    "CLI app-server {} is adopted and cannot report legacy release status",
+                    export.managed_session_id
+                );
+            }
+        }
+        infos.push(cli_app_server_info(existing));
+    }
+    Ok(infos)
+}
+
+fn missing_cli_app_server_info_from_handoff_export(
+    export: &HandoffCliAppServerExport,
+) -> CliAppServerInfo {
+    CliAppServerInfo {
+        managed_session_id: export.managed_session_id.clone(),
+        bound_thread_id: export.bound_thread_id.clone(),
+        session_epoch: export.session_epoch,
+        url: export.url.clone(),
+        pid: export.pid,
+        pid_identity: Some(export.pid_identity.clone()),
+        started_at: export.started_at,
+        lease_seconds_remaining: 0,
+        ownership: "missing",
+        source_daemon_socket_path: None,
+        handoff_daemon_socket_path: None,
+    }
+}
+
+fn validate_handoff_cli_app_server_exports(exports: &[HandoffCliAppServerExport]) -> Result<()> {
+    let mut managed_session_ids = HashSet::new();
+    for export in exports {
+        validate_handoff_cli_app_server_export(export)?;
+        if !managed_session_ids.insert(export.managed_session_id.as_str()) {
+            bail!(
+                "duplicate CLI app-server handoff export for managed session {}",
+                export.managed_session_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_handoff_cli_app_server_export(export: &HandoffCliAppServerExport) -> Result<()> {
+    validate_daemon_nonempty("managed_session_id", &export.managed_session_id)?;
+    validate_daemon_nonempty("bound_thread_id", &export.bound_thread_id)?;
+    validate_daemon_positive("session_epoch", export.session_epoch)?;
+    validate_daemon_nonempty("url", &export.url)?;
+    if !app_server_listener_url_is_loopback(&export.url) {
+        bail!("CLI app-server handoff url must be loopback");
+    }
+    if export.pid == 0 {
+        bail!("CLI app-server handoff pid must be positive");
+    }
+    validate_daemon_nonempty("pid_identity", &export.pid_identity)?;
+    validate_daemon_nonempty("lease_id", &export.lease_id)?;
+    if export.lease_millis_remaining == 0 {
+        bail!("CLI app-server handoff lease must be active");
+    }
+    Ok(())
+}
+
+fn cli_app_server_matches_export(
+    server: &ManagedCliAppServer,
+    export: &HandoffCliAppServerExport,
+) -> bool {
+    server.managed_session_id == export.managed_session_id
+        && server.bound_thread_id == export.bound_thread_id
+        && server.session_epoch == export.session_epoch
+        && server.url == export.url
+        && server.pid() == export.pid
+        && server.lease_id == export.lease_id
+}
+
+fn handoff_export_lease_duration(export: &HandoffCliAppServerExport) -> Duration {
+    Duration::from_millis(export.lease_millis_remaining.max(1)).max(Duration::from_secs(
+        HANDOFF_ADOPTED_CLI_APP_SERVER_LEASE_FLOOR_SECONDS,
+    ))
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn truncate_string_bytes(value: &mut String, max_bytes: usize) {
     if value.len() <= max_bytes {
         return;
@@ -4290,8 +5220,9 @@ fn ensure_cli_app_server(
     validate_daemon_nonempty_bytes("codex_binary", &payload.codex_binary)?;
     validate_daemon_nonempty("lease_id", &payload.lease_id)?;
     let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
-    ensure_daemon_not_stopping(state)?;
     let existing_dead_proof = {
+        let _handoff_guard = acquire_handoff_quiesce_lock(state)?;
+        ensure_daemon_accepts_new_work(state)?;
         let mut servers = state
             .cli_app_servers
             .lock()
@@ -4328,6 +5259,7 @@ fn ensure_cli_app_server(
         invalidate_and_stop_registered_cli_app_server(state, &proof)?;
     }
 
+    ensure_daemon_accepts_new_work(state)?;
     ensure_cli_app_server_reservation_matches(state, &payload.bound_thread_id, &payload.lease_id)?;
     ensure_daemon_not_stopping(state)?;
 
@@ -4342,97 +5274,85 @@ fn ensure_cli_app_server(
         stop_requested: &state.stop_requested,
     })?;
     let mut server = Some(server);
+    enum Registration {
+        Ready(CliAppServerInfo),
+        InvalidateExisting(ManagedCliAppServerProof),
+    }
     loop {
-        let mut servers = state
-            .cli_app_servers
-            .lock()
-            .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
-        if let Err(error) = ensure_daemon_not_stopping(state) {
-            drop(servers);
-            if let Some(server) = server.take() {
-                stop_managed_cli_app_server_process(server);
+        let registration = (|| -> Result<Registration> {
+            let _handoff_guard = acquire_handoff_quiesce_lock(state)?;
+            ensure_daemon_accepts_new_work(state)?;
+            let mut servers = state
+                .cli_app_servers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+            ensure_daemon_accepts_new_work(state)?;
+            if let Some(existing) = servers.get_mut(&payload.managed_session_id) {
+                if existing.bound_thread_id != payload.bound_thread_id {
+                    let attached_thread = existing.bound_thread_id.clone();
+                    bail!(
+                        "managed session {} is already attached to app-server for thread {}",
+                        payload.managed_session_id,
+                        attached_thread
+                    );
+                }
+                match cli_app_server_child_is_running(existing) {
+                    Ok(true) => {
+                        if existing.session_epoch != payload.session_epoch {
+                            let existing_epoch = existing.session_epoch;
+                            bail!(
+                                "managed session {} app-server is at epoch {}, not {}",
+                                payload.managed_session_id,
+                                existing_epoch,
+                                payload.session_epoch
+                            );
+                        }
+                        ensure_cli_app_server_lease_is_reentrant(existing, &payload.lease_id)?;
+                        existing.lease_id = payload.lease_id.clone();
+                        existing.lease_expires_at = Instant::now() + lease_ttl;
+                        Ok(Registration::Ready(cli_app_server_info(existing)))
+                    }
+                    Ok(false) => Ok(Registration::InvalidateExisting(cli_app_server_proof(
+                        existing,
+                    ))),
+                    Err(error) => Err(error),
+                }
+            } else {
+                let server_to_insert = server.take().expect("candidate server is still available");
+                let info = cli_app_server_info(&server_to_insert);
+                servers.insert(payload.managed_session_id.clone(), server_to_insert);
+                Ok(Registration::Ready(info))
             }
-            return Err(error);
-        }
-        if let Some(existing) = servers.get_mut(&payload.managed_session_id) {
-            if existing.bound_thread_id != payload.bound_thread_id {
-                let attached_thread = existing.bound_thread_id.clone();
-                drop(servers);
+        })();
+        match registration {
+            Ok(Registration::Ready(info)) => {
                 if let Some(server) = server.take() {
                     stop_managed_cli_app_server_process(server);
                 }
-                bail!(
-                    "managed session {} is already attached to app-server for thread {}",
-                    payload.managed_session_id,
-                    attached_thread
+                let _ = release_cli_app_server_reservation(
+                    state,
+                    CliAppServerReleasePayload {
+                        bound_thread_id: info.bound_thread_id.clone(),
+                        lease_id: payload.lease_id.clone(),
+                    },
                 );
+                return Ok(info);
             }
-            match cli_app_server_child_is_running(existing) {
-                Ok(true) => {
-                    if existing.session_epoch != payload.session_epoch {
-                        let existing_epoch = existing.session_epoch;
-                        drop(servers);
-                        if let Some(server) = server.take() {
-                            stop_managed_cli_app_server_process(server);
-                        }
-                        bail!(
-                            "managed session {} app-server is at epoch {}, not {}",
-                            payload.managed_session_id,
-                            existing_epoch,
-                            payload.session_epoch
-                        );
-                    }
-                    if let Err(error) =
-                        ensure_cli_app_server_lease_is_reentrant(existing, &payload.lease_id)
-                    {
-                        drop(servers);
-                        if let Some(server) = server.take() {
-                            stop_managed_cli_app_server_process(server);
-                        }
-                        return Err(error);
-                    }
-                    existing.lease_id = payload.lease_id.clone();
-                    existing.lease_expires_at = Instant::now() + lease_ttl;
-                    let info = cli_app_server_info(existing);
-                    drop(servers);
-                    if let Some(server) = server.take() {
-                        stop_managed_cli_app_server_process(server);
-                    }
-                    return Ok(info);
-                }
-                Ok(false) => {
-                    let proof = cli_app_server_proof(existing);
-                    drop(servers);
-                    if let Err(error) = invalidate_and_stop_registered_cli_app_server(state, &proof)
-                    {
-                        if let Some(server) = server.take() {
-                            stop_managed_cli_app_server_process(server);
-                        }
-                        return Err(error);
-                    }
-                    continue;
-                }
-                Err(error) => {
-                    drop(servers);
+            Ok(Registration::InvalidateExisting(proof)) => {
+                if let Err(error) = invalidate_and_stop_registered_cli_app_server(state, &proof) {
                     if let Some(server) = server.take() {
                         stop_managed_cli_app_server_process(server);
                     }
                     return Err(error);
                 }
             }
+            Err(error) => {
+                if let Some(server) = server.take() {
+                    stop_managed_cli_app_server_process(server);
+                }
+                return Err(error);
+            }
         }
-        let server_to_insert = server.take().expect("candidate server is still available");
-        let info = cli_app_server_info(&server_to_insert);
-        servers.insert(payload.managed_session_id.clone(), server_to_insert);
-        drop(servers);
-        let _ = release_cli_app_server_reservation(
-            state,
-            CliAppServerReleasePayload {
-                bound_thread_id: info.bound_thread_id.clone(),
-                lease_id: payload.lease_id,
-            },
-        );
-        return Ok(info);
     }
 }
 
@@ -4479,6 +5399,9 @@ fn refresh_cli_app_server_lease(
         );
     };
     ensure_cli_app_server_lease_matches(server, &payload.lease_id)?;
+    if server.is_handed_off() {
+        return Ok(cli_app_server_info(server));
+    }
     if !cli_app_server_child_is_running(server)? {
         let proof = cli_app_server_proof(server);
         drop(servers);
@@ -4492,7 +5415,10 @@ fn refresh_cli_app_server_lease(
     Ok(cli_app_server_info(server))
 }
 
-fn stop_cli_app_server(state: &DaemonState, payload: CliAppServerStopPayload) -> Result<bool> {
+fn stop_cli_app_server(
+    state: &DaemonState,
+    payload: CliAppServerStopPayload,
+) -> Result<CliAppServerStopInfo> {
     validate_daemon_nonempty("managed_session_id", &payload.managed_session_id)?;
     validate_daemon_nonempty("lease_id", &payload.lease_id)?;
     let servers = state
@@ -4500,12 +5426,25 @@ fn stop_cli_app_server(state: &DaemonState, payload: CliAppServerStopPayload) ->
         .lock()
         .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
     let Some(server) = servers.get(&payload.managed_session_id) else {
-        return Ok(false);
+        return Ok(CliAppServerStopInfo {
+            stopped: false,
+            handoff_daemon_socket_path: None,
+        });
     };
     ensure_cli_app_server_lease_matches(server, &payload.lease_id)?;
+    if server.is_handed_off() {
+        return Ok(CliAppServerStopInfo {
+            stopped: false,
+            handoff_daemon_socket_path: server.handoff_daemon_socket_path().map(ToOwned::to_owned),
+        });
+    }
     let proof = cli_app_server_proof(server);
     drop(servers);
-    invalidate_and_stop_registered_cli_app_server(state, &proof)
+    let stopped = invalidate_and_stop_registered_cli_app_server(state, &proof)?;
+    Ok(CliAppServerStopInfo {
+        stopped,
+        handoff_daemon_socket_path: None,
+    })
 }
 
 fn start_cli_thread(
@@ -4516,7 +5455,7 @@ fn start_cli_thread(
     validate_daemon_nonempty("cwd", &payload.cwd)?;
     validate_daemon_nonempty("lease_id", &payload.lease_id)?;
     let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
-    ensure_daemon_not_stopping(state)?;
+    ensure_daemon_accepts_new_work(state)?;
     let bootstrap_id = new_id();
     let server = spawn_cli_app_server(SpawnCliAppServerOptions {
         managed_session_id: &bootstrap_id,
@@ -4531,10 +5470,11 @@ fn start_cli_thread(
     let mut server = Some(server);
     let result = (|| {
         {
+            let _handoff_guard = acquire_handoff_quiesce_lock(state)?;
             let mut bootstraps = state.cli_thread_start_bootstraps.lock().map_err(|_| {
                 anyhow::anyhow!("CLI thread/start bootstrap registry lock is poisoned")
             })?;
-            ensure_daemon_not_stopping(state)?;
+            ensure_daemon_accepts_new_work(state)?;
             bootstraps.insert(
                 bootstrap_id.clone(),
                 server
@@ -4611,7 +5551,7 @@ fn start_cli_foreground_thread(
     validate_daemon_nonempty("cwd", &payload.cwd)?;
     validate_daemon_nonempty("lease_id", &payload.lease_id)?;
     let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
-    ensure_daemon_not_stopping(state)?;
+    ensure_daemon_accepts_new_work(state)?;
     let bootstrap_id = new_id();
     let server = spawn_cli_app_server(SpawnCliAppServerOptions {
         managed_session_id: &bootstrap_id,
@@ -4631,10 +5571,11 @@ fn start_cli_foreground_thread(
             .url
             .clone();
         {
+            let _handoff_guard = acquire_handoff_quiesce_lock(state)?;
             let mut bootstraps = state.cli_thread_start_bootstraps.lock().map_err(|_| {
                 anyhow::anyhow!("CLI thread/start bootstrap registry lock is poisoned")
             })?;
-            ensure_daemon_not_stopping(state)?;
+            ensure_daemon_accepts_new_work(state)?;
             bootstraps.insert(
                 bootstrap_id.clone(),
                 server
@@ -4805,7 +5746,8 @@ fn promote_cli_thread_start_app_server(
     validate_daemon_positive("session_epoch", payload.session_epoch)?;
     validate_daemon_nonempty("lease_id", &payload.lease_id)?;
     let lease_ttl = cli_app_server_lease_ttl(payload.lease_ttl_seconds)?;
-    ensure_daemon_not_stopping(state)?;
+    let _handoff_guard = acquire_handoff_quiesce_lock(state)?;
+    ensure_daemon_accepts_new_work(state)?;
     ensure_cli_app_server_reservation_matches(state, &payload.bound_thread_id, &payload.lease_id)?;
 
     let server = {
@@ -5034,13 +5976,15 @@ fn spawn_cli_app_server(options: SpawnCliAppServerOptions<'_>) -> Result<Managed
         bound_thread_id: options.bound_thread_id.to_owned(),
         session_epoch: options.session_epoch,
         url,
-        child,
+        process: ManagedCliAppServerProcess::Owned(OwnedCliAppServerProcess {
+            child,
+            drain_running,
+            stdout_worker: Some(stdout_worker),
+            stderr_worker: Some(stderr_worker),
+        }),
         started_at,
         lease_id: options.lease_id.to_owned(),
         lease_expires_at: Instant::now() + options.lease_ttl,
-        drain_running,
-        stdout_worker: Some(stdout_worker),
-        stderr_worker: Some(stderr_worker),
     })
 }
 
@@ -5265,9 +6209,30 @@ fn ensure_cli_app_server_lease_is_reentrant(
 }
 
 fn cli_app_server_child_is_running(server: &mut ManagedCliAppServer) -> Result<bool> {
-    match child_status_without_reaping(server.child.id()).context("check codex app-server")? {
-        ChildStatusWithoutReaping::Running => Ok(true),
-        ChildStatusWithoutReaping::Exited | ChildStatusWithoutReaping::NotWaitable => Ok(false),
+    match &mut server.process {
+        ManagedCliAppServerProcess::Owned(process) => {
+            match child_status_without_reaping(process.child.id())
+                .context("check codex app-server")?
+            {
+                ChildStatusWithoutReaping::Running => Ok(true),
+                ChildStatusWithoutReaping::Exited | ChildStatusWithoutReaping::NotWaitable => {
+                    Ok(false)
+                }
+            }
+        }
+        ManagedCliAppServerProcess::Adopted(process) => {
+            adopted_cli_app_server_leader_is_running(process)
+        }
+        ManagedCliAppServerProcess::HandedOff(process) => {
+            match child_status_without_reaping(process.child.id())
+                .context("check codex app-server")?
+            {
+                ChildStatusWithoutReaping::Running => Ok(true),
+                ChildStatusWithoutReaping::Exited | ChildStatusWithoutReaping::NotWaitable => {
+                    Ok(false)
+                }
+            }
+        }
     }
 }
 
@@ -5277,12 +6242,16 @@ fn cli_app_server_info(server: &ManagedCliAppServer) -> CliAppServerInfo {
         bound_thread_id: server.bound_thread_id.clone(),
         session_epoch: server.session_epoch,
         url: server.url.clone(),
-        pid: server.child.id(),
+        pid: server.pid(),
+        pid_identity: server.pid_identity().map(ToOwned::to_owned),
         started_at: server.started_at,
         lease_seconds_remaining: server
             .lease_expires_at
             .saturating_duration_since(Instant::now())
             .as_secs(),
+        ownership: server.ownership(),
+        source_daemon_socket_path: server.source_daemon_socket_path().map(ToOwned::to_owned),
+        handoff_daemon_socket_path: server.handoff_daemon_socket_path().map(ToOwned::to_owned),
     }
 }
 
@@ -5292,7 +6261,7 @@ fn cli_app_server_proof(server: &ManagedCliAppServer) -> ManagedCliAppServerProo
         bound_thread_id: server.bound_thread_id.clone(),
         session_epoch: server.session_epoch,
         lease_id: server.lease_id.clone(),
-        child_pid: server.child.id(),
+        child_pid: server.pid(),
     }
 }
 
@@ -5304,7 +6273,7 @@ fn cli_app_server_matches_proof(
         && server.bound_thread_id == proof.bound_thread_id
         && server.session_epoch == proof.session_epoch
         && server.lease_id == proof.lease_id
-        && server.child.id() == proof.child_pid
+        && server.pid() == proof.child_pid
 }
 
 fn cli_app_server_infos(state: &DaemonState) -> Vec<CliAppServerInfo> {
@@ -5347,19 +6316,27 @@ fn reap_expired_cli_app_servers(state: &DaemonState) {
         return;
     };
     let now = Instant::now();
-    let expired_proofs = servers
-        .values()
-        .filter_map(|server| {
+    let expired = servers
+        .iter()
+        .filter_map(|(managed_session_id, server)| {
             if server.lease_expires_at <= now {
-                Some(cli_app_server_proof(server))
+                Some((
+                    managed_session_id.clone(),
+                    server.is_handed_off(),
+                    cli_app_server_proof(server),
+                ))
             } else {
                 None
             }
         })
         .collect::<Vec<_>>();
     drop(servers);
-    for proof in expired_proofs {
-        let _ = invalidate_and_stop_registered_cli_app_server(state, &proof);
+    for (managed_session_id, handed_off, proof) in expired {
+        if handed_off {
+            let _ = reap_handed_off_cli_app_server_if_exited(state, &managed_session_id, &proof);
+        } else {
+            let _ = invalidate_and_stop_registered_cli_app_server(state, &proof);
+        }
     }
 }
 
@@ -5406,7 +6383,9 @@ fn stop_all_cli_app_servers(state: &DaemonState) {
         .collect::<Vec<_>>();
     drop(servers);
     for server in drained_servers {
-        let _ = invalidate_cli_app_server_proof(&state.layout, &cli_app_server_proof(&server));
+        if !server.is_handed_off() {
+            let _ = invalidate_cli_app_server_proof(&state.layout, &cli_app_server_proof(&server));
+        }
         stop_managed_cli_app_server_process(server);
     }
 }
@@ -5431,15 +6410,122 @@ fn clear_cli_app_server_reservations(state: &DaemonState) {
     }
 }
 
-fn stop_managed_cli_app_server_process(mut server: ManagedCliAppServer) {
-    server.drain_running.store(false, Ordering::Release);
-    stop_cli_app_server_process(&mut server.child);
-    if let Some(worker) = server.stdout_worker.take() {
+fn stop_managed_cli_app_server_process(server: ManagedCliAppServer) {
+    match server.process {
+        ManagedCliAppServerProcess::Owned(mut process) => {
+            stop_owned_cli_app_server_process(&mut process);
+        }
+        ManagedCliAppServerProcess::Adopted(process) => {
+            stop_adopted_cli_app_server_process(&process);
+        }
+        ManagedCliAppServerProcess::HandedOff(process) => {
+            // The resource has been adopted by another daemon. Dropping the
+            // old process handle must not signal the app-server or invalidate
+            // the managed-session proof.
+            detach_handed_off_cli_app_server_process(process);
+        }
+    }
+}
+
+fn reap_handed_off_cli_app_server_if_exited(
+    state: &DaemonState,
+    managed_session_id: &str,
+    proof: &ManagedCliAppServerProof,
+) -> Result<bool> {
+    let mut servers = state
+        .cli_app_servers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("CLI app-server registry lock is poisoned"))?;
+    let Some(server) = servers.get(managed_session_id) else {
+        return Ok(false);
+    };
+    if !server.is_handed_off() || !cli_app_server_matches_proof(server, proof) {
+        return Ok(false);
+    }
+    let ManagedCliAppServerProcess::HandedOff(process) = &server.process else {
+        return Ok(false);
+    };
+    if child_status_without_reaping(process.child.id())
+        .context("check handed-off CLI app-server child")?
+        == ChildStatusWithoutReaping::Running
+    {
+        return Ok(false);
+    }
+    let Some(server) = servers.remove(managed_session_id) else {
+        return Ok(false);
+    };
+    drop(servers);
+    stop_managed_cli_app_server_process(server);
+    Ok(true)
+}
+
+fn stop_owned_cli_app_server_process(process: &mut OwnedCliAppServerProcess) {
+    process.drain_running.store(false, Ordering::Release);
+    stop_cli_app_server_process(&mut process.child);
+    if let Some(worker) = process.stdout_worker.take() {
         join_worker(worker);
     }
-    if let Some(worker) = server.stderr_worker.take() {
+    if let Some(worker) = process.stderr_worker.take() {
         join_worker(worker);
     }
+}
+
+fn stop_adopted_cli_app_server_process(process: &AdoptedCliAppServerProcess) {
+    if !adopted_cli_app_server_process_group_is_active(process) {
+        return;
+    }
+    signal_process_group(process.pid, libc::SIGTERM);
+    let term_deadline = Instant::now() + CLI_APP_SERVER_TERM_GRACE;
+    while Instant::now() < term_deadline {
+        if !adopted_cli_app_server_process_group_is_active(process) {
+            return;
+        }
+        thread::sleep(READ_POLL_INTERVAL);
+    }
+    if adopted_cli_app_server_process_group_is_active(process) {
+        signal_process_group(process.pid, libc::SIGKILL);
+    }
+}
+
+fn adopted_cli_app_server_process_group_is_active(process: &AdoptedCliAppServerProcess) -> bool {
+    match process_start_identity(process.pid) {
+        Ok(Some(identity)) if identity == process.pid_identity => {
+            match process_is_zombie(process.pid) {
+                Ok(Some(true)) => process_group_has_live_members_after_leader_exit(process.pid),
+                Ok(Some(false)) | Ok(None) => process_group_exists(process.pid),
+                Err(_) => false,
+            }
+        }
+        Ok(Some(_)) => false,
+        Ok(None) => process_group_has_live_members_after_leader_exit(process.pid),
+        Err(_) => false,
+    }
+}
+
+fn adopted_cli_app_server_leader_is_running(process: &AdoptedCliAppServerProcess) -> Result<bool> {
+    if !app_server_process_identity_matches(process.pid, &process.pid_identity)? {
+        return Ok(false);
+    }
+    if process_is_zombie(process.pid)?.unwrap_or(false) {
+        return Ok(false);
+    }
+    Ok(process_group_exists(process.pid))
+}
+
+fn detach_handed_off_cli_app_server_process(mut process: HandedOffCliAppServerProcess) {
+    if child_status_without_reaping(process.child.id())
+        .is_ok_and(|status| status == ChildStatusWithoutReaping::Exited)
+    {
+        let _ = wait_child_until(
+            &mut process.child,
+            Instant::now() + CLI_APP_SERVER_KILL_GRACE,
+        );
+    }
+    let _ = process.pid_identity;
+    let _ = process.handoff_daemon_socket_path;
+    let _ = process.drain_running.load(Ordering::Acquire);
+    let _ = process.stdout_worker.take();
+    let _ = process.stderr_worker.take();
 }
 
 fn invalidate_and_stop_registered_cli_app_server(
@@ -5674,6 +6760,33 @@ fn macos_process_bsd_info(pid: u32) -> Result<Option<libc::proc_bsdinfo>> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_group_has_live_members_except_leader(_leader_pid: u32) -> Result<bool> {
     Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_zombie(pid: u32) -> Result<Option<bool>> {
+    let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let stat = match fs::read_to_string(&stat_path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", stat_path.display())),
+    };
+    let Some((state, _pgrp)) = linux_stat_state_and_pgrp(&stat) else {
+        bail!("parse {}", stat_path.display());
+    };
+    Ok(Some(state == 'Z'))
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_zombie(pid: u32) -> Result<Option<bool>> {
+    let Some(info) = macos_process_bsd_info(pid)? else {
+        return Ok(None);
+    };
+    Ok(Some(info.pbi_status == libc::SZOMB))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_is_zombie(_pid: u32) -> Result<Option<bool>> {
+    Ok(None)
 }
 
 #[cfg(target_os = "linux")]
@@ -6064,29 +7177,31 @@ mod tests {
             .expect("chmod temp home");
         let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
         let socket_path = layout.daemon_socket_path();
-        (
-            home,
-            DaemonState {
-                layout,
-                socket_path,
-                started_instant: Instant::now(),
-                started_at: 0,
-                idle_timeout: Duration::from_secs(60),
-                startup_sweep: SweepReport::default(),
-                stop_requested: AtomicBool::new(false),
-                quiescing: AtomicBool::new(false),
-                lifecycle_maintenance_suppressed: AtomicBool::new(false),
-                activity_generation: AtomicU64::new(0),
-                active_clients: AtomicUsize::new(0),
-                active_dispatches: AtomicUsize::new(0),
-                cli_app_servers: Mutex::new(HashMap::new()),
-                cli_app_server_reservations: Mutex::new(HashMap::new()),
-                cli_thread_start_bootstraps: Mutex::new(HashMap::new()),
-                supervised_tasks: Arc::new(Mutex::new(HashMap::new())),
-                task_recovery_scope: TaskRecoveryScope::Unowned,
-                supervisor_daemon_generation: None,
-            },
-        )
+        (home, test_state_for_layout(layout, socket_path))
+    }
+
+    fn test_state_for_layout(layout: FsLayout, socket_path: PathBuf) -> DaemonState {
+        DaemonState {
+            layout,
+            socket_path,
+            started_instant: Instant::now(),
+            started_at: 0,
+            idle_timeout: Duration::from_secs(60),
+            startup_sweep: SweepReport::default(),
+            stop_requested: AtomicBool::new(false),
+            quiescing: AtomicBool::new(false),
+            handoff_quiesce_lock: Mutex::new(()),
+            lifecycle_maintenance_suppressed: AtomicBool::new(false),
+            activity_generation: AtomicU64::new(0),
+            active_clients: AtomicUsize::new(0),
+            active_dispatches: AtomicUsize::new(0),
+            cli_app_servers: Mutex::new(HashMap::new()),
+            cli_app_server_reservations: Mutex::new(HashMap::new()),
+            cli_thread_start_bootstraps: Mutex::new(HashMap::new()),
+            supervised_tasks: Arc::new(Mutex::new(HashMap::new())),
+            task_recovery_scope: TaskRecoveryScope::Unowned,
+            supervisor_daemon_generation: None,
+        }
     }
 
     fn handle_test_request(state: &DaemonState, command: &str, payload: Value) -> Value {
@@ -6150,6 +7265,41 @@ mod tests {
             .note_cli_managed_session_activity(&managed_session_id, 1, "idle", 1, 102)
             .expect("note activity");
         managed_session_id
+    }
+
+    #[test]
+    fn handoff_post_adopt_timeout_has_floor_after_startup_deadline() {
+        let expired_deadline = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            handoff_post_adopt_timeout(expired_deadline),
+            HANDOFF_POST_ADOPT_TIMEOUT
+        );
+
+        let tiny_budget_deadline = Instant::now() + Duration::from_millis(1);
+        assert!(
+            handoff_post_adopt_timeout(tiny_budget_deadline) >= HANDOFF_POST_ADOPT_TIMEOUT,
+            "release/rollback after adoption must not inherit a near-zero startup budget"
+        );
+    }
+
+    #[test]
+    fn handoff_adopted_lease_duration_has_redirect_discovery_floor() {
+        let export = HandoffCliAppServerExport {
+            managed_session_id: "managed-handoff-short-lease".to_owned(),
+            bound_thread_id: "thread-handoff-short-lease".to_owned(),
+            session_epoch: 1,
+            url: "ws://127.0.0.1:1".to_owned(),
+            pid: 1,
+            pid_identity: "1:1".to_owned(),
+            started_at: 1,
+            lease_id: "lease-handoff-short".to_owned(),
+            lease_millis_remaining: 1,
+        };
+
+        assert_eq!(
+            handoff_export_lease_duration(&export),
+            Duration::from_secs(HANDOFF_ADOPTED_CLI_APP_SERVER_LEASE_FLOOR_SECONDS)
+        );
     }
 
     #[test]
@@ -6248,13 +7398,15 @@ mod tests {
             bound_thread_id: bound_thread_id.to_owned(),
             session_epoch: 1,
             url: "ws://127.0.0.1:1".to_owned(),
-            child,
+            process: ManagedCliAppServerProcess::Owned(OwnedCliAppServerProcess {
+                child,
+                drain_running: Arc::new(AtomicBool::new(true)),
+                stdout_worker: None,
+                stderr_worker: None,
+            }),
             started_at: 100,
             lease_id: "lease-test".to_owned(),
             lease_expires_at,
-            drain_running: Arc::new(AtomicBool::new(true)),
-            stdout_worker: None,
-            stderr_worker: None,
         }
     }
 
@@ -6386,6 +7538,35 @@ mod tests {
     }
 
     #[test]
+    fn handoff_unquiesce_clears_quiescing_with_fence() {
+        let (_home, state) = test_state();
+
+        let quiesce = handle_test_request(
+            &state,
+            "handoff_quiesce",
+            json!({
+                "expected_pid": std::process::id(),
+                "expected_binary_version": env!("CARGO_PKG_VERSION"),
+            }),
+        );
+        assert_eq!(quiesce["ok"], true);
+        assert!(state.quiescing.load(Ordering::Acquire));
+
+        let unquiesce = handle_test_request(
+            &state,
+            "handoff_unquiesce",
+            json!({
+                "expected_pid": std::process::id(),
+                "expected_binary_version": env!("CARGO_PKG_VERSION"),
+            }),
+        );
+        assert_eq!(unquiesce["ok"], true);
+        assert_eq!(unquiesce["response"]["quiescing"], false);
+        assert_eq!(unquiesce["response"]["daemon"]["quiescing"], false);
+        assert!(!state.quiescing.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn handoff_quiesce_rejects_pid_and_version_mismatch() {
         let (_home, state) = test_state();
 
@@ -6425,6 +7606,1176 @@ mod tests {
 
         let ping = handle_test_request(&state, "ping", Value::Null);
         assert_eq!(ping["response"]["daemon"]["quiescing"], false);
+    }
+
+    #[test]
+    fn handoff_quiesce_rolls_back_when_export_fails() {
+        let (_home, state) = test_state();
+
+        let error = quiesce_for_handoff_and_export_cli_app_servers_with(
+            &state,
+            HandoffQuiescePayload::default(),
+            |_state| bail!("export failure for test"),
+        )
+        .expect_err("export failure should fail quiesce");
+
+        assert!(
+            format!("{error:#}").contains("export failure for test"),
+            "{error:#}"
+        );
+        let ping = handle_test_request(&state, "ping", Value::Null);
+        assert_eq!(ping["response"]["daemon"]["quiescing"], false);
+        let dispatch = handle_test_request(&state, "dispatch", Value::Null);
+        assert_ne!(dispatch["error"], "daemon is quiescing for handoff");
+    }
+
+    #[test]
+    fn handoff_quiesce_rolls_back_while_bootstrap_is_active() {
+        let (_home, state) = test_state();
+        let bootstrap_id = "bootstrap-active".to_owned();
+        let server = test_managed_cli_app_server(
+            &bootstrap_id,
+            CLI_FOREGROUND_THREAD_BOOTSTRAP_BOUND_THREAD_ID,
+            Instant::now() + Duration::from_secs(60),
+        );
+        state
+            .cli_thread_start_bootstraps
+            .lock()
+            .expect("bootstraps lock")
+            .insert(bootstrap_id, server);
+
+        let quiesce = handle_test_request(&state, "handoff_quiesce", Value::Null);
+        assert_eq!(quiesce["ok"], false);
+        assert!(
+            quiesce["error"]
+                .as_str()
+                .expect("quiesce error")
+                .contains("bootstrap app-servers are active"),
+            "{quiesce}"
+        );
+        let ping = handle_test_request(&state, "ping", Value::Null);
+        assert_eq!(ping["response"]["daemon"]["quiescing"], false);
+
+        stop_all_cli_thread_start_bootstraps(&state);
+    }
+
+    #[test]
+    fn handoff_quiesce_exports_owned_cli_app_server() {
+        let (_home, state) = test_state();
+        let managed_session_id = create_proven_cli_session(&state, "thread-handoff-export");
+        let server = test_managed_cli_app_server(
+            &managed_session_id,
+            "thread-handoff-export",
+            Instant::now() + Duration::from_secs(60),
+        );
+        let pid = server.pid();
+        state
+            .cli_app_servers
+            .lock()
+            .expect("servers lock")
+            .insert(managed_session_id.clone(), server);
+
+        let quiesce = handle_test_request(&state, "handoff_quiesce", Value::Null);
+        assert_eq!(quiesce["ok"], true);
+        let exports = quiesce["response"]["cli_app_servers"]
+            .as_array()
+            .expect("handoff exports");
+        assert_eq!(exports.len(), 1);
+        let export = &exports[0];
+        assert_eq!(export["managed_session_id"], managed_session_id);
+        assert_eq!(export["bound_thread_id"], "thread-handoff-export");
+        assert_eq!(export["pid"], pid);
+        assert_eq!(export["url"], "ws://127.0.0.1:1");
+        assert!(
+            export["pid_identity"]
+                .as_str()
+                .expect("pid identity")
+                .contains(':')
+        );
+        assert!(
+            export["lease_millis_remaining"]
+                .as_u64()
+                .expect("lease remaining")
+                > 0
+        );
+
+        stop_all_cli_app_servers(&state);
+    }
+
+    #[test]
+    fn handoff_export_extends_legacy_lease_for_release_window() {
+        let (_home, state) = test_state();
+        let managed_session_id =
+            create_proven_cli_session(&state, "thread-handoff-short-legacy-lease");
+        let server = test_managed_cli_app_server(
+            &managed_session_id,
+            "thread-handoff-short-legacy-lease",
+            Instant::now() + Duration::from_secs(1),
+        );
+        state
+            .cli_app_servers
+            .lock()
+            .expect("servers lock")
+            .insert(managed_session_id.clone(), server);
+
+        let exports = export_cli_app_servers_for_handoff(&state).expect("export app-server");
+        assert_eq!(exports.len(), 1);
+        let lease_expires_at = state
+            .cli_app_servers
+            .lock()
+            .expect("servers lock")
+            .get(&managed_session_id)
+            .expect("server remains")
+            .lease_expires_at;
+        assert!(
+            lease_expires_at > Instant::now() + Duration::from_secs(30),
+            "legacy export must protect near-expired leases until release"
+        );
+
+        stop_all_cli_app_servers(&state);
+    }
+
+    #[test]
+    fn handoff_adopt_validates_payload_before_registering_any_server() {
+        let (_home, legacy_state) = test_state();
+        let generation_state = test_state_for_layout(
+            legacy_state.layout.clone(),
+            legacy_state
+                .layout
+                .daemon_generations_dir()
+                .join("test-generation")
+                .join("cbth.sock"),
+        );
+        let managed_session_id = create_proven_cli_session(&legacy_state, "thread-handoff-adopt");
+        let server = test_managed_cli_app_server(
+            &managed_session_id,
+            "thread-handoff-adopt",
+            Instant::now() + Duration::from_secs(60),
+        );
+        legacy_state
+            .cli_app_servers
+            .lock()
+            .expect("servers lock")
+            .insert(managed_session_id, server);
+        let mut exports =
+            export_cli_app_servers_for_handoff(&legacy_state).expect("export app-server");
+        assert_eq!(exports.len(), 1);
+        let mut bad_export = exports[0].clone();
+        bad_export.managed_session_id = "managed-bad-adopt".to_owned();
+        bad_export.pid_identity = "wrong-identity".to_owned();
+        exports.push(bad_export);
+
+        let error = adopt_handoff_cli_app_servers(
+            &generation_state,
+            HandoffCliAppServersAdoptPayload {
+                source_daemon_socket_path: legacy_state.socket_path.display().to_string(),
+                cli_app_servers: exports,
+            },
+        )
+        .expect_err("bad second export should fail adoption");
+        assert!(
+            format!("{error:#}").contains("pid identity no longer matches"),
+            "{error:#}"
+        );
+        assert!(
+            generation_state
+                .cli_app_servers
+                .lock()
+                .expect("generation servers lock")
+                .is_empty(),
+            "adopt failure must not leave earlier entries registered"
+        );
+
+        stop_all_cli_app_servers(&legacy_state);
+    }
+
+    #[test]
+    fn handoff_unadopt_rolls_back_adopted_entries_without_stopping_app_server() {
+        let (_home, legacy_state) = test_state();
+        let generation_state = test_state_for_layout(
+            legacy_state.layout.clone(),
+            legacy_state
+                .layout
+                .daemon_generations_dir()
+                .join("test-generation")
+                .join("cbth.sock"),
+        );
+        let managed_session_id = create_proven_cli_session(&legacy_state, "thread-handoff-unadopt");
+        let server = test_managed_cli_app_server(
+            &managed_session_id,
+            "thread-handoff-unadopt",
+            Instant::now() + Duration::from_secs(60),
+        );
+        let pid = server.pid();
+        legacy_state
+            .cli_app_servers
+            .lock()
+            .expect("servers lock")
+            .insert(managed_session_id, server);
+        let exports = export_cli_app_servers_for_handoff(&legacy_state).expect("export app-server");
+
+        let adopted = adopt_handoff_cli_app_servers(
+            &generation_state,
+            HandoffCliAppServersAdoptPayload {
+                source_daemon_socket_path: legacy_state.socket_path.display().to_string(),
+                cli_app_servers: exports.clone(),
+            },
+        )
+        .expect("adopt app-server");
+        assert_eq!(adopted.len(), 1);
+        let unadopted = unadopt_handoff_cli_app_servers(
+            &generation_state,
+            HandoffCliAppServersAdoptPayload {
+                source_daemon_socket_path: legacy_state.socket_path.display().to_string(),
+                cli_app_servers: exports,
+            },
+        )
+        .expect("unadopt app-server");
+        assert_eq!(unadopted.len(), 1);
+        assert!(
+            generation_state
+                .cli_app_servers
+                .lock()
+                .expect("generation servers lock")
+                .is_empty(),
+            "rollback must remove adopted generation entries"
+        );
+        assert!(
+            process_group_exists(pid),
+            "rollback must not stop the app-server still owned by legacy"
+        );
+
+        stop_all_cli_app_servers(&legacy_state);
+    }
+
+    #[test]
+    fn handoff_release_validates_payload_before_converting_any_server() {
+        let (_home, legacy_state) = test_state();
+        let managed_session_id = create_proven_cli_session(&legacy_state, "thread-handoff-release");
+        let server = test_managed_cli_app_server(
+            &managed_session_id,
+            "thread-handoff-release",
+            Instant::now() + Duration::from_secs(60),
+        );
+        legacy_state
+            .cli_app_servers
+            .lock()
+            .expect("servers lock")
+            .insert(managed_session_id.clone(), server);
+        quiesce_for_handoff(&legacy_state, HandoffQuiescePayload::default())
+            .expect("legacy quiesce");
+        let mut exports =
+            export_cli_app_servers_for_handoff(&legacy_state).expect("export app-server");
+        assert_eq!(exports.len(), 1);
+        let mut bad_export = exports[0].clone();
+        bad_export.managed_session_id = "managed-missing-release".to_owned();
+        exports.push(bad_export);
+
+        let error = release_handoff_cli_app_servers(
+            &legacy_state,
+            HandoffCliAppServersReleasePayload {
+                handoff_daemon_socket_path: "generation.sock".to_owned(),
+                cli_app_servers: exports,
+            },
+        )
+        .expect_err("bad second export should fail release");
+        assert!(format!("{error:#}").contains("is not running"), "{error:#}");
+        let servers = legacy_state
+            .cli_app_servers
+            .lock()
+            .expect("legacy servers lock");
+        let server = servers.get(&managed_session_id).expect("server remains");
+        assert_eq!(server.ownership(), "owned");
+        drop(servers);
+
+        stop_all_cli_app_servers(&legacy_state);
+    }
+
+    #[test]
+    fn handoff_release_status_reports_missing_for_removed_legacy_server() {
+        let (_home, legacy_state) = test_state();
+        let managed_session_id =
+            create_proven_cli_session(&legacy_state, "thread-handoff-missing-status");
+        let server = test_managed_cli_app_server(
+            &managed_session_id,
+            "thread-handoff-missing-status",
+            Instant::now() + Duration::from_secs(60),
+        );
+        legacy_state
+            .cli_app_servers
+            .lock()
+            .expect("servers lock")
+            .insert(managed_session_id.clone(), server);
+        quiesce_for_handoff(&legacy_state, HandoffQuiescePayload::default())
+            .expect("legacy quiesce");
+        let exports = export_cli_app_servers_for_handoff(&legacy_state).expect("export app-server");
+
+        assert!(
+            stop_cli_app_server(
+                &legacy_state,
+                CliAppServerStopPayload {
+                    managed_session_id,
+                    lease_id: "lease-test".to_owned(),
+                },
+            )
+            .expect("stop legacy app-server")
+            .stopped
+        );
+        let status = handoff_cli_app_server_release_status(
+            &legacy_state,
+            HandoffCliAppServersReleasePayload {
+                handoff_daemon_socket_path: "generation.sock".to_owned(),
+                cli_app_servers: exports,
+            },
+        )
+        .expect("missing release status");
+        assert_eq!(status[0].ownership, "missing");
+        let status = json!({ "cli_app_servers": status });
+        assert_eq!(
+            handoff_post_adopt_release_decision(&status, "generation.sock")
+                .expect("release decision"),
+            HandoffPostAdoptReleaseDecision::RollbackLegacyUnreleased
+        );
+    }
+
+    #[test]
+    fn handoff_adopt_failure_after_startup_deadline_unquiesces_legacy_daemon() {
+        fn accept_fake_daemon_request(
+            listener: &UnixListener,
+        ) -> (String, std::os::unix::net::UnixStream) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = String::new();
+                        stream
+                            .read_to_string(&mut request)
+                            .expect("read fake daemon request");
+                        return (request, stream);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for fake daemon request"
+                        );
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept fake daemon request: {error}"),
+                }
+            }
+        }
+
+        fn write_fake_daemon_response(
+            stream: &mut std::os::unix::net::UnixStream,
+            response: Value,
+        ) {
+            stream
+                .write_all(
+                    serde_json::to_string(&response)
+                        .expect("encode fake daemon response")
+                        .as_bytes(),
+                )
+                .expect("write fake daemon response");
+            stream
+                .write_all(b"\n")
+                .expect("write fake daemon response newline");
+        }
+
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        layout
+            .ensure_daemon_generation_dir("adopt-budget")
+            .expect("run dirs");
+        let legacy_socket = layout.daemon_socket_path();
+        let generation_socket = layout.daemon_generation_socket_path("adopt-budget");
+        let legacy_listener = UnixListener::bind(&legacy_socket).expect("bind legacy daemon");
+        let generation_listener =
+            UnixListener::bind(&generation_socket).expect("bind generation daemon");
+        fs::set_permissions(&legacy_socket, fs::Permissions::from_mode(0o600))
+            .expect("chmod legacy socket");
+        fs::set_permissions(&generation_socket, fs::Permissions::from_mode(0o600))
+            .expect("chmod generation socket");
+        legacy_listener
+            .set_nonblocking(true)
+            .expect("legacy nonblocking");
+        generation_listener
+            .set_nonblocking(true)
+            .expect("generation nonblocking");
+
+        let generation_handle = thread::spawn(move || {
+            let (request, mut stream) = accept_fake_daemon_request(&generation_listener);
+            assert!(
+                request.contains("\"handoff_cli_app_servers_adopt\""),
+                "unexpected generation adopt request: {request}"
+            );
+            write_fake_daemon_response(
+                &mut stream,
+                json!({
+                    "ok": false,
+                    "error": "simulated adopt failure after startup deadline",
+                }),
+            );
+            drop(stream);
+
+            let (request, mut stream) = accept_fake_daemon_request(&generation_listener);
+            assert!(
+                request.contains("\"handoff_cli_app_servers_unadopt\""),
+                "unexpected generation unadopt request: {request}"
+            );
+            write_fake_daemon_response(
+                &mut stream,
+                json!({
+                    "ok": true,
+                    "response": {
+                        "unadopted_cli_app_servers": [],
+                    },
+                }),
+            );
+        });
+
+        let legacy_handle = thread::spawn(move || {
+            let (request, mut stream) = accept_fake_daemon_request(&legacy_listener);
+            assert!(
+                request.contains("\"handoff_unquiesce\""),
+                "unexpected legacy unquiesce request: {request}"
+            );
+            assert!(request.contains("\"expected_pid\":4242"));
+            assert!(request.contains("\"expected_binary_version\":\"0.2.0\""));
+            write_fake_daemon_response(
+                &mut stream,
+                json!({
+                    "ok": true,
+                    "response": {
+                        "daemon": {
+                            "pid": 4242,
+                            "binary_version": "0.2.0",
+                            "quiescing": false,
+                        },
+                        "quiescing": false,
+                    },
+                }),
+            );
+        });
+
+        let generation_endpoint = DaemonEndpoint::from_socket_path(generation_socket.clone());
+        let quiesce_response = Some(json!({
+            "daemon": {
+                "pid": 4242,
+                "binary_version": "0.2.0",
+                "quiescing": true,
+            },
+            "quiescing": true,
+            "cli_app_servers": [{
+                "managed_session_id": "managed-adopt-budget",
+                "bound_thread_id": "thread-adopt-budget",
+                "session_epoch": 1,
+                "url": "ws://127.0.0.1:1",
+                "pid": 4243,
+                "pid_identity": "pid-identity",
+                "started_at": 1,
+                "lease_id": "lease-adopt-budget",
+                "lease_millis_remaining": 60000,
+            }],
+        }));
+        let ensured = finalize_legacy_handoff_cli_app_servers(
+            &layout,
+            &generation_endpoint,
+            json!({
+                "started": true,
+                "daemon": {
+                    "socket_path": generation_socket.display().to_string(),
+                },
+            }),
+            &quiesce_response,
+            Instant::now() - Duration::from_secs(1),
+        )
+        .expect("adopt failure after startup deadline should degrade to coexistence");
+
+        assert_eq!(ensured["legacy_daemon_quiesced"], false);
+        assert_eq!(ensured["legacy_handoff_unquiesce"]["quiescing"], false);
+        assert_eq!(
+            ensured["legacy_cli_app_server_handoff_skipped"]["reason"],
+            "adopt_failed"
+        );
+        generation_handle.join().expect("generation fake daemon");
+        legacy_handle.join().expect("legacy fake daemon");
+    }
+
+    #[test]
+    fn handoff_release_rollback_unquiesces_legacy_daemon() {
+        fn accept_fake_daemon_request(
+            listener: &UnixListener,
+        ) -> (String, std::os::unix::net::UnixStream) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = String::new();
+                        stream
+                            .read_to_string(&mut request)
+                            .expect("read fake daemon request");
+                        return (request, stream);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for fake daemon request"
+                        );
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept fake daemon request: {error}"),
+                }
+            }
+        }
+
+        fn write_fake_daemon_response(
+            stream: &mut std::os::unix::net::UnixStream,
+            response: Value,
+        ) {
+            stream
+                .write_all(
+                    serde_json::to_string(&response)
+                        .expect("encode fake daemon response")
+                        .as_bytes(),
+                )
+                .expect("write fake daemon response");
+            stream
+                .write_all(b"\n")
+                .expect("write fake daemon response newline");
+        }
+
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        layout
+            .ensure_daemon_generation_dir("release-rollback")
+            .expect("run dirs");
+        let legacy_socket = layout.daemon_socket_path();
+        let generation_socket = layout.daemon_generation_socket_path("release-rollback");
+        let legacy_listener = UnixListener::bind(&legacy_socket).expect("bind legacy daemon");
+        let generation_listener =
+            UnixListener::bind(&generation_socket).expect("bind generation daemon");
+        fs::set_permissions(&legacy_socket, fs::Permissions::from_mode(0o600))
+            .expect("chmod legacy socket");
+        fs::set_permissions(&generation_socket, fs::Permissions::from_mode(0o600))
+            .expect("chmod generation socket");
+        legacy_listener
+            .set_nonblocking(true)
+            .expect("legacy nonblocking");
+        generation_listener
+            .set_nonblocking(true)
+            .expect("generation nonblocking");
+
+        let generation_handle = thread::spawn(move || {
+            let (request, mut stream) = accept_fake_daemon_request(&generation_listener);
+            assert!(
+                request.contains("\"handoff_cli_app_servers_adopt\""),
+                "unexpected generation adopt request: {request}"
+            );
+            write_fake_daemon_response(
+                &mut stream,
+                json!({
+                    "ok": true,
+                    "response": {
+                        "cli_app_servers": [{
+                            "managed_session_id": "managed-release-rollback",
+                            "ownership": "adopted",
+                        }],
+                    },
+                }),
+            );
+            drop(stream);
+
+            let (request, mut stream) = accept_fake_daemon_request(&generation_listener);
+            assert!(
+                request.contains("\"handoff_cli_app_servers_unadopt\""),
+                "unexpected generation unadopt request: {request}"
+            );
+            write_fake_daemon_response(
+                &mut stream,
+                json!({
+                    "ok": true,
+                    "response": {
+                        "unadopted_cli_app_servers": [{
+                            "managed_session_id": "managed-release-rollback",
+                            "ownership": "adopted",
+                        }],
+                    },
+                }),
+            );
+        });
+
+        let legacy_handle = thread::spawn(move || {
+            let (request, mut stream) = accept_fake_daemon_request(&legacy_listener);
+            assert!(
+                request.contains("\"handoff_cli_app_servers_release\""),
+                "unexpected legacy release request: {request}"
+            );
+            write_fake_daemon_response(
+                &mut stream,
+                json!({
+                    "ok": false,
+                    "error": "simulated release failure",
+                }),
+            );
+            drop(stream);
+
+            let (request, mut stream) = accept_fake_daemon_request(&legacy_listener);
+            assert!(
+                request.contains("\"handoff_cli_app_servers_release_status\""),
+                "unexpected legacy release status request: {request}"
+            );
+            write_fake_daemon_response(
+                &mut stream,
+                json!({
+                    "ok": true,
+                    "response": {
+                        "cli_app_servers": [{
+                            "managed_session_id": "managed-release-rollback",
+                            "ownership": "owned",
+                        }],
+                    },
+                }),
+            );
+            drop(stream);
+
+            let (request, mut stream) = accept_fake_daemon_request(&legacy_listener);
+            assert!(
+                request.contains("\"handoff_unquiesce\""),
+                "unexpected legacy unquiesce request: {request}"
+            );
+            assert!(request.contains("\"expected_pid\":4242"));
+            assert!(request.contains("\"expected_binary_version\":\"0.2.0\""));
+            write_fake_daemon_response(
+                &mut stream,
+                json!({
+                    "ok": true,
+                    "response": {
+                        "daemon": {
+                            "pid": 4242,
+                            "binary_version": "0.2.0",
+                            "quiescing": false,
+                        },
+                        "quiescing": false,
+                    },
+                }),
+            );
+        });
+
+        let generation_endpoint = DaemonEndpoint::from_socket_path(generation_socket.clone());
+        let quiesce_response = Some(json!({
+            "daemon": {
+                "pid": 4242,
+                "binary_version": "0.2.0",
+                "quiescing": true,
+            },
+            "quiescing": true,
+            "cli_app_servers": [{
+                "managed_session_id": "managed-release-rollback",
+                "bound_thread_id": "thread-release-rollback",
+                "session_epoch": 1,
+                "url": "ws://127.0.0.1:1",
+                "pid": 4243,
+                "pid_identity": "pid-identity",
+                "started_at": 1,
+                "lease_id": "lease-release-rollback",
+                "lease_millis_remaining": 60000,
+            }],
+        }));
+        let ensured = finalize_legacy_handoff_cli_app_servers(
+            &layout,
+            &generation_endpoint,
+            json!({
+                "started": true,
+                "daemon": {
+                    "socket_path": generation_socket.display().to_string(),
+                },
+            }),
+            &quiesce_response,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("safe release rollback should degrade to coexistence");
+
+        assert_eq!(ensured["legacy_daemon_quiesced"], false);
+        assert_eq!(ensured["legacy_handoff_unquiesce"]["quiescing"], false);
+        assert_eq!(
+            ensured["legacy_cli_app_server_handoff_skipped"]["reason"],
+            "release_failed"
+        );
+        generation_handle.join().expect("generation fake daemon");
+        legacy_handle.join().expect("legacy fake daemon");
+    }
+
+    #[test]
+    fn handoff_release_rejects_retargeting_handed_off_app_server() {
+        let (_home, legacy_state) = test_state();
+        let generation_state = test_state_for_layout(
+            legacy_state.layout.clone(),
+            legacy_state
+                .layout
+                .daemon_generation_socket_path("retarget-generation-a"),
+        );
+        let managed_session_id =
+            create_proven_cli_session(&legacy_state, "thread-handoff-retarget");
+        let server = test_managed_cli_app_server(
+            &managed_session_id,
+            "thread-handoff-retarget",
+            Instant::now() + Duration::from_secs(60),
+        );
+        legacy_state
+            .cli_app_servers
+            .lock()
+            .expect("servers lock")
+            .insert(managed_session_id.clone(), server);
+        quiesce_for_handoff(&legacy_state, HandoffQuiescePayload::default())
+            .expect("legacy quiesce");
+        let exports = export_cli_app_servers_for_handoff(&legacy_state).expect("export app-server");
+        adopt_handoff_cli_app_servers(
+            &generation_state,
+            HandoffCliAppServersAdoptPayload {
+                source_daemon_socket_path: legacy_state.socket_path.display().to_string(),
+                cli_app_servers: exports.clone(),
+            },
+        )
+        .expect("generation adopts app-server before legacy release");
+        release_handoff_cli_app_servers(
+            &legacy_state,
+            HandoffCliAppServersReleasePayload {
+                handoff_daemon_socket_path: "generation-a.sock".to_owned(),
+                cli_app_servers: exports.clone(),
+            },
+        )
+        .expect("release to first generation");
+
+        let error = release_handoff_cli_app_servers(
+            &legacy_state,
+            HandoffCliAppServersReleasePayload {
+                handoff_daemon_socket_path: "generation-b.sock".to_owned(),
+                cli_app_servers: exports.clone(),
+            },
+        )
+        .expect_err("retargeting handed-off app-server should fail");
+        assert!(
+            format!("{error:#}").contains("already handed off to another daemon"),
+            "{error:#}"
+        );
+        let status = handoff_cli_app_server_release_status(
+            &legacy_state,
+            HandoffCliAppServersReleasePayload {
+                handoff_daemon_socket_path: "generation-b.sock".to_owned(),
+                cli_app_servers: exports,
+            },
+        )
+        .expect("release status still reports handed-off app-server");
+        assert_eq!(status[0].ownership, "handed_off");
+        assert_eq!(
+            status[0].handoff_daemon_socket_path.as_deref(),
+            Some("generation-a.sock")
+        );
+
+        stop_all_cli_app_servers(&generation_state);
+        stop_all_cli_app_servers(&legacy_state);
+    }
+
+    #[test]
+    fn handoff_adopts_cli_app_server_and_redirects_legacy_refresh() {
+        let (_home, legacy_state) = test_state();
+        let layout = legacy_state.layout.clone();
+        let generation_socket = layout
+            .daemon_generations_dir()
+            .join("test-generation")
+            .join("cbth.sock");
+        let generation_socket_display = generation_socket.display().to_string();
+        let generation_state = test_state_for_layout(layout.clone(), generation_socket.clone());
+        let managed_session_id = create_proven_cli_session(&legacy_state, "thread-handoff-adopt");
+        let server = test_managed_cli_app_server(
+            &managed_session_id,
+            "thread-handoff-adopt",
+            Instant::now() + Duration::from_secs(60),
+        );
+        let pid = server.pid();
+        legacy_state
+            .cli_app_servers
+            .lock()
+            .expect("servers lock")
+            .insert(managed_session_id.clone(), server);
+
+        quiesce_for_handoff(&legacy_state, HandoffQuiescePayload::default())
+            .expect("legacy quiesce");
+        let exports = export_cli_app_servers_for_handoff(&legacy_state).expect("export app-server");
+        assert_eq!(exports.len(), 1);
+        let adopted = adopt_handoff_cli_app_servers(
+            &generation_state,
+            HandoffCliAppServersAdoptPayload {
+                source_daemon_socket_path: legacy_state.socket_path.display().to_string(),
+                cli_app_servers: exports.clone(),
+            },
+        )
+        .expect("adopt app-server");
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(adopted[0].pid, pid);
+        assert_eq!(adopted[0].url, "ws://127.0.0.1:1");
+        assert_eq!(adopted[0].ownership, "adopted");
+
+        let pre_release_status = handoff_cli_app_server_release_status(
+            &legacy_state,
+            HandoffCliAppServersReleasePayload {
+                handoff_daemon_socket_path: generation_socket_display.clone(),
+                cli_app_servers: exports.clone(),
+            },
+        )
+        .expect("pre-release status");
+        assert_eq!(pre_release_status[0].ownership, "owned");
+        let released = release_handoff_cli_app_servers(
+            &legacy_state,
+            HandoffCliAppServersReleasePayload {
+                handoff_daemon_socket_path: generation_socket_display.clone(),
+                cli_app_servers: exports.clone(),
+            },
+        )
+        .expect("release legacy app-server");
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].ownership, "handed_off");
+        assert_eq!(
+            released[0].handoff_daemon_socket_path.as_deref(),
+            Some(generation_socket_display.as_str())
+        );
+        let post_release_status = handoff_cli_app_server_release_status(
+            &legacy_state,
+            HandoffCliAppServersReleasePayload {
+                handoff_daemon_socket_path: generation_socket_display.clone(),
+                cli_app_servers: exports,
+            },
+        )
+        .expect("post-release status");
+        assert_eq!(post_release_status[0].ownership, "handed_off");
+
+        let legacy_refresh = refresh_cli_app_server_lease(
+            &legacy_state,
+            CliAppServerLeasePayload {
+                managed_session_id: managed_session_id.clone(),
+                lease_id: "lease-test".to_owned(),
+                lease_ttl_seconds: None,
+            },
+        )
+        .expect("legacy refresh redirects");
+        assert_eq!(legacy_refresh.pid, pid);
+        assert_eq!(
+            legacy_refresh.handoff_daemon_socket_path.as_deref(),
+            Some(generation_socket_display.as_str())
+        );
+        assert!(
+            process_group_exists(pid),
+            "legacy release must not kill handed-off app-server"
+        );
+        let legacy_stop = stop_cli_app_server(
+            &legacy_state,
+            CliAppServerStopPayload {
+                managed_session_id: managed_session_id.clone(),
+                lease_id: "lease-test".to_owned(),
+            },
+        )
+        .expect("legacy stop redirects");
+        assert!(!legacy_stop.stopped);
+        assert_eq!(
+            legacy_stop.handoff_daemon_socket_path.as_deref(),
+            Some(generation_socket_display.as_str())
+        );
+        {
+            let mut servers = legacy_state
+                .cli_app_servers
+                .lock()
+                .expect("legacy servers lock");
+            servers
+                .get_mut(&managed_session_id)
+                .expect("handed-off server")
+                .lease_expires_at = Instant::now() - Duration::from_millis(1);
+        }
+        reap_expired_cli_app_servers(&legacy_state);
+        assert!(
+            legacy_state
+                .cli_app_servers
+                .lock()
+                .expect("legacy servers lock")
+                .contains_key(&managed_session_id),
+            "legacy daemon must keep running handed-off child reapable"
+        );
+
+        let adopted_refresh = refresh_cli_app_server_lease(
+            &generation_state,
+            CliAppServerLeasePayload {
+                managed_session_id: managed_session_id.clone(),
+                lease_id: "lease-test".to_owned(),
+                lease_ttl_seconds: None,
+            },
+        )
+        .expect("adopted refresh succeeds");
+        assert_eq!(adopted_refresh.pid, pid);
+        assert_eq!(adopted_refresh.url, "ws://127.0.0.1:1");
+        assert_eq!(adopted_refresh.ownership, "adopted");
+
+        assert!(
+            stop_cli_app_server(
+                &generation_state,
+                CliAppServerStopPayload {
+                    managed_session_id: managed_session_id.clone(),
+                    lease_id: "lease-test".to_owned(),
+                },
+            )
+            .expect("stop adopted app-server")
+            .stopped
+        );
+        let reap_deadline = Instant::now() + Duration::from_secs(2);
+        while legacy_state
+            .cli_app_servers
+            .lock()
+            .expect("legacy servers lock")
+            .contains_key(&managed_session_id)
+            && Instant::now() < reap_deadline
+        {
+            reap_expired_cli_app_servers(&legacy_state);
+            thread::sleep(READ_POLL_INTERVAL);
+        }
+        assert!(
+            !legacy_state
+                .cli_app_servers
+                .lock()
+                .expect("legacy servers lock")
+                .contains_key(&managed_session_id),
+            "legacy daemon should remove handed-off child after it exits"
+        );
+        stop_all_cli_app_servers(&legacy_state);
+    }
+
+    #[test]
+    fn adopted_app_server_stop_terminates_group_after_leader_exit() {
+        let mut ready_pipe = [0 as RawFd; 2];
+        let mut release_pipe = [0 as RawFd; 2];
+        assert_eq!(
+            unsafe { libc::pipe(ready_pipe.as_mut_ptr()) },
+            0,
+            "create ready pipe"
+        );
+        assert_eq!(
+            unsafe { libc::pipe(release_pipe.as_mut_ptr()) },
+            0,
+            "create release pipe"
+        );
+
+        let leader_pid = unsafe { libc::fork() };
+        assert!(leader_pid >= 0, "fork leader failed");
+        if leader_pid == 0 {
+            unsafe {
+                let _ = libc::close(ready_pipe[0]);
+                let _ = libc::close(release_pipe[1]);
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(2);
+                }
+                let member_pid = libc::fork();
+                if member_pid < 0 {
+                    libc::_exit(3);
+                }
+                if member_pid == 0 {
+                    let _ = libc::close(ready_pipe[1]);
+                    let _ = libc::close(release_pipe[0]);
+                    loop {
+                        libc::sleep(30);
+                    }
+                }
+                let ready = 1_u8;
+                if libc::write(ready_pipe[1], (&ready as *const u8).cast(), 1) != 1 {
+                    libc::_exit(4);
+                }
+                let _ = libc::close(ready_pipe[1]);
+                let mut release = 0_u8;
+                let _ = libc::read(release_pipe[0], (&mut release as *mut u8).cast(), 1);
+                let _ = libc::close(release_pipe[0]);
+                libc::_exit(0);
+            }
+        }
+
+        unsafe {
+            let _ = libc::close(ready_pipe[1]);
+            let _ = libc::close(release_pipe[0]);
+        }
+        let mut ready = 0_u8;
+        let read_ready = unsafe { libc::read(ready_pipe[0], (&mut ready as *mut u8).cast(), 1) };
+        unsafe {
+            let _ = libc::close(ready_pipe[0]);
+        }
+        assert_eq!(read_ready, 1, "leader did not report ready");
+        let pid = u32::try_from(leader_pid).expect("leader pid");
+        let pid_identity = process_start_identity(pid)
+            .expect("process identity")
+            .expect("leader identity available before exit");
+
+        let release = 1_u8;
+        assert_eq!(
+            unsafe { libc::write(release_pipe[1], (&release as *const u8).cast(), 1) },
+            1,
+            "release leader"
+        );
+        unsafe {
+            let _ = libc::close(release_pipe[1]);
+        }
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(leader_pid, &mut status, 0) };
+        assert_eq!(waited, leader_pid, "wait leader");
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "leader exited unsuccessfully"
+        );
+        assert!(process_group_exists(pid), "member should keep group alive");
+
+        let process = AdoptedCliAppServerProcess {
+            pid,
+            pid_identity,
+            source_daemon_socket_path: "legacy.sock".to_owned(),
+        };
+        stop_adopted_cli_app_server_process(&process);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_group_exists(pid) && Instant::now() < deadline {
+            thread::sleep(READ_POLL_INTERVAL);
+        }
+        let group_exists = process_group_exists(pid);
+        if group_exists {
+            signal_process_group(pid, libc::SIGKILL);
+        }
+        assert!(
+            !group_exists,
+            "adopted stop should terminate descendants after leader exit"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn adopted_app_server_zombie_leader_without_members_is_stopped() {
+        let mut ready_pipe = [0 as RawFd; 2];
+        let mut release_pipe = [0 as RawFd; 2];
+        assert_eq!(
+            unsafe { libc::pipe(ready_pipe.as_mut_ptr()) },
+            0,
+            "create ready pipe"
+        );
+        assert_eq!(
+            unsafe { libc::pipe(release_pipe.as_mut_ptr()) },
+            0,
+            "create release pipe"
+        );
+
+        let leader_pid = unsafe { libc::fork() };
+        assert!(leader_pid >= 0, "fork leader failed");
+        if leader_pid == 0 {
+            unsafe {
+                let _ = libc::close(ready_pipe[0]);
+                let _ = libc::close(release_pipe[1]);
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(2);
+                }
+                let ready = 1_u8;
+                if libc::write(ready_pipe[1], (&ready as *const u8).cast(), 1) != 1 {
+                    libc::_exit(3);
+                }
+                let _ = libc::close(ready_pipe[1]);
+                let mut release = 0_u8;
+                let _ = libc::read(release_pipe[0], (&mut release as *mut u8).cast(), 1);
+                let _ = libc::close(release_pipe[0]);
+                libc::_exit(0);
+            }
+        }
+
+        unsafe {
+            let _ = libc::close(ready_pipe[1]);
+            let _ = libc::close(release_pipe[0]);
+        }
+        let mut ready = 0_u8;
+        let read_ready = unsafe { libc::read(ready_pipe[0], (&mut ready as *mut u8).cast(), 1) };
+        unsafe {
+            let _ = libc::close(ready_pipe[0]);
+        }
+        assert_eq!(read_ready, 1, "leader did not report ready");
+        let pid = u32::try_from(leader_pid).expect("leader pid");
+        let process = AdoptedCliAppServerProcess {
+            pid,
+            pid_identity: process_start_identity(pid)
+                .expect("process identity")
+                .expect("leader identity available before exit"),
+            source_daemon_socket_path: "legacy.sock".to_owned(),
+        };
+        assert!(
+            adopted_cli_app_server_process_group_is_active(&process),
+            "running adopted leader should be active"
+        );
+
+        let release = 1_u8;
+        assert_eq!(
+            unsafe { libc::write(release_pipe[1], (&release as *const u8).cast(), 1) },
+            1,
+            "release leader"
+        );
+        unsafe {
+            let _ = libc::close(release_pipe[1]);
+        }
+        let exit_deadline = Instant::now() + Duration::from_secs(2);
+        let mut exited_observed = false;
+        while Instant::now() < exit_deadline {
+            if child_status_without_reaping(pid).expect("child status")
+                == ChildStatusWithoutReaping::Exited
+            {
+                exited_observed = true;
+                break;
+            }
+            thread::sleep(READ_POLL_INTERVAL);
+        }
+        let zombie_status = process_is_zombie(pid).expect("zombie status");
+        let active_after_exit = adopted_cli_app_server_process_group_is_active(&process);
+        let (_home, generation_state) = test_state();
+        let adopt_error = adopt_handoff_cli_app_servers(
+            &generation_state,
+            HandoffCliAppServersAdoptPayload {
+                source_daemon_socket_path: "legacy.sock".to_owned(),
+                cli_app_servers: vec![HandoffCliAppServerExport {
+                    managed_session_id: "managed-zombie-adopt".to_owned(),
+                    bound_thread_id: "thread-zombie-adopt".to_owned(),
+                    session_epoch: 1,
+                    url: "ws://127.0.0.1:1".to_owned(),
+                    pid,
+                    pid_identity: process.pid_identity.clone(),
+                    started_at: 1,
+                    lease_id: "lease-zombie-adopt".to_owned(),
+                    lease_millis_remaining: 60_000,
+                }],
+            },
+        )
+        .expect_err("zombie app-server leader must not be adopted");
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(leader_pid, &mut status, 0) };
+
+        assert!(exited_observed, "leader should become waitable");
+        assert_ne!(
+            zombie_status,
+            Some(false),
+            "waitable exited leader must not look like a live process"
+        );
+        assert!(
+            !active_after_exit,
+            "zombie adopted leader with no live members should be stopped"
+        );
+        let adopt_error = format!("{adopt_error:#}");
+        assert!(
+            adopt_error.contains("pid identity no longer matches")
+                || adopt_error.contains("process is not running"),
+            "{adopt_error}"
+        );
+        assert_eq!(waited, leader_pid, "wait leader");
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "leader exited unsuccessfully"
+        );
     }
 
     #[test]
@@ -6607,7 +8958,7 @@ mod tests {
             "thread-daemon-replaced",
             Instant::now() + Duration::from_secs(60),
         );
-        let replacement_pid = replacement.child.id();
+        let replacement_pid = replacement.pid();
         state
             .cli_app_servers
             .lock()
@@ -6623,7 +8974,7 @@ mod tests {
         let server = servers
             .get(&managed_session_id)
             .expect("replacement remains registered");
-        assert_eq!(server.child.id(), replacement_pid);
+        assert_eq!(server.pid(), replacement_pid);
         drop(servers);
         let store = Store::open(&state.layout).expect("open store");
         let session = store
@@ -6721,6 +9072,113 @@ mod tests {
     }
 
     #[test]
+    fn cli_app_server_ensure_quiesce_during_spawn_kills_candidate_server() {
+        let (home, state) = test_state();
+        let state = Arc::new(state);
+        let managed_session_id = "session-ensure-quiesce-registration".to_owned();
+        let bound_thread_id = "thread-ensure-quiesce-registration".to_owned();
+        let lease_id = "lease-ensure-quiesce-registration".to_owned();
+        reserve_cli_app_server(
+            &state,
+            CliAppServerReservePayload {
+                bound_thread_id: bound_thread_id.clone(),
+                lease_id: lease_id.clone(),
+                lease_ttl_seconds: None,
+            },
+        )
+        .expect("reserve CLI app-server");
+
+        let fake_codex = home.path().join("fake-codex");
+        let pid_file = home.path().join("fake-codex.pid");
+        let release_file = home.path().join("release-listener");
+        let pid_file_quoted = pid_file.display().to_string().replace('\'', "'\\''");
+        let release_file_quoted = release_file.display().to_string().replace('\'', "'\\''");
+        fs::write(
+            &fake_codex,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{pid_file_quoted}'\nwhile [ ! -f '{release_file_quoted}' ]; do sleep 0.05; done\nprintf 'listening on: ws://127.0.0.1:1234\\n'\nwhile :; do sleep 1; done\n"
+            ),
+        )
+        .expect("write fake codex");
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700))
+            .expect("chmod fake codex");
+
+        let task_state = Arc::clone(&state);
+        let task = thread::spawn(move || {
+            ensure_cli_app_server(
+                &task_state,
+                CliAppServerEnsurePayload {
+                    managed_session_id,
+                    bound_thread_id,
+                    session_epoch: 1,
+                    codex_binary: fake_codex.into_os_string().into_vec(),
+                    lease_id,
+                    lease_ttl_seconds: None,
+                },
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Ok(pid) = fs::read_to_string(&pid_file)
+                .map(|pid| pid.trim().to_owned())
+                .and_then(|pid| {
+                    pid.parse::<u32>().map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })
+                })
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "fake app-server did not start");
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        let handoff_guard = state
+            .handoff_quiesce_lock
+            .try_lock()
+            .expect("handoff quiesce lock is free while app-server spawns");
+        drop(handoff_guard);
+        state.quiescing.store(true, Ordering::Release);
+        fs::write(&release_file, "go").expect("release fake listener");
+
+        let error = task
+            .join()
+            .expect("app-server ensure worker joins")
+            .expect_err("quiescing daemon should reject app-server registration");
+
+        assert!(
+            error
+                .to_string()
+                .contains("daemon is quiescing for handoff"),
+            "{error:#}"
+        );
+        assert!(
+            state
+                .cli_app_servers
+                .lock()
+                .expect("servers lock")
+                .is_empty()
+        );
+        let stopped_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < stopped_deadline
+            && (process_is_zombie(pid)
+                .expect("inspect candidate app-server leader")
+                .is_some_and(|zombie| !zombie)
+                || process_group_has_enumerated_live_members_after_leader_exit(pid))
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            process_is_zombie(pid)
+                .expect("inspect candidate app-server leader")
+                .is_none_or(|zombie| zombie)
+                && !process_group_has_enumerated_live_members_after_leader_exit(pid),
+            "candidate app-server survived quiesced registration"
+        );
+    }
+
+    #[test]
     fn thread_start_stop_before_bootstrap_registration_kills_candidate_server() {
         let (home, state) = test_state();
         let state = Arc::new(state);
@@ -6794,6 +9252,81 @@ mod tests {
     }
 
     #[test]
+    fn thread_start_quiesce_before_bootstrap_registration_kills_candidate_server() {
+        let (home, state) = test_state();
+        let state = Arc::new(state);
+        let fake_codex = home.path().join("fake-codex");
+        let pid_file = home.path().join("fake-codex.pid");
+        let pid_file_quoted = pid_file.display().to_string().replace('\'', "'\\''");
+        fs::write(
+            &fake_codex,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{pid_file_quoted}'\nprintf 'listening on: ws://127.0.0.1:1234\\n'\nwhile :; do sleep 1; done\n"
+            ),
+        )
+        .expect("write fake codex");
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700))
+            .expect("chmod fake codex");
+        let bootstrap_guard = state
+            .cli_thread_start_bootstraps
+            .lock()
+            .expect("bootstrap lock");
+        let task_state = Arc::clone(&state);
+        let task = thread::spawn(move || {
+            start_cli_thread(
+                &task_state,
+                CliThreadStartPayload {
+                    codex_binary: fake_codex.into_os_string().into_vec(),
+                    cwd: home.path().display().to_string(),
+                    lease_id: "lease-quiesced-thread-start-registration".to_owned(),
+                    lease_ttl_seconds: None,
+                    thread_start_params: None,
+                },
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Ok(pid) = fs::read_to_string(&pid_file)
+                .map(|pid| pid.trim().to_owned())
+                .and_then(|pid| {
+                    pid.parse::<u32>().map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })
+                })
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "fake app-server did not start");
+            thread::sleep(Duration::from_millis(20));
+        };
+        state.quiescing.store(true, Ordering::Release);
+        drop(bootstrap_guard);
+        let error = task
+            .join()
+            .expect("thread/start worker joins")
+            .expect_err("quiescing daemon should reject bootstrap registration");
+
+        assert!(
+            error
+                .to_string()
+                .contains("daemon is quiescing for handoff"),
+            "{error:#}"
+        );
+        assert!(
+            state
+                .cli_thread_start_bootstraps
+                .lock()
+                .expect("bootstrap lock")
+                .is_empty()
+        );
+        assert!(
+            !process_group_exists(pid),
+            "candidate bootstrap app-server survived quiesced registration"
+        );
+    }
+
+    #[test]
     fn stopped_daemon_does_not_promote_removed_bootstrap_after_cleanup() {
         let (_home, state) = test_state();
         let state = Arc::new(state);
@@ -6814,7 +9347,7 @@ mod tests {
             &bound_thread_id,
             Instant::now() + Duration::from_secs(60),
         );
-        let pid = server.child.id();
+        let pid = server.pid();
         state
             .cli_thread_start_bootstraps
             .lock()
@@ -6894,7 +9427,7 @@ mod tests {
             "thread-promote-conflict",
             Instant::now() + Duration::from_secs(60),
         );
-        let existing_pid = existing.child.id();
+        let existing_pid = existing.pid();
         state
             .cli_app_servers
             .lock()
@@ -6906,7 +9439,7 @@ mod tests {
             "thread-promote-conflict",
             Instant::now() + Duration::from_secs(60),
         );
-        let candidate_pid = candidate.child.id();
+        let candidate_pid = candidate.pid();
         state
             .cli_thread_start_bootstraps
             .lock()
@@ -6944,7 +9477,7 @@ mod tests {
         let existing = servers
             .get(&managed_session_id)
             .expect("existing app-server remains registered");
-        assert_eq!(existing.child.id(), existing_pid);
+        assert_eq!(existing.pid(), existing_pid);
         assert!(
             process_group_exists(existing_pid),
             "running registered app-server should not be stopped by a duplicate promote"
