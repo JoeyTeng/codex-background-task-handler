@@ -12,6 +12,8 @@ The project is currently suitable for local dogfooding on dedicated macOS or Lin
 
 ## Install
 
+Release assets are currently available for Linux x86_64 glibc and macOS arm64. Intel macOS release assets are not published; Apple Silicon hosts launched from a Rosetta shell are mapped to the macOS arm64 asset by the installer.
+
 Install the latest GitHub Release:
 
 ```bash
