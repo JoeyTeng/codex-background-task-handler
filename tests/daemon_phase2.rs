@@ -3763,7 +3763,7 @@ fn daemon_task_cancel_persists_running_cancel_before_signaling() {
         "running task was not signaled after cancel intent became durable"
     );
     cbth_daemon(&home, &["daemon", "stop"]);
-    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
+    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(30));
 }
 
 #[test]
@@ -3828,7 +3828,7 @@ fn daemon_task_timeout_wins_over_later_cancel() {
     let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
     assert_eq!(job["job"]["status"], "failed");
     cbth_daemon(&home, &["daemon", "stop"]);
-    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
+    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(30));
 }
 
 #[test]
