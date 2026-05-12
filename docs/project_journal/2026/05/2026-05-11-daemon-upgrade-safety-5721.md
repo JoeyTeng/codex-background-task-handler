@@ -5,7 +5,7 @@ status: completed
 created: 2026-05-11
 updated: 2026-05-12
 branch: codex/release-0.2.0
-pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/67
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/68
 supersedes: []
 superseded_by:
 ---
@@ -49,7 +49,7 @@ superseded_by:
 - PR3: https://github.com/JoeyTeng/codex-background-task-handler/pull/64
 - PR4: https://github.com/JoeyTeng/codex-background-task-handler/pull/66
 - PR5: https://github.com/JoeyTeng/codex-background-task-handler/pull/67
-- Release PR: pending at branch `codex/release-0.2.0`
+- Release PR: https://github.com/JoeyTeng/codex-background-task-handler/pull/68
 - Local PR5 validation: `cargo test --locked task_run_rechecks_quiesce_before_registry_admission --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
 - Local PR5 validation: `cargo test --locked --test daemon_phase2 task_run_uses_generation_daemon_when_incompatible_default_daemon_is_quiescing --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
 - Local PR5 validation: `cargo test --locked --test daemon_phase2 task_cancel_falls_back_to_generation_recovery_when_owner_socket_is_stale --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
