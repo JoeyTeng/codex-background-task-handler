@@ -1,5 +1,7 @@
 # codex-background-task-handler
 
+Languages: [English (en-GB)](README.md) | [Simplified Chinese (zh-CN)](README.zh-CN.md)
+
 `codex-background-task-handler` provides the `cbth` companion CLI for supervised background work around Codex without modifying the upstream `codex` repository. It is a local, same-user helper for launching managed Codex CLI sessions, supervising long-running shell tasks, and delivering task results back to the bound Codex thread when the local safety checks allow it.
 
 ## Status

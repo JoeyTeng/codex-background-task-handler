@@ -1,5 +1,7 @@
 # Design Overview
 
+Languages: [English (en-GB)](DESIGN_OVERVIEW.en-GB.md) | [Simplified Chinese (zh-CN)](DESIGN_OVERVIEW.zh-CN.md)
+
 `cbth` is a companion layer around Codex for long-running local work. It does not modify upstream `codex`; instead, it owns local daemon state, supervised tasks, and narrow integration points with Codex CLI or Desktop experiments.
 
 ## What The Project Is For
