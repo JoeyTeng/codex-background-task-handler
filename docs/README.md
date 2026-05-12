@@ -1,14 +1,16 @@
 # Documentation
 
-This directory contains root-level operational notes, internal design records, implementation plans, validation notes, and project tracking entrypoints.
+This directory contains user-facing guides, internal design records, implementation plans, validation notes, and project tracking entrypoints.
 
-## Root-Level Notes
+## User-Facing Guides
 
-- [CLI operator recovery](CLI_OPERATOR_RECOVERY.md)
-- [Git hooks](GIT_HOOKS.md)
-- [Live E2E](LIVE_E2E.md)
+- [Usage guide](USAGE.en-GB.md)
+- [Design overview](DESIGN_OVERVIEW.en-GB.md)
+- [Operator recovery](OPERATOR_RECOVERY.en-GB.md)
+- [Development guide](DEVELOPMENT.en-GB.md)
+- [Live E2E guide](LIVE_E2E.en-GB.md)
 
-These files are retained under their existing names in this structure-only PR. The stable public guide set and language variants are introduced in follow-up documentation PRs.
+The repository root [README.md](../README.md) is the default `en-GB` entrypoint. `zh-CN` counterparts are added in the follow-up bilingual documentation PR.
 
 ## Internal Records
 
