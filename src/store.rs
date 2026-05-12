@@ -5333,6 +5333,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         stdout_truncated: row.get::<_, i64>("stdout_truncated")? != 0,
         stderr_truncated: row.get::<_, i64>("stderr_truncated")? != 0,
         cancel_requested_at: row.get("cancel_requested_at")?,
+        supervisor_daemon_generation: row.get("supervisor_daemon_generation")?,
     })
 }
 

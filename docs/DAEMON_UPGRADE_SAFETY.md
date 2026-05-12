@@ -124,3 +124,20 @@ Non-goals:
 
 - PR4 不迁移 live jobs，也不迁移 worker 内存状态。
 - PR4 不承诺 app-server stdout/stderr drain 无损迁移；只承诺 foreground websocket url/pid 不变且不会因为 legacy daemon handoff 被 reset。
+
+## PR5 Live Jobs Drain
+
+PR5 不迁移 worker memory、stdout/stderr stream ownership 或 pending job row ownership。它的目标是让旧 daemon 在 handoff 后进入 drain-only lifecycle：
+
+- Quiescing default daemon 不再作为 `daemon ensure` 的 new-work endpoint；新 CLI 会启动或复用 generation daemon，并把后续 `task_run` / mutating dispatch 发给 generation daemon。Already-quiescing default daemon is treated as an in-progress drain peer even if it is otherwise incompatible with the current binary: later ensures may re-send fenced `handoff_quiesce` to recover app-server export/adopt after a previous client crash, but if the peer has already completed drain-exit and the endpoint is gone, new work continues on the generation daemon.
+- Quiescing daemon 继续允许 `task_cancel`，并继续监督已经 admitted 的 supervised tasks。`task_cancel` routes by the task row's `supervisor_daemon_generation` before calling `daemon ensure`, so unowned live tasks cancel through the quiescing default daemon and generation-owned live tasks cancel through the quiescing generation daemon that owns their `SupervisedTaskControl`。If a default owner socket is stale or gone, cancel falls back to normal `daemon ensure`; if a generation owner socket is stale or gone, cancel starts or reuses the current generation daemon so generation-scoped startup recovery can kill/terminalize the lost task before the cancel request returns. Task admission 以 handoff quiesce lock fence registry transition：quiesce 已经赢时，新 task 不会进入 registry 或 durable store；task 已经进入 registry 时，旧 daemon 负责 drain 到 terminal。
+- Lifecycle status 仍按 recovery owner scope 统计。Default daemon 只 drain unowned jobs/tasks；generation daemon 只 drain current generation jobs/tasks，并仍可 recover stale dead-generation tasks。
+- Quiescing daemon 在没有 active clients、没有 lifecycle maintenance worker、scope 内 `active_jobs == 0`、`nonterminal_tasks == 0`、没有 active supervised task、没有 non-handed-off app-server/reservation/bootstrap 后，以 `shutdown_reason=handoff_drain_complete` 自动退出，不等待普通 idle timeout。
+- `handed_off` app-server entries 不阻止 old daemon drain exit；退出清理只 detach legacy child handle / drain worker，不 signal app-server、不 invalidate proof。`owned` 或 `adopted` app-server 仍阻止 drain exit，因为这表示 app-server handoff 没有完成。
+- Pending jobs without tasks are drain blockers until another path completes or fails them. PR5 only promises non-disruptive drain, not automatic job result synthesis.
+
+Failure boundaries:
+
+- If lifecycle status refresh fails, quiescing daemon stays alive and retries instead of exiting blind。
+- If a generation daemon is itself quiescing, `daemon ensure` fails closed rather than routing new work to a daemon that refuses it or stopping it as stale。
+- Explicit `daemon stop` remains a stop request and still terminates supervised tasks; handoff drain auto-exit is the only path that preserves live tasks to terminal.

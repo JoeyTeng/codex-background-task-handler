@@ -32,9 +32,10 @@ use crate::cli_app_server_client::{
 };
 use crate::daemon::{
     DaemonEndpoint, DaemonEnsureOptions, DaemonServeOptions, DaemonSocketKind,
-    daemon_endpoint_from_response, daemon_ensure, daemon_request, daemon_request_at_endpoint,
-    daemon_request_payload, daemon_request_payload_at_endpoint,
-    daemon_request_payload_timeout_at_endpoint, daemon_serve, validate_daemon_autostart_endpoint,
+    daemon_endpoint_for_supervisor_generation, daemon_endpoint_from_response, daemon_ensure,
+    daemon_ensure_generation, daemon_request, daemon_request_at_endpoint, daemon_request_payload,
+    daemon_request_payload_at_endpoint, daemon_request_payload_timeout_at_endpoint, daemon_serve,
+    error_is_daemon_endpoint_gone, validate_daemon_autostart_endpoint,
     validate_daemon_request_budget,
 };
 use crate::fs_layout::{
@@ -2486,7 +2487,7 @@ fn dispatch_daemon_task_command(
     layout: &FsLayout,
     startup_timeout_seconds: u64,
 ) -> Result<Value> {
-    let (daemon_command, payload) = match command {
+    let (daemon_command, payload, task_cancel_id) = match command {
         Commands::Task {
             command: TaskCommand::Run(args),
         } => {
@@ -2531,16 +2532,21 @@ fn dispatch_daemon_task_command(
                     "command": argv_payload(command),
                     "environment": environment_payload(),
                 }),
+                None,
             )
         }
         Commands::Task {
             command: TaskCommand::Cancel(args),
-        } => (
-            "task_cancel",
-            json!({
-                "task_id": args.task_id,
-            }),
-        ),
+        } => {
+            let task_id = args.task_id;
+            (
+                "task_cancel",
+                json!({
+                    "task_id": task_id.clone(),
+                }),
+                Some(task_id),
+            )
+        }
         _ => bail!("unsupported daemon task command"),
     };
 
@@ -2550,6 +2556,37 @@ fn dispatch_daemon_task_command(
         )
     })?;
     validate_daemon_autostart_endpoint(layout)?;
+    let task_cancel_owner = task_cancel_id
+        .as_deref()
+        .map(|task_id| task_cancel_daemon_endpoint(layout, task_id))
+        .transpose()?;
+    if let Some(owner) = &task_cancel_owner {
+        if owner.endpoint.socket_path().exists() {
+            match daemon_request_payload_at_endpoint(
+                layout,
+                &owner.endpoint,
+                daemon_command,
+                payload.clone(),
+            ) {
+                Ok(response) => return Ok(response),
+                Err(error) if error_is_daemon_endpoint_gone(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if owner.is_generation {
+            let ensure = daemon_ensure_generation(
+                layout,
+                DaemonEnsureOptions {
+                    idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
+                    startup_timeout_seconds,
+                    startup_sweep_now: Some(now_epoch_seconds()?),
+                    replace_incompatible: false,
+                },
+            )?;
+            let endpoint = daemon_endpoint_from_response(layout, &ensure)?;
+            return daemon_request_payload_at_endpoint(layout, &endpoint, daemon_command, payload);
+        }
+    }
     let ensure = daemon_ensure(
         layout,
         DaemonEnsureOptions {
@@ -2561,6 +2598,28 @@ fn dispatch_daemon_task_command(
     )?;
     let endpoint = daemon_endpoint_from_response(layout, &ensure)?;
     daemon_request_payload_at_endpoint(layout, &endpoint, daemon_command, payload)
+}
+
+struct TaskCancelDaemonEndpoint {
+    endpoint: DaemonEndpoint,
+    is_generation: bool,
+}
+
+fn task_cancel_daemon_endpoint(
+    layout: &FsLayout,
+    task_id: &str,
+) -> Result<TaskCancelDaemonEndpoint> {
+    let store = Store::open(layout)?;
+    let task = store.inspect_task(task_id)?;
+    let is_generation = task.supervisor_daemon_generation.is_some();
+    let endpoint = daemon_endpoint_for_supervisor_generation(
+        layout,
+        task.supervisor_daemon_generation.as_deref(),
+    )?;
+    Ok(TaskCancelDaemonEndpoint {
+        endpoint,
+        is_generation,
+    })
 }
 
 pub(crate) fn dispatch_daemon_argv(
