@@ -1265,7 +1265,7 @@ fn finalize_legacy_handoff_cli_app_servers(
             "source_daemon_socket_path": source_daemon_socket_path,
             "cli_app_servers": exports.clone(),
         }),
-        remaining_budget(startup_deadline)?,
+        handoff_post_adopt_timeout(startup_deadline),
     ) {
         Ok(response) => response,
         Err(adopt_error) => {
@@ -7936,6 +7936,171 @@ mod tests {
                 .expect("release decision"),
             HandoffPostAdoptReleaseDecision::RollbackLegacyUnreleased
         );
+    }
+
+    #[test]
+    fn handoff_adopt_failure_after_startup_deadline_unquiesces_legacy_daemon() {
+        fn accept_fake_daemon_request(
+            listener: &UnixListener,
+        ) -> (String, std::os::unix::net::UnixStream) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = String::new();
+                        stream
+                            .read_to_string(&mut request)
+                            .expect("read fake daemon request");
+                        return (request, stream);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for fake daemon request"
+                        );
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept fake daemon request: {error}"),
+                }
+            }
+        }
+
+        fn write_fake_daemon_response(
+            stream: &mut std::os::unix::net::UnixStream,
+            response: Value,
+        ) {
+            stream
+                .write_all(
+                    serde_json::to_string(&response)
+                        .expect("encode fake daemon response")
+                        .as_bytes(),
+                )
+                .expect("write fake daemon response");
+            stream
+                .write_all(b"\n")
+                .expect("write fake daemon response newline");
+        }
+
+        let home = tempfile::tempdir().expect("temp home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            .expect("chmod temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        layout
+            .ensure_daemon_generation_dir("adopt-budget")
+            .expect("run dirs");
+        let legacy_socket = layout.daemon_socket_path();
+        let generation_socket = layout.daemon_generation_socket_path("adopt-budget");
+        let legacy_listener = UnixListener::bind(&legacy_socket).expect("bind legacy daemon");
+        let generation_listener =
+            UnixListener::bind(&generation_socket).expect("bind generation daemon");
+        fs::set_permissions(&legacy_socket, fs::Permissions::from_mode(0o600))
+            .expect("chmod legacy socket");
+        fs::set_permissions(&generation_socket, fs::Permissions::from_mode(0o600))
+            .expect("chmod generation socket");
+        legacy_listener
+            .set_nonblocking(true)
+            .expect("legacy nonblocking");
+        generation_listener
+            .set_nonblocking(true)
+            .expect("generation nonblocking");
+
+        let generation_handle = thread::spawn(move || {
+            let (request, mut stream) = accept_fake_daemon_request(&generation_listener);
+            assert!(
+                request.contains("\"handoff_cli_app_servers_adopt\""),
+                "unexpected generation adopt request: {request}"
+            );
+            write_fake_daemon_response(
+                &mut stream,
+                json!({
+                    "ok": false,
+                    "error": "simulated adopt failure after startup deadline",
+                }),
+            );
+            drop(stream);
+
+            let (request, mut stream) = accept_fake_daemon_request(&generation_listener);
+            assert!(
+                request.contains("\"handoff_cli_app_servers_unadopt\""),
+                "unexpected generation unadopt request: {request}"
+            );
+            write_fake_daemon_response(
+                &mut stream,
+                json!({
+                    "ok": true,
+                    "response": {
+                        "unadopted_cli_app_servers": [],
+                    },
+                }),
+            );
+        });
+
+        let legacy_handle = thread::spawn(move || {
+            let (request, mut stream) = accept_fake_daemon_request(&legacy_listener);
+            assert!(
+                request.contains("\"handoff_unquiesce\""),
+                "unexpected legacy unquiesce request: {request}"
+            );
+            assert!(request.contains("\"expected_pid\":4242"));
+            assert!(request.contains("\"expected_binary_version\":\"0.2.0\""));
+            write_fake_daemon_response(
+                &mut stream,
+                json!({
+                    "ok": true,
+                    "response": {
+                        "daemon": {
+                            "pid": 4242,
+                            "binary_version": "0.2.0",
+                            "quiescing": false,
+                        },
+                        "quiescing": false,
+                    },
+                }),
+            );
+        });
+
+        let generation_endpoint = DaemonEndpoint::from_socket_path(generation_socket.clone());
+        let quiesce_response = Some(json!({
+            "daemon": {
+                "pid": 4242,
+                "binary_version": "0.2.0",
+                "quiescing": true,
+            },
+            "quiescing": true,
+            "cli_app_servers": [{
+                "managed_session_id": "managed-adopt-budget",
+                "bound_thread_id": "thread-adopt-budget",
+                "session_epoch": 1,
+                "url": "ws://127.0.0.1:1",
+                "pid": 4243,
+                "pid_identity": "pid-identity",
+                "started_at": 1,
+                "lease_id": "lease-adopt-budget",
+                "lease_millis_remaining": 60000,
+            }],
+        }));
+        let ensured = finalize_legacy_handoff_cli_app_servers(
+            &layout,
+            &generation_endpoint,
+            json!({
+                "started": true,
+                "daemon": {
+                    "socket_path": generation_socket.display().to_string(),
+                },
+            }),
+            &quiesce_response,
+            Instant::now() - Duration::from_secs(1),
+        )
+        .expect("adopt failure after startup deadline should degrade to coexistence");
+
+        assert_eq!(ensured["legacy_daemon_quiesced"], false);
+        assert_eq!(ensured["legacy_handoff_unquiesce"]["quiescing"], false);
+        assert_eq!(
+            ensured["legacy_cli_app_server_handoff_skipped"]["reason"],
+            "adopt_failed"
+        );
+        generation_handle.join().expect("generation fake daemon");
+        legacy_handle.join().expect("legacy fake daemon");
     }
 
     #[test]

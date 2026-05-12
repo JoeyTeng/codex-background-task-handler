@@ -72,6 +72,7 @@ superseded_by:
 - Internal PR4 review follow-up: eleventh helper-backed `codex-review` found long bootstrap start/RPC work could hold the handoff lock and a retarget regression test leaked a handed-off test app-server; fixed by narrowing the lock to registry transitions, covering quiesced pre-registration cleanup, and making the retarget test adopt/cleanup through a generation owner.
 - Internal PR4 review follow-up: twelfth helper-backed `codex-review` found `cli_app_server_ensure` still held the handoff lock across slow app-server spawn; fixed by narrowing ensure locking to registry transitions and routing post-spawn quiesce errors through candidate cleanup.
 - Internal PR4 final review attempt: helper-backed `codex-review` and `codex-readonly` fallback both remained inconclusive after bounded waits and produced no final artifact; proceeded with the fixed review findings above plus current full test/clippy gates.
+- PR4 GitHub review-gate finding: Codex found adopt could still skip rollback/unquiesce when startup budget was exhausted before the adopt RPC; fixed by using the post-adopt timeout floor for adopt and adding expired-deadline rollback coverage.
 - Local PR3 validation: `cargo fmt --all -- --check`
 - Local PR3 validation: `git diff --check`
 - Local PR3 validation: `uv run python /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /private/tmp/cbth-daemon-upgrade-stack`
