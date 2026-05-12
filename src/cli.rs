@@ -32,9 +32,10 @@ use crate::cli_app_server_client::{
 };
 use crate::daemon::{
     DaemonEndpoint, DaemonEnsureOptions, DaemonServeOptions, DaemonSocketKind,
-    daemon_endpoint_from_response, daemon_ensure, daemon_request, daemon_request_at_endpoint,
-    daemon_request_payload, daemon_request_payload_at_endpoint,
-    daemon_request_payload_timeout_at_endpoint, daemon_serve, validate_daemon_autostart_endpoint,
+    daemon_endpoint_for_supervisor_generation, daemon_endpoint_from_response, daemon_ensure,
+    daemon_ensure_generation, daemon_request, daemon_request_at_endpoint, daemon_request_payload,
+    daemon_request_payload_at_endpoint, daemon_request_payload_timeout_at_endpoint, daemon_serve,
+    error_is_daemon_endpoint_gone, validate_daemon_autostart_endpoint,
     validate_daemon_request_budget,
 };
 use crate::fs_layout::{
@@ -2699,7 +2700,7 @@ fn dispatch_daemon_task_command(
     layout: &FsLayout,
     startup_timeout_seconds: u64,
 ) -> Result<Value> {
-    let (daemon_command, payload) = match command {
+    let (daemon_command, payload, task_cancel_id) = match command {
         Commands::Task {
             command: TaskCommand::Run(args),
         } => {
@@ -2744,16 +2745,21 @@ fn dispatch_daemon_task_command(
                     "command": argv_payload(command),
                     "environment": environment_payload(),
                 }),
+                None,
             )
         }
         Commands::Task {
             command: TaskCommand::Cancel(args),
-        } => (
-            "task_cancel",
-            json!({
-                "task_id": args.task_id,
-            }),
-        ),
+        } => {
+            let task_id = args.task_id;
+            (
+                "task_cancel",
+                json!({
+                    "task_id": task_id.clone(),
+                }),
+                Some(task_id),
+            )
+        }
         _ => bail!("unsupported daemon task command"),
     };
 
@@ -2763,6 +2769,38 @@ fn dispatch_daemon_task_command(
         )
     })?;
     validate_daemon_autostart_endpoint(layout)?;
+    let task_cancel_owner = task_cancel_id
+        .as_deref()
+        .map(|task_id| task_cancel_daemon_endpoint(layout, task_id))
+        .transpose()?;
+    if let Some(owner) = &task_cancel_owner {
+        if owner.endpoint.socket_path().exists() {
+            match daemon_request_payload_at_endpoint(
+                layout,
+                &owner.endpoint,
+                daemon_command,
+                payload.clone(),
+            ) {
+                Ok(response) => return Ok(response),
+                Err(error) if error_is_daemon_endpoint_gone(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if owner.is_generation {
+            let ensure = daemon_ensure_generation(
+                layout,
+                DaemonEnsureOptions {
+                    idle_timeout_seconds: DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
+                    startup_timeout_seconds,
+                    startup_sweep_now: Some(now_epoch_seconds()?),
+                    replace_incompatible: false,
+                },
+            )?;
+            let endpoint = daemon_endpoint_from_response(layout, &ensure)?;
+            let _ = daemon_request_at_endpoint(layout, &endpoint, "lifecycle_recover")?;
+            return daemon_request_payload_at_endpoint(layout, &endpoint, daemon_command, payload);
+        }
+    }
     let ensure = daemon_ensure(
         layout,
         DaemonEnsureOptions {
@@ -2774,6 +2812,28 @@ fn dispatch_daemon_task_command(
     )?;
     let endpoint = daemon_endpoint_from_response(layout, &ensure)?;
     daemon_request_payload_at_endpoint(layout, &endpoint, daemon_command, payload)
+}
+
+struct TaskCancelDaemonEndpoint {
+    endpoint: DaemonEndpoint,
+    is_generation: bool,
+}
+
+fn task_cancel_daemon_endpoint(
+    layout: &FsLayout,
+    task_id: &str,
+) -> Result<TaskCancelDaemonEndpoint> {
+    let store = Store::open(layout)?;
+    let task = store.inspect_task(task_id)?;
+    let is_generation = task.supervisor_daemon_generation.is_some();
+    let endpoint = daemon_endpoint_for_supervisor_generation(
+        layout,
+        task.supervisor_daemon_generation.as_deref(),
+    )?;
+    Ok(TaskCancelDaemonEndpoint {
+        endpoint,
+        is_generation,
+    })
 }
 
 pub(crate) fn dispatch_daemon_argv(
@@ -2992,16 +3052,11 @@ fn run_cli_session(
             &bound_thread_id,
             &lease_id,
         );
-        let stop_endpoint = current_cli_app_server_daemon_endpoint(&app_server_daemon_endpoint);
-        let _ = daemon_request_payload_timeout_at_endpoint(
+        let _ = stop_cli_app_server_following_handoff(
             layout,
-            &stop_endpoint,
-            "cli_app_server_stop",
-            json!({
-                "managed_session_id": managed_session_id,
-                "lease_id": lease_id,
-            }),
-            Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+            &app_server_daemon_endpoint,
+            &managed_session_id,
+            &lease_id,
         );
         abort_cli_thread_start_bootstrap_best_effort(
             layout,
@@ -3027,16 +3082,11 @@ fn run_cli_session(
                 &bound_thread_id,
                 &lease_id,
             );
-            let stop_endpoint = current_cli_app_server_daemon_endpoint(&app_server_daemon_endpoint);
-            let _ = daemon_request_payload_timeout_at_endpoint(
+            let _ = stop_cli_app_server_following_handoff(
                 layout,
-                &stop_endpoint,
-                "cli_app_server_stop",
-                json!({
-                "managed_session_id": managed_session_id,
-                    "lease_id": lease_id,
-                }),
-                Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+                &app_server_daemon_endpoint,
+                &managed_session_id,
+                &lease_id,
             );
             abort_cli_thread_start_bootstrap_best_effort(
                 layout,
@@ -3053,6 +3103,7 @@ fn run_cli_session(
             daemon_endpoint: Arc::clone(&app_server_daemon_endpoint),
             url: url.clone(),
             managed_session_id: managed_session_id.clone(),
+            lease_id: lease_id.clone(),
             bound_thread_id: bound_thread_id.clone(),
             session_epoch,
             activity_revision,
@@ -3082,16 +3133,11 @@ fn run_cli_session(
         .with_context(|| format!("spawn foreground codex via {:?}", codex_binary));
     let passive_stop_result = passive_adapter.stop();
     refresh_running.store(false, Ordering::Release);
-    let stop_endpoint = current_cli_app_server_daemon_endpoint(&app_server_daemon_endpoint);
-    let stop_result = daemon_request_payload_timeout_at_endpoint(
+    let stop_result = stop_cli_app_server_following_handoff(
         layout,
-        &stop_endpoint,
-        "cli_app_server_stop",
-        json!({
-            "managed_session_id": managed_session_id,
-            "lease_id": lease_id,
-        }),
-        Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+        &app_server_daemon_endpoint,
+        &managed_session_id,
+        &lease_id,
     );
     if let Err(error) = stop_result {
         eprintln!("warning: failed to stop CLI app-server: {error:#}");
@@ -3763,16 +3809,11 @@ fn run_cli_new_thread_session(
                 &bound_thread_id,
                 &lease_id,
             );
-            let stop_endpoint = current_cli_app_server_daemon_endpoint(&app_server_daemon_endpoint);
-            let _ = daemon_request_payload_timeout_at_endpoint(
+            let _ = stop_cli_app_server_following_handoff(
                 layout,
-                &stop_endpoint,
-                "cli_app_server_stop",
-                json!({
-                "managed_session_id": managed_session_id,
-                    "lease_id": lease_id,
-                }),
-                Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+                &app_server_daemon_endpoint,
+                &managed_session_id,
+                &lease_id,
             );
             terminate_foreground_child_best_effort(&mut foreground_child);
             abort_cli_thread_start_bootstrap_best_effort(
@@ -3790,6 +3831,7 @@ fn run_cli_new_thread_session(
             daemon_endpoint: Arc::clone(&app_server_daemon_endpoint),
             url: url.clone(),
             managed_session_id: managed_session_id.clone(),
+            lease_id: lease_id.clone(),
             bound_thread_id: bound_thread_id.clone(),
             session_epoch,
             activity_revision,
@@ -3806,16 +3848,11 @@ fn run_cli_new_thread_session(
         .with_context(|| format!("wait for foreground codex via {:?}", codex_binary));
     let passive_stop_result = passive_adapter.stop();
     refresh_running.store(false, Ordering::Release);
-    let stop_endpoint = current_cli_app_server_daemon_endpoint(&app_server_daemon_endpoint);
-    let stop_result = daemon_request_payload_timeout_at_endpoint(
+    let stop_result = stop_cli_app_server_following_handoff(
         layout,
-        &stop_endpoint,
-        "cli_app_server_stop",
-        json!({
-            "managed_session_id": managed_session_id,
-            "lease_id": lease_id,
-        }),
-        Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+        &app_server_daemon_endpoint,
+        &managed_session_id,
+        &lease_id,
     );
     if let Err(error) = stop_result {
         eprintln!("warning: failed to stop CLI app-server: {error:#}");
@@ -4936,22 +4973,65 @@ fn spawn_cli_app_server_lease_refresher(
                 break;
             }
             let current_endpoint = current_cli_app_server_daemon_endpoint(&daemon_endpoint);
+            let refresh_payload = json!({
+                "managed_session_id": managed_session_id.clone(),
+                "lease_id": lease_id.clone(),
+                "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
+            });
             let refresh = daemon_request_payload_timeout_at_endpoint(
                 &layout,
                 &current_endpoint,
                 "cli_app_server_refresh",
-                json!({
-                    "managed_session_id": managed_session_id,
-                    "lease_id": lease_id,
-                    "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
-                }),
+                refresh_payload.clone(),
                 Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
             );
-            if let Ok(response) = refresh {
-                follow_cli_app_server_handoff_endpoint(&daemon_endpoint, &response);
+            if let Ok(response) = refresh
+                && let Some(updated_endpoint) =
+                    follow_cli_app_server_handoff_endpoint(&daemon_endpoint, &response)
+            {
+                let _ = daemon_request_payload_timeout_at_endpoint(
+                    &layout,
+                    &updated_endpoint,
+                    "cli_app_server_refresh",
+                    refresh_payload,
+                    Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+                );
             }
         }
     });
+}
+
+fn stop_cli_app_server_following_handoff(
+    layout: &FsLayout,
+    daemon_endpoint: &Arc<Mutex<DaemonEndpoint>>,
+    managed_session_id: &str,
+    lease_id: &str,
+) -> Result<Value> {
+    let stop_payload = json!({
+        "managed_session_id": managed_session_id,
+        "lease_id": lease_id,
+    });
+    let current_endpoint = current_cli_app_server_daemon_endpoint(daemon_endpoint);
+    let response = daemon_request_payload_timeout_at_endpoint(
+        layout,
+        &current_endpoint,
+        "cli_app_server_stop",
+        stop_payload.clone(),
+        Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+    )?;
+    if let Some(updated_endpoint) =
+        follow_cli_app_server_handoff_endpoint(daemon_endpoint, &response)
+    {
+        daemon_request_payload_timeout_at_endpoint(
+            layout,
+            &updated_endpoint,
+            "cli_app_server_stop",
+            stop_payload,
+            Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+        )
+    } else {
+        Ok(response)
+    }
 }
 
 fn current_cli_app_server_daemon_endpoint(
@@ -4966,19 +5046,22 @@ fn current_cli_app_server_daemon_endpoint(
 fn follow_cli_app_server_handoff_endpoint(
     daemon_endpoint: &Arc<Mutex<DaemonEndpoint>>,
     response: &Value,
-) {
-    let Some(socket_path) = response
-        .get("cli_app_server")
-        .and_then(|server| server.get("handoff_daemon_socket_path"))
+) -> Option<DaemonEndpoint> {
+    let socket_path = response
+        .get("handoff_daemon_socket_path")
         .and_then(Value::as_str)
-    else {
-        return;
-    };
+        .or_else(|| {
+            response
+                .get("cli_app_server")
+                .and_then(|server| server.get("handoff_daemon_socket_path"))
+                .and_then(Value::as_str)
+        })?;
     let updated = DaemonEndpoint::from_socket_path(PathBuf::from(socket_path));
     match daemon_endpoint.lock() {
-        Ok(mut endpoint) => *endpoint = updated,
-        Err(poisoned) => *poisoned.into_inner() = updated,
+        Ok(mut endpoint) => *endpoint = updated.clone(),
+        Err(poisoned) => *poisoned.into_inner() = updated.clone(),
     }
+    Some(updated)
 }
 
 #[derive(Clone)]
@@ -4987,6 +5070,7 @@ struct CliAppServerPassiveAdapterConfig {
     daemon_endpoint: Arc<Mutex<DaemonEndpoint>>,
     url: String,
     managed_session_id: String,
+    lease_id: String,
     bound_thread_id: String,
     session_epoch: i64,
     activity_revision: i64,
@@ -8914,22 +8998,68 @@ fn dispatch_cli_adapter_command(
         bail!("passive adapter command is not daemon-routable");
     };
     let daemon_endpoint = current_cli_app_server_daemon_endpoint(&config.daemon_endpoint);
-    let result = daemon_request_payload_timeout_at_endpoint(
-        &config.layout,
-        &daemon_endpoint,
-        "dispatch",
-        json!({ "argv": argv_payload(argv) }),
-        Duration::from_secs(CLI_APP_SERVER_PASSIVE_STORE_TIMEOUT_SECONDS),
-    );
-    match result {
-        Ok(value) => Ok(value),
-        Err(error) if allow_direct_fallback => {
-            dispatch(command, &config.layout, DispatchMode::Direct).with_context(|| {
-                format!("fallback direct passive adapter command after daemon error: {error:#}")
-            })
+    let error = match dispatch_cli_adapter_command_at_endpoint(config, &daemon_endpoint, &argv) {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    if let Some(updated_endpoint) =
+        refresh_cli_app_server_handoff_endpoint(config, &daemon_endpoint)
+    {
+        match dispatch_cli_adapter_command_at_endpoint(config, &updated_endpoint, &argv) {
+            Ok(value) => return Ok(value),
+            Err(retry_error) => {
+                if allow_direct_fallback {
+                    return dispatch(command, &config.layout, DispatchMode::Direct).with_context(
+                        || {
+                            format!(
+                                "fallback direct passive adapter command after handoff daemon error: {retry_error:#}"
+                            )
+                        },
+                    );
+                }
+                return Err(retry_error);
+            }
         }
-        Err(error) => Err(error),
     }
+    if allow_direct_fallback {
+        return dispatch(command, &config.layout, DispatchMode::Direct).with_context(|| {
+            format!("fallback direct passive adapter command after daemon error: {error:#}")
+        });
+    }
+    Err(error)
+}
+
+fn dispatch_cli_adapter_command_at_endpoint(
+    config: &CliAppServerPassiveAdapterConfig,
+    daemon_endpoint: &DaemonEndpoint,
+    argv: &[OsString],
+) -> Result<Value> {
+    daemon_request_payload_timeout_at_endpoint(
+        &config.layout,
+        daemon_endpoint,
+        "dispatch",
+        json!({ "argv": argv_payload(argv.to_vec()) }),
+        Duration::from_secs(CLI_APP_SERVER_PASSIVE_STORE_TIMEOUT_SECONDS),
+    )
+}
+
+fn refresh_cli_app_server_handoff_endpoint(
+    config: &CliAppServerPassiveAdapterConfig,
+    daemon_endpoint: &DaemonEndpoint,
+) -> Option<DaemonEndpoint> {
+    let response = daemon_request_payload_timeout_at_endpoint(
+        &config.layout,
+        daemon_endpoint,
+        "cli_app_server_refresh",
+        json!({
+            "managed_session_id": config.managed_session_id.as_str(),
+            "lease_id": config.lease_id.as_str(),
+            "lease_ttl_seconds": CLI_APP_SERVER_LEASE_TTL_SECONDS,
+        }),
+        Duration::from_secs(CLI_APP_SERVER_CONTROL_TIMEOUT_SECONDS),
+    )
+    .ok()?;
+    follow_cli_app_server_handoff_endpoint(&config.daemon_endpoint, &response)
 }
 
 fn passive_adapter_thread_matches(thread_id: &Option<String>, bound_thread_id: &str) -> bool {
@@ -13574,6 +13704,169 @@ mod tests {
                 .to_string()
                 .contains("bridge_arm_lease_id is not allowed for arm_accepted")
         );
+    }
+
+    #[test]
+    fn follow_handoff_endpoint_updates_and_returns_new_endpoint() {
+        let endpoint = Arc::new(Mutex::new(DaemonEndpoint::from_socket_path(PathBuf::from(
+            "/tmp/old-cbth.sock",
+        ))));
+        let response = json!({
+            "cli_app_server": {
+                "handoff_daemon_socket_path": "/tmp/new-cbth.sock"
+            }
+        });
+
+        let updated =
+            follow_cli_app_server_handoff_endpoint(&endpoint, &response).expect("handoff endpoint");
+
+        assert_eq!(updated.socket_path(), Path::new("/tmp/new-cbth.sock"));
+        assert_eq!(
+            endpoint.lock().expect("endpoint lock").socket_path(),
+            Path::new("/tmp/new-cbth.sock")
+        );
+
+        let response = json!({
+            "handoff_daemon_socket_path": "/tmp/newer-cbth.sock"
+        });
+        let updated =
+            follow_cli_app_server_handoff_endpoint(&endpoint, &response).expect("stop redirect");
+        assert_eq!(updated.socket_path(), Path::new("/tmp/newer-cbth.sock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passive_adapter_dispatch_follows_handoff_refresh_redirect() {
+        let home = tempfile::tempdir().expect("temp cbth home");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("chmod home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        fs::create_dir(layout.run_dir()).expect("create run dir");
+        fs::set_permissions(layout.run_dir(), fs::Permissions::from_mode(0o700))
+            .expect("chmod run dir");
+        let old_socket_path = layout.run_dir().join("old.sock");
+        let new_socket_path = layout.run_dir().join("new.sock");
+        let old_listener =
+            std::os::unix::net::UnixListener::bind(&old_socket_path).expect("bind old daemon");
+        let new_listener =
+            std::os::unix::net::UnixListener::bind(&new_socket_path).expect("bind new daemon");
+        fs::set_permissions(&old_socket_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod old socket");
+        fs::set_permissions(&new_socket_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod new socket");
+
+        let new_socket_display = new_socket_path.display().to_string();
+        let old_handle = thread::spawn(move || {
+            for request_index in 0..2 {
+                let (mut stream, _) = old_listener.accept().expect("accept old daemon request");
+                let mut request = String::new();
+                stream
+                    .read_to_string(&mut request)
+                    .expect("read old daemon request");
+                let response = if request_index == 0 {
+                    assert!(
+                        request.contains("\"dispatch\""),
+                        "unexpected first old request: {request}"
+                    );
+                    json!({
+                        "ok": false,
+                        "error": "daemon is quiescing for handoff",
+                    })
+                } else {
+                    assert!(
+                        request.contains("\"cli_app_server_refresh\""),
+                        "unexpected second old request: {request}"
+                    );
+                    assert!(request.contains("\"managed_session_id\":\"managed-handoff\""));
+                    assert!(request.contains("\"lease_id\":\"lease-handoff\""));
+                    json!({
+                        "ok": true,
+                        "response": {
+                            "cli_app_server": {
+                                "handoff_daemon_socket_path": new_socket_display,
+                            }
+                        },
+                    })
+                };
+                stream
+                    .write_all(
+                        serde_json::to_string(&response)
+                            .expect("encode response")
+                            .as_bytes(),
+                    )
+                    .expect("write old response");
+                stream.write_all(b"\n").expect("write old newline");
+            }
+        });
+        let new_handle = thread::spawn(move || {
+            let (mut stream, _) = new_listener.accept().expect("accept new daemon request");
+            let mut request = String::new();
+            stream
+                .read_to_string(&mut request)
+                .expect("read new daemon request");
+            assert!(
+                request.contains("\"dispatch\""),
+                "unexpected new request: {request}"
+            );
+            let response = json!({
+                "ok": true,
+                "response": {
+                    "routed": "generation",
+                },
+            });
+            stream
+                .write_all(
+                    serde_json::to_string(&response)
+                        .expect("encode response")
+                        .as_bytes(),
+                )
+                .expect("write new response");
+            stream.write_all(b"\n").expect("write new newline");
+        });
+
+        let endpoint = Arc::new(Mutex::new(DaemonEndpoint::from_socket_path(
+            old_socket_path.clone(),
+        )));
+        let config = CliAppServerPassiveAdapterConfig {
+            layout,
+            daemon_endpoint: Arc::clone(&endpoint),
+            url: "ws://127.0.0.1:1".to_owned(),
+            managed_session_id: "managed-handoff".to_owned(),
+            lease_id: "lease-handoff".to_owned(),
+            bound_thread_id: "thread-handoff".to_owned(),
+            session_epoch: 7,
+            activity_revision: 0,
+            capability_revision: 0,
+            auto_delivery_policy: CliAutoDeliveryPolicy::Off,
+            fresh_thread_bootstrap: false,
+            permission_inputs: CliSessionPermissionInputs {
+                approval: SessionAllowsValue::Explicit(false),
+                network: SessionAllowsValue::Explicit(false),
+                write_access: SessionAllowsValue::Explicit(false),
+            },
+            initial_thread_resume_params: json!({}),
+        };
+        let response = dispatch_cli_adapter_command(
+            &config,
+            Commands::Cli {
+                command: CliCommand::Session {
+                    command: CliSessionCommand::InvalidateProof(CliSessionInvalidateProofArgs {
+                        managed_session_id: "managed-handoff".to_owned(),
+                        session_epoch: 7,
+                        now: None,
+                    }),
+                },
+            },
+            false,
+        )
+        .expect("dispatch follows handoff redirect");
+
+        assert_eq!(response["routed"], "generation");
+        assert_eq!(
+            endpoint.lock().expect("endpoint lock").socket_path(),
+            new_socket_path.as_path()
+        );
+        old_handle.join().expect("old daemon thread");
+        new_handle.join().expect("new daemon thread");
     }
 
     #[test]

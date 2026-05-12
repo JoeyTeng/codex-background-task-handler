@@ -117,6 +117,8 @@ pub struct TaskRecord {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub cancel_requested_at: Option<i64>,
+    #[serde(skip_serializing)]
+    pub supervisor_daemon_generation: Option<String>,
 }
 
 #[derive(Clone, Debug)]

@@ -80,7 +80,7 @@ The job remains the delivery unit. A successful task completes its associated jo
 
 The submitted command runs with the `cbth task run` caller's environment, not the daemon's stale startup environment. The environment is transmitted over the same-user daemon IPC for spawn only and is not persisted in the task row, avoiding accidental long-term storage of secrets while keeping command behavior stable when the daemon was already running.
 
-Active supervised tasks prevent normal daemon idle exit. On intentional daemon shutdown, the daemon best-effort terminates all supervised process groups before releasing app-server resources.
+Active supervised tasks prevent normal daemon idle exit. During daemon handoff, a quiescing daemon rejects new task admission once quiesce wins the registry fence, but continues supervising already admitted tasks to terminal and exits with `handoff_drain_complete` after its owned pending jobs/tasks clear. On intentional daemon shutdown, the daemon best-effort terminates all supervised process groups before releasing app-server resources.
 
 If the daemon crashes or restarts, queued/running tasks that can no longer be proven supervised are failed closed on startup. Startup recovery only runs after the daemon has proven socket exclusivity, so a duplicate daemon process cannot kill tasks still owned by the active daemon. Before marking pending jobs lost, startup recovery sends the first termination signal only when the current PID still matches the process identity captured at spawn time; if identity is missing or mismatched, recovery skips the kill to avoid PID/PGID reuse damage. After that verified SIGTERM, recovery sends SIGKILL if the process group still exists, which covers leaders that exit on TERM while same-group descendants keep running. V1 does not attempt orphan process adoption.
 
@@ -111,6 +111,7 @@ Completed task log directories are removed by maintenance sweep only after all a
 Cancellation is durable and best-effort:
 
 - `task cancel` records the cancel request first.
+- During daemon handoff, `task cancel` routes to the daemon generation that owns the task row before running `daemon ensure`, so a quiescing owner daemon can still signal its live process group. If the default owner socket is stale or gone, cancel falls back to normal `daemon ensure`; if a generation owner socket is stale or gone, cancel starts or reuses the current generation daemon so generation-scoped startup recovery can kill and terminalize the lost process group before the cancel request returns.
 - If cancellation is already requested before the worker wins the spawn gate, the daemon closes the task as `cancelled` without executing the command.
 - The daemon sends SIGTERM to the task process group when available.
 - After the grace window, the daemon sends SIGKILL if the process group is still alive.
@@ -133,6 +134,7 @@ Default `cbth cli run` remains passive. `trusted-all` is still required for auto
 
 - No unbounded stdout/stderr memory accumulation.
 - No unbounded task registry growth: new submissions are rejected once the daemon reaches the active supervised task cap, and in-memory task controls are removed after terminal handling.
+- Quiesce-aware task admission prevents a handoff-draining daemon from accepting fresh tasks after the handoff fence has closed.
 - Child/process-group handles are explicitly cleaned up on spawn, post-spawn setup, cancellation, timeout, daemon shutdown, and worker failure paths.
 - Direct child exit does not by itself prove task completion; the daemon also waits for the supervised process group to disappear so backgrounded same-group work remains cancellable.
 - Store state is updated before externally visible actions whenever possible, so restart recovery can fail closed.

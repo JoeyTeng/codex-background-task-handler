@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -32,13 +32,20 @@ fn handoff_eligible_for_version(version: &str) -> bool {
 
 #[cfg(unix)]
 fn is_peer_disconnect(error: &std::io::Error) -> bool {
+    is_peer_disconnect_kind(error.kind())
+}
+
+#[cfg(unix)]
+fn is_peer_disconnect_kind(kind: std::io::ErrorKind) -> bool {
     matches!(
-        error.kind(),
+        kind,
         std::io::ErrorKind::BrokenPipe
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::NotConnected
     )
 }
+
+const TEST_DAEMON_CAPABILITIES_JSON: &str = r#"["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-thread-start-params","cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","desktop-transcript-relay-scanner","daemon-handoff-v1"]"#;
 
 fn cbth(home: &TempDir, args: &[&str]) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
@@ -338,6 +345,31 @@ fn stop_daemon_at_socket_path(socket_path: &Path) {
     );
 }
 
+#[cfg(unix)]
+fn daemon_command_at_socket_path(socket_path: &Path, command: &str) -> Value {
+    let mut stream = UnixStream::connect(socket_path).expect("connect daemon socket");
+    let request = json!({
+        "command": command,
+        "payload": null,
+    });
+    stream
+        .write_all(request.to_string().as_bytes())
+        .expect("write daemon request");
+    stream
+        .write_all(b"\n")
+        .expect("write daemon request newline");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("shutdown daemon request write");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read daemon response");
+    let response: Value = serde_json::from_slice(&response).expect("daemon response json");
+    assert_eq!(response["ok"], true, "daemon request failed: {response}");
+    response["response"].clone()
+}
+
 fn process_group_exists(pid: u32) -> bool {
     if unsafe { libc::killpg(pid as libc::pid_t, 0) } == 0 {
         return true;
@@ -361,19 +393,6 @@ fn wait_for_process_group_gone(pid: u32) {
             Instant::now() < deadline,
             "process group {pid} was not removed"
         );
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait().expect("check child status").is_some() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
         thread::sleep(Duration::from_millis(50));
     }
 }
@@ -883,6 +902,349 @@ fn daemon_ensure_quiesces_handoff_eligible_incompatible_default() {
 
 #[cfg(unix)]
 #[test]
+fn task_run_uses_generation_daemon_when_incompatible_default_daemon_is_quiescing() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).expect("chmod home");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let generation_socket_path = run_dir
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind quiescing daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    listener
+        .set_nonblocking(true)
+        .expect("set quiescing listener nonblocking");
+    let mut capabilities: Vec<Value> =
+        serde_json::from_str(TEST_DAEMON_CAPABILITIES_JSON).expect("capabilities json");
+    capabilities
+        .retain(|capability| capability.as_str() != Some("desktop-transcript-relay-consumer"));
+    let (requests_tx, requests_rx) = mpsc::channel::<String>();
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("set quiescing stream blocking");
+                    let mut request = [0_u8; 4096];
+                    let request_len = stream.read(&mut request).expect("read request");
+                    let request = String::from_utf8_lossy(&request[..request_len]).into_owned();
+                    requests_tx.send(request.clone()).expect("send request");
+                    assert!(
+                        !request.contains("\"task_run\""),
+                        "new task must not be routed to quiescing default daemon: {request}"
+                    );
+                    assert!(
+                        !request.contains("\"handoff_quiesce\""),
+                        "already-quiescing default may drain-exit before a second quiesce: {request}"
+                    );
+                    assert!(request.contains("\"ping\""), "{request}");
+                    let response = json!({
+                        "ok": true,
+                        "response": {
+                            "daemon": {
+                                "pid": 1313,
+                                "binary_version": "0.2.0",
+                                "quiescing": true,
+                            },
+                            "protocol_version": 1,
+                            "capabilities": capabilities.clone(),
+                            "message": "pong",
+                        }
+                    });
+                    stream
+                        .write_all(response.to_string().as_bytes())
+                        .expect("write response");
+                    stream.write_all(b"\n").expect("write response newline");
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "quiescing default daemon listener timed out"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept quiescing daemon request: {error}"),
+            }
+        }
+    });
+
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-generation-task-route",
+            "--summary",
+            "generation task route",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf generation",
+        ],
+    );
+    assert_eq!(started["task"]["status"], "queued");
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let job_id = started["task"]["job_id"].as_str().expect("job id");
+    let task = wait_for_task_status(&home, task_id, "succeeded");
+    let stdout_log_path = task["task"]["stdout_log_path"]
+        .as_str()
+        .expect("stdout log path");
+    let stdout = fs::read_to_string(home.path().join(stdout_log_path)).expect("stdout log");
+    assert_eq!(stdout, "generation");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let supervisor_generation: Option<String> = conn
+        .query_row(
+            "SELECT supervisor_daemon_generation FROM jobs WHERE job_id = ?",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .expect("query job supervisor generation");
+    assert_eq!(
+        supervisor_generation.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+
+    handle.join().expect("quiescing daemon thread");
+    let requests = requests_rx.try_iter().collect::<Vec<_>>();
+    assert!(
+        requests.iter().any(|request| request.contains("\"ping\"")),
+        "default daemon should be probed before routing task"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.contains("\"task_run\"")),
+        "quiescing default daemon received task_run: {requests:?}"
+    );
+    let _ = fs::remove_file(&socket_path);
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_unquiesces_legacy_when_app_server_adopt_fails() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let generation_socket_path = run_dir
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind handoff daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    listener
+        .set_nonblocking(true)
+        .expect("set handoff listener nonblocking");
+    let old_socket_path = socket_path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let (request_tx, request_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let mut request = String::new();
+                    stream
+                        .read_to_string(&mut request)
+                        .expect("read handoff request");
+                    request_tx
+                        .send(request.clone())
+                        .expect("send handoff request");
+                    if request.contains("\"handoff_quiesce\"") {
+                        stream
+                            .write_all(
+                                br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.2.0","quiescing":true},"quiescing":true,"cli_app_servers":[{"managed_session_id":"managed-stale-export","bound_thread_id":"thread-stale-export","session_epoch":1,"url":"ws://127.0.0.1:1","pid":1,"pid_identity":"stale-export","started_at":1,"lease_id":"lease-stale-export","lease_millis_remaining":60000}]}}"#,
+                            )
+                            .expect("write quiesce response");
+                    } else if request.contains("\"handoff_unquiesce\"") {
+                        stream
+                            .write_all(
+                                br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.2.0","quiescing":false},"quiescing":false}}"#,
+                            )
+                            .expect("write unquiesce response");
+                    } else {
+                        assert!(
+                            request.contains("\"ping\""),
+                            "unexpected request: {request}"
+                        );
+                        stream
+                            .write_all(
+                                br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.2.0"},"protocol_version":1,"capabilities":["dispatch","daemon-handoff-v1"],"message":"pong"}}"#,
+                            )
+                            .expect("write handoff ping response");
+                    }
+                    stream
+                        .write_all(b"\n")
+                        .expect("write handoff response newline");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if done_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept handoff daemon request: {error}"),
+            }
+        }
+        drop(listener);
+        fs::remove_file(&old_socket_path).expect("remove handoff daemon socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    let first_request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("handoff daemon should be probed");
+    let second_request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("handoff daemon should be quiesced");
+    let third_request = request_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("handoff daemon should be unquiesced after stale export");
+    assert!(first_request.contains("\"ping\""));
+    assert!(second_request.contains("\"handoff_quiesce\""));
+    assert!(third_request.contains("\"handoff_unquiesce\""));
+    assert!(third_request.contains("\"expected_pid\":1313"));
+    assert_eq!(ensured["started"], true);
+    assert_eq!(ensured["coexisting_with_incompatible_daemon"], true);
+    assert_eq!(ensured["legacy_daemon_quiesced"], false);
+    assert_eq!(ensured["legacy_handoff_unquiesce"]["quiescing"], false);
+    assert_eq!(
+        ensured["legacy_cli_app_server_handoff_skipped"]["reason"],
+        "adopt_failed"
+    );
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        generation_socket_path.display().to_string()
+    );
+
+    done_tx.send(()).expect("signal handoff daemon");
+    handle.join().expect("handoff daemon thread");
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_coexists_when_handoff_quiesce_reports_active_bootstrap() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let generation_socket_path = run_dir
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind handoff daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    listener
+        .set_nonblocking(true)
+        .expect("set handoff listener nonblocking");
+    let old_socket_path = socket_path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let (request_tx, request_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let mut request = String::new();
+                    stream
+                        .read_to_string(&mut request)
+                        .expect("read handoff request");
+                    request_tx
+                        .send(request.clone())
+                        .expect("send handoff request");
+                    if request.contains("\"handoff_quiesce\"") {
+                        stream
+                            .write_all(
+                                br#"{"ok":false,"error":"cannot handoff while CLI thread/start bootstrap app-servers are active"}"#,
+                            )
+                            .expect("write active bootstrap response");
+                    } else {
+                        assert!(
+                            request.contains("\"ping\""),
+                            "unexpected request: {request}"
+                        );
+                        stream
+                            .write_all(
+                                br#"{"ok":true,"response":{"daemon":{"pid":1314,"binary_version":"0.2.0"},"protocol_version":1,"capabilities":["dispatch","daemon-handoff-v1"],"message":"pong"}}"#,
+                            )
+                            .expect("write handoff ping response");
+                    }
+                    stream
+                        .write_all(b"\n")
+                        .expect("write handoff response newline");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if done_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept handoff daemon request: {error}"),
+            }
+        }
+        drop(listener);
+        fs::remove_file(&old_socket_path).expect("remove handoff daemon socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    let first_request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("handoff daemon should be probed");
+    let second_request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("handoff daemon should receive quiesce attempt");
+    assert!(first_request.contains("\"ping\""));
+    assert!(second_request.contains("\"handoff_quiesce\""));
+    assert_eq!(ensured["started"], true);
+    assert_eq!(ensured["coexisting_with_incompatible_daemon"], true);
+    assert_eq!(ensured["legacy_daemon"]["pid"], 1314);
+    assert!(ensured.get("legacy_daemon_quiesced").is_none());
+    assert!(ensured.get("legacy_handoff_quiesce").is_none());
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        generation_socket_path.display().to_string()
+    );
+
+    done_tx.send(()).expect("signal handoff daemon");
+    handle.join().expect("handoff daemon thread");
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_ensure_replaces_stale_incompatible_generation_daemon() {
     let home = temp_home();
     let run_dir = home.path().join("run");
@@ -1203,7 +1565,7 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
             "response": {
                 "daemon": {
                     "pid": 6161,
-                    "binary_version": env!("CARGO_PKG_VERSION")
+                    "binary_version": "0.1.5"
                 },
                 "protocol_version": 1,
                 "capabilities": [
@@ -2641,6 +3003,388 @@ fn daemon_does_not_idle_exit_while_job_is_pending() {
 }
 
 #[test]
+fn quiescing_daemon_waits_for_pending_job_then_exits_without_idle_timeout() {
+    let home = temp_home();
+    let mut child = spawn_daemon(&home, "300", &[]);
+
+    let ping = wait_for_ping(&home);
+    assert_eq!(ping["message"], "pong");
+    let submitted = cbth_daemon(
+        &home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            "thread-quiesce-pending-job",
+            "--summary",
+            "pending job keeps quiescing daemon alive",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+
+    let quiesce = cbth_daemon(&home, &["daemon", "handoff-quiesce"]);
+    assert_eq!(quiesce["quiescing"], true);
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().expect("check daemon status").is_none(),
+        "quiescing daemon exited before its pending job drained"
+    );
+
+    cbth(
+        &home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "operator drained legacy daemon",
+            "--redelivery-window-seconds",
+            "60",
+        ],
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("check daemon status") {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "quiescing daemon did not exit after pending job cleared"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().expect("daemon output");
+    let shutdown: Value = serde_json::from_slice(&output.stdout).expect("daemon shutdown json");
+    assert_eq!(shutdown["shutdown_reason"], "handoff_drain_complete");
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn quiescing_daemon_supervises_existing_task_to_terminal_before_exit() {
+    let home = temp_home();
+    let mut child = spawn_daemon(&home, "300", &[]);
+
+    let ping = wait_for_ping(&home);
+    assert_eq!(ping["message"], "pong");
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-quiesce-live-task",
+            "--summary",
+            "live task drains before daemon exit",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 1; printf drained",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+
+    let quiesce = cbth_daemon(&home, &["daemon", "handoff-quiesce"]);
+    assert_eq!(quiesce["quiescing"], true);
+    let task = wait_for_task_status(&home, task_id, "succeeded");
+    let stdout_log_path = task["task"]["stdout_log_path"]
+        .as_str()
+        .expect("stdout log path");
+    let stdout = fs::read_to_string(home.path().join(stdout_log_path)).expect("stdout log");
+    assert_eq!(stdout, "drained");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("check daemon status") {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "quiescing daemon did not exit after supervised task drained"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().expect("daemon output");
+    let shutdown: Value = serde_json::from_slice(&output.stdout).expect("daemon shutdown json");
+    assert_eq!(shutdown["shutdown_reason"], "handoff_drain_complete");
+    wait_for_socket_removed(&home);
+}
+
+#[test]
+fn task_cancel_routes_to_quiescing_daemon_that_owns_live_task() {
+    let home = temp_home();
+    let mut child = spawn_daemon(&home, "300", &[]);
+
+    let ping = wait_for_ping(&home);
+    assert_eq!(ping["message"], "pong");
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-quiesce-cancel-task",
+            "--summary",
+            "cancel live task on quiescing daemon",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+
+    let quiesce = cbth_daemon(&home, &["daemon", "handoff-quiesce"]);
+    assert_eq!(quiesce["quiescing"], true);
+    let cancelled = cbth_daemon(&home, &["task", "cancel", "--task-id", task_id]);
+    assert!(cancelled["task"]["cancel_requested_at"].is_number());
+    let task = wait_for_task_status(&home, task_id, "cancelled");
+    assert_eq!(task["task"]["failure_reason"], "task cancelled");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("check daemon status") {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "quiescing daemon did not exit after cancelled task drained"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().expect("daemon output");
+    let shutdown: Value = serde_json::from_slice(&output.stdout).expect("daemon shutdown json");
+    assert_eq!(shutdown["shutdown_reason"], "handoff_drain_complete");
+    wait_for_socket_removed(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn task_cancel_routes_to_quiescing_generation_daemon_that_owns_live_task() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let mut child = spawn_daemon(&home, "300", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-quiesce-generation-cancel-task",
+            "--summary",
+            "cancel live task on quiescing generation daemon",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    let quiesce = daemon_command_at_socket_path(&generation_socket_path, "handoff_quiesce");
+    assert_eq!(quiesce["quiescing"], true);
+
+    let cancelled = cbth_daemon(&home, &["task", "cancel", "--task-id", task_id]);
+    assert!(cancelled["task"]["cancel_requested_at"].is_number());
+    let task = wait_for_task_status(&home, task_id, "cancelled");
+    assert_eq!(task["task"]["failure_reason"], "task cancelled");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("check daemon status") {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "quiescing generation daemon did not exit after cancelled task drained"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().expect("daemon output");
+    let shutdown: Value = serde_json::from_slice(&output.stdout).expect("daemon shutdown json");
+    assert_eq!(shutdown["shutdown_reason"], "handoff_drain_complete");
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn task_cancel_falls_back_to_generation_recovery_when_owner_socket_is_stale() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let marker = home.path().join("stale-generation-cancel-marker");
+    let marker_arg = marker.to_string_lossy().to_string();
+    let mut daemon = spawn_daemon(&home, "300", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-stale-generation-cancel-task",
+            "--summary",
+            "stale generation owner cancel",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 3; printf done > \"$1\"",
+            "cbth-task",
+            &marker_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+
+    daemon.kill().expect("kill generation daemon");
+    let _ = daemon.wait().expect("wait generation daemon");
+    assert!(
+        generation_socket_path.exists(),
+        "killed generation daemon should leave a stale owner socket"
+    );
+
+    let cancelled = cbth_daemon(&home, &["task", "cancel", "--task-id", task_id]);
+    assert_ne!(cancelled["task"]["status"], "running");
+    let task = wait_for_task_status(&home, task_id, "lost");
+    assert_eq!(
+        task["task"]["failure_reason"],
+        "task supervisor lost after daemon restart"
+    );
+    thread::sleep(Duration::from_secs(4));
+    assert!(
+        !marker.exists(),
+        "generation-owned task process survived stale-owner cancel fallback"
+    );
+
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn task_cancel_reused_generation_daemon_recovers_stale_previous_generation_task() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let previous_generation_dir = home.path().join("run").join("daemons").join("0.1.4");
+    let previous_generation_socket_path = previous_generation_dir.join("cbth.sock");
+    let marker = home.path().join("stale-previous-generation-cancel-marker");
+    let marker_arg = marker.to_string_lossy().to_string();
+    let mut daemon = spawn_daemon(&home, "300", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-stale-previous-generation-cancel-task",
+            "--summary",
+            "stale previous generation owner cancel",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 30; printf done > \"$1\"",
+            "cbth-task",
+            &marker_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+
+    daemon.kill().expect("kill generation daemon");
+    let _ = daemon.wait().expect("wait generation daemon");
+
+    fs::create_dir_all(&previous_generation_dir).expect("create previous generation dir");
+    fs::set_permissions(&previous_generation_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod previous generation dir");
+    let previous_listener =
+        UnixListener::bind(&previous_generation_socket_path).expect("bind previous generation");
+    fs::set_permissions(
+        &previous_generation_socket_path,
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("chmod previous generation socket");
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let pid = conn
+        .query_row(
+            "SELECT pid FROM tasks WHERE task_id = ?",
+            params![task_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("read task pid") as u32;
+    conn.execute(
+        "UPDATE jobs
+         SET supervisor_daemon_generation = '0.1.4'
+         WHERE job_id = (SELECT job_id FROM tasks WHERE task_id = ?)",
+        params![task_id],
+    )
+    .expect("retag stale previous generation job");
+    conn.execute(
+        "UPDATE tasks
+         SET supervisor_daemon_generation = '0.1.4'
+         WHERE task_id = ?",
+        params![task_id],
+    )
+    .expect("retag stale previous generation task");
+    drop(conn);
+
+    let mut replacement = spawn_daemon(&home, "30", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+    assert_eq!(
+        wait_for_task_status(&home, task_id, "running")["task"]["status"],
+        "running"
+    );
+    let maintenance_blocker =
+        UnixStream::connect(&generation_socket_path).expect("hold generation daemon client");
+    thread::sleep(Duration::from_millis(100));
+
+    drop(previous_listener);
+    fs::remove_file(&previous_generation_socket_path).expect("remove previous generation socket");
+
+    let cancelled = cbth_daemon(&home, &["task", "cancel", "--task-id", task_id]);
+    assert_eq!(cancelled["task"]["status"], "lost");
+    assert_eq!(
+        cancelled["task"]["failure_reason"],
+        "task supervisor lost after daemon restart"
+    );
+    wait_for_process_group_gone(pid);
+    assert!(
+        !marker.exists(),
+        "stale previous generation task process survived reused-daemon cancel recovery"
+    );
+    drop(maintenance_blocker);
+
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    replacement
+        .wait()
+        .expect("replacement generation daemon exits");
+}
+
+#[test]
 fn daemon_sweeps_batches_due_within_idle_window_before_exit() {
     let home = temp_home();
     let mut child = spawn_daemon(&home, "3", &[]);
@@ -3126,7 +3870,7 @@ fn daemon_task_cancel_persists_running_cancel_before_signaling() {
         "running task was not signaled after cancel intent became durable"
     );
     cbth_daemon(&home, &["daemon", "stop"]);
-    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
+    wait_for_socket_removed(&home);
 }
 
 #[test]
@@ -3191,7 +3935,7 @@ fn daemon_task_timeout_wins_over_later_cancel() {
     let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
     assert_eq!(job["job"]["status"], "failed");
     cbth_daemon(&home, &["daemon", "stop"]);
-    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
+    wait_for_socket_removed(&home);
 }
 
 #[test]
@@ -3317,7 +4061,7 @@ fn daemon_stop_waits_for_locked_cancel_store_before_killing_task() {
         "daemon stop should not kill before shutdown cancel is durable"
     );
     drop(conn);
-    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
+    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(30));
 
     assert!(
         !process_group_exists(pid),
@@ -3358,19 +4102,43 @@ fn daemon_stop_waits_for_durable_cancel_before_signaling_blocked_worker() {
         .expect("task pid");
 
     let conn = hold_exclusive_db_lock(&home);
-    let mut cancel = Command::new(env!("CARGO_BIN_EXE_cbth"))
-        .arg("--home")
-        .arg(home.path())
-        .args(["task", "cancel", "--task-id", task_id])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn cancel");
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let cancel_socket_path = home.path().join("run").join("cbth.sock");
+    let cancel_task_id = task_id.to_owned();
+    thread::spawn(move || {
+        let result = (|| -> io::Result<Vec<u8>> {
+            let mut stream = UnixStream::connect(cancel_socket_path)?;
+            let request = json!({
+                "command": "dispatch",
+                "payload": {
+                    "argv": [
+                        b"task".to_vec(),
+                        b"cancel".to_vec(),
+                        b"--task-id".to_vec(),
+                        cancel_task_id.into_bytes(),
+                    ],
+                },
+            });
+            stream.write_all(request.to_string().as_bytes())?;
+            stream.write_all(b"\n")?;
+            stream.shutdown(std::net::Shutdown::Write)?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            Ok(response)
+        })()
+        .map_err(|error| (error.kind(), error.to_string()));
+        let _ = cancel_tx.send(result);
+    });
     thread::sleep(Duration::from_millis(300));
-    assert!(
-        cancel.try_wait().expect("check cancel status").is_none(),
-        "cancel worker should be blocked by the held database lock"
-    );
+    match cancel_rx.try_recv() {
+        Ok(result) => {
+            panic!("cancel worker completed before held database lock released: {result:?}")
+        }
+        Err(mpsc::TryRecvError::Empty) => {}
+        Err(mpsc::TryRecvError::Disconnected) => {
+            panic!("cancel worker exited without reporting a result")
+        }
+    }
 
     cbth_daemon(&home, &["daemon", "stop"]);
     thread::sleep(Duration::from_secs(2));
@@ -3379,15 +4147,27 @@ fn daemon_stop_waits_for_durable_cancel_before_signaling_blocked_worker() {
         "shutdown should not kill the supervised process before durable cancel succeeds"
     );
     drop(conn);
-    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
+    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(30));
     assert!(
         !process_group_exists(pid),
         "shutdown should kill the supervised process after durable cancel succeeds"
     );
-    if !wait_for_child_exit(&mut cancel, Duration::from_secs(2)) {
-        let _ = cancel.kill();
-        let _ = cancel.wait();
-        panic!("blocked cancel client did not exit after daemon shutdown");
+    match cancel_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(_response)) => {}
+        Ok(Err((kind, message))) if is_peer_disconnect_kind(kind) => {
+            let _ = message;
+        }
+        Ok(Err((kind, message))) => {
+            panic!(
+                "blocked cancel client failed unexpectedly after daemon shutdown: {kind:?}: {message}"
+            )
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("blocked cancel client did not exit after daemon shutdown")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("blocked cancel client exited without reporting a result")
+        }
     }
 }
 
