@@ -1,10 +1,10 @@
 ---
 id: 20260511-5721
 title: Daemon Upgrade Safety
-status: active
+status: completed
 created: 2026-05-11
 updated: 2026-05-12
-branch: codex/daemon-jobs-drain
+branch: codex/release-0.2.0
 pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/67
 supersedes: []
 superseded_by:
@@ -13,12 +13,13 @@ superseded_by:
 # Daemon Upgrade Safety
 
 ## Summary
-- The upgrade stack is split into PR1 through PR5, with the `0.2.0` release PR held until the safety work lands.
+- The upgrade stack is split into PR1 through PR5, followed by the `0.2.0` release PR.
 - PR1 changed incompatible daemon replacement to fail closed by default.
 - PR2 added generation daemon coexistence and scoped recovery ownership so a new daemon does not stop or recover work owned by an active old daemon.
 - PR3 adds the `daemon-handoff-v1` protocol skeleton, `binary_version` gate, and quiesce state without app-server or job resource takeover.
 - PR4 adds app-server handoff: legacy daemon exports owned app-server metadata, generation daemon adopts the same pid/url with pid identity fencing, and legacy refresh redirects wrappers to the new daemon.
 - PR5 adds live jobs drain: quiescing daemons reject new task admission, keep already admitted tasks/jobs alive until terminal, and exit with `handoff_drain_complete` after their owned drain scope clears.
+- The release PR bumps the package to `0.2.0`, updates install examples, and records the daemon upgrade plus recent Desktop transcript relay/writeback validation changes in the changelog.
 
 ## Current State
 - `docs/DAEMON_UPGRADE_SAFETY.md` is the design entrypoint for the upgrade sequence, PR3 gate/quiesce contract, PR4 app-server handoff contract, and PR5 jobs drain contract.
@@ -41,13 +42,14 @@ superseded_by:
 - PR4 handoff quiesce fencing no longer covers long app-server spawn or `thread/start` RPC work; CLI app-server/bootstrap candidates that lose to quiesce before registry registration are rejected and stopped, while registered bootstraps still force coexistence fallback.
 
 ## Next Steps
-- Release PR: bump `0.2.0`, update changelog/docs/install examples, and rerun release/version parsing checks after PR5 lands.
+- Post-release daemon follow-ups should continue in the active backlog rather than this completed release-tracking entry.
 
 ## Evidence
 - Design: [DAEMON_UPGRADE_SAFETY.md](../../../DAEMON_UPGRADE_SAFETY.md)
 - PR3: https://github.com/JoeyTeng/codex-background-task-handler/pull/64
 - PR4: https://github.com/JoeyTeng/codex-background-task-handler/pull/66
 - PR5: https://github.com/JoeyTeng/codex-background-task-handler/pull/67
+- Release PR: pending at branch `codex/release-0.2.0`
 - Local PR5 validation: `cargo test --locked task_run_rechecks_quiesce_before_registry_admission --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
 - Local PR5 validation: `cargo test --locked --test daemon_phase2 task_run_uses_generation_daemon_when_incompatible_default_daemon_is_quiescing --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
 - Local PR5 validation: `cargo test --locked --test daemon_phase2 task_cancel_falls_back_to_generation_recovery_when_owner_socket_is_stale --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`

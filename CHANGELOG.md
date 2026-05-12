@@ -2,6 +2,26 @@
 
 All notable release changes for `cbth` are documented here.
 
+## v0.2.0 - 2026-05-12
+
+### Added
+
+- Added daemon upgrade safety for `cbth new`, `resume`, and mutating commands: incompatible legacy daemons are no longer stopped by default, and new clients can start or reuse generation-specific daemons alongside old sessions.
+- Added `daemon-handoff-v1` quiesce/handoff support for handoff-capable daemons, including app-server adoption that preserves foreground websocket pid/url and live jobs drain for already admitted tasks.
+- Added operator visibility for coexistence with `daemon status --all` and `cli app-servers --all-daemons`.
+- Added Desktop transcript relay writeback consumption from trusted rollout `function_call_output` carriers, plus live validation evidence for the relay-to-CAS path.
+
+### Changed
+
+- Scoped daemon startup recovery by owner generation so new daemons avoid signaling work still owned by an active legacy or generation daemon.
+- Quiescing daemons now reject new work, keep control paths and task cancellation available, and auto-exit with `handoff_drain_complete` after their owned drain scope clears.
+- Updated daemon upgrade design documentation and project tracking for the full PR1-PR5 safety sequence.
+
+### Fixed
+
+- Fixed stale generation-owned task cancellation so fallback recovery runs before returning the cancel response, preventing orphaned process groups after daemon replacement or reuse.
+- Fixed app-server handoff rollback and redirect edge cases around stale exports, near-expired leases, release-status ambiguity, active bootstrap races, and adopted process cleanup.
+
 ## v0.1.5 - 2026-05-10
 
 ### Added

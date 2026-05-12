@@ -1561,7 +1561,7 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
             "response": {
                 "daemon": {
                     "pid": 6161,
-                    "binary_version": env!("CARGO_PKG_VERSION")
+                    "binary_version": "0.1.5"
                 },
                 "protocol_version": 1,
                 "capabilities": [
