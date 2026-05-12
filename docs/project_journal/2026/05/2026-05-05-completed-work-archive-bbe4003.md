@@ -35,9 +35,9 @@ superseded_by:
 
 - Migration PR: https://github.com/JoeyTeng/codex-background-task-handler/pull/37
 - Release: [v0.1.0](https://github.com/JoeyTeng/codex-background-task-handler/releases/tag/v0.1.0)
-- Live validation guide: [LIVE_E2E.md](../../../LIVE_E2E.md)
+- Live validation guide: [LIVE_E2E.en-GB.md](../../../LIVE_E2E.en-GB.md)
 - CLI dogfood plan: [CLI_DOGFOOD_V1_COMPLETION_PLAN.md](../../../plans/CLI_DOGFOOD_V1_COMPLETION_PLAN.md)
-- CLI recovery guide: [CLI_OPERATOR_RECOVERY.md](../../../CLI_OPERATOR_RECOVERY.md)
+- CLI recovery guide: [OPERATOR_RECOVERY.en-GB.md](../../../OPERATOR_RECOVERY.en-GB.md)
 - Shared architecture: [SHARED_CORE_ARCHITECTURE.md](../../../design/SHARED_CORE_ARCHITECTURE.md)
 - Desktop validation plan: [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](../../../validation/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md)
 - Historical PR / commit evidence is preserved verbatim in [legacy tracker snapshot](2026-05-05-legacy-tracker-snapshot-bbe4003.md).

@@ -1,7 +1,5 @@
 # Live E2E Guide
 
-Languages: [English (en-GB)](LIVE_E2E.en-GB.md) | [Simplified Chinese (zh-CN)](LIVE_E2E.zh-CN.md)
-
 This guide covers opt-in live checks that use a real Codex CLI login, model access, and network access. Default CI does not run these tests; they are intended for local validation and dogfooding.
 
 ## Environment
