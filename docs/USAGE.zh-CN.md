@@ -6,6 +6,8 @@
 
 ## 安装或升级
 
+当前 release assets 支持 Linux x86_64 glibc 和 macOS arm64。项目不发布 Intel macOS release asset；从 Rosetta shell 启动的 Apple Silicon host 会由 installer 映射到 macOS arm64 asset。
+
 安装最新 GitHub Release：
 
 ```bash
