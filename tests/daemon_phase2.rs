@@ -3269,6 +3269,111 @@ fn task_cancel_falls_back_to_generation_recovery_when_owner_socket_is_stale() {
     wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
 }
 
+#[cfg(unix)]
+#[test]
+fn task_cancel_reused_generation_daemon_recovers_stale_previous_generation_task() {
+    let home = temp_home();
+    let generation_socket_path = home
+        .path()
+        .join("run")
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let previous_generation_dir = home.path().join("run").join("daemons").join("0.1.4");
+    let previous_generation_socket_path = previous_generation_dir.join("cbth.sock");
+    let marker = home.path().join("stale-previous-generation-cancel-marker");
+    let marker_arg = marker.to_string_lossy().to_string();
+    let mut daemon = spawn_daemon(&home, "300", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+
+    let started = cbth_daemon(
+        &home,
+        &[
+            "task",
+            "run",
+            "--source-thread-id",
+            "thread-stale-previous-generation-cancel-task",
+            "--summary",
+            "stale previous generation owner cancel",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 30; printf done > \"$1\"",
+            "cbth-task",
+            &marker_arg,
+        ],
+    );
+    let task_id = started["task"]["task_id"].as_str().expect("task id");
+    wait_for_task_status(&home, task_id, "running");
+
+    daemon.kill().expect("kill generation daemon");
+    let _ = daemon.wait().expect("wait generation daemon");
+
+    fs::create_dir_all(&previous_generation_dir).expect("create previous generation dir");
+    fs::set_permissions(&previous_generation_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod previous generation dir");
+    let previous_listener =
+        UnixListener::bind(&previous_generation_socket_path).expect("bind previous generation");
+    fs::set_permissions(
+        &previous_generation_socket_path,
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("chmod previous generation socket");
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let pid = conn
+        .query_row(
+            "SELECT pid FROM tasks WHERE task_id = ?",
+            params![task_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("read task pid") as u32;
+    conn.execute(
+        "UPDATE jobs
+         SET supervisor_daemon_generation = '0.1.4'
+         WHERE job_id = (SELECT job_id FROM tasks WHERE task_id = ?)",
+        params![task_id],
+    )
+    .expect("retag stale previous generation job");
+    conn.execute(
+        "UPDATE tasks
+         SET supervisor_daemon_generation = '0.1.4'
+         WHERE task_id = ?",
+        params![task_id],
+    )
+    .expect("retag stale previous generation task");
+    drop(conn);
+
+    let mut replacement = spawn_daemon(&home, "30", &["--socket-kind", "generation"]);
+    wait_for_path(&generation_socket_path);
+    assert_eq!(
+        wait_for_task_status(&home, task_id, "running")["task"]["status"],
+        "running"
+    );
+    let maintenance_blocker =
+        UnixStream::connect(&generation_socket_path).expect("hold generation daemon client");
+    thread::sleep(Duration::from_millis(100));
+
+    drop(previous_listener);
+    fs::remove_file(&previous_generation_socket_path).expect("remove previous generation socket");
+
+    let cancelled = cbth_daemon(&home, &["task", "cancel", "--task-id", task_id]);
+    assert_eq!(cancelled["task"]["status"], "cancelled");
+    assert_eq!(cancelled["task"]["failure_reason"], "task cancelled");
+    wait_for_process_group_gone(pid);
+    assert!(
+        !marker.exists(),
+        "stale previous generation task process survived reused-daemon cancel recovery"
+    );
+    drop(maintenance_blocker);
+
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+    replacement
+        .wait()
+        .expect("replacement generation daemon exits");
+}
+
 #[test]
 fn daemon_sweeps_batches_due_within_idle_window_before_exit() {
     let home = temp_home();

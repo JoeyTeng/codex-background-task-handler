@@ -3769,7 +3769,11 @@ fn cancel_supervised_task(state: &DaemonState, payload: TaskCancelPayload) -> Re
         return Ok(task);
     }
     let task = persist_task_cancel_request(&state.layout, &payload.task_id)?;
-    Ok(task)
+    if task.completed_at.is_some() {
+        return Ok(task);
+    }
+    let _ = recover_registryless_lost_tasks(state)?;
+    Store::open(&state.layout)?.inspect_task(&payload.task_id)
 }
 
 #[allow(clippy::too_many_arguments)]
