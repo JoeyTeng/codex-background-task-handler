@@ -3,7 +3,7 @@ id: 20260505-bbe4003-active
 title: Current Follow-ups
 status: active
 created: 2026-05-05
-updated: 2026-05-07
+updated: 2026-05-12
 branch: master
 pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/37
 supersedes: []
@@ -28,7 +28,7 @@ superseded_by:
 - If still needed, run a scheduled Desktop heartbeat test that distinguishes app-open behavior from fully-quit app behavior.
 - Build a real heartbeat automation sample and confirm target-thread fields in `automation.toml` / `codex-dev.db`.
 - Validate whether external process edits to Desktop automation schedule state, especially `next_run_at` and status transitions, are hot-observed by the caller thread heartbeat.
-- Desktop heartbeat preflight attempts are recorded in [Desktop live preflight evidence](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md): direct heartbeat access to redundant chmod, `startup.lock`, Unix socket, and SQLite WAL paths failed under Desktop sandboxing even when POSIX ownership / mode looked correct.
+- Desktop heartbeat preflight attempts are recorded in [Desktop live preflight evidence](../../../validation/DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md): direct heartbeat access to redundant chmod, `startup.lock`, Unix socket, and SQLite WAL paths failed under Desktop sandboxing even when POSIX ownership / mode looked correct.
 - The Desktop boundary is now split: a normal shell / daemon / future sidecar publishes the inbox snapshot, while the heartbeat consumes it through no-DB read helpers. Real heartbeat validation succeeded for `read-snapshot`, `list-arm-pending`, `list-pause-due`, and read/peek `claim-next-ready` without approval.
 - `read_transport_capability=validated` now covers the no-DB direct-file-read helper path against an already-published revision-consistent snapshot, including the manifest-referenced installation-state export. It does not validate heartbeat-owned `bridge-preflight`, SQLite access, artifact payload reads, or writeback helpers.
 - `note-arm-pending` and `note-arm` now exist as local writeback primitives with fake coverage, but direct real Desktop heartbeat validation failed before `note-arm-pending` could mutate state because daemon-routed writeback tried to open `~/.cbth/run/startup.lock` and hit sandbox `EPERM`. Transcript relay now provides a non-Desktop consumer path that drives those CAS primitives from trusted rollout `function_call_output`, and live validation succeeded for heartbeat-emitted arm-pending and arm envelopes; `writeback_capability=validated` and `artifact_read_capability=unknown`.
@@ -46,7 +46,7 @@ superseded_by:
 - Implement real ready / arm / pause materialization behind the existing no-DB read helpers.
 - Extend `bridge_arm_lease` beyond the current `note-arm-pending` acquire / carry-forward primitive with overdue reconcile and cleanup semantics.
 - Redesign the writeback validation/execution path so Desktop heartbeat does not need daemon autostart / `startup.lock` access; only retry `note-arm-pending` / `note-arm` live validation after that boundary changes.
-- Live validation of the transcript / tool-output relay consumer succeeded: interactive Desktop tool-output and heartbeat automation output both prove exact prefixed stdout can be recovered from rollout `function_call_output`, and heartbeat-emitted arm-pending / arm envelopes were consumed from a normal shell to drive CAS into `cooldown` with marker/hash replay protection. Production consumption still needs durable scan cursors, marker issuance, background tailing, ready materialization, and caller wake.
+- Live validation of the transcript / tool-output relay consumer succeeded: interactive Desktop tool-output and heartbeat automation output both prove exact prefixed stdout can be recovered from rollout `function_call_output`, and heartbeat-emitted arm-pending / arm envelopes were consumed from a normal shell to drive CAS into `cooldown` with marker/hash replay protection. Production scanner foundation now has durable rollout binding, marker issuance, bounded daemon cursor scanning, and retention cleanup; it still needs opt-in live scanner validation before ready materialization and caller wake.
 - Implement `note-boundary-crossed` with prompt-token validation, binding / installation-state checks, `cooldown` and `armed_generation` preconditions, `handoff_recorded` close, and durable `boundary_recovery_envelope`.
 - Verify the continuation-boundary contract: only fresh `note-boundary-crossed` success allows inline handoff; post-boundary automatic replay and ordinary tool continuation remain out of v1.
 - Keep the v1 automatic path limited to read-only, no approval, no network, no write access batches, plus validated Desktop read and writeback capability; `requires_artifact_read=true` remains manual/operator follow-up.
@@ -80,11 +80,11 @@ superseded_by:
 ## Evidence
 
 - Migration PR: https://github.com/JoeyTeng/codex-background-task-handler/pull/37
-- Desktop bridge foundation: [DESKTOP_BRIDGE_FOUNDATION.md](../../../DESKTOP_BRIDGE_FOUNDATION.md)
-- Desktop live validation: [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](../../../DESKTOP_LIVE_PREFLIGHT_VALIDATION.md)
-- Desktop bridge design: [DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](../../../DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md)
-- Desktop live preflight evidence: [DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md)
-- Shared architecture: [SHARED_CORE_ARCHITECTURE.md](../../../SHARED_CORE_ARCHITECTURE.md)
-- CLI active steer design: [CLI_ACTIVE_TURN_STEER_DESIGN.md](../../../CLI_ACTIVE_TURN_STEER_DESIGN.md)
-- Live e2e commands and prior successes: [LIVE_E2E.md](../../../LIVE_E2E.md)
+- Desktop bridge foundation: [DESKTOP_BRIDGE_FOUNDATION.md](../../../design/DESKTOP_BRIDGE_FOUNDATION.md)
+- Desktop live validation: [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](../../../validation/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md)
+- Desktop bridge design: [DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](../../../design/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md)
+- Desktop live preflight evidence: [DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md](../../../validation/DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md)
+- Shared architecture: [SHARED_CORE_ARCHITECTURE.md](../../../design/SHARED_CORE_ARCHITECTURE.md)
+- CLI active steer design: [CLI_ACTIVE_TURN_STEER_DESIGN.md](../../../design/CLI_ACTIVE_TURN_STEER_DESIGN.md)
+- Live e2e commands and prior successes: [LIVE_E2E.en-GB.md](../../../LIVE_E2E.en-GB.md)
 - Full pre-migration checklist and state: [legacy tracker snapshot](2026-05-05-legacy-tracker-snapshot-bbe4003.md)

@@ -41,9 +41,9 @@ superseded_by:
 
 - Base branch: `master`
 - Base commit: `2b4ea029aa2a665b142947d644ebee53ce5a56e6`
-- Writeback blocker evidence: [Desktop live preflight evidence](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md#2026-05-07-attempt-writeback-helpers-blocked-by-startup-lock)
-- Dropbox probe evidence: [Desktop live preflight evidence](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md#2026-05-11-attempt-writeback-dropbox-local-fs-probe-blocked)
-- Validation instructions: [Desktop writeback dropbox probe validation](../../../DESKTOP_WRITEBACK_DROPBOX_PROBE_VALIDATION.md)
+- Writeback blocker evidence: [Desktop live preflight evidence](../../../validation/DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md#2026-05-07-attempt-writeback-helpers-blocked-by-startup-lock)
+- Dropbox probe evidence: [Desktop live preflight evidence](../../../validation/DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md#2026-05-11-attempt-writeback-dropbox-local-fs-probe-blocked)
+- Validation instructions: [Desktop writeback dropbox probe validation](../../../validation/DESKTOP_WRITEBACK_DROPBOX_PROBE_VALIDATION.md)
 
 ## Current State
 

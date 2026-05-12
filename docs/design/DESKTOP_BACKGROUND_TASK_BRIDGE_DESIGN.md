@@ -10,7 +10,7 @@
 
 共通核心部分见：
 
-- `docs/SHARED_CORE_ARCHITECTURE.md`
+- `docs/design/SHARED_CORE_ARCHITECTURE.md`
 
 ## 已敲定的约束
 
@@ -233,7 +233,8 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
 - 但这还不是充分条件；Desktop 自动续跑还必须额外满足：
   - 当前安装选定 `read_transport` 已验证可无审批执行
   - 当前 binding 的 `writeback_capability=validated`
-  - 也就是 `bridge-preflight` / `note-arm-pending` / `note-arm` / `note-boundary-crossed` 这组窄 helper 已经被证明可在 heartbeat 中无审批执行
+  - 当前 v1 写回路径是 transcript / tool-output relay：heartbeat 只输出结构化 stdout envelope，Desktop sandbox 外的 scanner 从 trusted `function_call_output` carrier 读取它，再调用 durable CAS
+  - `note-arm-pending` / `note-arm` 不要求 heartbeat 直接执行；真实 Desktop heartbeat 已证明直接 daemon / local filesystem writeback 不可用
 - 不满足这些条件的 batch 不得由 bridge 自动 arm caller heartbeat；它们保留为 manual/operator follow-up。
 - 对 `requires_artifact_read=true` 的 batch：
   - v1 不再把它纳入 Desktop automatic caller path
@@ -246,6 +247,23 @@ cbth desktop read-artifact --artifact-id <artifact_id> --artifact-read-lease-id 
 - 运行期 bridge 不得 blind create caller heartbeat；它只能更新已绑定 automation。
 - 旧 heartbeat prompt 必须能够通过 attempt token / generation 检测自己已经过期，并立即 no-op。
 - 旧 heartbeat prompt 即使被延迟唤醒，也不得直接 `pause` 当前这个长期复用的 caller heartbeat；否则会把新 generation 的合法 wake 一起关掉。
+
+## Transcript Relay Writeback Path
+
+Desktop v1 的 writeback side channel 采用 rollout transcript relay，而不是 heartbeat-owned daemon/socket/SQLite/local-file writes。
+
+- Bridge / sidecar 先显式绑定 `bridge_thread_id -> rollout_path`。绑定保存 resolved path、Unix device/inode identity、byte cursor 与 line cursor；fork、archive、side chat 或新 heartbeat thread 必须 operator rebind，不允许 silent path switch。
+- Bridge / sidecar 为每个待写回动作签发高熵 marker。marker 记录 expected envelope kind、source thread、attempt id、generation、bridge request id、expiry 与 retention。
+- Heartbeat 只运行 stdout-only helper：
+  - `emit-arm-pending` 输出 `arm_pending_requested`
+  - `emit-arm-accepted` 输出 `arm_accepted`
+- `arm_accepted` envelope 不携带 `bridge_arm_lease_id`；scanner 必须拒绝任何带该字段的 trusted `arm_accepted` envelope。`arm-accepted` marker 只能在 attempt 已 durable 进入 `arm_pending`、request/generation/lease 均匹配且 lease 尚未过期时签发；scanner 再从该 durable `arm_pending` attempt 解析 lease 并调用 `note-arm` CAS。
+- `arm_accepted` 在执行 pending-only lease lookup 前必须先检查同 marker/hash 的成功 replay fence，覆盖 CAS commit 后、marker 标 consumed 前崩溃的恢复窗口。scan maintenance 必须先 reconcile 已有 consumption fence，再把 issued marker 过期为 rejected，避免崩溃恢复时把已提交的 CAS 误判为 expired。production 不允许先签发 accepted marker 再依赖同 tick pending envelope 排序来补救状态。
+- scanner 只接受单个 trusted `response_item.payload.type=function_call_output` carrier 中的精确 prefixed envelope。prompt/user text、assistant final text、unissued marker、expired marker、duplicate trusted envelope、malformed trusted envelope、wrong field、wrong path、failed-CAS replay fence、truncate 或 inode drift 都不得推进 state。
+- daemon-owned scanner 只有在存在 issued marker + active scanner binding、issued marker + existing consumption fence、expired issued marker，或 due relay retention cleanup 时运行，并以低频有界 tick 扫描：每 tick 先用 `symlink_metadata` 对 bound rollout path 做 regular-file / identity gate，再用 nonblocking open 打开并用 opened handle 的 metadata / identity 冻结 tick-start EOF，最后读取 active marker set；只读取 tick-start EOF 之前的数据，最多处理 256 个完整 JSONL records 或 1 MiB；partial trailing line 和 tick-start EOF 之后追加的 line 留到下一次扫描，首条 record 超过预算时 degrade binding。FIFO / special-file replacement、truncate、identity drift 都 fail closed degrade，不允许卡住 daemon lifecycle maintenance。如果 tick 在达到 tick-start EOF 前已经看到 marker evidence，则同样 degrade binding，而不是先消费 marker；这样可以在保持有界扫描的同时避免漏掉本次 snapshot 后半段里的 duplicate / conflicting envelope。
+- scanner 发布 cursor、degrade binding、reject marker 时必须带 expected prior path / identity / byte cursor / line cursor / monotonic `binding_revision` 与 active state 条件；`updated_at` 只用于观测和排序，不作为 CAS token，因为同一秒内 rebind/reset 可能保留相同 timestamp。如果并发 scan 已推进 cursor、degrade binding 或 operator 已 rebind，旧 scan 不得回退 cursor、清掉 degraded state、degrade replacement binding 或 reject marker。
+- scanner 对新消费的 envelope 必须在同一个 immediate SQLite transaction 中重新确认 marker 仍为 issued、未过期、tokens / hash 匹配，且 scanner binding 的 path / identity / cursor 仍与本轮读取一致，然后才执行 `note-arm-pending` / `note-arm` CAS 并把 marker 标为 consumed；如果 marker 已被并发 reject / expire，或 binding 已被并发 rebind / degrade / cursor advance，不得尝试 CAS。
+- consumed / expired / rejected marker 与 replay fence 默认保留 7 天，用于 crash recovery、审计和幂等重放。
 
 ## 时序
 

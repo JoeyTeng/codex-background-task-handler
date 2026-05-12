@@ -23,11 +23,13 @@ use crate::models::{
     DEFAULT_REDELIVERY_WINDOW_SECONDS, DaemonLifecycleStatus, DeliveryAttemptRecord,
     DeliveryPolicy, DesktopArmPendingRecord, DesktopArmRecord, DesktopBindingRecord,
     DesktopBindingRepairRecord, DesktopInstallationRepairRecord, DesktopInstallationStateRecord,
-    DesktopTranscriptRelayConsumptionRecord, JobRecord, LostPendingTaskProcess, NewArtifact,
+    DesktopRelayScannerBindingRecord, DesktopTranscriptRelayConsumptionRecord,
+    DesktopTranscriptRelayMarkerRecord, JobRecord, LostPendingTaskProcess, NewArtifact,
     NewAuditDecision, NewBatch, NewCliAcceptPendingAttempt, NewCliManagedSessionPermissionSnapshot,
-    NewDesktopInstallationRepair, NewDesktopTranscriptRelayConsumption, NewDesktopWritebackFixture,
-    NewJob, NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport,
-    TaskRecord,
+    NewDesktopInstallationRepair, NewDesktopRelayScannerBinding,
+    NewDesktopTranscriptRelayConsumption, NewDesktopTranscriptRelayMarker,
+    NewDesktopWritebackFixture, NewJob, NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS,
+    POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport, TaskRecord,
 };
 
 const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
@@ -40,6 +42,7 @@ const DESKTOP_BRIDGE_ARM_LEASE_TTL_SECONDS: i64 = 5 * 60;
 const DESKTOP_ARM_PENDING_TIMEOUT_SECONDS: i64 = 5 * 60;
 const DESKTOP_PAUSE_NOT_BEFORE_SECONDS: i64 = 90;
 const DESKTOP_PAUSE_DEADLINE_GRACE_SECONDS: i64 = 90;
+const DESKTOP_TRANSCRIPT_RELAY_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(100);
 const SQLITE_TASK_SUPERVISOR_SETUP_TIMEOUT: Duration = Duration::from_millis(100);
@@ -2360,35 +2363,90 @@ impl Store {
         &mut self,
         consumption: NewDesktopTranscriptRelayConsumption,
     ) -> Result<DesktopTranscriptRelayConsumptionRecord> {
-        ensure_nonempty_value("marker", &consumption.marker)?;
-        ensure_nonempty_value("envelope_hash", &consumption.envelope_hash)?;
-        ensure_nonempty_value("envelope_kind", &consumption.envelope_kind)?;
-        ensure_nonempty_value("envelope_json", &consumption.envelope_json)?;
-        ensure_nonempty_value("source_thread_id", &consumption.source_thread_id)?;
-        ensure_nonempty_value("attempt_id", &consumption.attempt_id)?;
-        ensure_positive_value("generation", consumption.generation)?;
-        ensure_nonempty_value("bridge_request_id", &consumption.bridge_request_id)?;
-        if consumption.envelope_kind == "arm_requested" {
-            ensure_nonempty_value(
-                "bridge_arm_lease_id",
-                consumption.bridge_arm_lease_id.as_deref().unwrap_or(""),
-            )?;
-        } else if consumption.envelope_kind != "arm_pending_requested" {
-            bail!(
-                "unsupported Desktop transcript relay envelope kind {}",
-                consumption.envelope_kind
-            );
-        }
-
+        validate_desktop_transcript_relay_consumption(&consumption)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some((existing_hash, existing_kind, consumed_at, outcome_json)) = tx
+        match consume_desktop_transcript_relay_tx(&tx, &consumption)? {
+            DesktopTranscriptRelayConsumeTxResult::Consumed(record) => {
+                tx.commit()?;
+                Ok(record)
+            }
+            DesktopTranscriptRelayConsumeTxResult::DurableCasFailed { error_message } => {
+                tx.commit()?;
+                bail!("{error_message}")
+            }
+        }
+    }
+
+    pub fn consume_issued_desktop_transcript_relay_marker(
+        &mut self,
+        consumption: NewDesktopTranscriptRelayConsumption,
+        scanner_binding: &DesktopRelayScannerBindingRecord,
+    ) -> Result<(
+        DesktopTranscriptRelayConsumptionRecord,
+        DesktopTranscriptRelayMarkerRecord,
+    )> {
+        validate_desktop_transcript_relay_consumption(&consumption)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let marker = query_desktop_transcript_relay_marker_tx(&tx, &consumption.marker)?;
+        ensure_desktop_relay_marker_matches_consumption(&marker, &consumption)?;
+        ensure_desktop_relay_scanner_binding_matches_tx(&tx, scanner_binding, &marker)?;
+        match consume_desktop_transcript_relay_tx(&tx, &consumption)? {
+            DesktopTranscriptRelayConsumeTxResult::Consumed(record) => {
+                tx.execute(
+                    "UPDATE desktop_transcript_relay_markers
+                     SET marker_state = 'consumed',
+                         consumed_at = COALESCE(consumed_at, ?),
+                         envelope_hash = COALESCE(envelope_hash, ?)
+                     WHERE marker = ?",
+                    params![
+                        consumption.now,
+                        &consumption.envelope_hash,
+                        &consumption.marker
+                    ],
+                )?;
+                let marker = query_desktop_transcript_relay_marker_tx(&tx, &consumption.marker)?;
+                tx.commit()?;
+                Ok((record, marker))
+            }
+            DesktopTranscriptRelayConsumeTxResult::DurableCasFailed { error_message } => {
+                tx.execute(
+                    "UPDATE desktop_transcript_relay_markers
+                     SET marker_state = 'rejected',
+                         rejected_at = COALESCE(rejected_at, ?),
+                         rejection_reason = COALESCE(rejection_reason, ?),
+                         envelope_hash = COALESCE(envelope_hash, ?)
+                     WHERE marker = ?",
+                    params![
+                        consumption.now,
+                        &error_message,
+                        &consumption.envelope_hash,
+                        &consumption.marker
+                    ],
+                )?;
+                tx.commit()?;
+                bail!("{error_message}")
+            }
+        }
+    }
+
+    pub fn replay_desktop_transcript_relay_consumption(
+        &self,
+        marker: &str,
+        envelope_hash: &str,
+    ) -> Result<Option<DesktopTranscriptRelayConsumptionRecord>> {
+        ensure_nonempty_value("marker", marker)?;
+        ensure_nonempty_value("envelope_hash", envelope_hash)?;
+        let Some((existing_hash, existing_kind, consumed_at, outcome_json)) = self
+            .conn
             .query_row(
                 "SELECT envelope_hash, envelope_kind, consumed_at, outcome_json
                  FROM desktop_transcript_relay_consumptions
                  WHERE marker = ?",
-                params![&consumption.marker],
+                params![marker],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -2399,84 +2457,604 @@ impl Store {
                 },
             )
             .optional()?
+        else {
+            return Ok(None);
+        };
+        if existing_hash != envelope_hash {
+            bail!(
+                "Desktop transcript relay marker {} was already consumed with another envelope hash",
+                marker
+            );
+        }
+        let outcome: serde_json::Value =
+            serde_json::from_str(&outcome_json).context("parse stored relay outcome JSON")?;
+        if outcome.get("outcome").and_then(serde_json::Value::as_str) == Some("cas_failed") {
+            let error_message = outcome
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("stored CAS failure");
+            bail!("Desktop transcript relay marker {marker} replayed failed CAS: {error_message}");
+        }
+        Ok(Some(DesktopTranscriptRelayConsumptionRecord {
+            marker: marker.to_owned(),
+            envelope_hash: existing_hash,
+            envelope_kind: existing_kind,
+            replay_state: "replayed".to_owned(),
+            consumed_at,
+            outcome,
+        }))
+    }
+
+    pub fn bind_desktop_relay_scanner(
+        &mut self,
+        binding: NewDesktopRelayScannerBinding,
+    ) -> Result<DesktopRelayScannerBindingRecord> {
+        ensure_nonempty_value("bridge_thread_id", &binding.bridge_thread_id)?;
+        ensure_nonempty_value("rollout_path", &binding.rollout_path)?;
+        ensure_nonempty_value("rollout_identity", &binding.rollout_identity)?;
+        if binding.cursor_byte_offset < 0 {
+            bail!("cursor_byte_offset must be non-negative");
+        }
+        if binding.cursor_line_number < 0 {
+            bail!("cursor_line_number must be non-negative");
+        }
+        let tx = self.conn.transaction()?;
+        let created_at = tx
+            .query_row(
+                "SELECT created_at FROM desktop_relay_scanner_bindings WHERE bridge_thread_id = ?",
+                params![&binding.bridge_thread_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(binding.now);
+        tx.execute(
+            "INSERT INTO desktop_relay_scanner_bindings (
+                bridge_thread_id, rollout_path, rollout_identity,
+                cursor_byte_offset, cursor_line_number, binding_state,
+                last_scan_at, last_consumed_at, last_error,
+                binding_revision, created_at, updated_at, degraded_at
+            ) VALUES (?, ?, ?, ?, ?, 'active', NULL, NULL, NULL, 1, ?, ?, NULL)
+            ON CONFLICT(bridge_thread_id) DO UPDATE SET
+                rollout_path = excluded.rollout_path,
+                rollout_identity = excluded.rollout_identity,
+                cursor_byte_offset = excluded.cursor_byte_offset,
+                cursor_line_number = excluded.cursor_line_number,
+                binding_state = 'active',
+                last_scan_at = NULL,
+                last_consumed_at = NULL,
+                last_error = NULL,
+                binding_revision = desktop_relay_scanner_bindings.binding_revision + 1,
+                updated_at = excluded.updated_at,
+                degraded_at = NULL",
+            params![
+                binding.bridge_thread_id,
+                binding.rollout_path,
+                binding.rollout_identity,
+                binding.cursor_byte_offset,
+                binding.cursor_line_number,
+                created_at,
+                binding.now,
+            ],
+        )?;
+        let record = query_desktop_relay_scanner_binding_tx(&tx, &binding.bridge_thread_id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn list_desktop_relay_scanner_bindings(
+        &self,
+        bridge_thread_id: Option<&str>,
+    ) -> Result<Vec<DesktopRelayScannerBindingRecord>> {
+        if let Some(bridge_thread_id) = bridge_thread_id {
+            ensure_nonempty_value("bridge_thread_id", bridge_thread_id)?;
+            let mut stmt = self.conn.prepare(
+                "SELECT * FROM desktop_relay_scanner_bindings
+                 WHERE bridge_thread_id = ?
+                 ORDER BY updated_at DESC, bridge_thread_id",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![bridge_thread_id],
+                    desktop_relay_scanner_binding_from_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            return Ok(rows);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM desktop_relay_scanner_bindings
+             ORDER BY updated_at DESC, bridge_thread_id",
+        )?;
+        let rows = stmt
+            .query_map([], desktop_relay_scanner_binding_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn issue_desktop_transcript_relay_marker(
+        &mut self,
+        marker: NewDesktopTranscriptRelayMarker,
+    ) -> Result<DesktopTranscriptRelayMarkerRecord> {
+        ensure_nonempty_value("marker", &marker.marker)?;
+        ensure_nonempty_value("bridge_thread_id", &marker.bridge_thread_id)?;
+        ensure_nonempty_value("envelope_kind", &marker.envelope_kind)?;
+        ensure_nonempty_value("source_thread_id", &marker.source_thread_id)?;
+        ensure_nonempty_value("attempt_id", &marker.attempt_id)?;
+        ensure_positive_value("generation", marker.generation)?;
+        ensure_nonempty_value("bridge_request_id", &marker.bridge_request_id)?;
+        if marker.expires_at <= marker.issued_at {
+            bail!("marker expires_at must be after issued_at");
+        }
+        if marker.retention_until <= marker.expires_at {
+            bail!("marker retention_until must be after expires_at");
+        }
+        if marker.envelope_kind != "arm_pending_requested" && marker.envelope_kind != "arm_accepted"
         {
-            if existing_hash != consumption.envelope_hash {
+            bail!(
+                "unsupported Desktop transcript relay marker kind {}",
+                marker.envelope_kind
+            );
+        }
+        let tx = self.conn.transaction()?;
+        if marker.envelope_kind == "arm_accepted" {
+            let attempt = query_delivery_attempt_tx(&tx, &marker.attempt_id)?;
+            ensure_desktop_attempt_tokens(&attempt, &marker.source_thread_id, marker.generation)?;
+            if attempt.state != "arm_pending" {
                 bail!(
-                    "Desktop transcript relay marker {} was already consumed with another envelope hash",
-                    consumption.marker
+                    "delivery attempt {} is not arm_pending for Desktop arm-accepted marker issuance",
+                    attempt.attempt_id
                 );
             }
-            let outcome: serde_json::Value =
-                serde_json::from_str(&outcome_json).context("parse stored relay outcome JSON")?;
-            tx.commit()?;
-            return Ok(DesktopTranscriptRelayConsumptionRecord {
-                marker: consumption.marker,
-                envelope_hash: existing_hash,
-                envelope_kind: existing_kind,
-                replay_state: "replayed".to_owned(),
-                consumed_at,
-                outcome,
-            });
+            if attempt.bridge_request_id.as_deref() != Some(marker.bridge_request_id.as_str()) {
+                bail!(
+                    "delivery attempt {} bridge_request_id does not match marker issuance",
+                    attempt.attempt_id
+                );
+            }
+            let lease_deadline = attempt
+                .bridge_arm_lease_deadline
+                .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
+            if lease_deadline <= marker.issued_at {
+                bail!(
+                    "delivery attempt {} bridge arm lease expired at {} before marker issuance",
+                    attempt.attempt_id,
+                    lease_deadline
+                );
+            }
+            attempt
+                .bridge_arm_lease_id
+                .as_ref()
+                .context("arm_pending Desktop attempt is missing bridge_arm_lease_id")?;
         }
-
-        let outcome_result = match consumption.envelope_kind.as_str() {
-            "arm_pending_requested" => {
-                match note_desktop_arm_pending_tx(
-                    &tx,
-                    &consumption.source_thread_id,
-                    &consumption.attempt_id,
-                    consumption.generation,
-                    &consumption.bridge_request_id,
-                    consumption.now,
-                ) {
-                    Ok(record) => serde_json::to_value(record).map_err(Into::into),
-                    Err(error) => Err(error),
-                }
-            }
-            "arm_requested" => {
-                let bridge_arm_lease_id = consumption
-                    .bridge_arm_lease_id
-                    .as_deref()
-                    .context("arm_requested envelope missing bridge_arm_lease_id")?;
-                match note_desktop_arm_tx(
-                    &tx,
-                    &consumption.source_thread_id,
-                    &consumption.attempt_id,
-                    consumption.generation,
-                    &consumption.bridge_request_id,
-                    bridge_arm_lease_id,
-                    consumption.now,
-                ) {
-                    Ok(record) => serde_json::to_value(record).map_err(Into::into),
-                    Err(error) => Err(error),
-                }
-            }
-            _ => unreachable!("envelope kind was validated above"),
-        };
-        let outcome = match outcome_result {
-            Ok(outcome) => outcome,
-            Err(error) if is_durable_desktop_arm_failure(&error) => {
-                let error_message = error.to_string();
-                let outcome = serde_json::json!({
-                    "outcome": "cas_failed",
-                    "error": &error_message,
-                });
-                insert_desktop_transcript_relay_consumption_tx(&tx, &consumption, &outcome)?;
-                tx.commit()?;
-                bail!("{error_message}");
-            }
-            Err(error) => return Err(error),
-        };
-        insert_desktop_transcript_relay_consumption_tx(&tx, &consumption, &outcome)?;
+        tx.execute(
+            "INSERT INTO desktop_transcript_relay_markers (
+                marker, bridge_thread_id, envelope_kind,
+                source_thread_id, attempt_id, generation, bridge_request_id,
+                marker_state, issued_at, expires_at, retention_until,
+                consumed_at, rejected_at, rejection_reason, envelope_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', ?, ?, ?, NULL, NULL, NULL, NULL)",
+            params![
+                marker.marker,
+                marker.bridge_thread_id,
+                marker.envelope_kind,
+                marker.source_thread_id,
+                marker.attempt_id,
+                marker.generation,
+                marker.bridge_request_id,
+                marker.issued_at,
+                marker.expires_at,
+                marker.retention_until,
+            ],
+        )?;
+        let record = query_desktop_transcript_relay_marker_tx(&tx, &marker.marker)?;
         tx.commit()?;
-        Ok(DesktopTranscriptRelayConsumptionRecord {
-            marker: consumption.marker,
-            envelope_hash: consumption.envelope_hash,
-            envelope_kind: consumption.envelope_kind,
-            replay_state: "fresh".to_owned(),
-            consumed_at: consumption.now,
-            outcome,
-        })
+        Ok(record)
+    }
+
+    pub fn list_active_desktop_transcript_relay_markers(
+        &self,
+        bridge_thread_id: &str,
+        now: i64,
+    ) -> Result<Vec<DesktopTranscriptRelayMarkerRecord>> {
+        ensure_nonempty_value("bridge_thread_id", bridge_thread_id)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM desktop_transcript_relay_markers
+             WHERE bridge_thread_id = ?
+               AND marker_state = 'issued'
+               AND expires_at > ?
+             ORDER BY issued_at, marker",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![bridge_thread_id, now],
+                desktop_transcript_relay_marker_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn mark_desktop_transcript_relay_marker_consumed_for_scanner(
+        &mut self,
+        marker: &str,
+        envelope_hash: &str,
+        scanner_binding: &DesktopRelayScannerBindingRecord,
+        now: i64,
+    ) -> Result<DesktopTranscriptRelayMarkerRecord> {
+        ensure_nonempty_value("marker", marker)?;
+        ensure_nonempty_value("envelope_hash", envelope_hash)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = query_desktop_transcript_relay_marker_tx(&tx, marker)?;
+        match current.marker_state.as_str() {
+            "issued" | "consumed" => {}
+            state => bail!("Desktop transcript relay marker {marker} is {state}, not consumable"),
+        }
+        if let Some(existing_hash) = current.envelope_hash.as_deref()
+            && existing_hash != envelope_hash
+        {
+            bail!(
+                "Desktop transcript relay marker {marker} was already recorded with another envelope hash"
+            );
+        }
+        ensure_desktop_relay_scanner_binding_matches_tx(&tx, scanner_binding, &current)?;
+        tx.execute(
+            "UPDATE desktop_transcript_relay_markers
+             SET marker_state = 'consumed',
+                 consumed_at = COALESCE(consumed_at, ?),
+                 envelope_hash = COALESCE(envelope_hash, ?)
+             WHERE marker = ?",
+            params![now, envelope_hash, marker],
+        )?;
+        let record = query_desktop_transcript_relay_marker_tx(&tx, marker)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn mark_desktop_transcript_relay_marker_rejected_for_scanner(
+        &mut self,
+        marker: &str,
+        reason: &str,
+        envelope_hash: Option<&str>,
+        scanner_binding: &DesktopRelayScannerBindingRecord,
+        now: i64,
+    ) -> Result<DesktopTranscriptRelayMarkerRecord> {
+        ensure_nonempty_value("marker", marker)?;
+        ensure_nonempty_value("reason", reason)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = query_desktop_transcript_relay_marker_tx(&tx, marker)?;
+        match current.marker_state.as_str() {
+            "issued" | "rejected" => {}
+            state => bail!("Desktop transcript relay marker {marker} is {state}, not rejectable"),
+        }
+        if let (Some(existing_hash), Some(envelope_hash)) =
+            (current.envelope_hash.as_deref(), envelope_hash)
+            && existing_hash != envelope_hash
+        {
+            bail!(
+                "Desktop transcript relay marker {marker} was already recorded with another envelope hash"
+            );
+        }
+        ensure_desktop_relay_scanner_binding_matches_tx(&tx, scanner_binding, &current)?;
+        tx.execute(
+            "UPDATE desktop_transcript_relay_markers
+             SET marker_state = 'rejected',
+                 rejected_at = COALESCE(rejected_at, ?),
+                 rejection_reason = COALESCE(rejection_reason, ?),
+                 envelope_hash = COALESCE(envelope_hash, ?)
+             WHERE marker = ?",
+            params![now, reason, envelope_hash, marker],
+        )?;
+        let record = query_desktop_transcript_relay_marker_tx(&tx, marker)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn reconcile_desktop_transcript_relay_consumed_markers(
+        &mut self,
+        now: i64,
+    ) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let reconciliations = {
+            let mut stmt = tx.prepare(
+                "SELECT desktop_transcript_relay_markers.marker,
+                        desktop_transcript_relay_consumptions.envelope_hash,
+                        desktop_transcript_relay_consumptions.consumed_at,
+                        desktop_transcript_relay_consumptions.outcome_json
+                 FROM desktop_transcript_relay_markers
+                 JOIN desktop_transcript_relay_consumptions
+                   ON desktop_transcript_relay_consumptions.marker =
+                      desktop_transcript_relay_markers.marker
+                 WHERE desktop_transcript_relay_markers.marker_state = 'issued'",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut reconciliations = Vec::with_capacity(rows.len());
+            for (marker, envelope_hash, consumed_at, outcome_json) in rows {
+                let outcome: serde_json::Value = serde_json::from_str(&outcome_json)
+                    .context("parse stored relay outcome JSON for marker reconciliation")?;
+                let failed_cas = outcome.get("outcome").and_then(serde_json::Value::as_str)
+                    == Some("cas_failed");
+                let rejection_reason = failed_cas.then(|| {
+                    let error = outcome
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("stored CAS failure");
+                    format!("replayed failed CAS: {error}")
+                });
+                reconciliations.push((marker, envelope_hash, consumed_at, rejection_reason));
+            }
+            reconciliations
+        };
+        for (marker, envelope_hash, consumed_at, rejection_reason) in &reconciliations {
+            if let Some(reason) = rejection_reason {
+                tx.execute(
+                    "UPDATE desktop_transcript_relay_markers
+                     SET marker_state = 'rejected',
+                         rejected_at = COALESCE(rejected_at, ?),
+                         rejection_reason = COALESCE(rejection_reason, ?),
+                         envelope_hash = COALESCE(envelope_hash, ?)
+                     WHERE marker = ?
+                       AND marker_state = 'issued'",
+                    params![now, reason, envelope_hash, marker],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE desktop_transcript_relay_markers
+                     SET marker_state = 'consumed',
+                         consumed_at = COALESCE(consumed_at, ?),
+                         envelope_hash = COALESCE(envelope_hash, ?)
+                     WHERE marker = ?
+                       AND marker_state = 'issued'",
+                    params![consumed_at, envelope_hash, marker],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(reconciliations.len())
+    }
+
+    pub fn expire_desktop_transcript_relay_markers(&mut self, now: i64) -> Result<usize> {
+        let expired = self.conn.execute(
+            "UPDATE desktop_transcript_relay_markers
+             SET marker_state = 'expired',
+                 rejected_at = COALESCE(rejected_at, ?),
+                 rejection_reason = COALESCE(rejection_reason, 'expired')
+             WHERE marker_state = 'issued'
+               AND expires_at <= ?
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM desktop_transcript_relay_consumptions
+                 WHERE desktop_transcript_relay_consumptions.marker =
+                       desktop_transcript_relay_markers.marker
+               )",
+            params![now, now],
+        )?;
+        Ok(expired)
+    }
+
+    pub fn cleanup_desktop_transcript_relay_retention(&mut self, now: i64) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let markers_deleted = tx.execute(
+            "DELETE FROM desktop_transcript_relay_markers
+             WHERE marker_state IN ('consumed', 'expired', 'rejected')
+               AND retention_until <= ?",
+            params![now],
+        )?;
+        let consumptions_deleted = tx.execute(
+            "DELETE FROM desktop_transcript_relay_consumptions
+             WHERE consumed_at <= ?",
+            params![now - DESKTOP_TRANSCRIPT_RELAY_RETENTION_SECONDS],
+        )?;
+        tx.commit()?;
+        Ok(markers_deleted + consumptions_deleted)
+    }
+
+    pub fn update_desktop_relay_scanner_cursor(
+        &mut self,
+        scanner_binding: &DesktopRelayScannerBindingRecord,
+        cursor: (i64, i64),
+        consumed_count: usize,
+        now: i64,
+    ) -> Result<DesktopRelayScannerBindingRecord> {
+        ensure_nonempty_value("bridge_thread_id", &scanner_binding.bridge_thread_id)?;
+        let (cursor_byte_offset, cursor_line_number) = cursor;
+        if cursor_byte_offset < 0 {
+            bail!("cursor_byte_offset must be non-negative");
+        }
+        if cursor_line_number < 0 {
+            bail!("cursor_line_number must be non-negative");
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE desktop_relay_scanner_bindings
+             SET cursor_byte_offset = ?,
+                 cursor_line_number = ?,
+                 binding_state = 'active',
+                 last_scan_at = ?,
+                 last_consumed_at = CASE WHEN ? > 0 THEN ? ELSE last_consumed_at END,
+                 last_error = NULL,
+                 binding_revision = binding_revision + 1,
+                 updated_at = ?,
+                 degraded_at = NULL
+             WHERE bridge_thread_id = ?
+               AND rollout_path = ?
+               AND rollout_identity = ?
+               AND binding_state = 'active'
+               AND cursor_byte_offset = ?
+               AND cursor_line_number = ?
+               AND binding_revision = ?",
+            params![
+                cursor_byte_offset,
+                cursor_line_number,
+                now,
+                consumed_count as i64,
+                now,
+                now,
+                &scanner_binding.bridge_thread_id,
+                &scanner_binding.rollout_path,
+                &scanner_binding.rollout_identity,
+                scanner_binding.cursor_byte_offset,
+                scanner_binding.cursor_line_number,
+                scanner_binding.binding_revision,
+            ],
+        )?;
+        if tx.changes() == 0 {
+            bail!(
+                "desktop relay scanner binding changed during scan: {}",
+                scanner_binding.bridge_thread_id
+            );
+        }
+        let record =
+            query_desktop_relay_scanner_binding_tx(&tx, &scanner_binding.bridge_thread_id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn degrade_desktop_relay_scanner_binding_if_current(
+        &mut self,
+        scanner_binding: &DesktopRelayScannerBindingRecord,
+        reason: &str,
+        now: i64,
+    ) -> Result<DesktopRelayScannerBindingRecord> {
+        ensure_nonempty_value("bridge_thread_id", &scanner_binding.bridge_thread_id)?;
+        ensure_nonempty_value("reason", reason)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE desktop_relay_scanner_bindings
+             SET binding_state = 'degraded',
+                 last_scan_at = ?,
+                 last_error = ?,
+                 binding_revision = binding_revision + 1,
+                 updated_at = ?,
+                 degraded_at = COALESCE(degraded_at, ?)
+             WHERE bridge_thread_id = ?
+               AND rollout_path = ?
+               AND rollout_identity = ?
+               AND cursor_byte_offset = ?
+               AND cursor_line_number = ?
+               AND binding_state = 'active'
+               AND binding_revision = ?",
+            params![
+                now,
+                reason,
+                now,
+                now,
+                &scanner_binding.bridge_thread_id,
+                &scanner_binding.rollout_path,
+                &scanner_binding.rollout_identity,
+                scanner_binding.cursor_byte_offset,
+                scanner_binding.cursor_line_number,
+                scanner_binding.binding_revision,
+            ],
+        )?;
+        if tx.changes() == 0 {
+            bail!(
+                "desktop relay scanner binding changed during scan: {}",
+                scanner_binding.bridge_thread_id
+            );
+        }
+        let record =
+            query_desktop_relay_scanner_binding_tx(&tx, &scanner_binding.bridge_thread_id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn desktop_arm_lease_for_pending_attempt(
+        &self,
+        source_thread_id: &str,
+        attempt_id: &str,
+        generation: i64,
+        bridge_request_id: &str,
+        _now: i64,
+    ) -> Result<String> {
+        ensure_nonempty_value("source_thread_id", source_thread_id)?;
+        ensure_nonempty_value("attempt_id", attempt_id)?;
+        ensure_positive_value("generation", generation)?;
+        ensure_nonempty_value("bridge_request_id", bridge_request_id)?;
+        let attempt = self
+            .conn
+            .query_row(
+                "SELECT * FROM delivery_attempts
+                 WHERE attempt_id = ?",
+                params![attempt_id],
+                delivery_attempt_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("delivery attempt not found: {attempt_id}"))?;
+        ensure_desktop_attempt_tokens(&attempt, source_thread_id, generation)?;
+        if attempt.state != "arm_pending" {
+            bail!("delivery attempt {attempt_id} is not arm_pending");
+        }
+        if attempt.bridge_request_id.as_deref() != Some(bridge_request_id) {
+            bail!("delivery attempt {attempt_id} bridge_request_id does not match");
+        }
+        attempt
+            .bridge_arm_lease_deadline
+            .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
+        attempt
+            .bridge_arm_lease_id
+            .context("arm_pending Desktop attempt is missing bridge_arm_lease_id")
+    }
+
+    pub fn active_desktop_relay_marker_count(&self, now: i64) -> Result<i64> {
+        let retention_cutoff = now.saturating_sub(DESKTOP_TRANSCRIPT_RELAY_RETENTION_SECONDS);
+        self.conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM desktop_transcript_relay_markers
+                     WHERE marker_state = 'issued'
+                       AND EXISTS (
+                         SELECT 1
+                         FROM desktop_transcript_relay_consumptions
+                         WHERE desktop_transcript_relay_consumptions.marker =
+                               desktop_transcript_relay_markers.marker
+                       ))
+                  + (SELECT COUNT(*) FROM desktop_transcript_relay_markers
+                     WHERE marker_state = 'issued'
+                       AND expires_at <= ?
+                       AND NOT EXISTS (
+                         SELECT 1
+                         FROM desktop_transcript_relay_consumptions
+                         WHERE desktop_transcript_relay_consumptions.marker =
+                               desktop_transcript_relay_markers.marker
+                       ))
+                  + (SELECT COUNT(*) FROM desktop_transcript_relay_markers
+                     WHERE marker_state = 'issued'
+                       AND expires_at > ?
+                       AND NOT EXISTS (
+                         SELECT 1
+                         FROM desktop_transcript_relay_consumptions
+                         WHERE desktop_transcript_relay_consumptions.marker =
+                               desktop_transcript_relay_markers.marker
+                       )
+                       AND EXISTS (
+                         SELECT 1
+                         FROM desktop_relay_scanner_bindings
+                         WHERE desktop_relay_scanner_bindings.bridge_thread_id =
+                               desktop_transcript_relay_markers.bridge_thread_id
+                           AND desktop_relay_scanner_bindings.binding_state = 'active'
+                       ))
+                  + (SELECT COUNT(*) FROM desktop_transcript_relay_markers
+                     WHERE marker_state IN ('consumed', 'expired', 'rejected')
+                       AND retention_until <= ?)
+                  + (SELECT COUNT(*) FROM desktop_transcript_relay_consumptions
+                     WHERE consumed_at <= ?)",
+                params![now, now, now, retention_cutoff],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn list_desktop_arm_pending_bindings(&self, now: i64) -> Result<Vec<serde_json::Value>> {
@@ -2592,6 +3170,7 @@ impl Store {
         let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
         let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
         let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
+        let active_desktop_relay_markers = self.active_desktop_relay_marker_count(now)?;
         Ok(DaemonLifecycleStatus {
             active_jobs,
             nonterminal_tasks,
@@ -2599,6 +3178,7 @@ impl Store {
             cli_acceptances_stale_now,
             active_cli_observations,
             cli_observations_due_now,
+            active_desktop_relay_markers,
             open_batches_due_now,
             open_batches_due_within_idle,
         })
@@ -2630,6 +3210,7 @@ impl Store {
         let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
         let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
         let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
+        let active_desktop_relay_markers = self.active_desktop_relay_marker_count(now)?;
         Ok(DaemonLifecycleStatus {
             active_jobs,
             nonterminal_tasks,
@@ -2637,6 +3218,7 @@ impl Store {
             cli_acceptances_stale_now,
             active_cli_observations,
             cli_observations_due_now,
+            active_desktop_relay_markers,
             open_batches_due_now,
             open_batches_due_within_idle,
         })
@@ -2667,6 +3249,7 @@ impl Store {
         let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
         let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
         let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
+        let active_desktop_relay_markers = self.active_desktop_relay_marker_count(now)?;
         Ok(DaemonLifecycleStatus {
             active_jobs,
             nonterminal_tasks,
@@ -2674,6 +3257,7 @@ impl Store {
             cli_acceptances_stale_now,
             active_cli_observations,
             cli_observations_due_now,
+            active_desktop_relay_markers,
             open_batches_due_now,
             open_batches_due_within_idle,
         })
@@ -2730,6 +3314,7 @@ impl Store {
         let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
         let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
         let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
+        let active_desktop_relay_markers = self.active_desktop_relay_marker_count(now)?;
         Ok(DaemonLifecycleStatus {
             active_jobs,
             nonterminal_tasks,
@@ -2737,6 +3322,7 @@ impl Store {
             cli_acceptances_stale_now,
             active_cli_observations,
             cli_observations_due_now,
+            active_desktop_relay_markers,
             open_batches_due_now,
             open_batches_due_within_idle,
         })
@@ -3405,6 +3991,48 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_desktop_transcript_relay_consumptions_thread
             ON desktop_transcript_relay_consumptions(source_thread_id, consumed_at);
 
+        CREATE TABLE IF NOT EXISTS desktop_relay_scanner_bindings (
+            bridge_thread_id TEXT PRIMARY KEY,
+            rollout_path TEXT NOT NULL,
+            rollout_identity TEXT NOT NULL,
+            cursor_byte_offset INTEGER NOT NULL,
+            cursor_line_number INTEGER NOT NULL,
+            binding_state TEXT NOT NULL CHECK (binding_state IN ('active', 'degraded')),
+            last_scan_at INTEGER,
+            last_consumed_at INTEGER,
+            last_error TEXT,
+            binding_revision INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            degraded_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_desktop_relay_scanner_bindings_state
+            ON desktop_relay_scanner_bindings(binding_state, updated_at);
+
+        CREATE TABLE IF NOT EXISTS desktop_transcript_relay_markers (
+            marker TEXT PRIMARY KEY,
+            bridge_thread_id TEXT NOT NULL,
+            envelope_kind TEXT NOT NULL CHECK (envelope_kind IN ('arm_pending_requested', 'arm_accepted')),
+            source_thread_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            bridge_request_id TEXT NOT NULL,
+            marker_state TEXT NOT NULL CHECK (marker_state IN ('issued', 'consumed', 'expired', 'rejected')),
+            issued_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            retention_until INTEGER NOT NULL,
+            consumed_at INTEGER,
+            rejected_at INTEGER,
+            rejection_reason TEXT,
+            envelope_hash TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_desktop_transcript_relay_markers_scan
+            ON desktop_transcript_relay_markers(bridge_thread_id, marker_state, expires_at);
+        CREATE INDEX IF NOT EXISTS idx_desktop_transcript_relay_markers_retention
+            ON desktop_transcript_relay_markers(marker_state, retention_until);
+
         CREATE TABLE IF NOT EXISTS batch_jobs (
             batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
             job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
@@ -3615,6 +4243,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         "desktop_bindings",
         "pause_deadline",
         "ALTER TABLE desktop_bindings ADD COLUMN pause_deadline INTEGER",
+    )?;
+    ensure_column(
+        conn,
+        "desktop_relay_scanner_bindings",
+        "binding_revision",
+        "ALTER TABLE desktop_relay_scanner_bindings ADD COLUMN binding_revision INTEGER NOT NULL DEFAULT 1",
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_desktop_bindings_pause_due
@@ -4713,6 +5347,228 @@ fn insert_desktop_transcript_relay_consumption_tx(
     Ok(())
 }
 
+enum DesktopTranscriptRelayConsumeTxResult {
+    Consumed(DesktopTranscriptRelayConsumptionRecord),
+    DurableCasFailed { error_message: String },
+}
+
+fn validate_desktop_transcript_relay_consumption(
+    consumption: &NewDesktopTranscriptRelayConsumption,
+) -> Result<()> {
+    ensure_nonempty_value("marker", &consumption.marker)?;
+    ensure_nonempty_value("envelope_hash", &consumption.envelope_hash)?;
+    ensure_nonempty_value("envelope_kind", &consumption.envelope_kind)?;
+    ensure_nonempty_value("envelope_json", &consumption.envelope_json)?;
+    ensure_nonempty_value("source_thread_id", &consumption.source_thread_id)?;
+    ensure_nonempty_value("attempt_id", &consumption.attempt_id)?;
+    ensure_positive_value("generation", consumption.generation)?;
+    ensure_nonempty_value("bridge_request_id", &consumption.bridge_request_id)?;
+    if consumption.envelope_kind == "arm_requested" {
+        ensure_nonempty_value(
+            "bridge_arm_lease_id",
+            consumption.bridge_arm_lease_id.as_deref().unwrap_or(""),
+        )?;
+    } else if consumption.envelope_kind != "arm_pending_requested" {
+        bail!(
+            "unsupported Desktop transcript relay envelope kind {}",
+            consumption.envelope_kind
+        );
+    }
+    Ok(())
+}
+
+fn ensure_desktop_relay_marker_matches_consumption(
+    marker: &DesktopTranscriptRelayMarkerRecord,
+    consumption: &NewDesktopTranscriptRelayConsumption,
+) -> Result<()> {
+    if marker.marker_state != "issued" {
+        bail!(
+            "Desktop transcript relay marker {} is {}, not issued",
+            marker.marker,
+            marker.marker_state
+        );
+    }
+    if marker.expires_at <= consumption.now {
+        bail!(
+            "Desktop transcript relay marker {} expired before consumption",
+            marker.marker
+        );
+    }
+    let expected_marker_kind = match consumption.envelope_kind.as_str() {
+        "arm_pending_requested" => "arm_pending_requested",
+        "arm_requested" => "arm_accepted",
+        _ => unreachable!("relay consumption was validated above"),
+    };
+    if marker.envelope_kind != expected_marker_kind {
+        bail!(
+            "Desktop transcript relay marker {} kind {} does not match consumption kind {}",
+            marker.marker,
+            marker.envelope_kind,
+            consumption.envelope_kind
+        );
+    }
+    if marker.source_thread_id != consumption.source_thread_id
+        || marker.attempt_id != consumption.attempt_id
+        || marker.generation != consumption.generation
+        || marker.bridge_request_id != consumption.bridge_request_id
+    {
+        bail!(
+            "Desktop transcript relay marker {} tokens do not match consumption",
+            marker.marker
+        );
+    }
+    if let Some(existing_hash) = marker.envelope_hash.as_deref()
+        && existing_hash != consumption.envelope_hash
+    {
+        bail!(
+            "Desktop transcript relay marker {} was already recorded with another envelope hash",
+            marker.marker
+        );
+    }
+    Ok(())
+}
+
+fn ensure_desktop_relay_scanner_binding_matches_tx(
+    tx: &Transaction<'_>,
+    scanner_binding: &DesktopRelayScannerBindingRecord,
+    marker: &DesktopTranscriptRelayMarkerRecord,
+) -> Result<()> {
+    if scanner_binding.bridge_thread_id != marker.bridge_thread_id {
+        bail!(
+            "desktop relay scanner binding changed during consumption: {}",
+            marker.bridge_thread_id
+        );
+    }
+    let current =
+        query_desktop_relay_scanner_binding_tx(tx, scanner_binding.bridge_thread_id.as_str())?;
+    if current.binding_state != "active"
+        || current.rollout_path != scanner_binding.rollout_path
+        || current.rollout_identity != scanner_binding.rollout_identity
+        || current.cursor_byte_offset != scanner_binding.cursor_byte_offset
+        || current.cursor_line_number != scanner_binding.cursor_line_number
+        || current.binding_revision != scanner_binding.binding_revision
+    {
+        bail!(
+            "desktop relay scanner binding changed during consumption: {}",
+            scanner_binding.bridge_thread_id
+        );
+    }
+    Ok(())
+}
+
+fn consume_desktop_transcript_relay_tx(
+    tx: &Transaction<'_>,
+    consumption: &NewDesktopTranscriptRelayConsumption,
+) -> Result<DesktopTranscriptRelayConsumeTxResult> {
+    if let Some((existing_hash, existing_kind, consumed_at, outcome_json)) = tx
+        .query_row(
+            "SELECT envelope_hash, envelope_kind, consumed_at, outcome_json
+             FROM desktop_transcript_relay_consumptions
+             WHERE marker = ?",
+            params![&consumption.marker],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+    {
+        if existing_hash != consumption.envelope_hash {
+            bail!(
+                "Desktop transcript relay marker {} was already consumed with another envelope hash",
+                consumption.marker
+            );
+        }
+        let outcome: serde_json::Value =
+            serde_json::from_str(&outcome_json).context("parse stored relay outcome JSON")?;
+        if outcome.get("outcome").and_then(serde_json::Value::as_str) == Some("cas_failed") {
+            let error_message = outcome
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("stored CAS failure");
+            return Ok(DesktopTranscriptRelayConsumeTxResult::DurableCasFailed {
+                error_message: format!(
+                    "Desktop transcript relay marker {} replayed failed CAS: {}",
+                    consumption.marker, error_message
+                ),
+            });
+        }
+        return Ok(DesktopTranscriptRelayConsumeTxResult::Consumed(
+            DesktopTranscriptRelayConsumptionRecord {
+                marker: consumption.marker.clone(),
+                envelope_hash: existing_hash,
+                envelope_kind: existing_kind,
+                replay_state: "replayed".to_owned(),
+                consumed_at,
+                outcome,
+            },
+        ));
+    }
+
+    let outcome_result = match consumption.envelope_kind.as_str() {
+        "arm_pending_requested" => {
+            match note_desktop_arm_pending_tx(
+                tx,
+                &consumption.source_thread_id,
+                &consumption.attempt_id,
+                consumption.generation,
+                &consumption.bridge_request_id,
+                consumption.now,
+            ) {
+                Ok(record) => serde_json::to_value(record).map_err(Into::into),
+                Err(error) => Err(error),
+            }
+        }
+        "arm_requested" => {
+            let bridge_arm_lease_id = consumption
+                .bridge_arm_lease_id
+                .as_deref()
+                .context("arm_requested envelope missing bridge_arm_lease_id")?;
+            match note_desktop_arm_tx(
+                tx,
+                &consumption.source_thread_id,
+                &consumption.attempt_id,
+                consumption.generation,
+                &consumption.bridge_request_id,
+                bridge_arm_lease_id,
+                consumption.now,
+            ) {
+                Ok(record) => serde_json::to_value(record).map_err(Into::into),
+                Err(error) => Err(error),
+            }
+        }
+        _ => unreachable!("envelope kind was validated above"),
+    };
+    let outcome = match outcome_result {
+        Ok(outcome) => outcome,
+        Err(error) if is_durable_desktop_arm_failure(&error) => {
+            let error_message = error.to_string();
+            let outcome = serde_json::json!({
+                "outcome": "cas_failed",
+                "error": &error_message,
+            });
+            insert_desktop_transcript_relay_consumption_tx(tx, consumption, &outcome)?;
+            return Ok(DesktopTranscriptRelayConsumeTxResult::DurableCasFailed { error_message });
+        }
+        Err(error) => return Err(error),
+    };
+    insert_desktop_transcript_relay_consumption_tx(tx, consumption, &outcome)?;
+    Ok(DesktopTranscriptRelayConsumeTxResult::Consumed(
+        DesktopTranscriptRelayConsumptionRecord {
+            marker: consumption.marker.clone(),
+            envelope_hash: consumption.envelope_hash.clone(),
+            envelope_kind: consumption.envelope_kind.clone(),
+            replay_state: "fresh".to_owned(),
+            consumed_at: consumption.now,
+            outcome,
+        },
+    ))
+}
+
 fn query_active_delivery_attempt_for_cli_session_tx(
     tx: &Transaction<'_>,
     managed_session_id: &str,
@@ -5608,6 +6464,74 @@ fn desktop_binding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Desktop
     })
 }
 
+fn query_desktop_relay_scanner_binding_tx(
+    tx: &Transaction<'_>,
+    bridge_thread_id: &str,
+) -> Result<DesktopRelayScannerBindingRecord> {
+    tx.query_row(
+        "SELECT * FROM desktop_relay_scanner_bindings WHERE bridge_thread_id = ?",
+        params![bridge_thread_id],
+        desktop_relay_scanner_binding_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("desktop relay scanner binding not found: {bridge_thread_id}"))
+}
+
+fn desktop_relay_scanner_binding_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DesktopRelayScannerBindingRecord> {
+    Ok(DesktopRelayScannerBindingRecord {
+        bridge_thread_id: row.get("bridge_thread_id")?,
+        rollout_path: row.get("rollout_path")?,
+        rollout_identity: row.get("rollout_identity")?,
+        cursor_byte_offset: row.get("cursor_byte_offset")?,
+        cursor_line_number: row.get("cursor_line_number")?,
+        binding_revision: row.get("binding_revision")?,
+        binding_state: row.get("binding_state")?,
+        last_scan_at: row.get("last_scan_at")?,
+        last_consumed_at: row.get("last_consumed_at")?,
+        last_error: row.get("last_error")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        degraded_at: row.get("degraded_at")?,
+    })
+}
+
+fn query_desktop_transcript_relay_marker_tx(
+    tx: &Transaction<'_>,
+    marker: &str,
+) -> Result<DesktopTranscriptRelayMarkerRecord> {
+    tx.query_row(
+        "SELECT * FROM desktop_transcript_relay_markers WHERE marker = ?",
+        params![marker],
+        desktop_transcript_relay_marker_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| anyhow!("desktop transcript relay marker not found: {marker}"))
+}
+
+fn desktop_transcript_relay_marker_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DesktopTranscriptRelayMarkerRecord> {
+    Ok(DesktopTranscriptRelayMarkerRecord {
+        marker: row.get("marker")?,
+        bridge_thread_id: row.get("bridge_thread_id")?,
+        envelope_kind: row.get("envelope_kind")?,
+        source_thread_id: row.get("source_thread_id")?,
+        attempt_id: row.get("attempt_id")?,
+        generation: row.get("generation")?,
+        bridge_request_id: row.get("bridge_request_id")?,
+        marker_state: row.get("marker_state")?,
+        issued_at: row.get("issued_at")?,
+        expires_at: row.get("expires_at")?,
+        retention_until: row.get("retention_until")?,
+        consumed_at: row.get("consumed_at")?,
+        rejected_at: row.get("rejected_at")?,
+        rejection_reason: row.get("rejection_reason")?,
+        envelope_hash: row.get("envelope_hash")?,
+    })
+}
+
 fn ensure_job_pending(job: &JobRecord) -> Result<()> {
     if job.status == "pending" {
         Ok(())
@@ -6442,6 +7366,542 @@ mod tests {
             .list_tasks(None, None, 10_000)
             .expect("list clamped tasks");
         assert_eq!(tasks.len(), 500);
+    }
+
+    #[test]
+    fn desktop_relay_marker_count_includes_expiry_and_retention_work() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+
+        let retention_binding = store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-retention-work".to_owned(),
+                rollout_path: "/tmp/retention-work.jsonl".to_owned(),
+                rollout_identity: "unix:1:1".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 9,
+            })
+            .expect("bind scanner");
+        store
+            .issue_desktop_transcript_relay_marker(NewDesktopTranscriptRelayMarker {
+                marker: "marker-retention-work".to_owned(),
+                bridge_thread_id: "bridge-retention-work".to_owned(),
+                envelope_kind: "arm_pending_requested".to_owned(),
+                source_thread_id: "thread-retention-work".to_owned(),
+                attempt_id: "attempt-retention-work".to_owned(),
+                generation: 1,
+                bridge_request_id: "request-retention-work".to_owned(),
+                issued_at: 10,
+                expires_at: 20,
+                retention_until: 30,
+            })
+            .expect("issue marker");
+
+        assert_eq!(
+            store
+                .active_desktop_relay_marker_count(19)
+                .expect("active marker count"),
+            1
+        );
+        store
+            .degrade_desktop_relay_scanner_binding_if_current(&retention_binding, "test drift", 19)
+            .expect("degrade scanner");
+        assert_eq!(
+            store
+                .active_desktop_relay_marker_count(19)
+                .expect("degraded binding marker should not keep daemon alive"),
+            0
+        );
+        assert_eq!(
+            store
+                .active_desktop_relay_marker_count(20)
+                .expect("expired marker still needs maintenance"),
+            1
+        );
+        assert_eq!(
+            store
+                .expire_desktop_transcript_relay_markers(20)
+                .expect("expire marker"),
+            1
+        );
+        assert_eq!(
+            store
+                .active_desktop_relay_marker_count(29)
+                .expect("expired marker before retention"),
+            0
+        );
+        assert_eq!(
+            store
+                .active_desktop_relay_marker_count(30)
+                .expect("retention cleanup due"),
+            1
+        );
+        assert_eq!(
+            store
+                .cleanup_desktop_transcript_relay_retention(30)
+                .expect("cleanup retention"),
+            1
+        );
+        assert_eq!(
+            store
+                .active_desktop_relay_marker_count(30)
+                .expect("no marker maintenance after cleanup"),
+            0
+        );
+    }
+
+    #[test]
+    fn desktop_relay_marker_reconciles_consumption_before_expiry() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+
+        store
+            .issue_desktop_transcript_relay_marker(NewDesktopTranscriptRelayMarker {
+                marker: "marker-consumed-before-expiry".to_owned(),
+                bridge_thread_id: "bridge-consumed-before-expiry".to_owned(),
+                envelope_kind: "arm_pending_requested".to_owned(),
+                source_thread_id: "thread-consumed-before-expiry".to_owned(),
+                attempt_id: "attempt-consumed-before-expiry".to_owned(),
+                generation: 1,
+                bridge_request_id: "request-consumed-before-expiry".to_owned(),
+                issued_at: 10,
+                expires_at: 20,
+                retention_until: 30,
+            })
+            .expect("issue marker");
+        let outcome_json = serde_json::to_string(&serde_json::json!({ "outcome": "arm_pending" }))
+            .expect("outcome JSON");
+        store
+            .conn
+            .execute(
+                "INSERT INTO desktop_transcript_relay_consumptions (
+                    marker, envelope_hash, envelope_kind, envelope_json,
+                    source_thread_id, attempt_id, consumed_at, outcome_json
+                ) VALUES (?, ?, 'arm_pending_requested', '{}', ?, ?, ?, ?)",
+                params![
+                    "marker-consumed-before-expiry",
+                    "hash-consumed-before-expiry",
+                    "thread-consumed-before-expiry",
+                    "attempt-consumed-before-expiry",
+                    19,
+                    outcome_json,
+                ],
+            )
+            .expect("insert consumption");
+
+        assert_eq!(
+            store
+                .active_desktop_relay_marker_count(20)
+                .expect("consumed issued marker needs reconciliation"),
+            1
+        );
+        assert_eq!(
+            store
+                .expire_desktop_transcript_relay_markers(20)
+                .expect("expiry skips consumed issued marker"),
+            0
+        );
+        assert_eq!(
+            store
+                .reconcile_desktop_transcript_relay_consumed_markers(21)
+                .expect("reconcile consumed marker"),
+            1
+        );
+        let (state, hash, consumed_at): (String, String, i64) = store
+            .conn
+            .query_row(
+                "SELECT marker_state, envelope_hash, consumed_at
+                 FROM desktop_transcript_relay_markers
+                 WHERE marker = ?",
+                params!["marker-consumed-before-expiry"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query reconciled marker");
+        assert_eq!(state, "consumed");
+        assert_eq!(hash, "hash-consumed-before-expiry");
+        assert_eq!(consumed_at, 19);
+    }
+
+    #[test]
+    fn desktop_relay_marker_must_still_be_issued_before_cas() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let fixture = store
+            .prepare_desktop_writeback_fixture(NewDesktopWritebackFixture {
+                source_thread_id: "thread-atomic-marker".to_owned(),
+                caller_automation_id: "automation-atomic-marker".to_owned(),
+                bridge_request_id: "request-atomic-marker".to_owned(),
+                default_validation_fingerprint: "fp-atomic-marker".to_owned(),
+                now: 10,
+            })
+            .expect("prepare fixture");
+        store
+            .issue_desktop_transcript_relay_marker(NewDesktopTranscriptRelayMarker {
+                marker: "marker-atomic-marker".to_owned(),
+                bridge_thread_id: "bridge-atomic-marker".to_owned(),
+                envelope_kind: "arm_pending_requested".to_owned(),
+                source_thread_id: fixture.source_thread_id.clone(),
+                attempt_id: fixture.attempt.attempt_id.clone(),
+                generation: fixture.attempt.generation,
+                bridge_request_id: fixture.bridge_request_id.clone(),
+                issued_at: 11,
+                expires_at: 100,
+                retention_until: 200,
+            })
+            .expect("issue marker");
+        let scanner_binding = store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-atomic-marker".to_owned(),
+                rollout_path: "/tmp/atomic-marker.jsonl".to_owned(),
+                rollout_identity: "unix:10:11".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 11,
+            })
+            .expect("bind scanner");
+        store
+            .mark_desktop_transcript_relay_marker_rejected_for_scanner(
+                "marker-atomic-marker",
+                "simulated concurrent rejection",
+                None,
+                &scanner_binding,
+                12,
+            )
+            .expect("reject marker");
+
+        let error = store
+            .consume_issued_desktop_transcript_relay_marker(
+                NewDesktopTranscriptRelayConsumption {
+                    marker: "marker-atomic-marker".to_owned(),
+                    envelope_hash: "hash-atomic-marker".to_owned(),
+                    envelope_kind: "arm_pending_requested".to_owned(),
+                    envelope_json: "{}".to_owned(),
+                    source_thread_id: fixture.source_thread_id.clone(),
+                    attempt_id: fixture.attempt.attempt_id.clone(),
+                    generation: fixture.attempt.generation,
+                    bridge_request_id: fixture.bridge_request_id.clone(),
+                    bridge_arm_lease_id: None,
+                    now: 13,
+                },
+                &scanner_binding,
+            )
+            .expect_err("non-issued marker must fail before CAS");
+        assert!(
+            error.to_string().contains("not issued"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            store
+                .inspect_attempt(&fixture.attempt.attempt_id)
+                .expect("inspect attempt")
+                .state,
+            "prepared"
+        );
+        let consumptions: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM desktop_transcript_relay_consumptions WHERE marker = ?",
+                params!["marker-atomic-marker"],
+                |row| row.get(0),
+            )
+            .expect("count consumptions");
+        assert_eq!(consumptions, 0);
+    }
+
+    #[test]
+    fn desktop_relay_marker_cas_requires_unchanged_scanner_binding() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let fixture = store
+            .prepare_desktop_writeback_fixture(NewDesktopWritebackFixture {
+                source_thread_id: "thread-atomic-binding".to_owned(),
+                caller_automation_id: "automation-atomic-binding".to_owned(),
+                bridge_request_id: "request-atomic-binding".to_owned(),
+                default_validation_fingerprint: "fp-atomic-binding".to_owned(),
+                now: 20,
+            })
+            .expect("prepare fixture");
+        store
+            .issue_desktop_transcript_relay_marker(NewDesktopTranscriptRelayMarker {
+                marker: "marker-atomic-binding".to_owned(),
+                bridge_thread_id: "bridge-atomic-binding".to_owned(),
+                envelope_kind: "arm_pending_requested".to_owned(),
+                source_thread_id: fixture.source_thread_id.clone(),
+                attempt_id: fixture.attempt.attempt_id.clone(),
+                generation: fixture.attempt.generation,
+                bridge_request_id: fixture.bridge_request_id.clone(),
+                issued_at: 21,
+                expires_at: 100,
+                retention_until: 200,
+            })
+            .expect("issue marker");
+        let stale_binding = store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-atomic-binding".to_owned(),
+                rollout_path: "/tmp/atomic-binding.jsonl".to_owned(),
+                rollout_identity: "unix:20:21".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 21,
+            })
+            .expect("bind scanner");
+        store
+            .update_desktop_relay_scanner_cursor(&stale_binding, (128, 4), 0, 22)
+            .expect("advance cursor");
+
+        let error = store
+            .consume_issued_desktop_transcript_relay_marker(
+                NewDesktopTranscriptRelayConsumption {
+                    marker: "marker-atomic-binding".to_owned(),
+                    envelope_hash: "hash-atomic-binding".to_owned(),
+                    envelope_kind: "arm_pending_requested".to_owned(),
+                    envelope_json: "{}".to_owned(),
+                    source_thread_id: fixture.source_thread_id.clone(),
+                    attempt_id: fixture.attempt.attempt_id.clone(),
+                    generation: fixture.attempt.generation,
+                    bridge_request_id: fixture.bridge_request_id.clone(),
+                    bridge_arm_lease_id: None,
+                    now: 23,
+                },
+                &stale_binding,
+            )
+            .expect_err("stale scanner binding must fail before CAS");
+        assert!(
+            error
+                .to_string()
+                .contains("scanner binding changed during consumption"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            store
+                .inspect_attempt(&fixture.attempt.attempt_id)
+                .expect("inspect attempt")
+                .state,
+            "prepared"
+        );
+        let consumptions: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM desktop_transcript_relay_consumptions WHERE marker = ?",
+                params!["marker-atomic-binding"],
+                |row| row.get(0),
+            )
+            .expect("count consumptions");
+        assert_eq!(consumptions, 0);
+
+        let reject_error = store
+            .mark_desktop_transcript_relay_marker_rejected_for_scanner(
+                "marker-atomic-binding",
+                "simulated stale reject",
+                None,
+                &stale_binding,
+                24,
+            )
+            .expect_err("stale scanner binding must not reject marker");
+        assert!(
+            reject_error
+                .to_string()
+                .contains("scanner binding changed during consumption"),
+            "unexpected error: {reject_error:#}"
+        );
+        let marker_state: String = store
+            .conn
+            .query_row(
+                "SELECT marker_state FROM desktop_transcript_relay_markers WHERE marker = ?",
+                params!["marker-atomic-binding"],
+                |row| row.get(0),
+            )
+            .expect("query marker state");
+        assert_eq!(marker_state, "issued");
+    }
+
+    #[test]
+    fn desktop_relay_cursor_update_rejects_rebound_same_cursor() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let stale_binding = store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-rebound-cursor".to_owned(),
+                rollout_path: "/tmp/rebound-old.jsonl".to_owned(),
+                rollout_identity: "unix:30:31".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 30,
+            })
+            .expect("bind old scanner");
+        store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-rebound-cursor".to_owned(),
+                rollout_path: "/tmp/rebound-new.jsonl".to_owned(),
+                rollout_identity: "unix:40:41".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 31,
+            })
+            .expect("rebind scanner at same cursor");
+
+        let error = store
+            .update_desktop_relay_scanner_cursor(&stale_binding, (256, 8), 0, 32)
+            .expect_err("stale scanner tick must not advance rebound binding with same cursor");
+        assert!(
+            error.to_string().contains("changed during scan"),
+            "unexpected error: {error:#}"
+        );
+        let binding = store
+            .list_desktop_relay_scanner_bindings(Some("bridge-rebound-cursor"))
+            .expect("list binding")
+            .pop()
+            .expect("binding");
+        assert_eq!(binding.rollout_path, "/tmp/rebound-new.jsonl");
+        assert_eq!(binding.rollout_identity, "unix:40:41");
+        assert_eq!(binding.cursor_byte_offset, 0);
+        assert_eq!(binding.cursor_line_number, 0);
+        assert_eq!(binding.binding_state, "active");
+    }
+
+    #[test]
+    fn desktop_relay_cursor_update_rejects_same_second_identical_rebind() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let stale_binding = store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-identical-rebind".to_owned(),
+                rollout_path: "/tmp/identical-rebind.jsonl".to_owned(),
+                rollout_identity: "unix:50:51".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 50,
+            })
+            .expect("bind scanner");
+        let current_binding = store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-identical-rebind".to_owned(),
+                rollout_path: "/tmp/identical-rebind.jsonl".to_owned(),
+                rollout_identity: "unix:50:51".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 50,
+            })
+            .expect("rebind scanner with identical values in same second");
+
+        assert_eq!(stale_binding.updated_at, current_binding.updated_at);
+        assert_eq!(stale_binding.rollout_path, current_binding.rollout_path);
+        assert_eq!(
+            stale_binding.rollout_identity,
+            current_binding.rollout_identity
+        );
+        assert_eq!(
+            current_binding.binding_revision,
+            stale_binding.binding_revision + 1
+        );
+
+        let error = store
+            .update_desktop_relay_scanner_cursor(&stale_binding, (256, 8), 0, 51)
+            .expect_err("stale scanner tick must not advance identical replacement binding");
+        assert!(
+            error.to_string().contains("changed during scan"),
+            "unexpected error: {error:#}"
+        );
+        let degrade_error = store
+            .degrade_desktop_relay_scanner_binding_if_current(
+                &stale_binding,
+                "simulated stale degrade",
+                51,
+            )
+            .expect_err("stale scanner tick must not degrade identical replacement binding");
+        assert!(
+            degrade_error.to_string().contains("changed during scan"),
+            "unexpected error: {degrade_error:#}"
+        );
+        let binding = store
+            .list_desktop_relay_scanner_bindings(Some("bridge-identical-rebind"))
+            .expect("list binding")
+            .pop()
+            .expect("binding");
+        assert_eq!(binding.cursor_byte_offset, 0);
+        assert_eq!(binding.cursor_line_number, 0);
+        assert_eq!(binding.binding_state, "active");
+        assert_eq!(binding.binding_revision, current_binding.binding_revision);
+    }
+
+    #[test]
+    fn desktop_relay_cursor_update_rejects_stale_scan_ticks() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let initial_binding = store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-stale-cursor".to_owned(),
+                rollout_path: "/tmp/stale-cursor.jsonl".to_owned(),
+                rollout_identity: "unix:1:2".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 10,
+            })
+            .expect("bind scanner");
+        store
+            .update_desktop_relay_scanner_cursor(&initial_binding, (100, 5), 1, 11)
+            .expect("advance cursor");
+
+        let degrade_error = store
+            .degrade_desktop_relay_scanner_binding_if_current(
+                &initial_binding,
+                "simulated stale degrade",
+                12,
+            )
+            .expect_err("stale scanner tick must not degrade replacement state");
+        assert!(
+            degrade_error.to_string().contains("changed during scan"),
+            "unexpected error: {degrade_error:#}"
+        );
+
+        let error = store
+            .update_desktop_relay_scanner_cursor(&initial_binding, (50, 3), 0, 12)
+            .expect_err("stale scanner tick must not move cursor backward");
+        assert!(
+            error.to_string().contains("changed during scan"),
+            "unexpected error: {error:#}"
+        );
+        let binding = store
+            .list_desktop_relay_scanner_bindings(Some("bridge-stale-cursor"))
+            .expect("list binding")
+            .pop()
+            .expect("binding");
+        assert_eq!(binding.cursor_byte_offset, 100);
+        assert_eq!(binding.cursor_line_number, 5);
+        assert_eq!(binding.binding_state, "active");
+
+        let current_binding = store
+            .list_desktop_relay_scanner_bindings(Some("bridge-stale-cursor"))
+            .expect("list current binding")
+            .pop()
+            .expect("current binding");
+        store
+            .degrade_desktop_relay_scanner_binding_if_current(&current_binding, "test degrade", 13)
+            .expect("degrade binding");
+        let error = store
+            .update_desktop_relay_scanner_cursor(&current_binding, (120, 6), 0, 14)
+            .expect_err("stale scanner tick must not clear degraded state");
+        assert!(
+            error.to_string().contains("changed during scan"),
+            "unexpected error: {error:#}"
+        );
+        let binding = store
+            .list_desktop_relay_scanner_bindings(Some("bridge-stale-cursor"))
+            .expect("list binding")
+            .pop()
+            .expect("binding");
+        assert_eq!(binding.cursor_byte_offset, 100);
+        assert_eq!(binding.cursor_line_number, 5);
+        assert_eq!(binding.binding_state, "degraded");
+        assert_eq!(binding.last_error.as_deref(), Some("test degrade"));
     }
 
     #[test]

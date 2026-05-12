@@ -45,7 +45,7 @@ superseded_by:
 - Post-release daemon follow-ups should continue in the active backlog rather than this completed release-tracking entry.
 
 ## Evidence
-- Design: [DAEMON_UPGRADE_SAFETY.md](../../../DAEMON_UPGRADE_SAFETY.md)
+- Design: [DAEMON_UPGRADE_SAFETY.md](../../../plans/DAEMON_UPGRADE_SAFETY.md)
 - PR3: https://github.com/JoeyTeng/codex-background-task-handler/pull/64
 - PR4: https://github.com/JoeyTeng/codex-background-task-handler/pull/66
 - PR5: https://github.com/JoeyTeng/codex-background-task-handler/pull/67

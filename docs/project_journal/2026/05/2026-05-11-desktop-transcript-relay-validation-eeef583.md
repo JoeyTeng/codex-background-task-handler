@@ -40,7 +40,7 @@ superseded_by: 20260511-00afcf6-desktop-transcript-relay-consumer
 - Base branch: `master`
 - Base commit: `eeef583099d22af196e9525aa80de2d4a4cd5397`
 - Prior filesystem writeback blocker: [Desktop writeback dropbox probe](2026-05-11-desktop-writeback-dropbox-probe-2b4ea02.md)
-- Validation instructions: [Desktop transcript relay validation](../../../DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md)
+- Validation instructions: [Desktop transcript relay validation](../../../validation/DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md)
 - Interactive Desktop tool-output validation:
   - marker: `CBTH_TRANSCRIPT_RELAY_INTERACTIVE_20260511T132728Z`
   - rollout: `/Users/hoteng/.codex/sessions/2026/04/22/rollout-2026-04-22T10-14-58-019db478-a40c-7a62-b8d0-70ef2c3249d1.jsonl`
