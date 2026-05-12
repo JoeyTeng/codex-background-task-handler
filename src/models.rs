@@ -513,6 +513,7 @@ pub struct DesktopRelayScannerBindingRecord {
     pub rollout_identity: String,
     pub cursor_byte_offset: i64,
     pub cursor_line_number: i64,
+    pub binding_revision: i64,
     pub binding_state: String,
     pub last_scan_at: Option<i64>,
     pub last_consumed_at: Option<i64>,

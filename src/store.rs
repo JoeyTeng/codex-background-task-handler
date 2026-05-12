@@ -2512,8 +2512,8 @@ impl Store {
                 bridge_thread_id, rollout_path, rollout_identity,
                 cursor_byte_offset, cursor_line_number, binding_state,
                 last_scan_at, last_consumed_at, last_error,
-                created_at, updated_at, degraded_at
-            ) VALUES (?, ?, ?, ?, ?, 'active', NULL, NULL, NULL, ?, ?, NULL)
+                binding_revision, created_at, updated_at, degraded_at
+            ) VALUES (?, ?, ?, ?, ?, 'active', NULL, NULL, NULL, 1, ?, ?, NULL)
             ON CONFLICT(bridge_thread_id) DO UPDATE SET
                 rollout_path = excluded.rollout_path,
                 rollout_identity = excluded.rollout_identity,
@@ -2523,6 +2523,7 @@ impl Store {
                 last_scan_at = NULL,
                 last_consumed_at = NULL,
                 last_error = NULL,
+                binding_revision = desktop_relay_scanner_bindings.binding_revision + 1,
                 updated_at = excluded.updated_at,
                 degraded_at = NULL",
             params![
@@ -2882,6 +2883,7 @@ impl Store {
                  last_scan_at = ?,
                  last_consumed_at = CASE WHEN ? > 0 THEN ? ELSE last_consumed_at END,
                  last_error = NULL,
+                 binding_revision = binding_revision + 1,
                  updated_at = ?,
                  degraded_at = NULL
              WHERE bridge_thread_id = ?
@@ -2890,7 +2892,7 @@ impl Store {
                AND binding_state = 'active'
                AND cursor_byte_offset = ?
                AND cursor_line_number = ?
-               AND updated_at = ?",
+               AND binding_revision = ?",
             params![
                 cursor_byte_offset,
                 cursor_line_number,
@@ -2903,7 +2905,7 @@ impl Store {
                 &scanner_binding.rollout_identity,
                 scanner_binding.cursor_byte_offset,
                 scanner_binding.cursor_line_number,
-                scanner_binding.updated_at,
+                scanner_binding.binding_revision,
             ],
         )?;
         if tx.changes() == 0 {
@@ -2934,6 +2936,7 @@ impl Store {
              SET binding_state = 'degraded',
                  last_scan_at = ?,
                  last_error = ?,
+                 binding_revision = binding_revision + 1,
                  updated_at = ?,
                  degraded_at = COALESCE(degraded_at, ?)
              WHERE bridge_thread_id = ?
@@ -2942,7 +2945,7 @@ impl Store {
                AND cursor_byte_offset = ?
                AND cursor_line_number = ?
                AND binding_state = 'active'
-               AND updated_at = ?",
+               AND binding_revision = ?",
             params![
                 now,
                 reason,
@@ -2953,7 +2956,7 @@ impl Store {
                 &scanner_binding.rollout_identity,
                 scanner_binding.cursor_byte_offset,
                 scanner_binding.cursor_line_number,
-                scanner_binding.updated_at,
+                scanner_binding.binding_revision,
             ],
         )?;
         if tx.changes() == 0 {
@@ -3998,6 +4001,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             last_scan_at INTEGER,
             last_consumed_at INTEGER,
             last_error TEXT,
+            binding_revision INTEGER NOT NULL DEFAULT 1,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             degraded_at INTEGER
@@ -4239,6 +4243,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         "desktop_bindings",
         "pause_deadline",
         "ALTER TABLE desktop_bindings ADD COLUMN pause_deadline INTEGER",
+    )?;
+    ensure_column(
+        conn,
+        "desktop_relay_scanner_bindings",
+        "binding_revision",
+        "ALTER TABLE desktop_relay_scanner_bindings ADD COLUMN binding_revision INTEGER NOT NULL DEFAULT 1",
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_desktop_bindings_pause_due
@@ -5436,7 +5446,7 @@ fn ensure_desktop_relay_scanner_binding_matches_tx(
         || current.rollout_identity != scanner_binding.rollout_identity
         || current.cursor_byte_offset != scanner_binding.cursor_byte_offset
         || current.cursor_line_number != scanner_binding.cursor_line_number
-        || current.updated_at != scanner_binding.updated_at
+        || current.binding_revision != scanner_binding.binding_revision
     {
         bail!(
             "desktop relay scanner binding changed during consumption: {}",
@@ -6476,6 +6486,7 @@ fn desktop_relay_scanner_binding_from_row(
         rollout_identity: row.get("rollout_identity")?,
         cursor_byte_offset: row.get("cursor_byte_offset")?,
         cursor_line_number: row.get("cursor_line_number")?,
+        binding_revision: row.get("binding_revision")?,
         binding_state: row.get("binding_state")?,
         last_scan_at: row.get("last_scan_at")?,
         last_consumed_at: row.get("last_consumed_at")?,
@@ -7752,6 +7763,72 @@ mod tests {
         assert_eq!(binding.cursor_byte_offset, 0);
         assert_eq!(binding.cursor_line_number, 0);
         assert_eq!(binding.binding_state, "active");
+    }
+
+    #[test]
+    fn desktop_relay_cursor_update_rejects_same_second_identical_rebind() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let stale_binding = store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-identical-rebind".to_owned(),
+                rollout_path: "/tmp/identical-rebind.jsonl".to_owned(),
+                rollout_identity: "unix:50:51".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 50,
+            })
+            .expect("bind scanner");
+        let current_binding = store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-identical-rebind".to_owned(),
+                rollout_path: "/tmp/identical-rebind.jsonl".to_owned(),
+                rollout_identity: "unix:50:51".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 50,
+            })
+            .expect("rebind scanner with identical values in same second");
+
+        assert_eq!(stale_binding.updated_at, current_binding.updated_at);
+        assert_eq!(stale_binding.rollout_path, current_binding.rollout_path);
+        assert_eq!(
+            stale_binding.rollout_identity,
+            current_binding.rollout_identity
+        );
+        assert_eq!(
+            current_binding.binding_revision,
+            stale_binding.binding_revision + 1
+        );
+
+        let error = store
+            .update_desktop_relay_scanner_cursor(&stale_binding, (256, 8), 0, 51)
+            .expect_err("stale scanner tick must not advance identical replacement binding");
+        assert!(
+            error.to_string().contains("changed during scan"),
+            "unexpected error: {error:#}"
+        );
+        let degrade_error = store
+            .degrade_desktop_relay_scanner_binding_if_current(
+                &stale_binding,
+                "simulated stale degrade",
+                51,
+            )
+            .expect_err("stale scanner tick must not degrade identical replacement binding");
+        assert!(
+            degrade_error.to_string().contains("changed during scan"),
+            "unexpected error: {degrade_error:#}"
+        );
+        let binding = store
+            .list_desktop_relay_scanner_bindings(Some("bridge-identical-rebind"))
+            .expect("list binding")
+            .pop()
+            .expect("binding");
+        assert_eq!(binding.cursor_byte_offset, 0);
+        assert_eq!(binding.cursor_line_number, 0);
+        assert_eq!(binding.binding_state, "active");
+        assert_eq!(binding.binding_revision, current_binding.binding_revision);
     }
 
     #[test]
