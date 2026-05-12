@@ -10,7 +10,7 @@ This directory contains user-facing guides, internal design records, implementat
 - [Development guide](DEVELOPMENT.en-GB.md)
 - [Live E2E guide](LIVE_E2E.en-GB.md)
 
-The repository root [README.md](../README.md) is the default `en-GB` entrypoint. `zh-CN` counterparts are added in the follow-up bilingual documentation PR.
+The repository root [README.md](../README.md) is the default `en-GB` entrypoint.
 
 ## Internal Records
 
