@@ -3,9 +3,9 @@ id: 20260511-5721
 title: Daemon Upgrade Safety
 status: active
 created: 2026-05-11
-updated: 2026-05-11
+updated: 2026-05-12
 branch: codex/daemon-app-server-handoff
-pr:
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/66
 supersedes: []
 superseded_by:
 ---
