@@ -1,6 +1,6 @@
 [project]
 name = "codex-background-task-handler"
-version = "0.1.5"
+version = "0.2.0"
 description = "Reference experiments and companion tooling for Codex background task handling."
 readme = "README.md"
 requires-python = ">=3.11"
