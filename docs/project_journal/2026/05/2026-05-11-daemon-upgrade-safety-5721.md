@@ -4,8 +4,8 @@ title: Daemon Upgrade Safety
 status: active
 created: 2026-05-11
 updated: 2026-05-12
-branch: codex/daemon-app-server-handoff
-pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/66
+branch: codex/daemon-jobs-drain
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/67
 supersedes: []
 superseded_by:
 ---
@@ -18,13 +18,17 @@ superseded_by:
 - PR2 added generation daemon coexistence and scoped recovery ownership so a new daemon does not stop or recover work owned by an active old daemon.
 - PR3 adds the `daemon-handoff-v1` protocol skeleton, `binary_version` gate, and quiesce state without app-server or job resource takeover.
 - PR4 adds app-server handoff: legacy daemon exports owned app-server metadata, generation daemon adopts the same pid/url with pid identity fencing, and legacy refresh redirects wrappers to the new daemon.
+- PR5 adds live jobs drain: quiescing daemons reject new task admission, keep already admitted tasks/jobs alive until terminal, and exit with `handoff_drain_complete` after their owned drain scope clears.
 
 ## Current State
-- `docs/DAEMON_UPGRADE_SAFETY.md` is the design entrypoint for the upgrade sequence, PR3 gate/quiesce contract, and PR4 app-server handoff contract.
+- `docs/DAEMON_UPGRADE_SAFETY.md` is the design entrypoint for the upgrade sequence, PR3 gate/quiesce contract, PR4 app-server handoff contract, and PR5 jobs drain contract.
 - Handoff minimum is fixed at `0.2.0`; lower versions can coexist but are not sent `handoff_quiesce`.
 - A handoff-eligible incompatible default daemon is quiesced before the new binary starts or reuses a generation daemon.
 - Quiescing daemons reject new work while keeping control, lease refresh/release/stop, thread abort, and task cancel paths available.
 - Adopted app-servers keep the same websocket URL and pid; old daemon `handed_off` entries no longer stop or invalidate the app-server and return `handoff_daemon_socket_path` on matching refresh.
+- Quiescing default daemons are no longer selected as new-work endpoints by `daemon ensure`; new tasks and mutating dispatches route to the generation daemon while the old daemon drains.
+- Task cancellation is owner-routed by `supervisor_daemon_generation` before `daemon ensure`, so live unowned or generation-owned tasks continue to cancel through the quiescing daemon that owns their process controls; stale default owner sockets fall back to normal ensure, while stale generation owner sockets start/reuse the current generation daemon so generation-scoped startup recovery can kill and terminalize lost task process groups.
+- Quiescing daemons force lifecycle refreshes, wait for owner-scoped pending jobs/tasks, ignore only already `handed_off` app-server shims, and auto-exit with `shutdown_reason=handoff_drain_complete` once drain is complete.
 - PR4 quiesce export failure rolls back the new quiescing state, and adopted cleanup handles leader-exited process groups so app-server descendants are not orphaned.
 - PR4 adopt/release registry changes are all-or-nothing across the handoff payload, and legacy handed-off entries remain child reapers until the child has exited.
 - PR4 release failure now confirms legacy release status before rolling back generation adopted entries; old wrapper redirect immediately refreshes/stops against the new daemon; active bootstrap app-servers fail closed instead of being missed by export.
@@ -37,12 +41,34 @@ superseded_by:
 - PR4 handoff quiesce fencing no longer covers long app-server spawn or `thread/start` RPC work; CLI app-server/bootstrap candidates that lose to quiesce before registry registration are rejected and stopped, while registered bootstraps still force coexistence fallback.
 
 ## Next Steps
-- PR5: implement live jobs drain so old daemons reject new task work, supervise existing tasks to terminal, and exit after active jobs clear.
-- Release PR: bump `0.2.0`, update changelog/docs/install examples, and rerun release/version parsing checks.
+- Release PR: bump `0.2.0`, update changelog/docs/install examples, and rerun release/version parsing checks after PR5 lands.
 
 ## Evidence
 - Design: [DAEMON_UPGRADE_SAFETY.md](../../../DAEMON_UPGRADE_SAFETY.md)
 - PR3: https://github.com/JoeyTeng/codex-background-task-handler/pull/64
+- PR4: https://github.com/JoeyTeng/codex-background-task-handler/pull/66
+- PR5: https://github.com/JoeyTeng/codex-background-task-handler/pull/67
+- Local PR5 validation: `cargo test --locked task_run_rechecks_quiesce_before_registry_admission --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
+- Local PR5 validation: `cargo test --locked --test daemon_phase2 task_run_uses_generation_daemon_when_incompatible_default_daemon_is_quiescing --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
+- Local PR5 validation: `cargo test --locked --test daemon_phase2 task_cancel_falls_back_to_generation_recovery_when_owner_socket_is_stale --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
+- Local PR5 validation: `cargo test --locked --test daemon_phase2 quiescing_daemon_waits_for_pending_job_then_exits_without_idle_timeout --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
+- Local PR5 validation: `cargo test --locked --test daemon_phase2 quiescing_daemon_supervises_existing_task_to_terminal_before_exit --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
+- Local PR5 validation: `cargo test --locked --test daemon_phase2 task_cancel_routes_to_quiescing_daemon_that_owns_live_task --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
+- Local PR5 validation: `cargo test --locked --test daemon_phase2 task_cancel_routes_to_quiescing_generation_daemon_that_owns_live_task --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
+- Local PR5 validation: `cargo fmt --all -- --check`
+- Local PR5 validation: `git diff --check`
+- Local PR5 validation: `uv run python /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /private/tmp/cbth-daemon-upgrade-stack`
+- Local PR5 validation: `cargo test --locked --test daemon_phase2 --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
+- Local PR5 validation: `cargo clippy --locked --all-targets --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated -- -D warnings`
+- Local PR5 validation: `cargo test --locked --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr5-isolated`
+- Internal PR5 review: helper-managed `codex-readonly` found that `task_cancel` could route to generation instead of the quiescing daemon that owns the live task, and that a second quiesce request could fail if an already-quiescing default exited between ping and re-quiesce. Fixed with task owner-routed cancel and an endpoint-gone tolerant already-quiescing path; added regression coverage for both cases.
+- Internal PR5 review follow-up: helper-managed `codex-readonly` found owner-routed cancel still ran `daemon ensure` before owner lookup, which could block quiescing generation-owned task cancel, and that skipping re-quiesce for already-quiescing default could strand app-server exports after a previous client crash. Fixed by resolving the task owner endpoint before ensure and by reattempting fenced export/adopt for already-quiescing default while tolerating normal endpoint-gone drain exit.
+- Internal PR5 review follow-up: helper-managed `codex-readonly` found incompatible but already-quiescing default daemons still used the non-tolerant incompatible coexistence path, and stale owner sockets made `task cancel` fail before recovery. Fixed by deriving legacy coexistence from the quiescing flag and by retrying cancel through `daemon ensure` when the owner endpoint is gone.
+- Internal PR5 review follow-up: helper-managed `codex-readonly` found generation-owned stale owner fallback started a default daemon, whose recovery scope intentionally skips current-generation tasks. Fixed by adding a generation-specific ensure path for generation-owned cancel fallback and by covering a killed generation daemon with a still-running task process group.
+- Final internal PR5 review: helper-managed `codex-readonly` reviewed the fixed diff and returned `LGTM`.
+- PR5 CI follow-up: Ubuntu Rust check exposed a slow shutdown-cancel cleanup wait in `daemon_stop_waits_for_durable_cancel_before_signaling_blocked_worker`; widened the two matching socket-removal waits while keeping behavior assertions unchanged.
+- PR5 CI follow-up: the same Ubuntu test still failed because its `cbth task cancel` fixture could reconnect/autostart after the old daemon closed the blocked client. Reworked that fixture to use raw daemon socket dispatch so the test covers the blocked daemon worker without invoking CLI retry behavior.
+- PR5 review-gate follow-up: Codex found stale previous-generation cancel fallback reused an already-running current generation daemon without forcing recovery. The generation fallback now calls synchronous lifecycle recovery before `task_cancel`; `task_cancel` also recovers registryless tasks when no in-memory control exists. The regression test covers a fake previous-generation listener that disappears after current generation startup.
 - Local PR4 validation: `cargo check --locked --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr4-isolated`
 - Local PR4 validation: `cargo fmt --all -- --check`
 - Local PR4 validation: `git diff --check`

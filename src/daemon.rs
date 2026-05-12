@@ -173,6 +173,23 @@ impl DaemonEndpoint {
     }
 }
 
+pub fn daemon_endpoint_for_supervisor_generation(
+    layout: &FsLayout,
+    supervisor_daemon_generation: Option<&str>,
+) -> Result<DaemonEndpoint> {
+    match supervisor_daemon_generation {
+        Some(generation_id) => {
+            if !daemon_generation_id_is_path_safe(generation_id) {
+                bail!("task supervisor daemon generation is not path-safe");
+            }
+            Ok(DaemonEndpoint::from_socket_path(
+                layout.daemon_generation_socket_path(generation_id),
+            ))
+        }
+        None => Ok(DaemonEndpoint::default(layout)),
+    }
+}
+
 pub fn daemon_endpoint_from_response(
     layout: &FsLayout,
     response: &Value,
@@ -799,13 +816,15 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
                         last_activity_epoch = current_epoch_seconds()?;
                     }
                     let idle_elapsed = last_activity.elapsed() >= state.idle_timeout;
+                    let quiescing_for_handoff = state.quiescing.load(Ordering::Acquire);
                     let idle_deadline = last_activity
                         .checked_add(state.idle_timeout)
                         .unwrap_or(last_activity);
-                    let force_refresh = idle_elapsed
-                        && lifecycle_cache
-                            .refreshed_at
-                            .is_none_or(|at| at < idle_deadline);
+                    let force_refresh = quiescing_for_handoff
+                        || (idle_elapsed
+                            && lifecycle_cache
+                                .refreshed_at
+                                .is_none_or(|at| at < idle_deadline));
                     let idle_horizon_at = checked_epoch_add(
                         last_activity_epoch,
                         state.idle_timeout.as_secs(),
@@ -823,6 +842,13 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
                         &mut lifecycle_maintenance_worker,
                         &mut next_lifecycle_maintenance_at,
                     );
+                    if quiescing_for_handoff
+                        && lifecycle_maintenance_worker.is_none()
+                        && handoff_drain_is_complete(&state, &lifecycle_cache)
+                    {
+                        shutdown_reason = "handoff_drain_complete";
+                        break;
+                    }
                     if idle_elapsed
                         && lifecycle_maintenance_worker.is_none()
                         && !lifecycle_cache.has_exit_blockers(
@@ -877,6 +903,16 @@ pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Va
     }))
 }
 
+fn handoff_drain_is_complete(state: &DaemonState, cache: &DaemonLifecycleCache) -> bool {
+    !cache.refresh_failed
+        && cache.status.active_jobs == 0
+        && cache.status.nonterminal_tasks == 0
+        && !has_active_non_handed_off_cli_app_servers(state)
+        && !has_active_cli_app_server_reservations(state)
+        && !has_active_cli_thread_start_bootstraps(state)
+        && !has_active_supervised_tasks(state)
+}
+
 pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<Value> {
     validate_daemon_autostart_endpoint(layout)?;
     let startup_deadline = Instant::now() + Duration::from_secs(options.startup_timeout_seconds);
@@ -887,6 +923,15 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
                 "started": false,
                 "daemon": daemon_info_from_response_or_endpoint(&response, &default_endpoint),
             }));
+        }
+        DaemonEnsureProbe::CompatibleQuiescing(response) => {
+            return ensure_generation_daemon_for_legacy_default(
+                layout,
+                options,
+                startup_deadline,
+                response,
+                LegacyDefaultCoexistence::Quiescing,
+            );
         }
         DaemonEnsureProbe::Incompatible(response) => {
             if options.replace_incompatible {
@@ -900,11 +945,13 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
                     }));
                 }
             } else {
-                return ensure_generation_daemon_for_incompatible_default(
+                let coexistence = LegacyDefaultCoexistence::for_legacy_response(&response);
+                return ensure_generation_daemon_for_legacy_default(
                     layout,
                     options,
                     startup_deadline,
                     response,
+                    coexistence,
                 );
             }
         }
@@ -920,6 +967,15 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
                 "daemon": daemon_info_from_response_or_endpoint(&response, &default_endpoint),
             }));
         }
+        DaemonEnsureProbe::CompatibleQuiescing(response) => {
+            return ensure_generation_daemon_for_legacy_default(
+                layout,
+                options,
+                startup_deadline,
+                response,
+                LegacyDefaultCoexistence::Quiescing,
+            );
+        }
         DaemonEnsureProbe::Incompatible(response) => {
             if options.replace_incompatible {
                 if let Some(response) =
@@ -932,11 +988,13 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
                     }));
                 }
             } else {
-                return ensure_generation_daemon_for_incompatible_default(
+                let coexistence = LegacyDefaultCoexistence::for_legacy_response(&response);
+                return ensure_generation_daemon_for_legacy_default(
                     layout,
                     options,
                     startup_deadline,
                     response,
+                    coexistence,
                 );
             }
         }
@@ -953,6 +1011,12 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
                     "using_generation_daemon": true,
                 }));
             }
+        }
+        DaemonEnsureProbe::CompatibleQuiescing(_) => {
+            bail!(
+                "generation daemon at {} is quiescing for handoff",
+                generation_endpoint.socket_path().display()
+            );
         }
         DaemonEnsureProbe::Incompatible(_) => {
             let mut replaced_incompatible_generation_daemon = false;
@@ -971,6 +1035,12 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
                             "using_generation_daemon": true,
                         }));
                     }
+                }
+                DaemonEnsureProbe::CompatibleQuiescing(_) => {
+                    bail!(
+                        "generation daemon at {} is quiescing for handoff",
+                        generation_endpoint.socket_path().display()
+                    );
                 }
                 DaemonEnsureProbe::Incompatible(_) => {
                     // The generation socket belongs to this binary-version namespace. A
@@ -1005,6 +1075,59 @@ pub fn daemon_ensure(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<
     }
 
     spawn_daemon_until_ready(layout, DaemonSocketKind::Default, options, startup_deadline)
+}
+
+pub fn daemon_ensure_generation(layout: &FsLayout, options: DaemonEnsureOptions) -> Result<Value> {
+    validate_daemon_autostart_endpoint(layout)?;
+    let startup_deadline = Instant::now() + Duration::from_secs(options.startup_timeout_seconds);
+    let generation_endpoint = DaemonEndpoint::generation(layout);
+    layout.ensure_run_dir()?;
+    let _generation_startup_lock = acquire_generation_startup_lock(
+        layout,
+        current_daemon_generation_id(),
+        remaining_budget(startup_deadline)?,
+    )?;
+    let mut replaced_incompatible_generation_daemon = false;
+    match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)? {
+        DaemonEnsureProbe::Compatible(response) => {
+            return Ok(json!({
+                "started": false,
+                "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
+                "using_generation_daemon": true,
+            }));
+        }
+        DaemonEnsureProbe::CompatibleQuiescing(_) => {
+            bail!(
+                "generation daemon at {} is quiescing for handoff",
+                generation_endpoint.socket_path().display()
+            );
+        }
+        DaemonEnsureProbe::Incompatible(_) => {
+            if let Some(response) =
+                stop_incompatible_daemon(layout, &generation_endpoint, startup_deadline)?
+            {
+                return Ok(json!({
+                    "started": false,
+                    "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
+                    "using_generation_daemon": true,
+                    "replaced_incompatible_generation_daemon": true,
+                }));
+            }
+            replaced_incompatible_generation_daemon = true;
+        }
+        DaemonEnsureProbe::Unavailable => {}
+    }
+    let mut ensured = spawn_daemon_until_ready(
+        layout,
+        DaemonSocketKind::Generation,
+        options,
+        startup_deadline,
+    )?;
+    ensured["using_generation_daemon"] = Value::Bool(true);
+    if replaced_incompatible_generation_daemon {
+        ensured["replaced_incompatible_generation_daemon"] = Value::Bool(true);
+    }
+    Ok(ensured)
 }
 
 fn spawn_daemon_until_ready(
@@ -1093,30 +1216,91 @@ fn spawn_daemon_until_ready(
     }
 }
 
-fn ensure_generation_daemon_for_incompatible_default(
+#[derive(Clone, Copy)]
+enum LegacyDefaultCoexistence {
+    Incompatible,
+    Quiescing,
+}
+
+impl LegacyDefaultCoexistence {
+    fn for_legacy_response(response: &Value) -> Self {
+        if daemon_response_is_quiescing(response) {
+            Self::Quiescing
+        } else {
+            Self::Incompatible
+        }
+    }
+
+    fn response_key(self) -> &'static str {
+        match self {
+            Self::Incompatible => "coexisting_with_incompatible_daemon",
+            Self::Quiescing => "coexisting_with_quiescing_daemon",
+        }
+    }
+}
+
+fn ensured_generation_coexistence_response(
+    response: &Value,
+    generation_endpoint: &DaemonEndpoint,
+    legacy_response: &Value,
+    coexistence: LegacyDefaultCoexistence,
+) -> Value {
+    let mut ensured = json!({
+        "started": false,
+        "daemon": daemon_info_from_response_or_endpoint(response, generation_endpoint),
+        "legacy_daemon": legacy_response["daemon"].clone(),
+    });
+    ensured[coexistence.response_key()] = Value::Bool(true);
+    ensured
+}
+
+fn ensure_generation_daemon_for_legacy_default(
     layout: &FsLayout,
     options: DaemonEnsureOptions,
     startup_deadline: Instant,
     legacy_response: Value,
+    coexistence: LegacyDefaultCoexistence,
 ) -> Result<Value> {
     let generation_endpoint = DaemonEndpoint::generation(layout);
-    let legacy_handoff_quiesce =
-        maybe_quiesce_handoff_eligible_legacy_daemon(layout, &legacy_response, startup_deadline)?;
+    let legacy_handoff_quiesce = match coexistence {
+        LegacyDefaultCoexistence::Incompatible => maybe_quiesce_handoff_eligible_legacy_daemon(
+            layout,
+            &legacy_response,
+            startup_deadline,
+        )?,
+        LegacyDefaultCoexistence::Quiescing => {
+            match maybe_quiesce_handoff_eligible_legacy_daemon(
+                layout,
+                &legacy_response,
+                startup_deadline,
+            ) {
+                Ok(response) => response,
+                Err(error) if error_is_daemon_endpoint_gone(&error) => None,
+                Err(error) => return Err(error),
+            }
+        }
+    };
     let mut replaced_incompatible_generation_daemon = false;
     match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)? {
         DaemonEnsureProbe::Compatible(response) => {
-            let ensured = json!({
-                "started": false,
-                "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
-                "coexisting_with_incompatible_daemon": true,
-                "legacy_daemon": legacy_response["daemon"].clone(),
-            });
+            let ensured = ensured_generation_coexistence_response(
+                &response,
+                &generation_endpoint,
+                &legacy_response,
+                coexistence,
+            );
             return finalize_legacy_handoff_cli_app_servers(
                 layout,
                 &generation_endpoint,
                 ensured,
                 &legacy_handoff_quiesce,
                 startup_deadline,
+            );
+        }
+        DaemonEnsureProbe::CompatibleQuiescing(_) => {
+            bail!(
+                "generation daemon at {} is quiescing for handoff",
+                generation_endpoint.socket_path().display()
             );
         }
         DaemonEnsureProbe::Incompatible(_) => {}
@@ -1130,18 +1314,24 @@ fn ensure_generation_daemon_for_incompatible_default(
     )?;
     match probe_daemon_endpoint_for_ensure(layout, &generation_endpoint, startup_deadline)? {
         DaemonEnsureProbe::Compatible(response) => {
-            let ensured = json!({
-                "started": false,
-                "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
-                "coexisting_with_incompatible_daemon": true,
-                "legacy_daemon": legacy_response["daemon"].clone(),
-            });
+            let ensured = ensured_generation_coexistence_response(
+                &response,
+                &generation_endpoint,
+                &legacy_response,
+                coexistence,
+            );
             return finalize_legacy_handoff_cli_app_servers(
                 layout,
                 &generation_endpoint,
                 ensured,
                 &legacy_handoff_quiesce,
                 startup_deadline,
+            );
+        }
+        DaemonEnsureProbe::CompatibleQuiescing(_) => {
+            bail!(
+                "generation daemon at {} is quiescing for handoff",
+                generation_endpoint.socket_path().display()
             );
         }
         DaemonEnsureProbe::Incompatible(_response) => {
@@ -1151,13 +1341,13 @@ fn ensure_generation_daemon_for_incompatible_default(
             if let Some(response) =
                 stop_incompatible_daemon(layout, &generation_endpoint, startup_deadline)?
             {
-                let ensured = json!({
-                    "started": false,
-                    "daemon": daemon_info_from_response_or_endpoint(&response, &generation_endpoint),
-                    "coexisting_with_incompatible_daemon": true,
-                    "legacy_daemon": legacy_response["daemon"].clone(),
-                    "replaced_incompatible_generation_daemon": true,
-                });
+                let mut ensured = ensured_generation_coexistence_response(
+                    &response,
+                    &generation_endpoint,
+                    &legacy_response,
+                    coexistence,
+                );
+                ensured["replaced_incompatible_generation_daemon"] = Value::Bool(true);
                 return finalize_legacy_handoff_cli_app_servers(
                     layout,
                     &generation_endpoint,
@@ -1177,7 +1367,7 @@ fn ensure_generation_daemon_for_incompatible_default(
         options,
         startup_deadline,
     )?;
-    ensured["coexisting_with_incompatible_daemon"] = Value::Bool(true);
+    ensured[coexistence.response_key()] = Value::Bool(true);
     ensured["legacy_daemon"] = legacy_response["daemon"].clone();
     if replaced_incompatible_generation_daemon {
         ensured["replaced_incompatible_generation_daemon"] = Value::Bool(true);
@@ -1926,6 +2116,7 @@ fn remaining_budget(deadline: Instant) -> Result<Duration> {
 
 enum DaemonEnsureProbe {
     Compatible(Value),
+    CompatibleQuiescing(Value),
     Incompatible(Value),
     Unavailable,
 }
@@ -1943,6 +2134,9 @@ fn probe_daemon_endpoint_for_ensure(
             remaining_budget(startup_deadline)?,
         ) {
             Ok(response) if daemon_response_is_compatible(&response) => {
+                if daemon_response_is_quiescing(&response) {
+                    return Ok(DaemonEnsureProbe::CompatibleQuiescing(response));
+                }
                 return Ok(DaemonEnsureProbe::Compatible(response));
             }
             Ok(response) => return Ok(DaemonEnsureProbe::Incompatible(response)),
@@ -1965,6 +2159,21 @@ fn error_is_daemon_busy(error: &anyhow::Error) -> bool {
         message.as_str(),
         DAEMON_BUSY_ERROR | DAEMON_CONNECTION_LIMIT_ERROR
     )
+}
+
+pub(crate) fn error_is_daemon_endpoint_gone(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
 }
 
 fn try_acquire_dispatch_slot(state: &DaemonState) -> Result<DispatchGuard<'_>> {
@@ -1998,6 +2207,14 @@ fn daemon_response_is_compatible(response: &Value) -> bool {
                 })
             });
     has_protocol && has_capabilities
+}
+
+fn daemon_response_is_quiescing(response: &Value) -> bool {
+    response
+        .get("daemon")
+        .and_then(|daemon| daemon.get("quiescing"))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3024,6 +3241,12 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
                 "cli_app_servers": cli_app_server_infos(state),
             })
         }
+        "lifecycle_recover" => {
+            ensure_daemon_not_stopping(state)?;
+            json!({
+                "recovered_tasks": recover_registryless_lost_tasks(state)?,
+            })
+        }
         "handoff_quiesce" => {
             let payload = if request.payload.is_null() {
                 HandoffQuiescePayload::default()
@@ -3342,7 +3565,7 @@ where
         bail!("task command must not be empty");
     }
     validate_daemon_nonempty_bytes("task command argv[0]", &payload.command[0])?;
-    ensure_daemon_not_stopping(state)?;
+    ensure_daemon_accepts_new_work(state)?;
 
     let task_id = new_id();
     let job_id = new_id();
@@ -3353,11 +3576,13 @@ where
     let command_json = task_command_persistence_json(&payload.command)?;
     let control = Arc::new(SupervisedTaskControl::default());
     {
+        let _handoff_guard = acquire_handoff_quiesce_lock(state)?;
+        ensure_daemon_accepts_new_work(state)?;
         let mut supervised_tasks = state
             .supervised_tasks
             .lock()
             .map_err(|_| anyhow::anyhow!("supervised task map lock poisoned"))?;
-        ensure_daemon_not_stopping(state)?;
+        ensure_daemon_accepts_new_work(state)?;
         if supervised_tasks.len() >= MAX_SUPERVISED_TASKS {
             bail!("maximum supervised task limit reached ({MAX_SUPERVISED_TASKS})");
         }
@@ -3550,7 +3775,11 @@ fn cancel_supervised_task(state: &DaemonState, payload: TaskCancelPayload) -> Re
         return Ok(task);
     }
     let task = persist_task_cancel_request(&state.layout, &payload.task_id)?;
-    Ok(task)
+    if task.completed_at.is_some() {
+        return Ok(task);
+    }
+    let _ = recover_registryless_lost_tasks(state)?;
+    Store::open(&state.layout)?.inspect_task(&payload.task_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6290,6 +6519,13 @@ fn has_active_cli_app_servers(state: &DaemonState) -> bool {
         .is_ok_and(|servers| !servers.is_empty())
 }
 
+fn has_active_non_handed_off_cli_app_servers(state: &DaemonState) -> bool {
+    state
+        .cli_app_servers
+        .lock()
+        .is_ok_and(|servers| servers.values().any(|server| !server.is_handed_off()))
+}
+
 fn has_active_cli_app_server_reservations(state: &DaemonState) -> bool {
     state
         .cli_app_server_reservations
@@ -7535,6 +7771,53 @@ mod tests {
         let stop = handle_test_request(&state, "stop", Value::Null);
         assert_eq!(stop["ok"], true);
         assert_eq!(stop["response"]["stopping"], true);
+    }
+
+    #[test]
+    fn task_run_rechecks_quiesce_before_registry_admission() {
+        let (home, state) = test_state();
+        state.quiescing.store(true, Ordering::Release);
+        let spawner_called = Arc::new(AtomicBool::new(false));
+        let spawner_called_for_task = Arc::clone(&spawner_called);
+        let payload = TaskRunPayload {
+            source_thread_id: "thread-quiesced-task-run".to_owned(),
+            summary: "quiesced task run".to_owned(),
+            metadata_json: "{}".to_owned(),
+            policy: DeliveryPolicy::fail_closed(),
+            cwd: home.path().as_os_str().as_bytes().to_vec(),
+            cwd_display: home.path().display().to_string(),
+            timeout_seconds: None,
+            max_delivery_attempts: 3,
+            redelivery_window_seconds: 60,
+            command: vec![b"/bin/true".to_vec()],
+            environment: Vec::new(),
+        };
+
+        let error = start_supervised_task_with_spawner(&state, payload, |_name, _worker| {
+            spawner_called_for_task.store(true, Ordering::Release);
+            Err(io::Error::from_raw_os_error(libc::EAGAIN))
+        })
+        .expect_err("quiescing daemon should reject task run");
+
+        assert!(
+            error
+                .to_string()
+                .contains("daemon is quiescing for handoff"),
+            "{error:#}"
+        );
+        assert!(!spawner_called.load(Ordering::Acquire));
+        assert!(
+            state
+                .supervised_tasks
+                .lock()
+                .expect("task registry")
+                .is_empty()
+        );
+        let store = Store::open(&state.layout).expect("store");
+        let tasks = store
+            .list_tasks(Some("thread-quiesced-task-run"), None, 10)
+            .expect("list tasks");
+        assert!(tasks.is_empty(), "quiesced daemon should not create task");
     }
 
     #[test]
