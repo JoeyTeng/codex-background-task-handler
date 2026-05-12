@@ -1,10 +1,10 @@
-# CLI Operator Recovery
+# Operator Recovery
 
-This guide covers the manual recovery surface for CLI dogfood v1. It assumes a macOS/Linux single-user workstation and a trusted local `CBTH_HOME` / `~/.cbth`.
+This guide covers manual recovery for CLI dogfood v1. It assumes a macOS or Linux single-user workstation and a trusted local `CBTH_HOME` or `~/.cbth`.
 
 ## Inspect Current State
 
-Start with the daemon and readiness checks:
+Start with daemon and readiness checks:
 
 ```bash
 cbth doctor cli
@@ -33,7 +33,7 @@ cbth batch inspect --batch-id <batch-id>
 
 ## Task Logs
 
-Daemon-supervised tasks are inspectable even after their associated job has completed or failed:
+Daemon-supervised tasks remain inspectable after their associated job has completed or failed:
 
 ```bash
 cbth task list --source-thread-id <thread-id>
@@ -51,7 +51,7 @@ Completed task log directories are retained while linked batches remain open and
 
 ## Manual Resolution
 
-`manual_resolution_only` means `cbth` could not prove safe automatic delivery. Typical causes are ambiguous `turn/start` acceptance, websocket/app-server continuity loss after acceptance, terminal failure/interruption evidence, or a batch policy outside the current automatic path.
+`manual_resolution_only` means `cbth` could not prove safe automatic delivery. Typical causes include ambiguous `turn/start` acceptance, websocket/app-server continuity loss after acceptance, terminal failure/interruption evidence, or a batch policy outside the current automatic path.
 
 Use the audit trail to decide whether the assistant-visible result already landed:
 
@@ -60,7 +60,7 @@ cbth audit list --source-thread-id <thread-id> --limit 100
 cbth batch inspect-head --source-thread-id <thread-id>
 ```
 
-If you verified the caller thread already received and used the result, close the head batch as confirmed:
+If you verified that the caller thread already received and used the result, close the head batch as confirmed:
 
 ```bash
 cbth batch close-head \
@@ -92,9 +92,7 @@ cbth cli session retire \
   --reason "operator cleanup after manual recovery"
 ```
 
-Retirement is fail-closed. It refuses `live` sessions, sessions that still own active delivery attempts, and sessions whose bound thread still has an open `manual_resolution_only` head batch. In those cases, inspect the head batch or attempt first, close the manual head batch when you have made a decision, then retry `cli session retire` or `cli run`.
-
-`cbth cli run --bind-thread-id ...` can automatically retire and replace `detached`, `parked`, or `stale` records only after the same safety checks pass. Same-profile reattach also refuses active delivery attempts and open manual head batches, because reattaching would otherwise abandon observation ownership. It never creates a second non-retired session for the same bound thread.
+Retirement is fail-closed. It refuses `live` sessions, sessions that still own active delivery attempts, and sessions whose bound thread still has an open `manual_resolution_only` head batch.
 
 ## Maintenance And Cleanup
 
@@ -111,4 +109,4 @@ cbth task list --status running
 cbth daemon stop
 ```
 
-On daemon crash/restart, queued or running tasks that can no longer be proven supervised are failed closed during startup recovery. Inspect failed tasks and associated batches before resubmitting work.
+On daemon crash or restart, queued or running tasks that can no longer be proven supervised are failed closed during startup recovery. Inspect failed tasks and associated batches before resubmitting work.
