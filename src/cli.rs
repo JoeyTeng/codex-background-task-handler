@@ -2584,6 +2584,7 @@ fn dispatch_daemon_task_command(
                 },
             )?;
             let endpoint = daemon_endpoint_from_response(layout, &ensure)?;
+            let _ = daemon_request_at_endpoint(layout, &endpoint, "lifecycle_recover")?;
             return daemon_request_payload_at_endpoint(layout, &endpoint, daemon_command, payload);
         }
     }

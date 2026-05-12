@@ -68,7 +68,7 @@ superseded_by:
 - Final internal PR5 review: helper-managed `codex-readonly` reviewed the fixed diff and returned `LGTM`.
 - PR5 CI follow-up: Ubuntu Rust check exposed a slow shutdown-cancel cleanup wait in `daemon_stop_waits_for_durable_cancel_before_signaling_blocked_worker`; widened the two matching socket-removal waits while keeping behavior assertions unchanged.
 - PR5 CI follow-up: the same Ubuntu test still failed because its `cbth task cancel` fixture could reconnect/autostart after the old daemon closed the blocked client. Reworked that fixture to use raw daemon socket dispatch so the test covers the blocked daemon worker without invoking CLI retry behavior.
-- PR5 review-gate follow-up: Codex found stale previous-generation cancel fallback reused an already-running current generation daemon without forcing recovery. `task_cancel` now runs synchronous registryless recovery when no in-memory task control exists, and the regression test covers a fake previous-generation listener that disappears after current generation startup.
+- PR5 review-gate follow-up: Codex found stale previous-generation cancel fallback reused an already-running current generation daemon without forcing recovery. The generation fallback now calls synchronous lifecycle recovery before `task_cancel`; `task_cancel` also recovers registryless tasks when no in-memory control exists. The regression test covers a fake previous-generation listener that disappears after current generation startup.
 - Local PR4 validation: `cargo check --locked --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr4-isolated`
 - Local PR4 validation: `cargo fmt --all -- --check`
 - Local PR4 validation: `git diff --check`

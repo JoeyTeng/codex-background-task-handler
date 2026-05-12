@@ -3241,6 +3241,12 @@ fn handle_client(stream: &mut UnixStream, state: &DaemonState) -> Result<()> {
                 "cli_app_servers": cli_app_server_infos(state),
             })
         }
+        "lifecycle_recover" => {
+            ensure_daemon_not_stopping(state)?;
+            json!({
+                "recovered_tasks": recover_registryless_lost_tasks(state)?,
+            })
+        }
         "handoff_quiesce" => {
             let payload = if request.payload.is_null() {
                 HandoffQuiescePayload::default()

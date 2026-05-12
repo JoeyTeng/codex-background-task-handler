@@ -3358,8 +3358,11 @@ fn task_cancel_reused_generation_daemon_recovers_stale_previous_generation_task(
     fs::remove_file(&previous_generation_socket_path).expect("remove previous generation socket");
 
     let cancelled = cbth_daemon(&home, &["task", "cancel", "--task-id", task_id]);
-    assert_eq!(cancelled["task"]["status"], "cancelled");
-    assert_eq!(cancelled["task"]["failure_reason"], "task cancelled");
+    assert_eq!(cancelled["task"]["status"], "lost");
+    assert_eq!(
+        cancelled["task"]["failure_reason"],
+        "task supervisor lost after daemon restart"
+    );
     wait_for_process_group_gone(pid);
     assert!(
         !marker.exists(),
