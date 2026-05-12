@@ -25,7 +25,10 @@ Inspect the managed CLI session bound to the caller thread:
 ```bash
 cbth cli session list --bound-thread-id <thread-id>
 cbth cli session inspect --managed-session-id <managed-session-id>
+cbth cli app-servers -H
 ```
+
+`cbth cli app-servers -H` may print `loaded non-bound codex sessions` when the same Codex app-server reports loaded thread ids other than the session bound to `cbth`. Treat this as a best-effort diagnostic only: loaded does not mean foreground/current, and it does not retarget delivery. If the operator wants delivery for a different loaded thread, start an explicit managed session for that thread with `cbth resume <new-thread-id>` or `cbth cli run --bind-thread-id <new-thread-id>`.
 
 If the head batch has already closed and `inspect-head` no longer finds it, use the `batch_id` from audit or task/job output:
 

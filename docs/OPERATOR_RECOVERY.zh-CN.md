@@ -25,7 +25,10 @@ cbth audit list --source-thread-id <thread-id> --limit 50
 ```bash
 cbth cli session list --bound-thread-id <thread-id>
 cbth cli session inspect --managed-session-id <managed-session-id>
+cbth cli app-servers -H
 ```
+
+当同一个 Codex app-server 报告了除 `cbth` 绑定 session 以外的 loaded thread id 时，`cbth cli app-servers -H` 可能打印 `loaded non-bound codex sessions`。这只是 best-effort 诊断：loaded 不代表 foreground/current，也不会 retarget delivery。如果 operator 想让另一个 loaded thread 接收投递，需要用 `cbth resume <new-thread-id>` 或 `cbth cli run --bind-thread-id <new-thread-id>` 显式启动对应 managed session。
 
 如果 head batch 已经关闭，`inspect-head` 找不到它，可以从 audit 或 task/job output 中取 `batch_id`：
 
