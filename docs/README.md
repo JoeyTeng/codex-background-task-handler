@@ -1,6 +1,22 @@
 # Documentation
 
-This directory holds design notes, live validation records, project tracking entrypoints, and durable project journal records.
+This directory contains root-level operational notes, internal design records, implementation plans, validation notes, and project tracking entrypoints.
+
+## Root-Level Notes
+
+- [CLI operator recovery](CLI_OPERATOR_RECOVERY.md)
+- [Git hooks](GIT_HOOKS.md)
+- [Live E2E](LIVE_E2E.md)
+
+These files are retained under their existing names in this structure-only PR. The stable public guide set and language variants are introduced in follow-up documentation PRs.
+
+## Internal Records
+
+- [design/](design/) contains architecture and implementation design records.
+- [plans/](plans/) contains phased implementation and delivery plans.
+- [validation/](validation/) contains live validation harnesses, probes, and evidence records.
+
+These internal records are not required to be bilingual unless they are later promoted into the user-facing guide set.
 
 ## Project Tracking
 
@@ -16,7 +32,3 @@ This repo is squash-merge-only. Tracked journal docs should describe the target-
 - If a PR fully completes a workstream, mark the relevant journal entry `status: completed` before merge and use the PR link as evidence.
 - Do not leave tracked docs with transient states like "waiting for merge", "not merged yet", or "ready for review"; keep those in the PR body, checklist, or comments.
 - If a PR only completes part of a larger workstream, keep the journal `active` or `blocked` and record the real remaining next steps.
-
-## Design And Validation
-
-Use the root [README.md](../README.md) for the main status summary and links to the core design documents.

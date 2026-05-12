@@ -175,7 +175,7 @@ Production scanner foundation 在手动 consumer 之上增加了三层约束：
 - Production `emit-arm-accepted` envelope 不带 `bridge_arm_lease_id`，scanner 也会拒绝任何带该字段的 trusted `arm_accepted` envelope。`arm-accepted` marker 只能在 attempt 已 durable 进入 `arm_pending`、request/generation/lease 均匹配且 lease 尚未过期时签发；scanner 在 Desktop sandbox 外从该 durable attempt 解析 lease，再调用已有 `note-arm` CAS。这避免把 lease 暴露给 heartbeat prompt/output text，同时保持 CAS token 校验。
 - `arm_accepted` 在 pending-only lease lookup 前会先检查同 marker/hash 的成功 replay fence，且 scan maintenance 会先 reconcile 已有 consumption fence 再过期 issued marker，避免 CAS 已提交但 marker 尚未标 consumed 的 crash 窗口把成功写回误判为 expired/rejected。production 不允许先签发 accepted marker 再依赖同 tick pending envelope 排序来补救状态。
 
-2026-05-11 live validation 已证明真实 heartbeat arm envelopes + non-Desktop consumer 可以推进 `prepared -> arm_pending -> cooldown`，并由 operator 将 `writeback_capability` repair 为 `validated`；`artifact_read_capability` 仍为 `unknown`。Production scanner 仍需要后续 opt-in live validation。该 validation surface 记录在 [Desktop transcript relay validation](DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md) 和 [Desktop live preflight evidence](DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md)。
+2026-05-11 live validation 已证明真实 heartbeat arm envelopes + non-Desktop consumer 可以推进 `prepared -> arm_pending -> cooldown`，并由 operator 将 `writeback_capability` repair 为 `validated`；`artifact_read_capability` 仍为 `unknown`。Production scanner 仍需要后续 opt-in live validation。该 validation surface 记录在 [Desktop transcript relay validation](../validation/DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md) 和 [Desktop live preflight evidence](../validation/DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md)。
 
 ## No-DB Inbox Read Helpers
 
@@ -217,10 +217,10 @@ Production scanner foundation 在手动 consumer 之上增加了三层约束：
 - ready attempt materialization。
 - `note-boundary-crossed`。
 - writeback helper live Desktop heartbeat validation beyond the validation-only dropbox probe.
-- Desktop automatic delivery live validation；preflight/read validation workflow is documented separately in [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](DESKTOP_LIVE_PREFLIGHT_VALIDATION.md).
+- Desktop automatic delivery live validation；preflight/read validation workflow is documented separately in [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](../validation/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md).
 - 大 artifact automatic continuation。
 - 外部 Webex / GitHub / PR polling integrations。
 
 这些能力仍由 [DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md) 和 [SHARED_CORE_ARCHITECTURE.md](SHARED_CORE_ARCHITECTURE.md) 定义未来合同。
 
-Writeback helper live validation is tracked separately in [DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md](DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md).
+Writeback helper live validation is tracked separately in [DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md](../validation/DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md).

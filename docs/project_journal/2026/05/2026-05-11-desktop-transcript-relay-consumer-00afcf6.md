@@ -40,7 +40,7 @@ superseded_by: 20260511-0796bf3-desktop-transcript-relay-consumer-live-validatio
 - Base branch: `master`
 - Base commit: `00afcf6 Validate Desktop transcript relay side channel`
 - Transport evidence: [Desktop transcript relay validation](2026-05-11-desktop-transcript-relay-validation-eeef583.md)
-- Design docs: [Desktop transcript relay validation](../../../DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md), [Desktop bridge foundation](../../../DESKTOP_BRIDGE_FOUNDATION.md)
+- Design docs: [Desktop transcript relay validation](../../../validation/DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md), [Desktop bridge foundation](../../../design/DESKTOP_BRIDGE_FOUNDATION.md)
 
 ## Current State
 

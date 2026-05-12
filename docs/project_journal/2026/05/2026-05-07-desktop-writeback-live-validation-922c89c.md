@@ -48,8 +48,8 @@ superseded_by:
 
 ## Evidence
 
-- Live writeback evidence: [Desktop live preflight evidence](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md#2026-05-07-attempt-writeback-helpers-blocked-by-startup-lock)
-- Desktop bridge foundation: [Desktop bridge foundation](../../../DESKTOP_BRIDGE_FOUNDATION.md)
+- Live writeback evidence: [Desktop live preflight evidence](../../../validation/DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md#2026-05-07-attempt-writeback-helpers-blocked-by-startup-lock)
+- Desktop bridge foundation: [Desktop bridge foundation](../../../design/DESKTOP_BRIDGE_FOUNDATION.md)
 - Desktop no-DB reader journal: [2026-05-07-desktop-no-db-inbox-reader-98dc2b4.md](2026-05-07-desktop-no-db-inbox-reader-98dc2b4.md)
 - Writeback helper foundation journal: [2026-05-07-desktop-writeback-helper-foundation-d740ea1.md](2026-05-07-desktop-writeback-helper-foundation-d740ea1.md)
 - Active backlog: [2026-05-05-current-follow-ups-bbe4003.md](2026-05-05-current-follow-ups-bbe4003.md)
