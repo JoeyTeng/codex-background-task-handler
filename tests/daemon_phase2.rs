@@ -503,6 +503,7 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "desktop-writeback-helper-foundation",
             "desktop-writeback-live-validation-fixture",
             "desktop-transcript-relay-consumer",
+            "desktop-transcript-relay-scanner",
             "daemon-handoff-v1"
         ])
     );
@@ -545,6 +546,7 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "desktop-writeback-helper-foundation",
             "desktop-writeback-live-validation-fixture",
             "desktop-transcript-relay-consumer",
+            "desktop-transcript-relay-scanner",
             "daemon-handoff-v1"
         ])
     );
@@ -653,6 +655,7 @@ fn daemon_ensure_restarts_incompatible_daemon() {
             "desktop-writeback-helper-foundation",
             "desktop-writeback-live-validation-fixture",
             "desktop-transcript-relay-consumer",
+            "desktop-transcript-relay-scanner",
             "daemon-handoff-v1"
         ])
     );
@@ -1128,6 +1131,7 @@ fn daemon_dispatch_uses_probed_socket_when_ping_omits_socket_path() {
                     "desktop-writeback-helper-foundation",
                     "desktop-writeback-live-validation-fixture",
                     "desktop-transcript-relay-consumer",
+                    "desktop-transcript-relay-scanner",
                     "daemon-handoff-v1"
                 ],
                 "message": "pong"
@@ -1846,6 +1850,7 @@ fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
             "desktop-writeback-helper-foundation",
             "desktop-writeback-live-validation-fixture",
             "desktop-transcript-relay-consumer",
+            "desktop-transcript-relay-scanner",
             "daemon-handoff-v1"
         ])
     );
@@ -1931,6 +1936,7 @@ fn daemon_ensure_restarts_daemon_missing_auto_delivery_capability() {
             "desktop-writeback-helper-foundation",
             "desktop-writeback-live-validation-fixture",
             "desktop-transcript-relay-consumer",
+            "desktop-transcript-relay-scanner",
             "daemon-handoff-v1"
         ])
     );
@@ -2016,6 +2022,7 @@ fn daemon_ensure_restarts_daemon_missing_session_capability_dispatch() {
             "desktop-writeback-helper-foundation",
             "desktop-writeback-live-validation-fixture",
             "desktop-transcript-relay-consumer",
+            "desktop-transcript-relay-scanner",
             "daemon-handoff-v1"
         ])
     );
@@ -2084,7 +2091,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
                     assert!(request.contains("\"ping\""));
                     if let Err(error) = stream.write_all(
                         br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-thread-start-params",
-            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","daemon-handoff-v1"],"message":"pong"}}"#,
+            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","desktop-transcript-relay-scanner","daemon-handoff-v1"],"message":"pong"}}"#,
                     ) {
                         if is_peer_disconnect(&error) {
                             continue;
@@ -2152,7 +2159,7 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
                 r#"{"ok":false,"error":"daemon connection limit reached"}"#
             } else {
                 r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-thread-start-params",
-            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","daemon-handoff-v1"],"message":"pong"}}"#
+            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","desktop-transcript-relay-scanner","daemon-handoff-v1"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())

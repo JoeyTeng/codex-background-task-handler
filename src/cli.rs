@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{CStr, OsStr, OsString};
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -45,9 +45,12 @@ use crate::models::{
     CliManagedSessionCapabilities, CliManagedSessionPermissions, CliManagedSessionProfile,
     CliManagedSessionProfileRequirement, DEFAULT_MAX_DELIVERY_ATTEMPTS,
     DEFAULT_REDELIVERY_WINDOW_SECONDS, DeliveryPolicy, DesktopInstallationStateRecord,
-    NewAuditDecision, NewCliAcceptPendingAttempt, NewCliManagedSessionPermissionSnapshot,
-    NewDesktopInstallationRepair, NewDesktopTranscriptRelayConsumption, NewDesktopWritebackFixture,
-    NewJob, PartialDeliveryPolicy, SubmitMetadata, SweepReport,
+    DesktopRelayScannerBindingRecord, DesktopTranscriptRelayConsumptionRecord,
+    DesktopTranscriptRelayMarkerRecord, NewAuditDecision, NewCliAcceptPendingAttempt,
+    NewCliManagedSessionPermissionSnapshot, NewDesktopInstallationRepair,
+    NewDesktopRelayScannerBinding, NewDesktopTranscriptRelayConsumption,
+    NewDesktopTranscriptRelayMarker, NewDesktopWritebackFixture, NewJob, PartialDeliveryPolicy,
+    SubmitMetadata, SweepReport,
 };
 use crate::self_update::{
     SelfUpdateOptions, current_release_target_triple, run_self_update, run_self_update_interactive,
@@ -92,6 +95,10 @@ const DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX: &str = "CBTH_TRANSCRIPT_WRITEBACK_V1 
 const DESKTOP_TRANSCRIPT_WRITEBACK_CHANNEL: &str = "desktop_transcript_writeback";
 const DESKTOP_TRANSCRIPT_WRITEBACK_MAX_MARKER_BYTES: usize = 4 * 1024;
 const DESKTOP_TRANSCRIPT_SCAN_MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+const DESKTOP_TRANSCRIPT_SCANNER_MAX_LINES_PER_TICK: usize = 256;
+const DESKTOP_TRANSCRIPT_SCANNER_MAX_BYTES_PER_TICK: usize = 1024 * 1024;
+const DESKTOP_TRANSCRIPT_RELAY_MARKER_TTL_SECONDS: i64 = 6 * 60 * 60;
+const DESKTOP_TRANSCRIPT_RELAY_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "dispatch",
     "attempt-dispatch",
@@ -114,6 +121,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-writeback-helper-foundation",
     "desktop-writeback-live-validation-fixture",
     "desktop-transcript-relay-consumer",
+    "desktop-transcript-relay-scanner",
     "daemon-handoff-v1",
 ];
 
@@ -444,12 +452,199 @@ enum DesktopValidationCommand {
 #[derive(Debug, Subcommand)]
 enum DesktopRelayCommand {
     #[command(
+        name = "emit-arm-pending",
+        about = "Emit a production Desktop transcript arm-pending request envelope"
+    )]
+    EmitArmPending(DesktopRelayEmitArmPendingArgs),
+    #[command(
+        name = "emit-arm-accepted",
+        about = "Emit a production Desktop transcript arm-accepted request envelope"
+    )]
+    EmitArmAccepted(DesktopRelayEmitArmAcceptedArgs),
+    #[command(
         name = "consume-transcript",
         about = "Consume one trusted Desktop transcript writeback envelope"
     )]
     ConsumeTranscript(DesktopRelayConsumeTranscriptArgs),
+    #[command(about = "Manage the production Desktop transcript relay scanner")]
+    Scanner {
+        #[command(subcommand)]
+        command: DesktopRelayScannerCommand,
+    },
+    #[command(about = "Manage issued Desktop transcript relay markers")]
+    Marker {
+        #[command(subcommand)]
+        command: DesktopRelayMarkerCommand,
+    },
     #[command(name = "consume-prepared-transcript", hide = true)]
     ConsumePreparedTranscript(DesktopRelayConsumePreparedTranscriptArgs),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DesktopRelayMarkerKind {
+    #[value(name = "arm-pending")]
+    ArmPending,
+    #[value(name = "arm-accepted")]
+    ArmAccepted,
+}
+
+impl DesktopRelayMarkerKind {
+    fn envelope_kind(&self) -> &'static str {
+        match self {
+            Self::ArmPending => "arm_pending_requested",
+            Self::ArmAccepted => "arm_accepted",
+        }
+    }
+
+    fn marker_prefix(&self) -> &'static str {
+        match self {
+            Self::ArmPending => "CBTH_DESKTOP_RELAY_ARM_PENDING",
+            Self::ArmAccepted => "CBTH_DESKTOP_RELAY_ARM_ACCEPTED",
+        }
+    }
+
+    fn cli_value(&self) -> &'static str {
+        match self {
+            Self::ArmPending => "arm-pending",
+            Self::ArmAccepted => "arm-accepted",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum DesktopRelayScannerCommand {
+    #[command(about = "Bind a Desktop bridge thread to a resolved Codex rollout path")]
+    Bind(DesktopRelayScannerBindArgs),
+    #[command(about = "Inspect Desktop transcript relay scanner status")]
+    Status(DesktopRelayScannerStatusArgs),
+    #[command(about = "Run one bounded Desktop transcript relay scan")]
+    ScanOnce(DesktopRelayScannerScanOnceArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum DesktopRelayMarkerCommand {
+    #[command(about = "Issue a high-entropy Desktop transcript relay marker")]
+    Issue(DesktopRelayMarkerIssueArgs),
+}
+
+#[derive(Debug, Args)]
+struct DesktopRelayEmitArmPendingArgs {
+    #[arg(long)]
+    source_thread_id: String,
+
+    #[arg(long)]
+    attempt_id: String,
+
+    #[arg(long)]
+    generation: i64,
+
+    #[arg(long)]
+    bridge_request_id: String,
+
+    #[arg(long, help = "Issued high-entropy transcript relay marker")]
+    marker: String,
+
+    #[arg(long, help = "Emit the prefixed JSON envelope")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopRelayEmitArmAcceptedArgs {
+    #[arg(long)]
+    source_thread_id: String,
+
+    #[arg(long)]
+    attempt_id: String,
+
+    #[arg(long)]
+    generation: i64,
+
+    #[arg(long)]
+    bridge_request_id: String,
+
+    #[arg(long, help = "Issued high-entropy transcript relay marker")]
+    marker: String,
+
+    #[arg(long, help = "Emit the prefixed JSON envelope")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopRelayScannerBindArgs {
+    #[arg(long, help = "Desktop bridge thread id whose rollout will be scanned")]
+    bridge_thread_id: String,
+
+    #[arg(long, help = "Resolved Codex rollout JSONL path for the bridge thread")]
+    rollout_path: PathBuf,
+
+    #[arg(
+        long,
+        help = "Start scanning from the beginning instead of the current EOF"
+    )]
+    from_start: bool,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopRelayScannerStatusArgs {
+    #[arg(
+        long,
+        help = "Only show scanner status for this Desktop bridge thread id"
+    )]
+    bridge_thread_id: Option<String>,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct DesktopRelayScannerScanOnceArgs {
+    #[arg(long, help = "Only scan this Desktop bridge thread id")]
+    bridge_thread_id: Option<String>,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Args)]
+struct DesktopRelayMarkerIssueArgs {
+    #[arg(long, help = "Desktop bridge thread id that owns the marker")]
+    bridge_thread_id: String,
+
+    #[arg(long, value_enum, help = "Envelope kind this marker authorizes")]
+    kind: DesktopRelayMarkerKind,
+
+    #[arg(long)]
+    source_thread_id: String,
+
+    #[arg(long)]
+    attempt_id: String,
+
+    #[arg(long)]
+    generation: i64,
+
+    #[arg(long)]
+    bridge_request_id: String,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
 }
 
 #[derive(Debug, Args)]
@@ -2240,6 +2435,24 @@ pub fn run() -> Result<()> {
                 },
         } => {
             write_desktop_transcript_arm(args)?;
+            return Ok(());
+        }
+        Commands::Desktop {
+            command:
+                DesktopCommand::Relay {
+                    command: DesktopRelayCommand::EmitArmPending(args),
+                },
+        } => {
+            write_desktop_relay_arm_pending(args)?;
+            return Ok(());
+        }
+        Commands::Desktop {
+            command:
+                DesktopCommand::Relay {
+                    command: DesktopRelayCommand::EmitArmAccepted(args),
+                },
+        } => {
+            write_desktop_relay_arm_accepted(args)?;
             return Ok(());
         }
         command => dispatch(
@@ -9245,6 +9458,95 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
         }
         Commands::Desktop {
             command:
+                DesktopCommand::Relay {
+                    command:
+                        DesktopRelayCommand::Scanner {
+                            command: DesktopRelayScannerCommand::Bind(args),
+                        },
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("desktop"),
+                OsString::from("relay"),
+                OsString::from("scanner"),
+                OsString::from("bind"),
+            ];
+            push_string_arg(&mut argv, "--bridge-thread-id", &args.bridge_thread_id);
+            push_path_arg(
+                &mut argv,
+                "--rollout-path",
+                &absolute_cli_path(&args.rollout_path)?,
+            );
+            if args.from_start {
+                argv.push(OsString::from("--from-start"));
+            }
+            if args.json {
+                argv.push(OsString::from("--json"));
+            }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Desktop {
+            command:
+                DesktopCommand::Relay {
+                    command:
+                        DesktopRelayCommand::Scanner {
+                            command: DesktopRelayScannerCommand::ScanOnce(args),
+                        },
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("desktop"),
+                OsString::from("relay"),
+                OsString::from("scanner"),
+                OsString::from("scan-once"),
+            ];
+            push_optional_string_arg(
+                &mut argv,
+                "--bridge-thread-id",
+                args.bridge_thread_id.as_deref(),
+            );
+            if args.json {
+                argv.push(OsString::from("--json"));
+            }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Desktop {
+            command:
+                DesktopCommand::Relay {
+                    command:
+                        DesktopRelayCommand::Marker {
+                            command: DesktopRelayMarkerCommand::Issue(args),
+                        },
+                },
+        } => {
+            let mut argv = vec![
+                OsString::from("desktop"),
+                OsString::from("relay"),
+                OsString::from("marker"),
+                OsString::from("issue"),
+            ];
+            push_string_arg(&mut argv, "--bridge-thread-id", &args.bridge_thread_id);
+            push_string_arg(&mut argv, "--kind", args.kind.cli_value());
+            push_string_arg(&mut argv, "--source-thread-id", &args.source_thread_id);
+            push_string_arg(&mut argv, "--attempt-id", &args.attempt_id);
+            push_i64_arg(&mut argv, "--generation", args.generation);
+            push_string_arg(&mut argv, "--bridge-request-id", &args.bridge_request_id);
+            if args.json {
+                argv.push(OsString::from("--json"));
+            }
+            if let Some(now) = args.now {
+                push_i64_arg(&mut argv, "--now", now);
+            }
+            argv
+        }
+        Commands::Desktop {
+            command:
                 DesktopCommand::Validation {
                     command: DesktopValidationCommand::PrepareWritebackFixture(args),
                 },
@@ -9341,8 +9643,13 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
             command:
                 DesktopCommand::Relay {
                     command:
-                        DesktopRelayCommand::ConsumeTranscript(_)
-                        | DesktopRelayCommand::ConsumePreparedTranscript(_),
+                        DesktopRelayCommand::EmitArmPending(_)
+                        | DesktopRelayCommand::EmitArmAccepted(_)
+                        | DesktopRelayCommand::ConsumeTranscript(_)
+                        | DesktopRelayCommand::ConsumePreparedTranscript(_)
+                        | DesktopRelayCommand::Scanner {
+                            command: DesktopRelayScannerCommand::Status(_),
+                        },
                 },
         }
         | Commands::Doctor { .. }
@@ -10650,6 +10957,16 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
             let consumption = consume_prepared_desktop_transcript_relay(&mut store, prepared, now)?;
             Ok(json!({ "desktop_transcript_relay_consumption": consumption }))
         }
+        DesktopCommand::Relay {
+            command: DesktopRelayCommand::Scanner { command },
+        } => dispatch_desktop_relay_scanner(command, layout),
+        DesktopCommand::Relay {
+            command: DesktopRelayCommand::Marker { command },
+        } => dispatch_desktop_relay_marker(command, layout),
+        DesktopCommand::Relay {
+            command:
+                DesktopRelayCommand::EmitArmPending(_) | DesktopRelayCommand::EmitArmAccepted(_),
+        } => bail!("desktop relay emit commands must execute from the foreground client"),
         DesktopCommand::Validation {
             command: DesktopValidationCommand::PrepareWritebackFixture(args),
         } => {
@@ -11236,6 +11553,35 @@ fn desktop_transcript_arm_envelope(
     }))
 }
 
+fn desktop_transcript_arm_accepted_envelope(
+    source_thread_id: &str,
+    attempt_id: &str,
+    generation: i64,
+    bridge_request_id: &str,
+    marker: &str,
+    now: i64,
+) -> Result<Value> {
+    validate_desktop_transcript_arm_fields(
+        source_thread_id,
+        attempt_id,
+        generation,
+        bridge_request_id,
+        marker,
+    )?;
+    Ok(json!({
+        "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "channel": DESKTOP_TRANSCRIPT_WRITEBACK_CHANNEL,
+        "kind": "arm_accepted",
+        "source_thread_id": source_thread_id,
+        "attempt_id": attempt_id,
+        "generation": generation,
+        "bridge_request_id": bridge_request_id,
+        "marker": marker,
+        "created_at": now,
+        "cbth_version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
 fn validate_desktop_transcript_arm_fields(
     source_thread_id: &str,
     attempt_id: &str,
@@ -11297,6 +11643,32 @@ fn write_desktop_transcript_arm(args: DesktopEmitTranscriptArmArgs) -> Result<()
         args.generation,
         &args.bridge_request_id,
         &args.bridge_arm_lease_id,
+        &args.marker,
+        now,
+    )?;
+    write_desktop_transcript_writeback_envelope(&envelope)
+}
+
+fn write_desktop_relay_arm_pending(args: DesktopRelayEmitArmPendingArgs) -> Result<()> {
+    let now = args.now.unwrap_or(now_epoch_seconds()?);
+    let envelope = desktop_transcript_arm_pending_envelope(
+        &args.source_thread_id,
+        &args.attempt_id,
+        args.generation,
+        &args.bridge_request_id,
+        &args.marker,
+        now,
+    )?;
+    write_desktop_transcript_writeback_envelope(&envelope)
+}
+
+fn write_desktop_relay_arm_accepted(args: DesktopRelayEmitArmAcceptedArgs) -> Result<()> {
+    let now = args.now.unwrap_or(now_epoch_seconds()?);
+    let envelope = desktop_transcript_arm_accepted_envelope(
+        &args.source_thread_id,
+        &args.attempt_id,
+        args.generation,
+        &args.bridge_request_id,
         &args.marker,
         now,
     )?;
@@ -11562,6 +11934,680 @@ fn consume_prepared_desktop_transcript_relay(
     }))
 }
 
+fn dispatch_desktop_relay_scanner(
+    command: DesktopRelayScannerCommand,
+    layout: &FsLayout,
+) -> Result<Value> {
+    match command {
+        DesktopRelayScannerCommand::Bind(args) => {
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            let binding = prepare_desktop_relay_scanner_binding(
+                &args.bridge_thread_id,
+                &args.rollout_path,
+                args.from_start,
+                now,
+            )?;
+            let mut store = Store::open(layout)?;
+            let record = store.bind_desktop_relay_scanner(binding)?;
+            Ok(json!({ "desktop_relay_scanner_binding": record }))
+        }
+        DesktopRelayScannerCommand::Status(args) => {
+            let now = now_epoch_seconds()?;
+            let store = Store::open(layout)?;
+            let bindings =
+                store.list_desktop_relay_scanner_bindings(args.bridge_thread_id.as_deref())?;
+            let active_marker_counts = desktop_relay_active_marker_counts(&store, &bindings, now)?;
+            Ok(json!({
+                "desktop_relay_scanner_status": {
+                    "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+                    "bindings": bindings,
+                    "active_marker_counts": active_marker_counts,
+                }
+            }))
+        }
+        DesktopRelayScannerCommand::ScanOnce(args) => {
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            let mut store = Store::open(layout)?;
+            let report = run_desktop_relay_scanner_scan_once(
+                &mut store,
+                args.bridge_thread_id.as_deref(),
+                now,
+            )?;
+            Ok(json!({ "desktop_relay_scanner_scan": report }))
+        }
+    }
+}
+
+fn dispatch_desktop_relay_marker(
+    command: DesktopRelayMarkerCommand,
+    layout: &FsLayout,
+) -> Result<Value> {
+    match command {
+        DesktopRelayMarkerCommand::Issue(args) => {
+            let now = args.now.unwrap_or(now_epoch_seconds()?);
+            validate_nonempty("bridge_thread_id", &args.bridge_thread_id)?;
+            validate_nonempty("source_thread_id", &args.source_thread_id)?;
+            validate_nonempty("attempt_id", &args.attempt_id)?;
+            validate_nonempty("bridge_request_id", &args.bridge_request_id)?;
+            if args.generation <= 0 {
+                bail!("generation must be positive");
+            }
+            let mut store = Store::open(layout)?;
+            let marker = format!("{}_{}", args.kind.marker_prefix(), new_id());
+            let record =
+                store.issue_desktop_transcript_relay_marker(NewDesktopTranscriptRelayMarker {
+                    marker,
+                    bridge_thread_id: args.bridge_thread_id,
+                    envelope_kind: args.kind.envelope_kind().to_owned(),
+                    source_thread_id: args.source_thread_id,
+                    attempt_id: args.attempt_id,
+                    generation: args.generation,
+                    bridge_request_id: args.bridge_request_id,
+                    issued_at: now,
+                    expires_at: validate_timestamp_add(
+                        now,
+                        DESKTOP_TRANSCRIPT_RELAY_MARKER_TTL_SECONDS,
+                        "relay marker expires_at",
+                    )?,
+                    retention_until: validate_timestamp_add(
+                        now,
+                        DESKTOP_TRANSCRIPT_RELAY_RETENTION_SECONDS,
+                        "relay marker retention_until",
+                    )?,
+                })?;
+            Ok(json!({
+                "desktop_transcript_relay_marker": {
+                    "kind": args.kind.cli_value(),
+                    "record": record,
+                }
+            }))
+        }
+    }
+}
+
+fn desktop_relay_active_marker_counts(
+    store: &Store,
+    bindings: &[DesktopRelayScannerBindingRecord],
+    now: i64,
+) -> Result<Value> {
+    let mut counts = serde_json::Map::new();
+    for binding in bindings {
+        let count = store
+            .list_active_desktop_transcript_relay_markers(&binding.bridge_thread_id, now)?
+            .len();
+        counts.insert(binding.bridge_thread_id.clone(), json!(count));
+    }
+    Ok(Value::Object(counts))
+}
+
+fn prepare_desktop_relay_scanner_binding(
+    bridge_thread_id: &str,
+    rollout_path: &Path,
+    from_start: bool,
+    now: i64,
+) -> Result<NewDesktopRelayScannerBinding> {
+    validate_nonempty("bridge_thread_id", bridge_thread_id)?;
+    let canonical_path = rollout_path
+        .canonicalize()
+        .with_context(|| format!("resolve rollout path {}", rollout_path.display()))?;
+    let metadata = fs::metadata(&canonical_path)
+        .with_context(|| format!("stat rollout path {}", canonical_path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "rollout path {} is not a regular file",
+            canonical_path.display()
+        );
+    }
+    let rollout_identity = desktop_relay_rollout_identity(&metadata);
+    let (cursor_byte_offset, cursor_line_number) = if from_start {
+        (0_i64, 0_i64)
+    } else {
+        (
+            i64::try_from(metadata.len()).context("rollout file length fits i64")?,
+            count_complete_lines(&canonical_path)?,
+        )
+    };
+    Ok(NewDesktopRelayScannerBinding {
+        bridge_thread_id: bridge_thread_id.to_owned(),
+        rollout_path: canonical_path.display().to_string(),
+        rollout_identity,
+        cursor_byte_offset,
+        cursor_line_number,
+        now,
+    })
+}
+
+fn count_complete_lines(path: &Path) -> Result<i64> {
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader = io::BufReader::new(file);
+    let mut lines = 0_i64;
+    loop {
+        let available = reader
+            .fill_buf()
+            .with_context(|| format!("read {}", path.display()))?;
+        if available.is_empty() {
+            return Ok(lines);
+        }
+        let newlines = available.iter().filter(|byte| **byte == b'\n').count();
+        lines = lines
+            .checked_add(i64::try_from(newlines).context("line count chunk fits i64")?)
+            .context("rollout line count overflow")?;
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
+}
+
+fn desktop_relay_rollout_identity(metadata: &fs::Metadata) -> String {
+    format!("unix:{}:{}", metadata.dev(), metadata.ino())
+}
+
+fn run_desktop_relay_scanner_scan_once(
+    store: &mut Store,
+    bridge_thread_id: Option<&str>,
+    now: i64,
+) -> Result<Value> {
+    if let Some(bridge_thread_id) = bridge_thread_id {
+        validate_nonempty("bridge_thread_id", bridge_thread_id)?;
+    }
+    let reconciled_markers = store.reconcile_desktop_transcript_relay_consumed_markers(now)?;
+    let expired_markers = store.expire_desktop_transcript_relay_markers(now)?;
+    let retention_deleted = store.cleanup_desktop_transcript_relay_retention(now)?;
+    let bindings = store.list_desktop_relay_scanner_bindings(bridge_thread_id)?;
+    let mut reports = Vec::new();
+    let mut scanned_bindings = 0_usize;
+    let mut consumed_markers = 0_usize;
+    let mut rejected_markers = 0_usize;
+    for binding in bindings {
+        if binding.binding_state != "active" {
+            continue;
+        }
+        let Some(report) = scan_desktop_relay_binding_once(store, &binding, now)? else {
+            continue;
+        };
+        scanned_bindings += 1;
+        consumed_markers += report
+            .get("consumed_markers")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        rejected_markers += report
+            .get("rejected_markers")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        reports.push(report);
+    }
+    Ok(json!({
+        "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
+        "scanned_bindings": scanned_bindings,
+        "consumed_markers": consumed_markers,
+        "rejected_markers": rejected_markers,
+        "reconciled_markers": reconciled_markers,
+        "expired_markers": expired_markers,
+        "retention_deleted": retention_deleted,
+        "bindings": reports,
+    }))
+}
+
+struct DesktopRelayTrustedEnvelope {
+    marker: String,
+    envelope: Value,
+    envelope_hash: String,
+    carrier: Value,
+}
+
+fn desktop_relay_marker_dependency_rank(envelope_kind: &str) -> i32 {
+    match envelope_kind {
+        "arm_pending_requested" => 0,
+        "arm_accepted" => 1,
+        _ => 2,
+    }
+}
+
+fn scan_desktop_relay_binding_once(
+    store: &mut Store,
+    binding: &DesktopRelayScannerBindingRecord,
+    now: i64,
+) -> Result<Option<Value>> {
+    let path = Path::new(&binding.rollout_path);
+    let pre_open_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let reason = format!("stat rollout failed: {error}");
+            let degraded =
+                store.degrade_desktop_relay_scanner_binding_if_current(binding, &reason, now)?;
+            return Ok(Some(json!({
+                "bridge_thread_id": binding.bridge_thread_id,
+                "outcome": "degraded",
+                "reason": reason,
+                "binding": degraded,
+            })));
+        }
+    };
+    if !pre_open_metadata.file_type().is_file() {
+        let reason = "rollout path is not a regular file before open";
+        let degraded =
+            store.degrade_desktop_relay_scanner_binding_if_current(binding, reason, now)?;
+        return Ok(Some(json!({
+            "bridge_thread_id": binding.bridge_thread_id,
+            "outcome": "degraded",
+            "reason": reason,
+            "binding": degraded,
+        })));
+    }
+    let pre_open_identity = desktop_relay_rollout_identity(&pre_open_metadata);
+    if pre_open_identity != binding.rollout_identity {
+        let reason = "rollout identity drift before open";
+        let degraded =
+            store.degrade_desktop_relay_scanner_binding_if_current(binding, reason, now)?;
+        return Ok(Some(json!({
+            "bridge_thread_id": binding.bridge_thread_id,
+            "outcome": "degraded",
+            "reason": reason,
+            "binding": degraded,
+        })));
+    }
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let reason = format!("open rollout failed: {error}");
+            let degraded =
+                store.degrade_desktop_relay_scanner_binding_if_current(binding, &reason, now)?;
+            return Ok(Some(json!({
+                "bridge_thread_id": binding.bridge_thread_id,
+                "outcome": "degraded",
+                "reason": reason,
+                "binding": degraded,
+            })));
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let reason = format!("opened rollout metadata failed: {error}");
+            let degraded =
+                store.degrade_desktop_relay_scanner_binding_if_current(binding, &reason, now)?;
+            return Ok(Some(json!({
+                "bridge_thread_id": binding.bridge_thread_id,
+                "outcome": "degraded",
+                "reason": reason,
+                "binding": degraded,
+            })));
+        }
+    };
+    if !metadata.is_file() {
+        let reason = "rollout path is not a regular file";
+        let degraded =
+            store.degrade_desktop_relay_scanner_binding_if_current(binding, reason, now)?;
+        return Ok(Some(json!({
+            "bridge_thread_id": binding.bridge_thread_id,
+            "outcome": "degraded",
+            "reason": reason,
+            "binding": degraded,
+        })));
+    }
+    let current_identity = desktop_relay_rollout_identity(&metadata);
+    if current_identity != binding.rollout_identity {
+        let reason = "rollout identity drift";
+        let degraded =
+            store.degrade_desktop_relay_scanner_binding_if_current(binding, reason, now)?;
+        return Ok(Some(json!({
+            "bridge_thread_id": binding.bridge_thread_id,
+            "outcome": "degraded",
+            "reason": reason,
+            "binding": degraded,
+        })));
+    }
+    let file_len = i64::try_from(metadata.len()).context("rollout file length fits i64")?;
+    if file_len < binding.cursor_byte_offset {
+        let reason = "rollout truncated before scanner cursor";
+        let degraded =
+            store.degrade_desktop_relay_scanner_binding_if_current(binding, reason, now)?;
+        return Ok(Some(json!({
+            "bridge_thread_id": binding.bridge_thread_id,
+            "outcome": "degraded",
+            "reason": reason,
+            "binding": degraded,
+        })));
+    }
+
+    let markers =
+        store.list_active_desktop_transcript_relay_markers(&binding.bridge_thread_id, now)?;
+    if markers.is_empty() {
+        return Ok(None);
+    }
+    let mut marker_records = markers;
+    marker_records.sort_by_key(|marker| {
+        (
+            desktop_relay_marker_dependency_rank(&marker.envelope_kind),
+            marker.issued_at,
+            marker.marker.clone(),
+        )
+    });
+    let marker_ids = marker_records
+        .iter()
+        .map(|marker| marker.marker.clone())
+        .collect::<Vec<_>>();
+    let mut trusted: HashMap<String, Vec<DesktopRelayTrustedEnvelope>> = HashMap::new();
+    let mut rejected: HashMap<String, String> = HashMap::new();
+    let mut bytes_read = 0_usize;
+    let mut lines_read = 0_usize;
+    let mut next_offset = binding.cursor_byte_offset;
+    let mut next_line_number = binding.cursor_line_number;
+    file.seek(SeekFrom::Start(
+        u64::try_from(binding.cursor_byte_offset).context("cursor offset fits u64")?,
+    ))?;
+    let mut reader = io::BufReader::new(file);
+    let mut line = Vec::new();
+
+    while lines_read < DESKTOP_TRANSCRIPT_SCANNER_MAX_LINES_PER_TICK {
+        let line_number = next_line_number + 1;
+        let line_start_offset = next_offset;
+        let Some(max_line_bytes) =
+            desktop_relay_scanner_next_read_limit(file_len, next_offset, bytes_read)?
+        else {
+            break;
+        };
+        let limit_is_snapshot_eof = line_start_offset
+            .checked_add(i64::try_from(max_line_bytes).context("scanner line limit fits i64")?)
+            .is_some_and(|limit_end| limit_end >= file_len);
+        let bytes = match read_desktop_relay_scanner_line(
+            &mut reader,
+            &mut line,
+            line_number,
+            max_line_bytes,
+            limit_is_snapshot_eof,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if bytes_read > 0 {
+                    break;
+                }
+                let reason = format!("read rollout line failed: {error}");
+                let degraded = store
+                    .degrade_desktop_relay_scanner_binding_if_current(binding, &reason, now)?;
+                return Ok(Some(json!({
+                    "bridge_thread_id": binding.bridge_thread_id,
+                    "outcome": "degraded",
+                    "reason": reason,
+                    "binding": degraded,
+                })));
+            }
+        };
+        if bytes == 0 {
+            break;
+        }
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        bytes_read += bytes;
+        lines_read += 1;
+        next_offset = validate_timestamp_add(
+            line_start_offset,
+            i64::try_from(bytes).context("line byte count fits i64")?,
+            "desktop relay scanner cursor",
+        )?;
+        next_line_number += 1;
+        let line_text = std::str::from_utf8(&line)
+            .with_context(|| format!("decode rollout UTF-8 line {line_number}"))?;
+        if !line_text.contains(DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX) {
+            continue;
+        }
+        let record: Value = match serde_json::from_str(line_text.trim_end()) {
+            Ok(record) => record,
+            Err(error) => {
+                let reason = format!("parse rollout JSON line {line_number}: {error}");
+                let degraded = store
+                    .degrade_desktop_relay_scanner_binding_if_current(binding, &reason, now)?;
+                return Ok(Some(json!({
+                    "bridge_thread_id": binding.bridge_thread_id,
+                    "outcome": "degraded",
+                    "reason": reason,
+                    "binding": degraded,
+                })));
+            }
+        };
+        for carrier in desktop_transcript_carriers(&record) {
+            if !matches!(carrier.trust, DesktopTranscriptCarrierTrust::TrustedAuto)
+                || !carrier.text.contains(DESKTOP_TRANSCRIPT_WRITEBACK_PREFIX)
+            {
+                continue;
+            }
+            for marker in &marker_ids {
+                if !carrier.text.contains(marker) {
+                    continue;
+                }
+                let mut saw_prefixed_envelope = false;
+                let mut saw_matching_envelope_or_error = false;
+                for parsed in extract_desktop_transcript_writeback_envelopes(&carrier.text, marker)
+                {
+                    saw_prefixed_envelope = true;
+                    match parsed {
+                        Ok(Some(envelope)) => {
+                            saw_matching_envelope_or_error = true;
+                            let canonical = canonical_json(&envelope)?;
+                            let envelope_hash = sha256_hex(canonical.as_bytes());
+                            trusted.entry(marker.clone()).or_default().push(
+                                DesktopRelayTrustedEnvelope {
+                                    marker: marker.clone(),
+                                    envelope,
+                                    envelope_hash,
+                                    carrier: desktop_transcript_envelope_entry(
+                                        &carrier,
+                                        line_number,
+                                        serde_json::from_str(&canonical)
+                                            .context("parse canonical envelope")?,
+                                    ),
+                                },
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            saw_matching_envelope_or_error = true;
+                            rejected
+                                .entry(marker.clone())
+                                .or_insert_with(|| error.to_string());
+                        }
+                    }
+                }
+                if saw_prefixed_envelope && !saw_matching_envelope_or_error {
+                    rejected.entry(marker.clone()).or_insert_with(|| {
+                        "trusted carrier mentioned marker but contained no matching relay envelope"
+                            .to_owned()
+                    });
+                }
+            }
+        }
+    }
+
+    if next_offset < file_len && (!trusted.is_empty() || !rejected.is_empty()) {
+        let reason = "trusted marker evidence before scanner reached tick-start EOF";
+        let degraded =
+            store.degrade_desktop_relay_scanner_binding_if_current(binding, reason, now)?;
+        return Ok(Some(json!({
+            "bridge_thread_id": binding.bridge_thread_id,
+            "outcome": "degraded",
+            "reason": reason,
+            "binding": degraded,
+        })));
+    }
+
+    let mut consumed_reports = Vec::new();
+    let mut rejected_reports = Vec::new();
+    for marker_record in marker_records {
+        let marker = marker_record.marker.clone();
+        if let Some(reason) = rejected.remove(&marker) {
+            let record = store.mark_desktop_transcript_relay_marker_rejected_for_scanner(
+                &marker, &reason, None, binding, now,
+            )?;
+            rejected_reports.push(json!({
+                "marker": marker,
+                "reason": reason,
+                "record": record,
+            }));
+            continue;
+        }
+        let Some(matches) = trusted.remove(&marker) else {
+            continue;
+        };
+        if matches.len() != 1 {
+            let reason = format!("duplicate trusted envelopes: {}", matches.len());
+            let envelope_hash = matches.first().map(|entry| entry.envelope_hash.as_str());
+            let record = store.mark_desktop_transcript_relay_marker_rejected_for_scanner(
+                &marker,
+                &reason,
+                envelope_hash,
+                binding,
+                now,
+            )?;
+            rejected_reports.push(json!({
+                "marker": marker,
+                "reason": reason,
+                "record": record,
+            }));
+            continue;
+        }
+        let entry = matches.into_iter().next().expect("single trusted match");
+        match consume_desktop_relay_scanner_envelope(store, binding, &marker_record, entry, now) {
+            Ok(report) => consumed_reports.push(report),
+            Err(error) => {
+                let reason = error.to_string();
+                if reason.contains("desktop relay scanner binding changed during consumption") {
+                    return Err(error);
+                }
+                let record = store.mark_desktop_transcript_relay_marker_rejected_for_scanner(
+                    &marker, &reason, None, binding, now,
+                )?;
+                rejected_reports.push(json!({
+                    "marker": marker,
+                    "reason": reason,
+                    "record": record,
+                }));
+            }
+        }
+    }
+
+    let binding = store.update_desktop_relay_scanner_cursor(
+        binding,
+        (next_offset, next_line_number),
+        consumed_reports.len(),
+        now,
+    )?;
+    Ok(Some(json!({
+        "bridge_thread_id": binding.bridge_thread_id,
+        "outcome": "scanned",
+        "lines_read": lines_read,
+        "bytes_read": bytes_read,
+        "cursor_byte_offset": next_offset,
+        "cursor_line_number": next_line_number,
+        "consumed_markers": consumed_reports,
+        "rejected_markers": rejected_reports,
+        "binding": binding,
+    })))
+}
+
+fn consume_desktop_relay_scanner_envelope(
+    store: &mut Store,
+    binding: &DesktopRelayScannerBindingRecord,
+    marker_record: &DesktopTranscriptRelayMarkerRecord,
+    entry: DesktopRelayTrustedEnvelope,
+    now: i64,
+) -> Result<Value> {
+    let kind = json_str_field(&entry.envelope, "kind", "transcript envelope")?;
+    if kind != marker_record.envelope_kind {
+        bail!(
+            "trusted transcript envelope kind {kind} does not match issued marker kind {}",
+            marker_record.envelope_kind
+        );
+    }
+    let source_thread_id =
+        json_str_field(&entry.envelope, "source_thread_id", "transcript envelope")?;
+    let attempt_id = json_str_field(&entry.envelope, "attempt_id", "transcript envelope")?;
+    let generation = json_i64_field(&entry.envelope, "generation", "transcript envelope")?;
+    let bridge_request_id =
+        json_str_field(&entry.envelope, "bridge_request_id", "transcript envelope")?;
+    if source_thread_id != marker_record.source_thread_id
+        || attempt_id != marker_record.attempt_id
+        || generation != marker_record.generation
+        || bridge_request_id != marker_record.bridge_request_id
+    {
+        bail!("trusted transcript envelope fields do not match issued marker");
+    }
+    let canonical_envelope_json = canonical_json(&entry.envelope)?;
+    let envelope_hash = entry.envelope_hash.clone();
+    let mut envelope_kind = kind.to_owned();
+    let mut bridge_arm_lease_id = None;
+    if kind == "arm_accepted" {
+        if let Some(consumption) =
+            store.replay_desktop_transcript_relay_consumption(&entry.marker, &envelope_hash)?
+        {
+            let marker = store.mark_desktop_transcript_relay_marker_consumed_for_scanner(
+                &entry.marker,
+                &entry.envelope_hash,
+                binding,
+                now,
+            )?;
+            return finish_desktop_relay_scanner_consumption(entry, consumption, marker);
+        }
+        envelope_kind = "arm_requested".to_owned();
+        bridge_arm_lease_id = match store.desktop_arm_lease_for_pending_attempt(
+            &marker_record.source_thread_id,
+            &marker_record.attempt_id,
+            marker_record.generation,
+            &marker_record.bridge_request_id,
+            now,
+        ) {
+            Ok(lease_id) => Some(lease_id),
+            Err(error) => {
+                if let Some(consumption) = store
+                    .replay_desktop_transcript_relay_consumption(&entry.marker, &envelope_hash)?
+                {
+                    let marker = store.mark_desktop_transcript_relay_marker_consumed_for_scanner(
+                        &entry.marker,
+                        &entry.envelope_hash,
+                        binding,
+                        now,
+                    )?;
+                    return finish_desktop_relay_scanner_consumption(entry, consumption, marker);
+                }
+                return Err(error);
+            }
+        };
+    }
+    let (consumption, marker) = store.consume_issued_desktop_transcript_relay_marker(
+        NewDesktopTranscriptRelayConsumption {
+            marker: entry.marker.clone(),
+            envelope_hash,
+            envelope_kind,
+            envelope_json: canonical_envelope_json,
+            source_thread_id: marker_record.source_thread_id.clone(),
+            attempt_id: marker_record.attempt_id.clone(),
+            generation: marker_record.generation,
+            bridge_request_id: marker_record.bridge_request_id.clone(),
+            bridge_arm_lease_id,
+            now,
+        },
+        binding,
+    )?;
+    finish_desktop_relay_scanner_consumption(entry, consumption, marker)
+}
+
+fn finish_desktop_relay_scanner_consumption(
+    entry: DesktopRelayTrustedEnvelope,
+    consumption: DesktopTranscriptRelayConsumptionRecord,
+    marker: DesktopTranscriptRelayMarkerRecord,
+) -> Result<Value> {
+    Ok(json!({
+        "marker": entry.marker,
+        "envelope_hash": entry.envelope_hash,
+        "carrier": entry.carrier,
+        "marker_record": marker,
+        "consumption": consumption,
+    }))
+}
+
 fn trusted_desktop_transcript_relay_entry(scan: &Value) -> Result<&Value> {
     let auto_decision = json_object_field(scan, "auto_decision")?;
     let trusted = auto_decision
@@ -11630,6 +12676,26 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn desktop_relay_scanner_next_read_limit(
+    snapshot_file_len: i64,
+    next_offset: i64,
+    bytes_read: usize,
+) -> Result<Option<usize>> {
+    if next_offset >= snapshot_file_len
+        || bytes_read >= DESKTOP_TRANSCRIPT_SCANNER_MAX_BYTES_PER_TICK
+    {
+        return Ok(None);
+    }
+    let snapshot_remaining = usize::try_from(snapshot_file_len - next_offset)
+        .context("rollout snapshot remaining bytes fit usize")?;
+    let tick_remaining = DESKTOP_TRANSCRIPT_SCANNER_MAX_BYTES_PER_TICK - bytes_read;
+    Ok(Some(
+        snapshot_remaining
+            .min(tick_remaining)
+            .min(DESKTOP_TRANSCRIPT_SCAN_MAX_LINE_BYTES),
+    ))
+}
+
 fn read_bounded_desktop_transcript_line<R: BufRead>(
     reader: &mut R,
     line: &mut Vec<u8>,
@@ -11650,7 +12716,7 @@ fn read_bounded_desktop_transcript_line<R: BufRead>(
                 .map_or(available.len(), |index| index + 1);
             if total + take > max_bytes {
                 let remaining = max_bytes.saturating_sub(total);
-                (0, false, Some((remaining + 1).min(available.len())))
+                (0, false, Some(remaining.min(available.len())))
             } else {
                 line.extend_from_slice(&available[..take]);
                 (take, available[take - 1] == b'\n', None)
@@ -11666,6 +12732,25 @@ fn read_bounded_desktop_transcript_line<R: BufRead>(
             return Ok(total);
         }
     }
+}
+
+fn read_desktop_relay_scanner_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    line_number: i64,
+    max_bytes: usize,
+    limit_is_snapshot_eof: bool,
+) -> Result<usize> {
+    line.clear();
+    let mut limited = reader.take(u64::try_from(max_bytes).context("scanner line limit fits u64")?);
+    let bytes = limited.read_until(b'\n', line)?;
+    if bytes == 0 || line.ends_with(b"\n") {
+        return Ok(bytes);
+    }
+    if limit_is_snapshot_eof || bytes < max_bytes {
+        return Ok(bytes);
+    }
+    bail!("rollout line {line_number} exceeds {max_bytes} bytes")
 }
 
 #[derive(Clone, Copy)]
@@ -11841,7 +12926,7 @@ fn validate_desktop_transcript_writeback_envelope(
                 bail!("transcript envelope probe_id must be a string");
             }
         }
-        "arm_pending_requested" | "arm_requested" => {
+        "arm_pending_requested" | "arm_requested" | "arm_accepted" => {
             for field in ["source_thread_id", "attempt_id", "bridge_request_id"] {
                 let field_value = value[field]
                     .as_str()
@@ -11857,6 +12942,12 @@ fn validate_desktop_transcript_writeback_envelope(
                 if lease_id.is_empty() {
                     bail!("transcript envelope bridge_arm_lease_id must not be empty");
                 }
+            } else if kind == "arm_accepted"
+                && value
+                    .as_object()
+                    .is_some_and(|object| object.contains_key("bridge_arm_lease_id"))
+            {
+                bail!("transcript envelope bridge_arm_lease_id is not allowed for arm_accepted");
             }
             let generation = value["generation"]
                 .as_i64()
@@ -12411,6 +13502,78 @@ mod tests {
         let bytes = read_bounded_desktop_transcript_line(&mut reader, &mut line, 2, 8).unwrap();
         assert_eq!(bytes, 5);
         assert_eq!(line, b"next\n");
+    }
+
+    #[test]
+    fn desktop_relay_scanner_read_limit_stops_at_snapshot_eof() {
+        assert_eq!(
+            desktop_relay_scanner_next_read_limit(100, 90, 0).unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            desktop_relay_scanner_next_read_limit(100, 100, 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            desktop_relay_scanner_next_read_limit(
+                2 * DESKTOP_TRANSCRIPT_SCANNER_MAX_BYTES_PER_TICK as i64,
+                0,
+                DESKTOP_TRANSCRIPT_SCANNER_MAX_BYTES_PER_TICK - 1,
+            )
+            .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn desktop_relay_scanner_line_treats_snapshot_eof_as_partial() {
+        let mut reader =
+            io::BufReader::new(io::Cursor::new(b"partial-line-now-complete\n".to_vec()));
+        let mut line = Vec::new();
+
+        let bytes = read_desktop_relay_scanner_line(&mut reader, &mut line, 1, 7, true).unwrap();
+
+        assert_eq!(bytes, 7);
+        assert_eq!(line, b"partial");
+        assert!(!line.ends_with(b"\n"));
+    }
+
+    #[test]
+    fn desktop_relay_scanner_line_rejects_non_snapshot_oversize() {
+        let mut reader = io::BufReader::new(io::Cursor::new(b"oversized\n".to_vec()));
+        let mut line = Vec::new();
+
+        let error =
+            read_desktop_relay_scanner_line(&mut reader, &mut line, 1, 4, false).unwrap_err();
+
+        assert!(error.to_string().contains("rollout line 1 exceeds 4 bytes"));
+    }
+
+    #[test]
+    fn desktop_transcript_arm_accepted_rejects_lease_key_even_when_null() {
+        let envelope = json!({
+            "schema_version": 1,
+            "channel": "desktop_transcript_writeback",
+            "kind": "arm_accepted",
+            "source_thread_id": "thread-lease-null",
+            "attempt_id": "attempt-lease-null",
+            "generation": 1,
+            "bridge_request_id": "request-lease-null",
+            "marker": "CBTH_RELAY_NULL_LEASE",
+            "bridge_arm_lease_id": Value::Null,
+            "created_at": 1,
+        });
+        let encoded = serde_json::to_string(&envelope).expect("encode envelope");
+
+        let error =
+            validate_desktop_transcript_writeback_envelope(&encoded, "CBTH_RELAY_NULL_LEASE")
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("bridge_arm_lease_id is not allowed for arm_accepted")
+        );
     }
 
     #[test]

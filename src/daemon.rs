@@ -41,6 +41,7 @@ const SOCKET_LIVENESS_TIMEOUT: Duration = Duration::from_millis(250);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_MAINTENANCE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const DESKTOP_RELAY_SCANNER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CLI_APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_THREAD_START_BOOTSTRAP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CLI_APP_SERVER_TERM_GRACE: Duration = Duration::from_secs(2);
@@ -97,6 +98,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-writeback-helper-foundation",
     "desktop-writeback-live-validation-fixture",
     "desktop-transcript-relay-consumer",
+    "desktop-transcript-relay-scanner",
     DAEMON_HANDOFF_CAPABILITY,
 ];
 const CLI_THREAD_START_BOOTSTRAP_BOUND_THREAD_ID: &str = "__cbth_thread_start_bootstrap__";
@@ -553,6 +555,7 @@ impl DaemonLifecycleCache {
             || self.status.active_cli_observations > 0
             || (!maintenance_suppressed && self.status.cli_acceptances_stale_now > 0)
             || (!maintenance_suppressed && self.status.cli_observations_due_now > 0)
+            || (!maintenance_suppressed && self.status.active_desktop_relay_markers > 0)
             || (!maintenance_suppressed && self.status.open_batches_due_within_idle > 0)
     }
 }
@@ -2402,22 +2405,35 @@ fn maybe_spawn_lifecycle_maintenance(
         .lifecycle_maintenance_suppressed
         .load(Ordering::Acquire);
     let should_recover_lost_tasks = cache.status.nonterminal_tasks > 0;
+    let should_scan_desktop_relay =
+        !maintenance_suppressed && cache.status.active_desktop_relay_markers > 0;
     let should_sweep = !maintenance_suppressed && cache.status.has_due_maintenance();
     if worker.is_some()
         || cache.refresh_failed
-        || (!should_recover_lost_tasks && !should_sweep)
+        || (!should_recover_lost_tasks && !should_sweep && !should_scan_desktop_relay)
         || now < *next_attempt_at
     {
         return;
     }
 
     let state = Arc::clone(state);
-    *next_attempt_at = now + DAEMON_MAINTENANCE_RETRY_INTERVAL;
+    *next_attempt_at = now
+        + if should_scan_desktop_relay {
+            DESKTOP_RELAY_SCANNER_POLL_INTERVAL
+        } else {
+            DAEMON_MAINTENANCE_RETRY_INTERVAL
+        };
     *worker = Some(thread::spawn(move || {
         if state.stop_requested.load(Ordering::Acquire) {
             return;
         }
         let _ = recover_registryless_lost_tasks(&state);
+        if state.stop_requested.load(Ordering::Acquire) {
+            return;
+        }
+        if should_scan_desktop_relay {
+            let _ = run_desktop_relay_scanner_once(&state);
+        }
         if state.stop_requested.load(Ordering::Acquire) {
             return;
         }
@@ -2434,6 +2450,30 @@ fn maybe_spawn_lifecycle_maintenance(
             let _ = store.sweep(&state.layout, now);
         }
     }));
+}
+
+fn run_desktop_relay_scanner_once(state: &DaemonState) -> Result<()> {
+    let current_exe = std::env::current_exe().context("resolve current cbth executable")?;
+    let mut command = Command::new(current_exe);
+    command
+        .arg("--home")
+        .arg(state.layout.home_dir())
+        .arg("--direct-store")
+        .arg("desktop")
+        .arg("relay")
+        .arg("scanner")
+        .arg("scan-once")
+        .arg("--json")
+        .env("CBTH_ALLOW_DIRECT_STORE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = spawn_command_locked(&mut command).context("spawn desktop relay scanner")?;
+    let status = child.wait().context("wait for desktop relay scanner")?;
+    if !status.success() {
+        bail!("desktop relay scanner exited with {status}");
+    }
+    Ok(())
 }
 
 fn recover_registryless_lost_tasks(state: &DaemonState) -> Result<usize> {

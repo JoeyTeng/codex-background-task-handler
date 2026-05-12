@@ -494,6 +494,65 @@ pub struct NewDesktopTranscriptRelayConsumption {
     pub now: i64,
 }
 
+#[derive(Clone, Debug)]
+pub struct NewDesktopRelayScannerBinding {
+    pub bridge_thread_id: String,
+    pub rollout_path: String,
+    pub rollout_identity: String,
+    pub cursor_byte_offset: i64,
+    pub cursor_line_number: i64,
+    pub now: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopRelayScannerBindingRecord {
+    pub bridge_thread_id: String,
+    pub rollout_path: String,
+    pub rollout_identity: String,
+    pub cursor_byte_offset: i64,
+    pub cursor_line_number: i64,
+    pub binding_state: String,
+    pub last_scan_at: Option<i64>,
+    pub last_consumed_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub degraded_at: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewDesktopTranscriptRelayMarker {
+    pub marker: String,
+    pub bridge_thread_id: String,
+    pub envelope_kind: String,
+    pub source_thread_id: String,
+    pub attempt_id: String,
+    pub generation: i64,
+    pub bridge_request_id: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub retention_until: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DesktopTranscriptRelayMarkerRecord {
+    pub marker: String,
+    pub bridge_thread_id: String,
+    pub envelope_kind: String,
+    pub source_thread_id: String,
+    pub attempt_id: String,
+    pub generation: i64,
+    pub bridge_request_id: String,
+    pub marker_state: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub retention_until: i64,
+    pub consumed_at: Option<i64>,
+    pub rejected_at: Option<i64>,
+    pub rejection_reason: Option<String>,
+    pub envelope_hash: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DesktopTranscriptRelayConsumptionRecord {
     pub marker: String,
@@ -544,6 +603,7 @@ pub struct DaemonLifecycleStatus {
     pub cli_acceptances_stale_now: i64,
     pub active_cli_observations: i64,
     pub cli_observations_due_now: i64,
+    pub active_desktop_relay_markers: i64,
     pub open_batches_due_now: i64,
     pub open_batches_due_within_idle: i64,
 }

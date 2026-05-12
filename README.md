@@ -166,7 +166,7 @@ Managed CLI startup and `cbth doctor cli` also perform a soft Codex CLI compatib
 
 Use `cbth cli session list`, `cbth cli session inspect`, and `cbth cli session retire` for managed-session recovery. Operator retirement refuses `live` sessions, sessions that still own active delivery attempts, and sessions whose bound thread still has an open `manual_resolution_only` head batch. `detached`, `parked`, or `stale` sessions with no blockers can be retired manually; `cli run` can also auto-retire and replace retire-eligible `parked` / `stale` / profile-drift records. Same-profile reattach refuses the same active-attempt/manual-head blockers. A fail-closed accepted or pre-accept delivery path parks the session until the manual head batch is closed or swept.
 
-Desktop bridge foundation commands are implemented as operator/helper surfaces, not as an enabled Desktop automatic delivery path. `cbth desktop installation-state` owns installation-wide Desktop read/write capability state, `cbth desktop binding repair` durably binds a Desktop source thread to a caller heartbeat automation id, and `cbth desktop bridge-preflight` publishes a stable `~/.cbth/inbox/current-snapshot.json` manifest that points at revision-specific inbox snapshot files under `~/.cbth/inbox/snapshots/<revision>/`, including the installation-state export for that revision. It also exports latest-only `~/.cbth/inbox/desktop-installation-state.json` for convenience, but no-DB readers use the revision-specific export referenced by the manifest. Default preflight remains daemon-routed; `--require-existing-daemon` avoids daemon autostart but still uses the same-user Unix socket, while `--helper-direct-store` bypasses daemon autostart, `startup.lock`, and socket IPC but still opens SQLite to publish a fresh snapshot. Desktop heartbeat validation now prefers no-DB read helpers such as `read-snapshot`, `list-arm-pending`, `list-pause-due`, and `claim-next-ready`; those helpers only read already-published inbox JSON and do not open SQLite, connect the daemon, or write files. `note-arm-pending` and `note-arm` provide durable Desktop writeback primitives for existing prepared attempts, and transcript relay helpers can now emit stdout-only arm envelopes that `cbth desktop relay consume-transcript` consumes from a trusted rollout `function_call_output` carrier with marker/hash replay protection before calling those same CAS primitives. Preflight can export real arm-pending / pause-due entries, but ready attempt materialization, caller wake, `note-boundary-crossed`, artifact reads, production rollout tailing, and automatic Desktop delivery remain future work. See [docs/DESKTOP_BRIDGE_FOUNDATION.md](docs/DESKTOP_BRIDGE_FOUNDATION.md), [docs/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](docs/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md), [docs/DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md](docs/DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md), and [docs/DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md](docs/DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md).
+Desktop bridge foundation commands are implemented as operator/helper surfaces, not as an enabled Desktop automatic delivery path. `cbth desktop installation-state` owns installation-wide Desktop read/write capability state, `cbth desktop binding repair` durably binds a Desktop source thread to a caller heartbeat automation id, and `cbth desktop bridge-preflight` publishes a stable `~/.cbth/inbox/current-snapshot.json` manifest that points at revision-specific inbox snapshot files under `~/.cbth/inbox/snapshots/<revision>/`, including the installation-state export for that revision. It also exports latest-only `~/.cbth/inbox/desktop-installation-state.json` for convenience, but no-DB readers use the revision-specific export referenced by the manifest. Default preflight remains daemon-routed; `--require-existing-daemon` avoids daemon autostart but still uses the same-user Unix socket, while `--helper-direct-store` bypasses daemon autostart, `startup.lock`, and socket IPC but still opens SQLite to publish a fresh snapshot. Desktop heartbeat validation now prefers no-DB read helpers such as `read-snapshot`, `list-arm-pending`, `list-pause-due`, and `claim-next-ready`; those helpers only read already-published inbox JSON and do not open SQLite, connect the daemon, or write files. `note-arm-pending` and `note-arm` provide durable Desktop writeback primitives for existing prepared attempts. Transcript relay helpers can emit stdout-only arm envelopes that `cbth desktop relay consume-transcript` manually consumes from a trusted rollout `function_call_output` carrier with marker/hash replay protection, and the production scanner foundation adds explicit rollout binding, high-entropy marker issuance, daemon-owned bounded cursor scanning, and retention cleanup for the same CAS path. Production `emit-arm-accepted` omits the arm lease; `arm-accepted` marker issuance requires durable `arm_pending`, and the scanner resolves the lease from that durable state before calling `note-arm`. Preflight can export real arm-pending / pause-due entries, but ready attempt materialization, caller wake, `note-boundary-crossed`, artifact reads, scanner live validation, and automatic Desktop delivery remain future work. See [docs/DESKTOP_BRIDGE_FOUNDATION.md](docs/DESKTOP_BRIDGE_FOUNDATION.md), [docs/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](docs/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md), [docs/DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md](docs/DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md), and [docs/DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md](docs/DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md).
 
 ```bash
 cargo run --bin cbth -- \
@@ -238,6 +238,22 @@ cargo run --bin cbth -- \
   desktop relay consume-transcript \
   --rollout-path <rollout-jsonl> \
   --marker <marker> \
+  --json
+
+cargo run --bin cbth -- \
+  desktop relay scanner bind \
+  --bridge-thread-id <bridge-thread-id> \
+  --rollout-path <rollout-jsonl> \
+  --json
+
+cargo run --bin cbth -- \
+  desktop relay marker issue \
+  --bridge-thread-id <bridge-thread-id> \
+  --kind arm-pending \
+  --source-thread-id <thread-id> \
+  --attempt-id <attempt-id> \
+  --generation <generation> \
+  --bridge-request-id <request-id> \
   --json
 ```
 
