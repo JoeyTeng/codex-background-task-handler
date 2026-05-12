@@ -28,16 +28,16 @@ superseded_by:
 - `v0.1.0` was released with Linux x86_64 glibc and macOS arm64 assets, release workflow run `25336039804`, tag object `84ca65b57ada2dd696c960dd554c55364dec67ea`, and target commit `e6d013adbae633eb43efc5b7f9a3d680a4bb82a5`.
 - Desktop experiments established that external app-server / `codex exec resume` can append persisted turns, but cannot reliably push into the live Desktop in-memory session.
 - Desktop bridge architecture was documented and narrowed to bridge heartbeat plus pre-bound caller automation, direct-file-read snapshots, and gated `note-boundary-crossed` continuation.
-- Desktop bridge foundation landed: installation state, binding repair, `bridge-preflight`, revision-consistent snapshot skeletons, and direct-file-read export documented in [DESKTOP_BRIDGE_FOUNDATION.md](../../../DESKTOP_BRIDGE_FOUNDATION.md).
+- Desktop bridge foundation landed: installation state, binding repair, `bridge-preflight`, revision-consistent snapshot skeletons, and direct-file-read export documented in [DESKTOP_BRIDGE_FOUNDATION.md](../../../design/DESKTOP_BRIDGE_FOUNDATION.md).
 - Shared core and early Rust phases landed: local store, artifact ingest / retention / GC, daemon IPC, domain RPC routing, lifecycle guard, accepted attempt state, managed sessions, app-server lifecycle, passive adapter, trusted-all delivery loop, audit, and capability gates.
 
 ## Evidence
 
 - Migration PR: https://github.com/JoeyTeng/codex-background-task-handler/pull/37
 - Release: [v0.1.0](https://github.com/JoeyTeng/codex-background-task-handler/releases/tag/v0.1.0)
-- Live validation guide: [LIVE_E2E.md](../../../LIVE_E2E.md)
-- CLI dogfood plan: [CLI_DOGFOOD_V1_COMPLETION_PLAN.md](../../../CLI_DOGFOOD_V1_COMPLETION_PLAN.md)
-- CLI recovery guide: [CLI_OPERATOR_RECOVERY.md](../../../CLI_OPERATOR_RECOVERY.md)
-- Shared architecture: [SHARED_CORE_ARCHITECTURE.md](../../../SHARED_CORE_ARCHITECTURE.md)
-- Desktop validation plan: [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](../../../DESKTOP_LIVE_PREFLIGHT_VALIDATION.md)
+- Live validation guide: [LIVE_E2E.md](../../../LIVE_E2E.en-GB.md)
+- CLI dogfood plan: [CLI_DOGFOOD_V1_COMPLETION_PLAN.md](../../../plans/CLI_DOGFOOD_V1_COMPLETION_PLAN.md)
+- CLI recovery guide: [CLI_OPERATOR_RECOVERY.md](../../../OPERATOR_RECOVERY.en-GB.md)
+- Shared architecture: [SHARED_CORE_ARCHITECTURE.md](../../../design/SHARED_CORE_ARCHITECTURE.md)
+- Desktop validation plan: [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](../../../validation/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md)
 - Historical PR / commit evidence is preserved verbatim in [legacy tracker snapshot](2026-05-05-legacy-tracker-snapshot-bbe4003.md).

@@ -49,8 +49,8 @@ superseded_by:
 ## Evidence
 
 - Base merge commit: `98dc2b42f8edd595d1ede6dd846634ab09a86779`
-- Prior live evidence: [Desktop live preflight evidence](../../../DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md)
-- Foundation design: [Desktop bridge foundation](../../../DESKTOP_BRIDGE_FOUNDATION.md)
+- Prior live evidence: [Desktop live preflight evidence](../../../validation/DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md)
+- Foundation design: [Desktop bridge foundation](../../../design/DESKTOP_BRIDGE_FOUNDATION.md)
 - Initial live validation marker: `CBTH_DESKTOP_NO_DB_INBOX_READ_V4 VALIDATION_OK`
 - Initial live validation snapshot revision: `019e0188-51de-77a2-87e9-af4a6cd15379`
 - Revision-specific installation-state validation marker: `CBTH_DESKTOP_NO_DB_INBOX_READ_V5 VALIDATION_OK`

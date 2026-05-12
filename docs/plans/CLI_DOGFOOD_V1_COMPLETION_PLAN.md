@@ -16,7 +16,7 @@ Desktop bridge、Socket/API 插件协议、Homebrew/Tap 发布、规则/allowlis
 
 ## Task Supervisor Contract
 
-The detailed supervisor design is tracked in [CLI_TASK_SUPERVISOR_DESIGN.md](CLI_TASK_SUPERVISOR_DESIGN.md). This section records the stable Dogfood V1 contract for the PR sequence.
+The detailed supervisor design is tracked in [CLI_TASK_SUPERVISOR_DESIGN.md](../design/CLI_TASK_SUPERVISOR_DESIGN.md). This section records the stable Dogfood V1 contract for the PR sequence.
 
 用户入口：
 
@@ -63,7 +63,7 @@ Resource defaults:
 2. **Supervisor PR**: implement daemon-owned `cbth task run/list/inspect/cancel`, task state, bounded log spool/tails, child cleanup, daemon idle integration, fake e2e, and opt-in live task-supervisor e2e.
 3. **Diagnostics/deploy PR**: implement `cbth doctor cli`, recovery docs for tasks/batches/audit/manual-resolution states, local binary install, PATH verification, dogfood walkthrough, and live retest commands.
 4. **Optional packaging PR**: only after dogfood stability, decide whether release binaries or package-manager docs are worth adding.
-5. **Steer design PR**: record the future active-turn `turn/steer` risk/capability contract in [CLI_ACTIVE_TURN_STEER_DESIGN.md](CLI_ACTIVE_TURN_STEER_DESIGN.md) without enabling automatic steer.
+5. **Steer design PR**: record the future active-turn `turn/steer` risk/capability contract in [CLI_ACTIVE_TURN_STEER_DESIGN.md](../design/CLI_ACTIVE_TURN_STEER_DESIGN.md) without enabling automatic steer.
 
 ## Test Plan
 

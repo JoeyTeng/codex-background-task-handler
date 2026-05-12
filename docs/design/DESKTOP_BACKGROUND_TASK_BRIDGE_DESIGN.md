@@ -10,7 +10,7 @@
 
 共通核心部分见：
 
-- `docs/SHARED_CORE_ARCHITECTURE.md`
+- `docs/design/SHARED_CORE_ARCHITECTURE.md`
 
 ## 已敲定的约束
 
