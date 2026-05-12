@@ -6,6 +6,8 @@ This guide covers the normal `cbth` CLI workflow for local dogfooding. It assume
 
 ## Install Or Upgrade
 
+Release assets are currently available for Linux x86_64 glibc and macOS arm64. Intel macOS release assets are not published; Apple Silicon hosts launched from a Rosetta shell are mapped to the macOS arm64 asset by the installer.
+
 Install the latest GitHub Release:
 
 ```bash
