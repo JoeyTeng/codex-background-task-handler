@@ -1,5 +1,7 @@
 # codex-background-task-handler
 
+Languages: [English (en-GB)](README.md) | [Simplified Chinese (zh-CN)](README.zh-CN.md)
+
 `codex-background-task-handler` provides the `cbth` companion CLI for supervised background work around Codex without modifying the upstream `codex` repository. It is a local, same-user helper for launching managed Codex CLI sessions, supervising long-running shell tasks, and delivering task results back to the bound Codex thread when the local safety checks allow it.
 
 ## Status
@@ -11,6 +13,8 @@ The project is currently suitable for local dogfooding on dedicated macOS or Lin
 - The implementation is intentionally outside the upstream `codex` repository. This repo contains the companion Rust binary, integration experiments, and documentation for the external control surfaces.
 
 ## Install
+
+Release assets are currently available for Linux x86_64 glibc and macOS arm64. Intel macOS release assets are not published; Apple Silicon hosts launched from a Rosetta shell are mapped to the macOS arm64 asset by the installer.
 
 Install the latest GitHub Release:
 
