@@ -1,14 +1,16 @@
 # Documentation
 
-This directory contains user-facing entrypoints, internal design records, implementation plans, validation notes, and project tracking entrypoints.
+This directory contains user-facing guides, internal design records, implementation plans, validation notes, and project tracking entrypoints.
 
-## Current User-Facing Entrypoints
+## User-Facing Guides
 
+- [Usage guide](USAGE.en-GB.md)
+- [Design overview](DESIGN_OVERVIEW.en-GB.md)
 - [Operator recovery](OPERATOR_RECOVERY.en-GB.md)
 - [Development guide](DEVELOPMENT.en-GB.md)
 - [Live E2E guide](LIVE_E2E.en-GB.md)
 
-The fuller public guide set and bilingual counterparts are added in follow-up documentation PRs.
+The repository root [README.md](../README.md) is the default `en-GB` entrypoint. `zh-CN` counterparts are added in the follow-up bilingual documentation PR.
 
 ## Internal Records
 
