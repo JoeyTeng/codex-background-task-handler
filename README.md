@@ -21,7 +21,7 @@ Design docs:
 - [docs/design/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](docs/design/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md)
 - [docs/design/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md](docs/design/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md)
 - [docs/design/CLI_ACTIVE_TURN_STEER_DESIGN.md](docs/design/CLI_ACTIVE_TURN_STEER_DESIGN.md)
-- [docs/OPERATOR_RECOVERY.en-GB.md](docs/OPERATOR_RECOVERY.en-GB.md)
+- [docs/CLI_OPERATOR_RECOVERY.md](docs/CLI_OPERATOR_RECOVERY.md)
 
 ## Project Journal
 
@@ -57,7 +57,7 @@ For merge-time project-journal bookkeeping rules, see [docs/README.md](docs/READ
 bash scripts/install-git-hooks.sh
 ```
 
-详细设计、工作树安全策略和后续跟踪见 [docs/DEVELOPMENT.en-GB.md](docs/DEVELOPMENT.en-GB.md)。
+详细设计、工作树安全策略和后续跟踪见 [docs/GIT_HOOKS.md](docs/GIT_HOOKS.md)。
 
 ## Release Install
 
@@ -142,7 +142,7 @@ CBTH_RUN_LIVE_NEW_THREAD_E2E=1 cargo test --test live_new_thread -- --ignored
 CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture
 ```
 
-复测步骤、环境变量和失败排查见 [docs/LIVE_E2E.en-GB.md](docs/LIVE_E2E.en-GB.md)。
+复测步骤、环境变量和失败排查见 [docs/LIVE_E2E.md](docs/LIVE_E2E.md)。
 
 ## Rust CLI Usage
 
@@ -370,7 +370,7 @@ cargo run --bin cbth -- daemon stop
 
 `daemon ensure` starts `cbth daemon serve` on demand when no active daemon is reachable. The daemon listens on `~/.cbth/run/cbth.sock`, requires private `~/.cbth` / `run` directories, validates peer uid before serving requests, runs a startup maintenance sweep, and exits after an idle timeout. Mutating CLI commands use this IPC path by default and fail closed if the same-user socket proof cannot be established.
 
-Operator recovery procedures for `manual_resolution_only`, head batch inspection, task logs, audit records, and manual close are documented in [docs/OPERATOR_RECOVERY.en-GB.md](docs/OPERATOR_RECOVERY.en-GB.md).
+Operator recovery procedures for `manual_resolution_only`, head batch inspection, task logs, audit records, and manual close are documented in [docs/CLI_OPERATOR_RECOVERY.md](docs/CLI_OPERATOR_RECOVERY.md).
 
 ## Python Usage
 

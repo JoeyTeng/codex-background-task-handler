@@ -86,5 +86,5 @@ superseded_by:
 - Desktop live preflight evidence: [DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md](../../../validation/DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md)
 - Shared architecture: [SHARED_CORE_ARCHITECTURE.md](../../../design/SHARED_CORE_ARCHITECTURE.md)
 - CLI active steer design: [CLI_ACTIVE_TURN_STEER_DESIGN.md](../../../design/CLI_ACTIVE_TURN_STEER_DESIGN.md)
-- Live e2e commands and prior successes: [LIVE_E2E.md](../../../LIVE_E2E.en-GB.md)
+- Live e2e commands and prior successes: [LIVE_E2E.md](../../../LIVE_E2E.md)
 - Full pre-migration checklist and state: [legacy tracker snapshot](2026-05-05-legacy-tracker-snapshot-bbe4003.md)

@@ -1,14 +1,14 @@
 # Documentation
 
-This directory contains user-facing entrypoints, internal design records, implementation plans, validation notes, and project tracking entrypoints.
+This directory contains root-level operational notes, internal design records, implementation plans, validation notes, and project tracking entrypoints.
 
-## Current User-Facing Entrypoints
+## Root-Level Notes
 
-- [Operator recovery](OPERATOR_RECOVERY.en-GB.md)
-- [Development guide](DEVELOPMENT.en-GB.md)
-- [Live E2E guide](LIVE_E2E.en-GB.md)
+- [CLI operator recovery](CLI_OPERATOR_RECOVERY.md)
+- [Git hooks](GIT_HOOKS.md)
+- [Live E2E](LIVE_E2E.md)
 
-The fuller public guide set and bilingual counterparts are added in follow-up documentation PRs.
+These files are retained under their existing names in this structure-only PR. The stable public guide set and language variants are introduced in follow-up documentation PRs.
 
 ## Internal Records
 
