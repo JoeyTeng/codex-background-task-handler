@@ -880,6 +880,220 @@ fn daemon_ensure_quiesces_handoff_eligible_incompatible_default() {
 
 #[cfg(unix)]
 #[test]
+fn daemon_ensure_unquiesces_legacy_when_app_server_adopt_fails() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let generation_socket_path = run_dir
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind handoff daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    listener
+        .set_nonblocking(true)
+        .expect("set handoff listener nonblocking");
+    let old_socket_path = socket_path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let (request_tx, request_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let mut request = String::new();
+                    stream
+                        .read_to_string(&mut request)
+                        .expect("read handoff request");
+                    request_tx
+                        .send(request.clone())
+                        .expect("send handoff request");
+                    if request.contains("\"handoff_quiesce\"") {
+                        stream
+                            .write_all(
+                                br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.2.0","quiescing":true},"quiescing":true,"cli_app_servers":[{"managed_session_id":"managed-stale-export","bound_thread_id":"thread-stale-export","session_epoch":1,"url":"ws://127.0.0.1:1","pid":1,"pid_identity":"stale-export","started_at":1,"lease_id":"lease-stale-export","lease_millis_remaining":60000}]}}"#,
+                            )
+                            .expect("write quiesce response");
+                    } else if request.contains("\"handoff_unquiesce\"") {
+                        stream
+                            .write_all(
+                                br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.2.0","quiescing":false},"quiescing":false}}"#,
+                            )
+                            .expect("write unquiesce response");
+                    } else {
+                        assert!(
+                            request.contains("\"ping\""),
+                            "unexpected request: {request}"
+                        );
+                        stream
+                            .write_all(
+                                br#"{"ok":true,"response":{"daemon":{"pid":1313,"binary_version":"0.2.0"},"protocol_version":1,"capabilities":["dispatch","daemon-handoff-v1"],"message":"pong"}}"#,
+                            )
+                            .expect("write handoff ping response");
+                    }
+                    stream
+                        .write_all(b"\n")
+                        .expect("write handoff response newline");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if done_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept handoff daemon request: {error}"),
+            }
+        }
+        drop(listener);
+        fs::remove_file(&old_socket_path).expect("remove handoff daemon socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    let first_request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("handoff daemon should be probed");
+    let second_request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("handoff daemon should be quiesced");
+    let third_request = request_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("handoff daemon should be unquiesced after stale export");
+    assert!(first_request.contains("\"ping\""));
+    assert!(second_request.contains("\"handoff_quiesce\""));
+    assert!(third_request.contains("\"handoff_unquiesce\""));
+    assert!(third_request.contains("\"expected_pid\":1313"));
+    assert_eq!(ensured["started"], true);
+    assert_eq!(ensured["coexisting_with_incompatible_daemon"], true);
+    assert_eq!(ensured["legacy_daemon_quiesced"], false);
+    assert_eq!(ensured["legacy_handoff_unquiesce"]["quiescing"], false);
+    assert_eq!(
+        ensured["legacy_cli_app_server_handoff_skipped"]["reason"],
+        "adopt_failed"
+    );
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        generation_socket_path.display().to_string()
+    );
+
+    done_tx.send(()).expect("signal handoff daemon");
+    handle.join().expect("handoff daemon thread");
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_ensure_coexists_when_handoff_quiesce_reports_active_bootstrap() {
+    let home = temp_home();
+    let run_dir = home.path().join("run");
+    fs::create_dir(&run_dir).expect("create run dir");
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("chmod run dir");
+    let socket_path = run_dir.join("cbth.sock");
+    let generation_socket_path = run_dir
+        .join("daemons")
+        .join(env!("CARGO_PKG_VERSION"))
+        .join("cbth.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind handoff daemon socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).expect("chmod socket");
+    listener
+        .set_nonblocking(true)
+        .expect("set handoff listener nonblocking");
+    let old_socket_path = socket_path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let (request_tx, request_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let mut request = String::new();
+                    stream
+                        .read_to_string(&mut request)
+                        .expect("read handoff request");
+                    request_tx
+                        .send(request.clone())
+                        .expect("send handoff request");
+                    if request.contains("\"handoff_quiesce\"") {
+                        stream
+                            .write_all(
+                                br#"{"ok":false,"error":"cannot handoff while CLI thread/start bootstrap app-servers are active"}"#,
+                            )
+                            .expect("write active bootstrap response");
+                    } else {
+                        assert!(
+                            request.contains("\"ping\""),
+                            "unexpected request: {request}"
+                        );
+                        stream
+                            .write_all(
+                                br#"{"ok":true,"response":{"daemon":{"pid":1314,"binary_version":"0.2.0"},"protocol_version":1,"capabilities":["dispatch","daemon-handoff-v1"],"message":"pong"}}"#,
+                            )
+                            .expect("write handoff ping response");
+                    }
+                    stream
+                        .write_all(b"\n")
+                        .expect("write handoff response newline");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if done_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept handoff daemon request: {error}"),
+            }
+        }
+        drop(listener);
+        fs::remove_file(&old_socket_path).expect("remove handoff daemon socket");
+    });
+
+    let ensured = cbth(
+        &home,
+        &[
+            "daemon",
+            "ensure",
+            "--idle-timeout-seconds",
+            "10",
+            "--startup-timeout-seconds",
+            "5",
+        ],
+    );
+    let first_request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("handoff daemon should be probed");
+    let second_request = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("handoff daemon should receive quiesce attempt");
+    assert!(first_request.contains("\"ping\""));
+    assert!(second_request.contains("\"handoff_quiesce\""));
+    assert_eq!(ensured["started"], true);
+    assert_eq!(ensured["coexisting_with_incompatible_daemon"], true);
+    assert_eq!(ensured["legacy_daemon"]["pid"], 1314);
+    assert!(ensured.get("legacy_daemon_quiesced").is_none());
+    assert!(ensured.get("legacy_handoff_quiesce").is_none());
+    assert_eq!(
+        ensured["daemon"]["socket_path"],
+        generation_socket_path.display().to_string()
+    );
+
+    done_tx.send(()).expect("signal handoff daemon");
+    handle.join().expect("handoff daemon thread");
+    stop_daemon_at_socket_path(&generation_socket_path);
+    wait_for_socket_path_removed(&generation_socket_path, Duration::from_secs(10));
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_ensure_replaces_stale_incompatible_generation_daemon() {
     let home = temp_home();
     let run_dir = home.path().join("run");
