@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -32,8 +32,13 @@ fn handoff_eligible_for_version(version: &str) -> bool {
 
 #[cfg(unix)]
 fn is_peer_disconnect(error: &std::io::Error) -> bool {
+    is_peer_disconnect_kind(error.kind())
+}
+
+#[cfg(unix)]
+fn is_peer_disconnect_kind(kind: std::io::ErrorKind) -> bool {
     matches!(
-        error.kind(),
+        kind,
         std::io::ErrorKind::BrokenPipe
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::NotConnected
@@ -388,19 +393,6 @@ fn wait_for_process_group_gone(pid: u32) {
             Instant::now() < deadline,
             "process group {pid} was not removed"
         );
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait().expect("check child status").is_some() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
         thread::sleep(Duration::from_millis(50));
     }
 }
@@ -3995,19 +3987,43 @@ fn daemon_stop_waits_for_durable_cancel_before_signaling_blocked_worker() {
         .expect("task pid");
 
     let conn = hold_exclusive_db_lock(&home);
-    let mut cancel = Command::new(env!("CARGO_BIN_EXE_cbth"))
-        .arg("--home")
-        .arg(home.path())
-        .args(["task", "cancel", "--task-id", task_id])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn cancel");
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let cancel_socket_path = home.path().join("run").join("cbth.sock");
+    let cancel_task_id = task_id.to_owned();
+    thread::spawn(move || {
+        let result = (|| -> io::Result<Vec<u8>> {
+            let mut stream = UnixStream::connect(cancel_socket_path)?;
+            let request = json!({
+                "command": "dispatch",
+                "payload": {
+                    "argv": [
+                        b"task".to_vec(),
+                        b"cancel".to_vec(),
+                        b"--task-id".to_vec(),
+                        cancel_task_id.into_bytes(),
+                    ],
+                },
+            });
+            stream.write_all(request.to_string().as_bytes())?;
+            stream.write_all(b"\n")?;
+            stream.shutdown(std::net::Shutdown::Write)?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            Ok(response)
+        })()
+        .map_err(|error| (error.kind(), error.to_string()));
+        let _ = cancel_tx.send(result);
+    });
     thread::sleep(Duration::from_millis(300));
-    assert!(
-        cancel.try_wait().expect("check cancel status").is_none(),
-        "cancel worker should be blocked by the held database lock"
-    );
+    match cancel_rx.try_recv() {
+        Ok(result) => {
+            panic!("cancel worker completed before held database lock released: {result:?}")
+        }
+        Err(mpsc::TryRecvError::Empty) => {}
+        Err(mpsc::TryRecvError::Disconnected) => {
+            panic!("cancel worker exited without reporting a result")
+        }
+    }
 
     cbth_daemon(&home, &["daemon", "stop"]);
     thread::sleep(Duration::from_secs(2));
@@ -4021,10 +4037,22 @@ fn daemon_stop_waits_for_durable_cancel_before_signaling_blocked_worker() {
         !process_group_exists(pid),
         "shutdown should kill the supervised process after durable cancel succeeds"
     );
-    if !wait_for_child_exit(&mut cancel, Duration::from_secs(2)) {
-        let _ = cancel.kill();
-        let _ = cancel.wait();
-        panic!("blocked cancel client did not exit after daemon shutdown");
+    match cancel_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(_response)) => {}
+        Ok(Err((kind, message))) if is_peer_disconnect_kind(kind) => {
+            let _ = message;
+        }
+        Ok(Err((kind, message))) => {
+            panic!(
+                "blocked cancel client failed unexpectedly after daemon shutdown: {kind:?}: {message}"
+            )
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("blocked cancel client did not exit after daemon shutdown")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("blocked cancel client exited without reporting a result")
+        }
     }
 }
 

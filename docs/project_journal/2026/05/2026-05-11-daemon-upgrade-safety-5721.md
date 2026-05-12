@@ -67,6 +67,7 @@ superseded_by:
 - Internal PR5 review follow-up: helper-managed `codex-readonly` found generation-owned stale owner fallback started a default daemon, whose recovery scope intentionally skips current-generation tasks. Fixed by adding a generation-specific ensure path for generation-owned cancel fallback and by covering a killed generation daemon with a still-running task process group.
 - Final internal PR5 review: helper-managed `codex-readonly` reviewed the fixed diff and returned `LGTM`.
 - PR5 CI follow-up: Ubuntu Rust check exposed a slow shutdown-cancel cleanup wait in `daemon_stop_waits_for_durable_cancel_before_signaling_blocked_worker`; widened the two matching socket-removal waits while keeping behavior assertions unchanged.
+- PR5 CI follow-up: the same Ubuntu test still failed because its `cbth task cancel` fixture could reconnect/autostart after the old daemon closed the blocked client. Reworked that fixture to use raw daemon socket dispatch so the test covers the blocked daemon worker without invoking CLI retry behavior.
 - Local PR4 validation: `cargo check --locked --target-dir /Users/hoteng/.cache/cargo-target/cbth-pr4-isolated`
 - Local PR4 validation: `cargo fmt --all -- --check`
 - Local PR4 validation: `git diff --check`
