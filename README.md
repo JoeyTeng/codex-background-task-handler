@@ -17,11 +17,11 @@ The shared architecture is converging on one Rust binary with thin integration e
 
 Design docs:
 
-- [docs/SHARED_CORE_ARCHITECTURE.md](docs/SHARED_CORE_ARCHITECTURE.md)
-- [docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](docs/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md)
-- [docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md](docs/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md)
-- [docs/CLI_ACTIVE_TURN_STEER_DESIGN.md](docs/CLI_ACTIVE_TURN_STEER_DESIGN.md)
-- [docs/CLI_OPERATOR_RECOVERY.md](docs/CLI_OPERATOR_RECOVERY.md)
+- [docs/design/SHARED_CORE_ARCHITECTURE.md](docs/design/SHARED_CORE_ARCHITECTURE.md)
+- [docs/design/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md](docs/design/DESKTOP_BACKGROUND_TASK_BRIDGE_DESIGN.md)
+- [docs/design/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md](docs/design/CLI_SHARED_APP_SERVER_SIDECAR_DESIGN.md)
+- [docs/design/CLI_ACTIVE_TURN_STEER_DESIGN.md](docs/design/CLI_ACTIVE_TURN_STEER_DESIGN.md)
+- [docs/OPERATOR_RECOVERY.en-GB.md](docs/OPERATOR_RECOVERY.en-GB.md)
 
 ## Project Journal
 
@@ -57,7 +57,7 @@ For merge-time project-journal bookkeeping rules, see [docs/README.md](docs/READ
 bash scripts/install-git-hooks.sh
 ```
 
-详细设计、工作树安全策略和后续跟踪见 [docs/GIT_HOOKS.md](docs/GIT_HOOKS.md)。
+详细设计、工作树安全策略和后续跟踪见 [docs/DEVELOPMENT.en-GB.md](docs/DEVELOPMENT.en-GB.md)。
 
 ## Release Install
 
@@ -142,7 +142,7 @@ CBTH_RUN_LIVE_NEW_THREAD_E2E=1 cargo test --test live_new_thread -- --ignored
 CBTH_RUN_LIVE_TASK_SUPERVISOR_E2E=1 cargo test --test live_task_supervisor -- --ignored --nocapture
 ```
 
-复测步骤、环境变量和失败排查见 [docs/LIVE_E2E.md](docs/LIVE_E2E.md)。
+复测步骤、环境变量和失败排查见 [docs/LIVE_E2E.en-GB.md](docs/LIVE_E2E.en-GB.md)。
 
 ## Rust CLI Usage
 
@@ -162,11 +162,11 @@ Default `cbth cli run` remains passive and records only current-state proof. Exi
 
 Managed CLI startup and `cbth doctor cli` also perform a soft Codex CLI compatibility check. `cbth` is currently validated against `codex-cli 0.130.x`; newer or unparsable versions produce a warning with diagnostic details, but execution continues and still relies on fail-closed protocol parsing for required fields.
 
-`trusted-all` is deliberately broad: it bypasses batch policy, artifact-read, and managed-session risk-profile gates, but it still requires an open head batch, remaining budget, matching `source_thread_id`, bound `managed_session_id`, matching `session_epoch`, and fresh idle proof. `cbth audit list` exposes the append-only decision trail for allow/deny/attempt-start/accepted/rejected/reconciled/observed/manualized records. `turn/steer`, active-turn injection, rollout-only delivery proof, and foreground thread retargeting are still outside the implemented automatic delivery path; the future steer contract is documented in [docs/CLI_ACTIVE_TURN_STEER_DESIGN.md](docs/CLI_ACTIVE_TURN_STEER_DESIGN.md).
+`trusted-all` is deliberately broad: it bypasses batch policy, artifact-read, and managed-session risk-profile gates, but it still requires an open head batch, remaining budget, matching `source_thread_id`, bound `managed_session_id`, matching `session_epoch`, and fresh idle proof. `cbth audit list` exposes the append-only decision trail for allow/deny/attempt-start/accepted/rejected/reconciled/observed/manualized records. `turn/steer`, active-turn injection, rollout-only delivery proof, and foreground thread retargeting are still outside the implemented automatic delivery path; the future steer contract is documented in [docs/design/CLI_ACTIVE_TURN_STEER_DESIGN.md](docs/design/CLI_ACTIVE_TURN_STEER_DESIGN.md).
 
 Use `cbth cli session list`, `cbth cli session inspect`, and `cbth cli session retire` for managed-session recovery. Operator retirement refuses `live` sessions, sessions that still own active delivery attempts, and sessions whose bound thread still has an open `manual_resolution_only` head batch. `detached`, `parked`, or `stale` sessions with no blockers can be retired manually; `cli run` can also auto-retire and replace retire-eligible `parked` / `stale` / profile-drift records. Same-profile reattach refuses the same active-attempt/manual-head blockers. A fail-closed accepted or pre-accept delivery path parks the session until the manual head batch is closed or swept.
 
-Desktop bridge foundation commands are implemented as operator/helper surfaces, not as an enabled Desktop automatic delivery path. `cbth desktop installation-state` owns installation-wide Desktop read/write capability state, `cbth desktop binding repair` durably binds a Desktop source thread to a caller heartbeat automation id, and `cbth desktop bridge-preflight` publishes a stable `~/.cbth/inbox/current-snapshot.json` manifest that points at revision-specific inbox snapshot files under `~/.cbth/inbox/snapshots/<revision>/`, including the installation-state export for that revision. It also exports latest-only `~/.cbth/inbox/desktop-installation-state.json` for convenience, but no-DB readers use the revision-specific export referenced by the manifest. Default preflight remains daemon-routed; `--require-existing-daemon` avoids daemon autostart but still uses the same-user Unix socket, while `--helper-direct-store` bypasses daemon autostart, `startup.lock`, and socket IPC but still opens SQLite to publish a fresh snapshot. Desktop heartbeat validation now prefers no-DB read helpers such as `read-snapshot`, `list-arm-pending`, `list-pause-due`, and `claim-next-ready`; those helpers only read already-published inbox JSON and do not open SQLite, connect the daemon, or write files. `note-arm-pending` and `note-arm` provide durable Desktop writeback primitives for existing prepared attempts, and transcript relay helpers can now emit stdout-only arm envelopes that `cbth desktop relay consume-transcript` consumes from a trusted rollout `function_call_output` carrier with marker/hash replay protection before calling those same CAS primitives. Preflight can export real arm-pending / pause-due entries, but ready attempt materialization, caller wake, `note-boundary-crossed`, artifact reads, production rollout tailing, and automatic Desktop delivery remain future work. See [docs/DESKTOP_BRIDGE_FOUNDATION.md](docs/DESKTOP_BRIDGE_FOUNDATION.md), [docs/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](docs/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md), [docs/DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md](docs/DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md), and [docs/DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md](docs/DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md).
+Desktop bridge foundation commands are implemented as operator/helper surfaces, not as an enabled Desktop automatic delivery path. `cbth desktop installation-state` owns installation-wide Desktop read/write capability state, `cbth desktop binding repair` durably binds a Desktop source thread to a caller heartbeat automation id, and `cbth desktop bridge-preflight` publishes a stable `~/.cbth/inbox/current-snapshot.json` manifest that points at revision-specific inbox snapshot files under `~/.cbth/inbox/snapshots/<revision>/`, including the installation-state export for that revision. It also exports latest-only `~/.cbth/inbox/desktop-installation-state.json` for convenience, but no-DB readers use the revision-specific export referenced by the manifest. Default preflight remains daemon-routed; `--require-existing-daemon` avoids daemon autostart but still uses the same-user Unix socket, while `--helper-direct-store` bypasses daemon autostart, `startup.lock`, and socket IPC but still opens SQLite to publish a fresh snapshot. Desktop heartbeat validation now prefers no-DB read helpers such as `read-snapshot`, `list-arm-pending`, `list-pause-due`, and `claim-next-ready`; those helpers only read already-published inbox JSON and do not open SQLite, connect the daemon, or write files. `note-arm-pending` and `note-arm` provide durable Desktop writeback primitives for existing prepared attempts, and transcript relay helpers can now emit stdout-only arm envelopes that `cbth desktop relay consume-transcript` consumes from a trusted rollout `function_call_output` carrier with marker/hash replay protection before calling those same CAS primitives. Preflight can export real arm-pending / pause-due entries, but ready attempt materialization, caller wake, `note-boundary-crossed`, artifact reads, production rollout tailing, and automatic Desktop delivery remain future work. See [docs/design/DESKTOP_BRIDGE_FOUNDATION.md](docs/design/DESKTOP_BRIDGE_FOUNDATION.md), [docs/validation/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](docs/validation/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md), [docs/validation/DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md](docs/validation/DESKTOP_WRITEBACK_HELPER_LIVE_VALIDATION.md), and [docs/validation/DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md](docs/validation/DESKTOP_TRANSCRIPT_RELAY_VALIDATION.md).
 
 ```bash
 cargo run --bin cbth -- \
@@ -370,7 +370,7 @@ cargo run --bin cbth -- daemon stop
 
 `daemon ensure` starts `cbth daemon serve` on demand when no active daemon is reachable. The daemon listens on `~/.cbth/run/cbth.sock`, requires private `~/.cbth` / `run` directories, validates peer uid before serving requests, runs a startup maintenance sweep, and exits after an idle timeout. Mutating CLI commands use this IPC path by default and fail closed if the same-user socket proof cannot be established.
 
-Operator recovery procedures for `manual_resolution_only`, head batch inspection, task logs, audit records, and manual close are documented in [docs/CLI_OPERATOR_RECOVERY.md](docs/CLI_OPERATOR_RECOVERY.md).
+Operator recovery procedures for `manual_resolution_only`, head batch inspection, task logs, audit records, and manual close are documented in [docs/OPERATOR_RECOVERY.en-GB.md](docs/OPERATOR_RECOVERY.en-GB.md).
 
 ## Python Usage
 
@@ -388,7 +388,7 @@ The current CLI shared-server PoC is [scripts/cli_shared_app_server_poc.mjs](scr
 
 In addition to the protocol-level PoC, the shared-server CLI route has also been validated against a real foreground TUI session running through `codex --remote`, confirming that the user-facing TUI output reflects the sidecar-triggered turn while the foreground stays on the same caller thread used in the PTY validation. That PTY validation matches the current loopback-only upstream surface available in `codex-cli 0.123.0`.
 
-The current CLI active-turn steering PoC is [scripts/cli_turn_steer_poc.mjs](scripts/cli_turn_steer_poc.mjs). It starts a long-running turn, submits `turn/steer` from a second client while that turn is still active, and validates that the same turn completes normally instead of ending early. The PoC is narrow evidence for the future gated contract in [docs/CLI_ACTIVE_TURN_STEER_DESIGN.md](docs/CLI_ACTIVE_TURN_STEER_DESIGN.md); automatic steer remains disabled.
+The current CLI active-turn steering PoC is [scripts/cli_turn_steer_poc.mjs](scripts/cli_turn_steer_poc.mjs). It starts a long-running turn, submits `turn/steer` from a second client while that turn is still active, and validates that the same turn completes normally instead of ending early. The PoC is narrow evidence for the future gated contract in [docs/design/CLI_ACTIVE_TURN_STEER_DESIGN.md](docs/design/CLI_ACTIVE_TURN_STEER_DESIGN.md); automatic steer remains disabled.
 
 ## Planned Implementation Direction
 
