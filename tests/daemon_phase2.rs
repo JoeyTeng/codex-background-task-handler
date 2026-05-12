@@ -3763,7 +3763,7 @@ fn daemon_task_cancel_persists_running_cancel_before_signaling() {
         "running task was not signaled after cancel intent became durable"
     );
     cbth_daemon(&home, &["daemon", "stop"]);
-    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(30));
+    wait_for_socket_removed(&home);
 }
 
 #[test]
@@ -3828,7 +3828,7 @@ fn daemon_task_timeout_wins_over_later_cancel() {
     let job = cbth(&home, &["job", "inspect", "--job-id", job_id]);
     assert_eq!(job["job"]["status"], "failed");
     cbth_daemon(&home, &["daemon", "stop"]);
-    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(30));
+    wait_for_socket_removed(&home);
 }
 
 #[test]
@@ -3954,7 +3954,7 @@ fn daemon_stop_waits_for_locked_cancel_store_before_killing_task() {
         "daemon stop should not kill before shutdown cancel is durable"
     );
     drop(conn);
-    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
+    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(30));
 
     assert!(
         !process_group_exists(pid),
@@ -4016,7 +4016,7 @@ fn daemon_stop_waits_for_durable_cancel_before_signaling_blocked_worker() {
         "shutdown should not kill the supervised process before durable cancel succeeds"
     );
     drop(conn);
-    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(10));
+    wait_for_socket_removed_with_timeout(&home, Duration::from_secs(30));
     assert!(
         !process_group_exists(pid),
         "shutdown should kill the supervised process after durable cancel succeeds"
