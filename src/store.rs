@@ -2612,6 +2612,7 @@ impl Store {
                AND batches.delivery_requires_write_access = 0
                AND batches.requires_artifact_read = 0
                AND batches.delivery_attempt_count < batches.max_delivery_attempts
+               AND batches.redelivery_window_ends_at > ?
                AND batches.batch_id = (
                  SELECT head.batch_id
                  FROM batches AS head
@@ -2663,6 +2664,7 @@ impl Store {
         let candidate_ids = stmt
             .query_map(
                 params![
+                    now,
                     &installation_state.read_transport,
                     installation_state.read_transport_generation,
                     &installation_state.validation_fingerprint,
@@ -2679,6 +2681,7 @@ impl Store {
                 || ensure_desktop_binding_quiesced_for_fresh_arm(&binding).is_err()
                 || ensure_batch_allows_desktop_delivery(&batch).is_err()
                 || ensure_attempt_budget_remaining(&batch).is_err()
+                || ensure_batch_redelivery_window_open(&batch, now).is_err()
             {
                 continue;
             }
@@ -3534,6 +3537,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         let stale_cli_acceptances_abandoned = expire_stale_cli_acceptances_tx(&tx, now)?;
         let expired_cli_observations_abandoned = expire_due_cli_observations_tx(&tx, now)?;
+        expire_expired_desktop_prepared_attempts_tx(&tx, now)?;
         let (expired_manual_batches_closed, artifacts_to_sync) =
             close_expired_manual_batches_tx(&tx, now)?;
         let (expired_automatic_batches_closed, automatic_artifacts_to_sync) =
@@ -5014,6 +5018,26 @@ fn close_expired_manual_batches_tx(
         )?);
     }
     Ok((batch_ids.len(), artifacts_to_sync))
+}
+
+fn expire_expired_desktop_prepared_attempts_tx(tx: &Transaction<'_>, now: i64) -> Result<usize> {
+    tx.execute(
+        "UPDATE delivery_attempts
+         SET state = 'abandoned',
+             delivery_observation_state = 'abandoned',
+             updated_at = ?,
+             abandoned_at = ?
+         WHERE adapter_kind = 'desktop'
+           AND state = 'prepared'
+           AND batch_id IN (
+             SELECT batch_id FROM batches
+             WHERE state = 'open'
+               AND replay_policy = 'automatic'
+               AND redelivery_window_ends_at <= ?
+           )",
+        params![now, now, now],
+    )
+    .map_err(Into::into)
 }
 
 fn count_open_batches_due_at(conn: &Connection, due_at: i64) -> Result<i64> {
@@ -7559,6 +7583,14 @@ fn ensure_attempt_budget_remaining(batch: &BatchRecord) -> Result<()> {
         Ok(())
     } else {
         bail!("batch {} has exhausted delivery attempts", batch.batch_id)
+    }
+}
+
+fn ensure_batch_redelivery_window_open(batch: &BatchRecord, now: i64) -> Result<()> {
+    if batch.redelivery_window_ends_at > now {
+        Ok(())
+    } else {
+        bail!("batch {} redelivery window is closed", batch.batch_id)
     }
 }
 

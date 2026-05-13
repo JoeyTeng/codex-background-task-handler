@@ -985,6 +985,88 @@ fn desktop_bridge_preflight_materializes_ready_entry_and_claim_peeks_it() {
 }
 
 #[test]
+fn desktop_bridge_preflight_abandons_expired_prepared_attempt_before_ready() {
+    let home = temp_home();
+    repair_validated_desktop_installation_and_binding(
+        &home,
+        "thread-ready-expired",
+        "automation-ready-expired",
+        3100,
+    );
+    let batch_id = create_desktop_batch(&home, "thread-ready-expired");
+
+    let first = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-expired",
+            "--json",
+            "--now",
+            "3110",
+        ],
+    );
+    assert_eq!(
+        first["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["count"],
+        1
+    );
+    let ready_path = first["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
+        .as_str()
+        .unwrap();
+    let ready = read_json_file(ready_path);
+    let attempt_id = ready["ready_threads"]["entries"][0]["attempt_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE batches SET redelivery_window_ends_at = ? WHERE batch_id = ?",
+        params![3111, &batch_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let second = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-expired",
+            "--json",
+            "--now",
+            "3112",
+        ],
+    );
+    assert_eq!(
+        second["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["count"],
+        0
+    );
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let attempt_state: String = conn
+        .query_row(
+            "SELECT state FROM delivery_attempts WHERE attempt_id = ?",
+            params![attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_state, "abandoned");
+    let batch_state: String = conn
+        .query_row(
+            "SELECT state FROM batches WHERE batch_id = ?",
+            params![batch_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(batch_state, "closed");
+}
+
+#[test]
 fn desktop_bridge_preflight_filters_ineligible_ready_candidates() {
     for (case, mutate) in [
         ("unknown-capability", "none"),
