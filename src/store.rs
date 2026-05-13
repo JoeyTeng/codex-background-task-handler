@@ -3189,8 +3189,7 @@ impl Store {
                AND EXISTS (
                  SELECT 1
                  FROM desktop_transcript_relay_markers AS pending_marker
-                 WHERE pending_marker.bridge_thread_id = ?
-                   AND pending_marker.envelope_kind = 'arm_pending_requested'
+                 WHERE pending_marker.envelope_kind = 'arm_pending_requested'
                    AND pending_marker.marker_state = 'consumed'
                    AND pending_marker.attempt_id = delivery_attempts.attempt_id
                    AND pending_marker.generation = delivery_attempts.generation
@@ -3209,7 +3208,7 @@ impl Store {
                       delivery_attempts.attempt_id ASC",
         )?;
         let rows = stmt
-            .query_map(params![now, now, now, bridge_thread_id], |row| {
+            .query_map(params![now, now, now], |row| {
                 let deadline: Option<i64> = row.get(9)?;
                 Ok(serde_json::json!({
                     "source_thread_id": row.get::<_, String>(0)?,

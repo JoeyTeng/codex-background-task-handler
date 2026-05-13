@@ -1823,32 +1823,6 @@ fn desktop_ready_markers_drive_scanner_to_cooldown() {
     let bridge_request_id = ready_entry["bridge_request_id"].as_str().unwrap();
     let pending_marker = ready_entry["arm_pending_marker"].as_str().unwrap();
 
-    let other_bridge_ready_preflight = cbth(
-        &home,
-        &[
-            "desktop",
-            "bridge-preflight",
-            "--helper-direct-store",
-            "--bridge-thread-id",
-            "bridge-ready-scanner-other",
-            "--json",
-            "--now",
-            "3410",
-        ],
-    );
-    assert_eq!(
-        other_bridge_ready_preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["count"],
-        1
-    );
-    let other_ready_path = other_bridge_ready_preflight["desktop_bridge_preflight"]["snapshots"]
-        ["ready_threads"]["path"]
-        .as_str()
-        .unwrap();
-    let other_ready = read_json_file(other_ready_path);
-    let other_ready_entry = &other_ready["ready_threads"]["entries"][0];
-    assert_eq!(other_ready_entry["attempt_id"], attempt_id);
-    assert_ne!(other_ready_entry["arm_pending_marker"], pending_marker);
-
     let pending_emit = cbth_output(
         &home,
         &[
@@ -1894,6 +1868,22 @@ fn desktop_ready_markers_drive_scanner_to_cooldown() {
     let pending_attempt = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
     assert_eq!(pending_attempt["attempt"]["state"], "arm_pending");
 
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "scanner",
+            "bind",
+            "--bridge-thread-id",
+            "bridge-ready-scanner-other",
+            "--rollout-path",
+            rollout.to_str().unwrap(),
+            "--json",
+            "--now",
+            "3420",
+        ],
+    );
     let other_bridge_arm_preflight = cbth(
         &home,
         &[
@@ -1910,22 +1900,9 @@ fn desktop_ready_markers_drive_scanner_to_cooldown() {
     assert_eq!(
         other_bridge_arm_preflight["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]
             ["count"],
-        0
+        1
     );
-
-    let arm_preflight = cbth(
-        &home,
-        &[
-            "desktop",
-            "bridge-preflight",
-            "--helper-direct-store",
-            "--bridge-thread-id",
-            "bridge-ready-scanner",
-            "--json",
-            "--now",
-            "3421",
-        ],
-    );
+    let arm_preflight = other_bridge_arm_preflight;
     assert_eq!(
         arm_preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["count"],
         0
@@ -1942,6 +1919,16 @@ fn desktop_ready_markers_drive_scanner_to_cooldown() {
     let arm_entry = &arm_pending["arm_pending_bindings"]["entries"][0];
     let arm_marker = arm_entry["arm_accepted_marker"].as_str().unwrap();
     assert!(arm_marker.starts_with("CBTH_DESKTOP_RELAY_ARM_ACCEPTED_"));
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let arm_marker_bridge: String = conn
+        .query_row(
+            "SELECT bridge_thread_id FROM desktop_transcript_relay_markers WHERE marker = ?",
+            params![arm_marker],
+            |row| row.get(0),
+        )
+        .expect("query accepted marker bridge");
+    assert_eq!(arm_marker_bridge, "bridge-ready-scanner-other");
+    drop(conn);
     assert!(
         arm_entry["marker_expires_at"].as_i64().unwrap()
             <= arm_entry["bridge_arm_lease_deadline"].as_i64().unwrap()
@@ -1983,7 +1970,7 @@ fn desktop_ready_markers_drive_scanner_to_cooldown() {
             "scanner",
             "scan-once",
             "--bridge-thread-id",
-            "bridge-ready-scanner",
+            "bridge-ready-scanner-other",
             "--json",
             "--now",
             "3430",
@@ -2006,7 +1993,7 @@ fn desktop_ready_markers_drive_scanner_to_cooldown() {
             "scanner",
             "scan-once",
             "--bridge-thread-id",
-            "bridge-ready-scanner",
+            "bridge-ready-scanner-other",
             "--json",
             "--now",
             "3431",
