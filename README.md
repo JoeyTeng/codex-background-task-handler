@@ -95,7 +95,7 @@ cbth audit list --source-thread-id <thread-id> --limit 50
 - [Operator recovery](docs/OPERATOR_RECOVERY.en-GB.md): manual recovery for `manual_resolution_only`, task logs, sessions, and maintenance.
 - [Development guide](docs/DEVELOPMENT.en-GB.md): local development install, deterministic tests, hooks, and repo conventions.
 - [Live E2E guide](docs/LIVE_E2E.en-GB.md): opt-in checks that use a real Codex login, network, and model access.
-- [Codex Review Gate](tools/codex-review-gate/README.md): reusable GitHub status check for Codex review completion.
+- [Codex Review Gate](https://github.com/JoeyTeng/codex-review-gate): reusable GitHub status check for Codex review completion.
 - [Documentation index](docs/README.md): user-facing docs, internal design notes, plans, validation records, and project tracking entrypoints.
 
 ## License
