@@ -1,6 +1,6 @@
 # Codex Review Gate
 
-语言：[English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
+语言：[British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
 `codex-review-gate` 是一个内部子项目，负责可复用的 `codex/review-gate` GitHub status check。它适用于希望把 required status 保持为 pending 或 failing，直到当前 PR head 的 Codex review output 干净为止的仓库。
 

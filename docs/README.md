@@ -1,6 +1,6 @@
 # Documentation
 
-Languages: [English (en-GB)](README.md) | [Simplified Chinese (zh-CN)](README.zh-CN.md)
+Languages: [English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
 This directory contains user-facing guides, internal design records, implementation plans, validation notes, and project tracking entrypoints.
 

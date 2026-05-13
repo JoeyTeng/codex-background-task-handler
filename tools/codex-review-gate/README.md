@@ -1,6 +1,6 @@
 # Codex Review Gate
 
-Languages: [English (en-GB)](README.md) | [Simplified Chinese (zh-CN)](README.zh-CN.md)
+Languages: [English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
 `codex-review-gate` is an internal subproject that owns the reusable `codex/review-gate` GitHub status check. It is designed for repositories that want a required status to stay pending or failing until Codex review output for the current PR head is clean.
 

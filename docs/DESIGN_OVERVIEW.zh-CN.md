@@ -1,6 +1,6 @@
 # 设计概览
 
-语言：[English (en-GB)](DESIGN_OVERVIEW.en-GB.md) | [简体中文 (zh-CN)](DESIGN_OVERVIEW.zh-CN.md)
+语言：[British English (en-GB)](DESIGN_OVERVIEW.en-GB.md) | [简体中文 (zh-CN)](DESIGN_OVERVIEW.zh-CN.md)
 
 `cbth` 是围绕 Codex 长时间本地工作的 companion layer。它不修改上游 `codex`，而是自己管理本地 daemon state、supervised tasks，以及与 Codex CLI 或 Desktop 实验面的窄集成点。
 
