@@ -95,7 +95,7 @@ cbth audit list --source-thread-id <thread-id> --limit 50
 - [操作恢复](docs/OPERATOR_RECOVERY.zh-CN.md)：`manual_resolution_only`、task logs、sessions 和维护命令的手动恢复。
 - [开发指南](docs/DEVELOPMENT.zh-CN.md)：本地开发安装、确定性测试、hooks 和仓库约定。
 - [真实 E2E 指南](docs/LIVE_E2E.zh-CN.md)：需要真实 Codex 登录态、网络和模型访问的 opt-in 检查。
-- [Codex Review Gate](tools/codex-review-gate/README.zh-CN.md)：可复用的 Codex review 完成状态检查。
+- [Codex Review Gate](https://github.com/JoeyTeng/codex-review-gate)：可复用的 Codex review 完成状态检查。
 - [文档索引](docs/README.zh-CN.md)：user-facing 文档、内部设计记录、计划、验证记录和项目 tracking 入口。
 
 ## License
