@@ -176,7 +176,7 @@ export function hasNewPlusOneTransition(baselinePlusOne, currentPlusOne, markerC
 
   const currentCreatedAt = parseTimestamp(currentPlusOne.createdAt, "Codex +1 reaction creation time");
   const markerCreated = parseTimestamp(markerCreatedAt, "marker creation time");
-  if (currentCreatedAt <= markerCreated) {
+  if (currentCreatedAt < markerCreated) {
     return false;
   }
 
@@ -190,7 +190,7 @@ export function hasNewEyesTransition(baselineEyes, currentEyes, markerCreatedAt)
 
   const currentCreatedAt = parseTimestamp(currentEyes.createdAt, "Codex eyes reaction creation time");
   const markerCreated = parseTimestamp(markerCreatedAt, "marker creation time");
-  if (currentCreatedAt <= markerCreated) {
+  if (currentCreatedAt < markerCreated) {
     return false;
   }
 
@@ -204,7 +204,7 @@ export function hasNewCompletionComment(baselineComment, currentComment, markerC
 
   const currentCreatedAt = parseTimestamp(currentComment.createdAt, "Codex completion comment creation time");
   const markerCreated = parseTimestamp(markerCreatedAt, "marker creation time");
-  if (currentCreatedAt <= markerCreated) {
+  if (currentCreatedAt < markerCreated) {
     return false;
   }
 

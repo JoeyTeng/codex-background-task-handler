@@ -81,6 +81,30 @@ test("accepts a new +1 identity after the marker", () => {
   );
 });
 
+test("accepts a same-second new +1 identity at the marker boundary", () => {
+  const baseline = {
+    id: "1",
+    content: "+1",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+  };
+  const current = {
+    id: "2",
+    content: "+1",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+  };
+
+  assert.equal(
+    hasNewPlusOneTransition(baseline, current, "2026-04-26T10:01:00Z"),
+    true,
+  );
+  assert.equal(
+    hasNewPlusOneTransition(current, current, "2026-04-26T10:01:00Z"),
+    false,
+  );
+});
+
 test("accepts a new Codex completion comment after the marker", () => {
   const baseline = {
     id: "1",
@@ -98,6 +122,30 @@ test("accepts a new Codex completion comment after the marker", () => {
   assert.equal(
     hasNewCompletionComment(baseline, current, "2026-04-26T10:01:00Z"),
     true,
+  );
+});
+
+test("accepts a same-second new Codex completion comment at the marker boundary", () => {
+  const baseline = {
+    id: "1",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/1",
+  };
+  const current = {
+    id: "2",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/2",
+  };
+
+  assert.equal(
+    hasNewCompletionComment(baseline, current, "2026-04-26T10:01:00Z"),
+    true,
+  );
+  assert.equal(
+    hasNewCompletionComment(current, current, "2026-04-26T10:01:00Z"),
+    false,
   );
 });
 
@@ -261,6 +309,24 @@ test("treats eyes as liveness only after the marker", () => {
   };
 
   assert.equal(hasNewEyesTransition(null, current, "2026-04-26T10:01:00Z"), true);
+});
+
+test("accepts same-second eyes when the reaction identity changed", () => {
+  const baseline = {
+    id: "4",
+    content: "eyes",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+  };
+  const current = {
+    id: "5",
+    content: "eyes",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+  };
+
+  assert.equal(hasNewEyesTransition(baseline, current, "2026-04-26T10:01:00Z"), true);
+  assert.equal(hasNewEyesTransition(current, current, "2026-04-26T10:01:00Z"), false);
 });
 
 test("summarizes only Codex bot PR-body reactions", () => {
