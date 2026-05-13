@@ -2406,6 +2406,7 @@ impl Store {
         let marker = query_desktop_transcript_relay_marker_tx(&tx, &consumption.marker)?;
         ensure_desktop_relay_marker_matches_consumption(&marker, &consumption)?;
         ensure_desktop_relay_scanner_binding_matches_tx(&tx, scanner_binding, &marker)?;
+        ensure_desktop_relay_marker_matches_current_desktop_binding_tx(&tx, &marker)?;
         match consume_desktop_transcript_relay_tx(&tx, &consumption)? {
             DesktopTranscriptRelayConsumeTxResult::Consumed(record) => {
                 tx.execute(
@@ -2724,6 +2725,9 @@ impl Store {
                     bridge_thread_id,
                     envelope_kind: "arm_pending_requested",
                     source_thread_id: &batch.source_thread_id,
+                    caller_automation_id: &binding.caller_automation_id,
+                    read_transport_generation: binding.read_transport_generation,
+                    validation_fingerprint: &binding.validation_fingerprint,
                     attempt_id: &attempt.attempt_id,
                     generation: attempt.generation,
                     bridge_request_id: None,
@@ -3271,6 +3275,9 @@ impl Store {
                         bridge_thread_id,
                         envelope_kind: "arm_accepted",
                         source_thread_id: &source_thread_id,
+                        caller_automation_id: &binding.caller_automation_id,
+                        read_transport_generation: binding.read_transport_generation,
+                        validation_fingerprint: &binding.validation_fingerprint,
                         attempt_id: &attempt_id,
                         generation,
                         bridge_request_id: Some(&bridge_request_id),
@@ -4214,6 +4221,9 @@ fn migrate(conn: &Connection) -> Result<()> {
             bridge_thread_id TEXT NOT NULL,
             envelope_kind TEXT NOT NULL CHECK (envelope_kind IN ('arm_pending_requested', 'arm_accepted')),
             source_thread_id TEXT NOT NULL,
+            caller_automation_id TEXT NOT NULL,
+            read_transport_generation INTEGER NOT NULL,
+            validation_fingerprint TEXT NOT NULL,
             attempt_id TEXT NOT NULL,
             generation INTEGER NOT NULL,
             bridge_request_id TEXT NOT NULL,
@@ -4448,6 +4458,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         "desktop_relay_scanner_bindings",
         "binding_revision",
         "ALTER TABLE desktop_relay_scanner_bindings ADD COLUMN binding_revision INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        conn,
+        "desktop_transcript_relay_markers",
+        "caller_automation_id",
+        "ALTER TABLE desktop_transcript_relay_markers ADD COLUMN caller_automation_id TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "desktop_transcript_relay_markers",
+        "read_transport_generation",
+        "ALTER TABLE desktop_transcript_relay_markers ADD COLUMN read_transport_generation INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "desktop_transcript_relay_markers",
+        "validation_fingerprint",
+        "ALTER TABLE desktop_transcript_relay_markers ADD COLUMN validation_fingerprint TEXT NOT NULL DEFAULT ''",
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_desktop_bindings_pause_due
@@ -5728,6 +5756,25 @@ fn ensure_desktop_relay_scanner_binding_matches_tx(
     Ok(())
 }
 
+fn ensure_desktop_relay_marker_matches_current_desktop_binding_tx(
+    tx: &Transaction<'_>,
+    marker: &DesktopTranscriptRelayMarkerRecord,
+) -> Result<()> {
+    let binding = query_desktop_binding_tx(tx, &marker.source_thread_id)?;
+    if binding.binding_state != "bound"
+        || binding.caller_automation_id != marker.caller_automation_id
+        || binding.read_transport_generation != marker.read_transport_generation
+        || binding.validation_fingerprint != marker.validation_fingerprint
+    {
+        bail!(
+            "Desktop binding {} changed since transcript relay marker {} was issued",
+            marker.source_thread_id,
+            marker.marker
+        );
+    }
+    Ok(())
+}
+
 fn consume_desktop_transcript_relay_tx(
     tx: &Transaction<'_>,
     consumption: &NewDesktopTranscriptRelayConsumption,
@@ -6848,6 +6895,9 @@ struct DesktopRelayMarkerRequest<'a> {
     bridge_thread_id: &'a str,
     envelope_kind: &'a str,
     source_thread_id: &'a str,
+    caller_automation_id: &'a str,
+    read_transport_generation: i64,
+    validation_fingerprint: &'a str,
     attempt_id: &'a str,
     generation: i64,
     bridge_request_id: Option<&'a str>,
@@ -6867,6 +6917,9 @@ fn find_issued_desktop_relay_marker_tx(
                  WHERE bridge_thread_id = ?
                    AND envelope_kind = ?
                    AND source_thread_id = ?
+                   AND caller_automation_id = ?
+                   AND read_transport_generation = ?
+                   AND validation_fingerprint = ?
                    AND attempt_id = ?
                    AND generation = ?
                    AND bridge_request_id = ?
@@ -6878,6 +6931,9 @@ fn find_issued_desktop_relay_marker_tx(
                     request.bridge_thread_id,
                     request.envelope_kind,
                     request.source_thread_id,
+                    request.caller_automation_id,
+                    request.read_transport_generation,
+                    request.validation_fingerprint,
                     request.attempt_id,
                     request.generation,
                     bridge_request_id,
@@ -6894,6 +6950,9 @@ fn find_issued_desktop_relay_marker_tx(
          WHERE bridge_thread_id = ?
            AND envelope_kind = ?
            AND source_thread_id = ?
+           AND caller_automation_id = ?
+           AND read_transport_generation = ?
+           AND validation_fingerprint = ?
            AND attempt_id = ?
            AND generation = ?
            AND marker_state = 'issued'
@@ -6904,6 +6963,9 @@ fn find_issued_desktop_relay_marker_tx(
             request.bridge_thread_id,
             request.envelope_kind,
             request.source_thread_id,
+            request.caller_automation_id,
+            request.read_transport_generation,
+            request.validation_fingerprint,
             request.attempt_id,
             request.generation,
             now,
@@ -6981,6 +7043,8 @@ fn insert_desktop_transcript_relay_marker_tx(
             marker.envelope_kind
         );
     }
+    let binding = query_desktop_binding_tx(tx, &marker.source_thread_id)?;
+    ensure_desktop_binding_bound_for_arm(&binding)?;
     if marker.envelope_kind == "arm_accepted" {
         let attempt = query_delivery_attempt_tx(tx, &marker.attempt_id)?;
         ensure_desktop_attempt_tokens(&attempt, &marker.source_thread_id, marker.generation)?;
@@ -7015,15 +7079,19 @@ fn insert_desktop_transcript_relay_marker_tx(
     tx.execute(
         "INSERT INTO desktop_transcript_relay_markers (
             marker, bridge_thread_id, envelope_kind,
-            source_thread_id, attempt_id, generation, bridge_request_id,
+            source_thread_id, caller_automation_id, read_transport_generation,
+            validation_fingerprint, attempt_id, generation, bridge_request_id,
             marker_state, issued_at, expires_at, retention_until,
             consumed_at, rejected_at, rejection_reason, envelope_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', ?, ?, ?, NULL, NULL, NULL, NULL)",
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', ?, ?, ?, NULL, NULL, NULL, NULL)",
         params![
             &marker.marker,
             &marker.bridge_thread_id,
             &marker.envelope_kind,
             &marker.source_thread_id,
+            &binding.caller_automation_id,
+            binding.read_transport_generation,
+            &binding.validation_fingerprint,
             &marker.attempt_id,
             marker.generation,
             &marker.bridge_request_id,
@@ -7043,6 +7111,9 @@ fn desktop_transcript_relay_marker_from_row(
         bridge_thread_id: row.get("bridge_thread_id")?,
         envelope_kind: row.get("envelope_kind")?,
         source_thread_id: row.get("source_thread_id")?,
+        caller_automation_id: row.get("caller_automation_id")?,
+        read_transport_generation: row.get("read_transport_generation")?,
+        validation_fingerprint: row.get("validation_fingerprint")?,
         attempt_id: row.get("attempt_id")?,
         generation: row.get("generation")?,
         bridge_request_id: row.get("bridge_request_id")?,
@@ -7928,6 +7999,14 @@ mod tests {
             })
             .expect("bind scanner");
         store
+            .repair_desktop_binding(
+                "thread-retention-work",
+                "automation-retention-work",
+                "fp-retention-work",
+                9,
+            )
+            .expect("bind Desktop source");
+        store
             .issue_desktop_transcript_relay_marker(NewDesktopTranscriptRelayMarker {
                 marker: "marker-retention-work".to_owned(),
                 bridge_thread_id: "bridge-retention-work".to_owned(),
@@ -8001,6 +8080,14 @@ mod tests {
         let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
         let mut store = Store::open(&layout).expect("store");
 
+        store
+            .repair_desktop_binding(
+                "thread-consumed-before-expiry",
+                "automation-consumed-before-expiry",
+                "fp-consumed-before-expiry",
+                9,
+            )
+            .expect("bind Desktop source");
         store
             .issue_desktop_transcript_relay_marker(NewDesktopTranscriptRelayMarker {
                 marker: "marker-consumed-before-expiry".to_owned(),
@@ -8261,6 +8348,94 @@ mod tests {
             )
             .expect("query marker state");
         assert_eq!(marker_state, "issued");
+    }
+
+    #[test]
+    fn desktop_relay_marker_cas_requires_unchanged_desktop_binding() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let fixture = store
+            .prepare_desktop_writeback_fixture(NewDesktopWritebackFixture {
+                source_thread_id: "thread-atomic-desktop-binding".to_owned(),
+                caller_automation_id: "automation-atomic-desktop-binding".to_owned(),
+                bridge_request_id: "request-atomic-desktop-binding".to_owned(),
+                default_validation_fingerprint: "fp-atomic-desktop-binding".to_owned(),
+                now: 30,
+            })
+            .expect("prepare fixture");
+        store
+            .issue_desktop_transcript_relay_marker(NewDesktopTranscriptRelayMarker {
+                marker: "marker-atomic-desktop-binding".to_owned(),
+                bridge_thread_id: "bridge-atomic-desktop-binding".to_owned(),
+                envelope_kind: "arm_pending_requested".to_owned(),
+                source_thread_id: fixture.source_thread_id.clone(),
+                attempt_id: fixture.attempt.attempt_id.clone(),
+                generation: fixture.attempt.generation,
+                bridge_request_id: fixture.bridge_request_id.clone(),
+                issued_at: 31,
+                expires_at: 100,
+                retention_until: 200,
+            })
+            .expect("issue marker");
+        let scanner_binding = store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-atomic-desktop-binding".to_owned(),
+                rollout_path: "/tmp/atomic-desktop-binding.jsonl".to_owned(),
+                rollout_identity: "unix:30:31".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 31,
+            })
+            .expect("bind scanner");
+        store
+            .repair_desktop_binding(
+                &fixture.source_thread_id,
+                "automation-atomic-desktop-binding-repointed",
+                "fp-atomic-desktop-binding",
+                32,
+            )
+            .expect("repoint binding");
+
+        let error = store
+            .consume_issued_desktop_transcript_relay_marker(
+                NewDesktopTranscriptRelayConsumption {
+                    marker: "marker-atomic-desktop-binding".to_owned(),
+                    envelope_hash: "hash-atomic-desktop-binding".to_owned(),
+                    envelope_kind: "arm_pending_requested".to_owned(),
+                    envelope_json: "{}".to_owned(),
+                    source_thread_id: fixture.source_thread_id.clone(),
+                    attempt_id: fixture.attempt.attempt_id.clone(),
+                    generation: fixture.attempt.generation,
+                    bridge_request_id: fixture.bridge_request_id.clone(),
+                    bridge_arm_lease_id: None,
+                    now: 33,
+                },
+                &scanner_binding,
+            )
+            .expect_err("stale Desktop binding marker must fail before CAS");
+        assert!(
+            error
+                .to_string()
+                .contains("changed since transcript relay marker"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            store
+                .inspect_attempt(&fixture.attempt.attempt_id)
+                .expect("inspect attempt")
+                .state,
+            "prepared"
+        );
+        let consumptions: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM desktop_transcript_relay_consumptions WHERE marker = ?",
+                params!["marker-atomic-desktop-binding"],
+                |row| row.get(0),
+            )
+            .expect("count consumptions");
+        assert_eq!(consumptions, 0);
     }
 
     #[test]
