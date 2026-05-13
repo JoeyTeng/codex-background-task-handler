@@ -2380,6 +2380,25 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let marker = query_desktop_transcript_relay_marker_tx(&tx, &consumption.marker)?;
+        ensure_desktop_relay_marker_tokens_match_consumption(&marker, &consumption)?;
+        match replay_desktop_transcript_relay_consumption_tx(
+            &tx,
+            &consumption.marker,
+            &consumption.envelope_hash,
+        )? {
+            DesktopTranscriptRelayReplayTxResult::Consumed(record) => {
+                tx.commit()?;
+                return Ok(record);
+            }
+            DesktopTranscriptRelayReplayTxResult::DurableCasFailed { error_message } => {
+                tx.commit()?;
+                bail!("{error_message}");
+            }
+            DesktopTranscriptRelayReplayTxResult::None => {}
+        }
+        ensure_desktop_relay_marker_matches_consumption(&marker, &consumption)?;
+        ensure_desktop_relay_marker_matches_current_desktop_binding_tx(&tx, &marker)?;
         match consume_desktop_transcript_relay_tx(&tx, &consumption)? {
             DesktopTranscriptRelayConsumeTxResult::Consumed(record) => {
                 tx.commit()?;
@@ -2454,49 +2473,13 @@ impl Store {
     ) -> Result<Option<DesktopTranscriptRelayConsumptionRecord>> {
         ensure_nonempty_value("marker", marker)?;
         ensure_nonempty_value("envelope_hash", envelope_hash)?;
-        let Some((existing_hash, existing_kind, consumed_at, outcome_json)) = self
-            .conn
-            .query_row(
-                "SELECT envelope_hash, envelope_kind, consumed_at, outcome_json
-                 FROM desktop_transcript_relay_consumptions
-                 WHERE marker = ?",
-                params![marker],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()?
-        else {
-            return Ok(None);
-        };
-        if existing_hash != envelope_hash {
-            bail!(
-                "Desktop transcript relay marker {} was already consumed with another envelope hash",
-                marker
-            );
+        match replay_desktop_transcript_relay_consumption_tx(&self.conn, marker, envelope_hash)? {
+            DesktopTranscriptRelayReplayTxResult::None => Ok(None),
+            DesktopTranscriptRelayReplayTxResult::Consumed(record) => Ok(Some(record)),
+            DesktopTranscriptRelayReplayTxResult::DurableCasFailed { error_message } => {
+                bail!("{error_message}")
+            }
         }
-        let outcome: serde_json::Value =
-            serde_json::from_str(&outcome_json).context("parse stored relay outcome JSON")?;
-        if outcome.get("outcome").and_then(serde_json::Value::as_str) == Some("cas_failed") {
-            let error_message = outcome
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("stored CAS failure");
-            bail!("Desktop transcript relay marker {marker} replayed failed CAS: {error_message}");
-        }
-        Ok(Some(DesktopTranscriptRelayConsumptionRecord {
-            marker: marker.to_owned(),
-            envelope_hash: existing_hash,
-            envelope_kind: existing_kind,
-            replay_state: "replayed".to_owned(),
-            consumed_at,
-            outcome,
-        }))
     }
 
     pub fn bind_desktop_relay_scanner(
@@ -3266,41 +3249,42 @@ impl Store {
                 .get("arm_pending_deadline")
                 .and_then(serde_json::Value::as_i64);
             let binding = query_desktop_binding_tx(tx, &source_thread_id)?;
-            if lease_deadline.is_some_and(|deadline| deadline > now)
-                && arm_pending_deadline.is_some_and(|deadline| deadline > now)
-                && installation_state.read_transport_capability == "validated"
-                && installation_state.writeback_capability == "validated"
-                && desktop_binding_matches_installation(&binding, installation_state)
+            if lease_deadline.is_none_or(|deadline| deadline <= now)
+                || arm_pending_deadline.is_none_or(|deadline| deadline <= now)
+                || installation_state.read_transport_capability != "validated"
+                || installation_state.writeback_capability != "validated"
+                || !desktop_binding_matches_installation(&binding, installation_state)
             {
-                let marker = find_or_issue_desktop_relay_marker_tx(
-                    tx,
-                    &DesktopRelayMarkerRequest {
-                        bridge_thread_id,
-                        envelope_kind: "arm_accepted",
-                        source_thread_id: &source_thread_id,
-                        caller_automation_id: &binding.caller_automation_id,
-                        read_transport_generation: binding.read_transport_generation,
-                        validation_fingerprint: &binding.validation_fingerprint,
-                        attempt_id: &attempt_id,
-                        generation,
-                        bridge_request_id: Some(&bridge_request_id),
-                        marker_prefix: "CBTH_DESKTOP_RELAY_ARM_ACCEPTED",
-                        expires_at_cap: None,
-                    },
-                    now,
-                )?;
-                let object = entry
-                    .as_object_mut()
-                    .ok_or_else(|| anyhow!("arm_pending entry is not an object"))?;
-                object.insert(
-                    "arm_accepted_marker".to_owned(),
-                    serde_json::Value::String(marker.marker),
-                );
-                object.insert(
-                    "marker_expires_at".to_owned(),
-                    serde_json::Value::Number(marker.expires_at.into()),
-                );
+                continue;
             }
+            let marker = find_or_issue_desktop_relay_marker_tx(
+                tx,
+                &DesktopRelayMarkerRequest {
+                    bridge_thread_id,
+                    envelope_kind: "arm_accepted",
+                    source_thread_id: &source_thread_id,
+                    caller_automation_id: &binding.caller_automation_id,
+                    read_transport_generation: binding.read_transport_generation,
+                    validation_fingerprint: &binding.validation_fingerprint,
+                    attempt_id: &attempt_id,
+                    generation,
+                    bridge_request_id: Some(&bridge_request_id),
+                    marker_prefix: "CBTH_DESKTOP_RELAY_ARM_ACCEPTED",
+                    expires_at_cap: None,
+                },
+                now,
+            )?;
+            let object = entry
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("arm_pending entry is not an object"))?;
+            object.insert(
+                "arm_accepted_marker".to_owned(),
+                serde_json::Value::String(marker.marker),
+            );
+            object.insert(
+                "marker_expires_at".to_owned(),
+                serde_json::Value::Number(marker.expires_at.into()),
+            );
             entries.push(entry);
         }
         Ok(entries)
@@ -5757,6 +5741,67 @@ enum DesktopTranscriptRelayConsumeTxResult {
     DurableCasFailed { error_message: String },
 }
 
+enum DesktopTranscriptRelayReplayTxResult {
+    None,
+    Consumed(DesktopTranscriptRelayConsumptionRecord),
+    DurableCasFailed { error_message: String },
+}
+
+fn replay_desktop_transcript_relay_consumption_tx(
+    conn: &Connection,
+    marker: &str,
+    envelope_hash: &str,
+) -> Result<DesktopTranscriptRelayReplayTxResult> {
+    let Some((existing_hash, existing_kind, consumed_at, outcome_json)) = conn
+        .query_row(
+            "SELECT envelope_hash, envelope_kind, consumed_at, outcome_json
+             FROM desktop_transcript_relay_consumptions
+             WHERE marker = ?",
+            params![marker],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(DesktopTranscriptRelayReplayTxResult::None);
+    };
+    if existing_hash != envelope_hash {
+        bail!(
+            "Desktop transcript relay marker {} was already consumed with another envelope hash",
+            marker
+        );
+    }
+    let outcome: serde_json::Value =
+        serde_json::from_str(&outcome_json).context("parse stored relay outcome JSON")?;
+    if outcome.get("outcome").and_then(serde_json::Value::as_str) == Some("cas_failed") {
+        let error_message = outcome
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("stored CAS failure");
+        return Ok(DesktopTranscriptRelayReplayTxResult::DurableCasFailed {
+            error_message: format!(
+                "Desktop transcript relay marker {marker} replayed failed CAS: {error_message}"
+            ),
+        });
+    }
+    Ok(DesktopTranscriptRelayReplayTxResult::Consumed(
+        DesktopTranscriptRelayConsumptionRecord {
+            marker: marker.to_owned(),
+            envelope_hash: existing_hash,
+            envelope_kind: existing_kind,
+            replay_state: "replayed".to_owned(),
+            consumed_at,
+            outcome,
+        },
+    ))
+}
+
 fn validate_desktop_transcript_relay_consumption(
     consumption: &NewDesktopTranscriptRelayConsumption,
 ) -> Result<()> {
@@ -5799,6 +5844,13 @@ fn ensure_desktop_relay_marker_matches_consumption(
             marker.marker
         );
     }
+    ensure_desktop_relay_marker_tokens_match_consumption(marker, consumption)
+}
+
+fn ensure_desktop_relay_marker_tokens_match_consumption(
+    marker: &DesktopTranscriptRelayMarkerRecord,
+    consumption: &NewDesktopTranscriptRelayConsumption,
+) -> Result<()> {
     let expected_marker_kind = match consumption.envelope_kind.as_str() {
         "arm_pending_requested" => "arm_pending_requested",
         "arm_requested" => "arm_accepted",
@@ -5884,53 +5936,19 @@ fn consume_desktop_transcript_relay_tx(
     tx: &Transaction<'_>,
     consumption: &NewDesktopTranscriptRelayConsumption,
 ) -> Result<DesktopTranscriptRelayConsumeTxResult> {
-    if let Some((existing_hash, existing_kind, consumed_at, outcome_json)) = tx
-        .query_row(
-            "SELECT envelope_hash, envelope_kind, consumed_at, outcome_json
-             FROM desktop_transcript_relay_consumptions
-             WHERE marker = ?",
-            params![&consumption.marker],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()?
-    {
-        if existing_hash != consumption.envelope_hash {
-            bail!(
-                "Desktop transcript relay marker {} was already consumed with another envelope hash",
-                consumption.marker
-            );
+    match replay_desktop_transcript_relay_consumption_tx(
+        tx,
+        &consumption.marker,
+        &consumption.envelope_hash,
+    ) {
+        Ok(DesktopTranscriptRelayReplayTxResult::Consumed(record)) => {
+            return Ok(DesktopTranscriptRelayConsumeTxResult::Consumed(record));
         }
-        let outcome: serde_json::Value =
-            serde_json::from_str(&outcome_json).context("parse stored relay outcome JSON")?;
-        if outcome.get("outcome").and_then(serde_json::Value::as_str) == Some("cas_failed") {
-            let error_message = outcome
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("stored CAS failure");
-            return Ok(DesktopTranscriptRelayConsumeTxResult::DurableCasFailed {
-                error_message: format!(
-                    "Desktop transcript relay marker {} replayed failed CAS: {}",
-                    consumption.marker, error_message
-                ),
-            });
+        Ok(DesktopTranscriptRelayReplayTxResult::DurableCasFailed { error_message }) => {
+            return Ok(DesktopTranscriptRelayConsumeTxResult::DurableCasFailed { error_message });
         }
-        return Ok(DesktopTranscriptRelayConsumeTxResult::Consumed(
-            DesktopTranscriptRelayConsumptionRecord {
-                marker: consumption.marker.clone(),
-                envelope_hash: existing_hash,
-                envelope_kind: existing_kind,
-                replay_state: "replayed".to_owned(),
-                consumed_at,
-                outcome,
-            },
-        ));
+        Ok(DesktopTranscriptRelayReplayTxResult::None) => {}
+        Err(error) => return Err(error),
     }
 
     let outcome_result = match consumption.envelope_kind.as_str() {

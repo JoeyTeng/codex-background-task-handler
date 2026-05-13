@@ -1657,7 +1657,35 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
     let attempt_id = fixture["desktop_writeback_fixture"]["attempt"]["attempt_id"]
         .as_str()
         .expect("attempt id");
-    let marker = "CBTH_GENERATION_RELAY_ENDPOINT";
+    let marker_now = (now + 5).to_string();
+    let marker = cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "marker",
+            "issue",
+            "--bridge-thread-id",
+            "bridge-generation-relay",
+            "--kind",
+            "arm-pending",
+            "--source-thread-id",
+            "thread-generation-relay",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-generation-relay",
+            "--now",
+            &marker_now,
+            "--json",
+        ],
+    );
+    let marker = marker["desktop_transcript_relay_marker"]["record"]["marker"]
+        .as_str()
+        .expect("marker")
+        .to_owned();
     let envelope = json!({
         "schema_version": 1,
         "channel": "desktop_transcript_writeback",
@@ -1666,7 +1694,7 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
         "attempt_id": attempt_id,
         "generation": 1,
         "bridge_request_id": "bridge-request-generation-relay",
-        "marker": marker,
+        "marker": &marker,
         "created_at": now + 10,
     });
     let rollout = home.path().join("generation-relay-rollout.jsonl");
@@ -1687,7 +1715,7 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
             "--rollout-path",
             rollout.to_str().unwrap(),
             "--marker",
-            marker,
+            &marker,
             "--json",
             "--now",
             &consume_now,

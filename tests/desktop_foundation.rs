@@ -394,6 +394,47 @@ fn mark_consumed_pending_marker_for_bridge(
     .expect("mark pending marker consumed");
 }
 
+#[allow(clippy::too_many_arguments)]
+fn issue_desktop_relay_marker(
+    home: &TempDir,
+    bridge_thread_id: &str,
+    kind: &str,
+    source_thread_id: &str,
+    attempt_id: &str,
+    generation: i64,
+    bridge_request_id: &str,
+    now: i64,
+) -> String {
+    let marker = cbth(
+        home,
+        &[
+            "desktop",
+            "relay",
+            "marker",
+            "issue",
+            "--bridge-thread-id",
+            bridge_thread_id,
+            "--kind",
+            kind,
+            "--source-thread-id",
+            source_thread_id,
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            &generation.to_string(),
+            "--bridge-request-id",
+            bridge_request_id,
+            "--json",
+            "--now",
+            &now.to_string(),
+        ],
+    );
+    marker["desktop_transcript_relay_marker"]["record"]["marker"]
+        .as_str()
+        .expect("marker")
+        .to_owned()
+}
+
 #[test]
 fn desktop_installation_state_defaults_and_repairs_without_extra_writes() {
     let home = temp_home();
@@ -620,20 +661,11 @@ fn desktop_commands_fail_closed_for_invalid_inputs() {
 #[test]
 fn desktop_note_arm_pending_and_note_arm_are_idempotent_and_exported() {
     let home = temp_home();
-    cbth(
+    repair_validated_desktop_installation_and_binding(
         &home,
-        &[
-            "desktop",
-            "binding",
-            "repair",
-            "--source-thread-id",
-            "thread-desktop-writeback",
-            "--caller-automation-id",
-            "automation-writeback",
-            "--json",
-            "--now",
-            "2000",
-        ],
+        "thread-desktop-writeback",
+        "automation-writeback",
+        2000,
     );
     let batch_id = create_desktop_batch_and_prepared_attempt(
         &home,
@@ -2647,7 +2679,16 @@ fn desktop_transcript_relay_consumer_drives_arm_cas_and_replay_fence() {
     let attempt_id = fixture["attempt"]["attempt_id"].as_str().unwrap();
     let batch_id = fixture["batch"]["batch_id"].as_str().unwrap();
 
-    let pending_marker = "CBTH_RELAY_CONSUMER_PENDING";
+    let pending_marker = issue_desktop_relay_marker(
+        &home,
+        "bridge-relay-consumer",
+        "arm-pending",
+        "thread-relay-consumer",
+        attempt_id,
+        1,
+        "bridge-request-relay-consumer",
+        7005,
+    );
     let pending_emit = cbth_output(
         &home,
         &[
@@ -2663,7 +2704,7 @@ fn desktop_transcript_relay_consumer_drives_arm_cas_and_replay_fence() {
             "--bridge-request-id",
             "bridge-request-relay-consumer",
             "--marker",
-            pending_marker,
+            &pending_marker,
             "--json",
             "--now",
             "7010",
@@ -2689,7 +2730,7 @@ fn desktop_transcript_relay_consumer_drives_arm_cas_and_replay_fence() {
             "--rollout-path",
             pending_rollout.to_str().unwrap(),
             "--marker",
-            pending_marker,
+            &pending_marker,
             "--json",
             "--now",
             "7020",
@@ -2717,7 +2758,7 @@ fn desktop_transcript_relay_consumer_drives_arm_cas_and_replay_fence() {
             "--rollout-path",
             pending_rollout.to_str().unwrap(),
             "--marker",
-            pending_marker,
+            &pending_marker,
             "--json",
             "--now",
             "7021",
@@ -2747,7 +2788,7 @@ fn desktop_transcript_relay_consumer_drives_arm_cas_and_replay_fence() {
             "--bridge-request-id",
             "bridge-request-relay-consumer",
             "--marker",
-            pending_marker,
+            &pending_marker,
             "--json",
             "--now",
             "7022",
@@ -2769,7 +2810,7 @@ fn desktop_transcript_relay_consumer_drives_arm_cas_and_replay_fence() {
             "--rollout-path",
             conflicting_rollout.to_str().unwrap(),
             "--marker",
-            pending_marker,
+            &pending_marker,
             "--json",
             "--now",
             "7023",
@@ -2777,7 +2818,16 @@ fn desktop_transcript_relay_consumer_drives_arm_cas_and_replay_fence() {
     );
     assert!(conflict.contains("already consumed with another envelope hash"));
 
-    let arm_marker = "CBTH_RELAY_CONSUMER_ARM";
+    let arm_marker = issue_desktop_relay_marker(
+        &home,
+        "bridge-relay-consumer",
+        "arm-accepted",
+        "thread-relay-consumer",
+        attempt_id,
+        1,
+        "bridge-request-relay-consumer",
+        7025,
+    );
     let arm_emit = cbth_output(
         &home,
         &[
@@ -2795,7 +2845,7 @@ fn desktop_transcript_relay_consumer_drives_arm_cas_and_replay_fence() {
             "--bridge-arm-lease-id",
             &lease_id,
             "--marker",
-            arm_marker,
+            &arm_marker,
             "--json",
             "--now",
             "7030",
@@ -2814,7 +2864,7 @@ fn desktop_transcript_relay_consumer_drives_arm_cas_and_replay_fence() {
             "--rollout-path",
             arm_rollout.to_str().unwrap(),
             "--marker",
-            arm_marker,
+            &arm_marker,
             "--json",
             "--now",
             "7040",
@@ -2836,7 +2886,7 @@ fn desktop_transcript_relay_consumer_drives_arm_cas_and_replay_fence() {
             "--rollout-path",
             arm_rollout.to_str().unwrap(),
             "--marker",
-            arm_marker,
+            &arm_marker,
             "--json",
             "--now",
             "7041",
@@ -2848,6 +2898,110 @@ fn desktop_transcript_relay_consumer_drives_arm_cas_and_replay_fence() {
     );
     let inspected = cbth(&home, &["batch", "inspect", "--batch-id", batch_id]);
     assert_eq!(inspected["batch"]["batch"]["delivery_attempt_count"], 1);
+}
+
+#[test]
+fn desktop_transcript_relay_consumer_rejects_stale_binding_marker() {
+    let home = temp_home();
+    let fixture = cbth(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "prepare-writeback-fixture",
+            "--source-thread-id",
+            "thread-relay-consumer-stale-binding",
+            "--caller-automation-id",
+            "automation-relay-consumer-stale-binding",
+            "--bridge-request-id",
+            "bridge-request-relay-consumer-stale-binding",
+            "--now",
+            "7060",
+            "--json",
+        ],
+    );
+    let fixture = &fixture["desktop_writeback_fixture"];
+    let attempt_id = fixture["attempt"]["attempt_id"].as_str().unwrap();
+    let marker = issue_desktop_relay_marker(
+        &home,
+        "bridge-relay-consumer-stale-binding",
+        "arm-pending",
+        "thread-relay-consumer-stale-binding",
+        attempt_id,
+        1,
+        "bridge-request-relay-consumer-stale-binding",
+        7061,
+    );
+
+    let pending_emit = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "validation",
+            "emit-transcript-arm-pending",
+            "--source-thread-id",
+            "thread-relay-consumer-stale-binding",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-relay-consumer-stale-binding",
+            "--marker",
+            &marker,
+            "--json",
+            "--now",
+            "7062",
+        ],
+        false,
+    );
+    assert!(pending_emit.status.success());
+    let rollout = home.path().join("pending-stale-binding-rollout.jsonl");
+    write_function_call_rollout(&rollout, &String::from_utf8(pending_emit.stdout).unwrap());
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE desktop_bindings
+         SET caller_automation_id = ?
+         WHERE source_thread_id = ?",
+        params![
+            "automation-relay-consumer-stale-binding-repaired",
+            "thread-relay-consumer-stale-binding"
+        ],
+    )
+    .expect("simulate Desktop binding repair after marker issue");
+    drop(conn);
+
+    let stale = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            rollout.to_str().unwrap(),
+            "--marker",
+            &marker,
+            "--json",
+            "--now",
+            "7063",
+        ],
+    );
+    assert!(stale.contains("changed since transcript relay marker"));
+
+    let attempt = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
+    assert_eq!(attempt["attempt"]["state"], "prepared");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let consumptions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM desktop_transcript_relay_consumptions
+             WHERE marker = ?",
+            params![marker],
+            |row| row.get(0),
+        )
+        .expect("count relay consumptions");
+    assert_eq!(consumptions, 0);
 }
 
 #[test]
@@ -4161,7 +4315,16 @@ fn desktop_transcript_relay_consumer_records_failed_cas_replay_fence() {
     let fixture = &fixture["desktop_writeback_fixture"];
     let attempt_id = fixture["attempt"]["attempt_id"].as_str().unwrap();
 
-    let pending_marker = "CBTH_RELAY_EXPIRED_PENDING";
+    let pending_marker = issue_desktop_relay_marker(
+        &home,
+        "bridge-relay-expired",
+        "arm-pending",
+        "thread-relay-expired",
+        attempt_id,
+        1,
+        "bridge-request-relay-expired",
+        7305,
+    );
     let pending_emit = cbth_output(
         &home,
         &[
@@ -4177,7 +4340,7 @@ fn desktop_transcript_relay_consumer_records_failed_cas_replay_fence() {
             "--bridge-request-id",
             "bridge-request-relay-expired",
             "--marker",
-            pending_marker,
+            &pending_marker,
             "--json",
             "--now",
             "7310",
@@ -4199,7 +4362,7 @@ fn desktop_transcript_relay_consumer_records_failed_cas_replay_fence() {
             "--rollout-path",
             pending_rollout.to_str().unwrap(),
             "--marker",
-            pending_marker,
+            &pending_marker,
             "--json",
             "--now",
             "7320",
@@ -4210,11 +4373,27 @@ fn desktop_transcript_relay_consumer_records_failed_cas_replay_fence() {
         .as_str()
         .unwrap()
         .to_owned();
-    let lease_deadline = pending["record"]["outcome"]["bridge_arm_lease_deadline"]
-        .as_i64()
-        .unwrap();
 
-    let arm_marker = "CBTH_RELAY_EXPIRED_ARM";
+    let arm_marker = issue_desktop_relay_marker(
+        &home,
+        "bridge-relay-expired",
+        "arm-accepted",
+        "thread-relay-expired",
+        attempt_id,
+        1,
+        "bridge-request-relay-expired",
+        7325,
+    );
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE delivery_attempts
+         SET bridge_arm_lease_deadline = ?,
+             arm_pending_deadline = ?
+         WHERE attempt_id = ?",
+        params![7335, 7335, attempt_id],
+    )
+    .expect("shorten arm deadlines after marker issue");
+    drop(conn);
     let arm_emit = cbth_output(
         &home,
         &[
@@ -4232,7 +4411,7 @@ fn desktop_transcript_relay_consumer_records_failed_cas_replay_fence() {
             "--bridge-arm-lease-id",
             &lease_id,
             "--marker",
-            arm_marker,
+            &arm_marker,
             "--json",
             "--now",
             "7330",
@@ -4242,7 +4421,6 @@ fn desktop_transcript_relay_consumer_records_failed_cas_replay_fence() {
     assert!(arm_emit.status.success());
     let arm_rollout = home.path().join("expired-arm-rollout.jsonl");
     write_function_call_rollout(&arm_rollout, &String::from_utf8(arm_emit.stdout).unwrap());
-    let expired_now = (lease_deadline + 1).to_string();
     let expired_error = cbth_failure(
         &home,
         &[
@@ -4252,17 +4430,19 @@ fn desktop_transcript_relay_consumer_records_failed_cas_replay_fence() {
             "--rollout-path",
             arm_rollout.to_str().unwrap(),
             "--marker",
-            arm_marker,
+            &arm_marker,
             "--json",
             "--now",
-            &expired_now,
+            "7340",
         ],
     );
-    assert!(expired_error.contains("bridge arm lease expired"));
+    assert!(
+        expired_error.contains("bridge arm lease expired"),
+        "unexpected error: {expired_error}"
+    );
     let inspected = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
     assert_eq!(inspected["attempt"]["state"], "abandoned");
 
-    let replay_now = (lease_deadline + 2).to_string();
     let replay_error = cbth_failure(
         &home,
         &[
@@ -4272,10 +4452,10 @@ fn desktop_transcript_relay_consumer_records_failed_cas_replay_fence() {
             "--rollout-path",
             arm_rollout.to_str().unwrap(),
             "--marker",
-            arm_marker,
+            &arm_marker,
             "--json",
             "--now",
-            &replay_now,
+            "7341",
         ],
     );
     assert!(replay_error.contains("replayed failed CAS"));
@@ -4298,7 +4478,7 @@ fn desktop_transcript_relay_consumer_records_failed_cas_replay_fence() {
             "--bridge-arm-lease-id",
             &lease_id,
             "--marker",
-            arm_marker,
+            &arm_marker,
             "--json",
             "--now",
             "7331",
@@ -4320,10 +4500,10 @@ fn desktop_transcript_relay_consumer_records_failed_cas_replay_fence() {
             "--rollout-path",
             conflicting_rollout.to_str().unwrap(),
             "--marker",
-            arm_marker,
+            &arm_marker,
             "--json",
             "--now",
-            &replay_now,
+            "7341",
         ],
     );
     assert!(conflict_error.contains("already consumed with another envelope hash"));
@@ -4352,7 +4532,16 @@ fn desktop_transcript_relay_consumer_rolls_back_non_durable_cas_failure() {
     let fixture = &fixture["desktop_writeback_fixture"];
     let attempt_id = fixture["attempt"]["attempt_id"].as_str().unwrap();
 
-    let pending_marker = "CBTH_RELAY_ROLLBACK_PENDING";
+    let pending_marker = issue_desktop_relay_marker(
+        &home,
+        "bridge-relay-rollback",
+        "arm-pending",
+        "thread-relay-rollback",
+        attempt_id,
+        1,
+        "bridge-request-relay-rollback",
+        7405,
+    );
     let pending_emit = cbth_output(
         &home,
         &[
@@ -4368,7 +4557,7 @@ fn desktop_transcript_relay_consumer_rolls_back_non_durable_cas_failure() {
             "--bridge-request-id",
             "bridge-request-relay-rollback",
             "--marker",
-            pending_marker,
+            &pending_marker,
             "--json",
             "--now",
             "7410",
@@ -4390,7 +4579,7 @@ fn desktop_transcript_relay_consumer_rolls_back_non_durable_cas_failure() {
             "--rollout-path",
             pending_rollout.to_str().unwrap(),
             "--marker",
-            pending_marker,
+            &pending_marker,
             "--json",
             "--now",
             "7420",
@@ -4402,7 +4591,16 @@ fn desktop_transcript_relay_consumer_rolls_back_non_durable_cas_failure() {
             .unwrap()
             .to_owned();
 
-    let arm_marker = "CBTH_RELAY_ROLLBACK_ARM";
+    let arm_marker = issue_desktop_relay_marker(
+        &home,
+        "bridge-relay-rollback",
+        "arm-accepted",
+        "thread-relay-rollback",
+        attempt_id,
+        1,
+        "bridge-request-relay-rollback",
+        7425,
+    );
     let wrong_arm_emit = cbth_output(
         &home,
         &[
@@ -4420,7 +4618,7 @@ fn desktop_transcript_relay_consumer_rolls_back_non_durable_cas_failure() {
             "--bridge-arm-lease-id",
             "wrong-lease",
             "--marker",
-            arm_marker,
+            &arm_marker,
             "--json",
             "--now",
             "7430",
@@ -4442,7 +4640,7 @@ fn desktop_transcript_relay_consumer_rolls_back_non_durable_cas_failure() {
             "--rollout-path",
             wrong_arm_rollout.to_str().unwrap(),
             "--marker",
-            arm_marker,
+            &arm_marker,
             "--json",
             "--now",
             "7440",
@@ -4469,7 +4667,7 @@ fn desktop_transcript_relay_consumer_rolls_back_non_durable_cas_failure() {
             "--bridge-arm-lease-id",
             &lease_id,
             "--marker",
-            arm_marker,
+            &arm_marker,
             "--json",
             "--now",
             "7450",
@@ -4491,7 +4689,7 @@ fn desktop_transcript_relay_consumer_rolls_back_non_durable_cas_failure() {
             "--rollout-path",
             correct_arm_rollout.to_str().unwrap(),
             "--marker",
-            arm_marker,
+            &arm_marker,
             "--json",
             "--now",
             "7460",
@@ -4858,7 +5056,16 @@ fn desktop_transcript_relay_consumer_scans_before_daemon_autostart() {
     let attempt_id = fixture["desktop_writeback_fixture"]["attempt"]["attempt_id"]
         .as_str()
         .unwrap();
-    let trusted_marker = "CBTH_RELAY_DAEMON_TRUSTED";
+    let trusted_marker = issue_desktop_relay_marker(
+        &trusted_home,
+        "bridge-relay-daemon",
+        "arm-pending",
+        "thread-relay-daemon",
+        attempt_id,
+        1,
+        "bridge-request-relay-daemon",
+        trusted_now.saturating_add(65),
+    );
     let emit = cbth_output(
         &trusted_home,
         &[
@@ -4874,7 +5081,7 @@ fn desktop_transcript_relay_consumer_scans_before_daemon_autostart() {
             "--bridge-request-id",
             "bridge-request-relay-daemon",
             "--marker",
-            trusted_marker,
+            &trusted_marker,
             "--json",
             "--now",
             &emit_now,
@@ -4893,7 +5100,7 @@ fn desktop_transcript_relay_consumer_scans_before_daemon_autostart() {
             "--rollout-path",
             rollout.to_str().unwrap(),
             "--marker",
-            trusted_marker,
+            &trusted_marker,
             "--json",
             "--now",
             &consume_now,
@@ -5203,6 +5410,32 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
             .unwrap()
             .starts_with("CBTH_DESKTOP_RELAY_ARM_ACCEPTED_")
     );
+    let conn = Connection::open(degraded_home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE desktop_installation_state
+         SET validation_fingerprint = ?
+         WHERE id = 1",
+        params!["helper-fingerprint-drift-without-binding-repair"],
+    )
+    .expect("simulate helper fingerprint drift without binding repair");
+    drop(conn);
+    let helper_drift = cbth(
+        &degraded_home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-thread",
+            "--json",
+            "--now",
+            "2404",
+        ],
+    );
+    assert_eq!(
+        helper_drift["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["count"], 0,
+        "helper-local capability downgrade must not publish entries without accepted markers"
+    );
     let expired_attempt = cbth(
         &degraded_home,
         &[
@@ -5226,7 +5459,7 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
             "drifted-fingerprint",
             "--json",
             "--now",
-            "2404",
+            "2405",
         ],
     );
     let degraded = cbth(
@@ -5239,7 +5472,7 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
             "bridge-thread",
             "--json",
             "--now",
-            "2405",
+            "2406",
         ],
     );
     assert_eq!(
@@ -5261,7 +5494,7 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
             "bridge-request-attempt-degraded-export",
             "--json",
             "--now",
-            "2406",
+            "2407",
         ],
     );
     assert!(degraded_retry.contains("Desktop binding thread-degraded-export is degraded"));
