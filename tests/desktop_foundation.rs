@@ -4594,6 +4594,17 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
             .unwrap()
             .starts_with("CBTH_DESKTOP_RELAY_ARM_ACCEPTED_")
     );
+    let expired_attempt = cbth(
+        &degraded_home,
+        &[
+            "attempt",
+            "inspect",
+            "--attempt-id",
+            "attempt-degraded-export",
+        ],
+    );
+    assert_eq!(expired_attempt["attempt"]["state"], "abandoned");
+    assert_eq!(expired_attempt["attempt"]["abandoned_at"], 2403);
     cbth(
         &degraded_home,
         &[

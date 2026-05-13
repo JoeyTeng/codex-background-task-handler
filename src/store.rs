@@ -3553,6 +3553,7 @@ impl Store {
         let stale_cli_acceptances_abandoned = expire_stale_cli_acceptances_tx(&tx, now)?;
         let expired_cli_observations_abandoned = expire_due_cli_observations_tx(&tx, now)?;
         expire_expired_desktop_prepared_attempts_tx(&tx, now)?;
+        expire_expired_desktop_arm_pending_attempts_tx(&tx, now)?;
         let (expired_manual_batches_closed, artifacts_to_sync) =
             close_expired_manual_batches_tx(&tx, now)?;
         let (expired_automatic_batches_closed, automatic_artifacts_to_sync) =
@@ -5051,6 +5052,35 @@ fn expire_expired_desktop_prepared_attempts_tx(tx: &Transaction<'_>, now: i64) -
                AND redelivery_window_ends_at <= ?
            )",
         params![now, now, now],
+    )
+    .map_err(Into::into)
+}
+
+fn expire_expired_desktop_arm_pending_attempts_tx(tx: &Transaction<'_>, now: i64) -> Result<usize> {
+    tx.execute(
+        "UPDATE delivery_attempts
+         SET state = 'abandoned',
+             delivery_observation_state = 'abandoned',
+             updated_at = ?,
+             abandoned_at = ?
+         WHERE adapter_kind = 'desktop'
+           AND state = 'arm_pending'
+           AND batch_id IN (
+             SELECT batches.batch_id FROM batches
+             WHERE batches.state = 'open'
+               AND batches.replay_policy = 'automatic'
+           )
+           AND (
+             COALESCE(bridge_arm_lease_deadline, 0) <= ?
+             OR COALESCE(arm_pending_deadline, 0) <= ?
+             OR batch_id IN (
+               SELECT batches.batch_id FROM batches
+               WHERE batches.state = 'open'
+                 AND batches.replay_policy = 'automatic'
+                 AND batches.redelivery_window_ends_at <= ?
+             )
+           )",
+        params![now, now, now, now, now],
     )
     .map_err(Into::into)
 }
