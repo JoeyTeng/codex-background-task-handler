@@ -149,6 +149,8 @@ cbth cli app-servers
 cbth cli app-servers --human
 ```
 
+When the app-server supports `thread/loaded/list`, JSON output may include optional `loaded_non_bound_codex_sessions`, and `--human` / `-H` may print `loaded non-bound codex sessions`. This is a best-effort loaded-thread diagnostic only. It does not identify the foreground/current session and does not change delivery routing; unsupported, erroring, or empty loaded lists are omitted.
+
 Daemon control commands:
 
 ```bash

@@ -149,6 +149,8 @@ cbth cli app-servers
 cbth cli app-servers --human
 ```
 
+当 app-server 支持 `thread/loaded/list` 时，JSON output 可能包含可选字段 `loaded_non_bound_codex_sessions`，`--human` / `-H` 也可能打印 `loaded non-bound codex sessions`。这只是 best-effort 的 loaded-thread 诊断信息；它不表示 foreground/current session，也不会改变投递路由。API 不支持、返回错误或列表为空时，该字段会被省略。
+
 Daemon control commands：
 
 ```bash

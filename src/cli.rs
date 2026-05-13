@@ -3193,6 +3193,8 @@ struct CliAppServerSummary {
     lease_seconds_remaining: u64,
     cwd: Option<String>,
     title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loaded_non_bound_codex_sessions: Option<Vec<String>>,
     thread_info_error: Option<String>,
 }
 
@@ -3200,6 +3202,7 @@ struct CliAppServerSummary {
 struct CliAppServerThreadInfo {
     cwd: Option<String>,
     title: Option<String>,
+    loaded_non_bound_codex_sessions: Option<Vec<String>>,
     error: Option<String>,
 }
 
@@ -3325,6 +3328,7 @@ fn cli_app_server_summary_from_status(server: &Value) -> Option<CliAppServerSumm
         lease_seconds_remaining,
         cwd: thread_info.cwd,
         title: thread_info.title,
+        loaded_non_bound_codex_sessions: thread_info.loaded_non_bound_codex_sessions,
         thread_info_error: thread_info.error,
     })
 }
@@ -3379,6 +3383,8 @@ fn read_cli_app_server_thread_info(url: &str, codex_session_id: &str) -> CliAppS
                 info.error = Some(format!("{error:#}"));
             }
         }
+        info.loaded_non_bound_codex_sessions =
+            read_loaded_non_bound_thread_ids(&mut client, codex_session_id);
     }
     if info.title.is_none() {
         info.title = codex_home.as_deref().and_then(|home| {
@@ -3388,6 +3394,30 @@ fn read_cli_app_server_thread_info(url: &str, codex_session_id: &str) -> CliAppS
         });
     }
     info
+}
+
+fn read_loaded_non_bound_thread_ids(
+    client: &mut AppServerJsonRpcClient,
+    bound_thread_id: &str,
+) -> Option<Vec<String>> {
+    let loaded = client
+        .request(
+            "thread/loaded/list",
+            json!({}),
+            Duration::from_secs(CLI_APP_SERVER_PASSIVE_REQUEST_TIMEOUT_SECONDS),
+        )
+        .ok()?;
+    let mut seen = HashSet::new();
+    let non_bound = loaded
+        .get("data")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|thread_id| !thread_id.is_empty() && *thread_id != bound_thread_id)
+        .filter(|thread_id| seen.insert((*thread_id).to_owned()))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    (!non_bound.is_empty()).then_some(non_bound)
 }
 
 fn thread_read_title_from_response<'a>(read: &'a Value, thread_id: &str) -> Option<&'a str> {
@@ -3474,6 +3504,13 @@ fn write_cli_app_servers_human(report: &CliAppServersReport) -> Result<()> {
                     server.pid,
                     server.lease_seconds_remaining
                 )?;
+                if let Some(loaded) = &server.loaded_non_bound_codex_sessions {
+                    writeln!(
+                        out,
+                        "    loaded non-bound codex sessions: {}",
+                        loaded.join(", ")
+                    )?;
+                }
             }
         }
         return Ok(());
@@ -3518,6 +3555,13 @@ fn write_cli_app_servers_human(report: &CliAppServersReport) -> Result<()> {
             "  lease: {}s remaining",
             server.lease_seconds_remaining
         )?;
+        if let Some(loaded) = &server.loaded_non_bound_codex_sessions {
+            writeln!(
+                out,
+                "  loaded non-bound codex sessions: {}",
+                loaded.join(", ")
+            )?;
+        }
         if let Some(error) = &server.thread_info_error {
             writeln!(out, "  thread info: unavailable ({error})")?;
         }

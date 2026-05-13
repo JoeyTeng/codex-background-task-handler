@@ -187,6 +187,21 @@ fn spawn_fake_app_server_for_listing(
     cwd: &'static str,
     title: &'static str,
 ) -> (String, mpsc::Sender<()>, mpsc::Receiver<Result<(), String>>) {
+    spawn_fake_app_server_for_listing_with_loaded_list(
+        thread_id,
+        cwd,
+        title,
+        FakeLoadedList::Supported(vec![thread_id]),
+    )
+}
+
+#[cfg(unix)]
+fn spawn_fake_app_server_for_listing_with_loaded_list(
+    thread_id: &'static str,
+    cwd: &'static str,
+    title: &'static str,
+    loaded_list: FakeLoadedList,
+) -> (String, mpsc::Sender<()>, mpsc::Receiver<Result<(), String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake app-server");
     listener
         .set_nonblocking(true)
@@ -196,11 +211,25 @@ fn spawn_fake_app_server_for_listing(
     let (done_tx, done_rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let result = accept_fake_app_server_for_listing(&listener, &stop_rx, thread_id, cwd, title);
+        let result = accept_fake_app_server_for_listing(
+            &listener,
+            &stop_rx,
+            thread_id,
+            cwd,
+            title,
+            loaded_list,
+        );
         let _ = done_tx.send(result);
     });
 
     (url, stop_tx, done_rx)
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+enum FakeLoadedList {
+    Supported(Vec<&'static str>),
+    Unsupported,
 }
 
 #[cfg(unix)]
@@ -710,15 +739,37 @@ fn accept_fake_app_server_for_listing(
     thread_id: &str,
     cwd: &str,
     title: &str,
+    loaded_list: FakeLoadedList,
 ) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(10);
+    let (client_done_tx, client_done_rx) = mpsc::channel();
     loop {
+        while let Ok(result) = client_done_rx.try_recv() {
+            result?;
+        }
         if stop_rx.try_recv().is_ok() {
+            while let Ok(result) = client_done_rx.try_recv() {
+                result?;
+            }
             return Ok(());
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                handle_fake_app_server_listing_client(&mut stream, thread_id, cwd, title)?
+                let client_done_tx = client_done_tx.clone();
+                let client_thread_id = thread_id.to_owned();
+                let client_cwd = cwd.to_owned();
+                let client_title = title.to_owned();
+                let client_loaded_list = loaded_list.clone();
+                thread::spawn(move || {
+                    let result = handle_fake_app_server_listing_client(
+                        &mut stream,
+                        &client_thread_id,
+                        &client_cwd,
+                        &client_title,
+                        &client_loaded_list,
+                    );
+                    let _ = client_done_tx.send(result);
+                });
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
@@ -739,6 +790,7 @@ fn handle_fake_app_server_listing_client(
     thread_id: &str,
     cwd: &str,
     title: &str,
+    loaded_list: &FakeLoadedList,
 ) -> Result<(), String> {
     stream
         .set_nonblocking(false)
@@ -755,9 +807,24 @@ fn handle_fake_app_server_listing_client(
         .map_err(|error| format!("write fake app-server handshake: {error}"))?;
 
     let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_any_message = false;
+    let mut saw_thread_resume = false;
     let mut saw_thread_read = false;
-    while !saw_thread_read && Instant::now() < deadline {
-        let message = read_fake_client_text_frame(stream)?;
+    let mut saw_loaded_list = false;
+    while (!saw_thread_read || (!saw_thread_resume && !saw_loaded_list))
+        && Instant::now() < deadline
+    {
+        let Some(message) = try_read_fake_client_text_frame(stream)? else {
+            if saw_thread_read {
+                break;
+            }
+            return if saw_any_message {
+                Err("fake app-server listing client closed before thread/read".to_owned())
+            } else {
+                Ok(())
+            };
+        };
+        saw_any_message = true;
         let method = message
             .get("method")
             .and_then(serde_json::Value::as_str)
@@ -775,11 +842,23 @@ fn handle_fake_app_server_listing_client(
             )?,
             "initialized" => {}
             "thread/resume" => {
-                write_fake_thread_response_with_title(stream, &message, thread_id, cwd, title)?
+                write_fake_thread_response_with_title(stream, &message, thread_id, cwd, title)?;
+                saw_thread_resume = true;
             }
             "thread/read" => {
                 write_fake_thread_response_with_title(stream, &message, thread_id, cwd, title)?;
                 saw_thread_read = true;
+            }
+            "thread/loaded/list" => {
+                match loaded_list {
+                    FakeLoadedList::Supported(loaded) => {
+                        write_fake_loaded_list_response(stream, &message, loaded)?
+                    }
+                    FakeLoadedList::Unsupported => {
+                        write_fake_json_error(stream, &message, -32601, "method not found")?
+                    }
+                }
+                saw_loaded_list = true;
             }
             _ => {}
         }
@@ -2281,6 +2360,22 @@ fn write_fake_json_response(
 }
 
 #[cfg(unix)]
+fn write_fake_loaded_list_response(
+    stream: &mut TcpStream,
+    request: &serde_json::Value,
+    loaded_thread_ids: &[&str],
+) -> Result<(), String> {
+    write_fake_json_response(
+        stream,
+        request,
+        serde_json::json!({
+            "data": loaded_thread_ids,
+            "nextCursor": null
+        }),
+    )
+}
+
+#[cfg(unix)]
 fn write_fake_server_text_frame(
     stream: &mut TcpStream,
     message: &serde_json::Value,
@@ -2729,6 +2824,10 @@ fn cli_app_servers_lists_running_managed_app_server_as_json_and_human() {
     assert_eq!(server["cwd"], thread_cwd);
     assert_eq!(server["title"], thread_title);
     assert!(
+        server.get("loaded_non_bound_codex_sessions").is_none(),
+        "bound-only loaded session should be omitted: {server}"
+    );
+    assert!(
         server["session_epoch"]
             .as_i64()
             .is_some_and(|epoch| epoch > 0)
@@ -2760,6 +2859,233 @@ fn cli_app_servers_lists_running_managed_app_server_as_json_and_human() {
     assert!(human.contains(&app_server_url));
     assert!(human.contains(thread_cwd));
     assert!(human.contains("started:"));
+    assert!(!human.contains("loaded non-bound codex sessions:"));
+
+    let output = wait_with_timeout(child, Duration::from_secs(10));
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = stop_server_tx.send(());
+    let server_result = server_done
+        .recv_timeout(Duration::from_secs(2))
+        .expect("fake listing server result");
+    assert!(
+        server_result.is_ok(),
+        "fake server failed: {server_result:?}"
+    );
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_app_servers_reports_loaded_non_bound_sessions_when_present() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cli-app-server-list-loaded-bound";
+    let other_thread_id = "thread-cli-app-server-list-loaded-other";
+    let thread_cwd = "/tmp/fake-list-cwd-loaded";
+    let thread_title = "Fake Listing Thread With Loaded Other";
+    let (app_server_url, stop_server_tx, server_done) =
+        spawn_fake_app_server_for_listing_with_loaded_list(
+            thread_id,
+            thread_cwd,
+            thread_title,
+            FakeLoadedList::Supported(vec![thread_id, other_thread_id, other_thread_id, ""]),
+        );
+
+    let child = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg(thread_id)
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "3")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cbth cli run");
+
+    wait_for_log_contains(&log_path, "foreground\t--remote");
+    wait_for_cli_activity_state(&home, thread_id, "idle");
+
+    let json_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("app-servers")
+        .output()
+        .expect("run app-servers json");
+    assert!(
+        json_output.status.success(),
+        "app-servers json failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&json_output.stdout),
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&json_output.stdout).expect("app-servers json");
+    let servers = json["cli_app_servers"].as_array().expect("servers array");
+    assert_eq!(servers.len(), 1, "unexpected app-server list: {json}");
+    let server = &servers[0];
+    assert_eq!(server["ws_url"], app_server_url);
+    assert_eq!(server["cwd"], thread_cwd);
+    assert_eq!(server["title"], thread_title);
+    assert_eq!(
+        server["loaded_non_bound_codex_sessions"],
+        serde_json::json!([other_thread_id]),
+        "unexpected app-server summary: {server}; stderr: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+
+    let human_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("app-servers")
+        .arg("--human")
+        .output()
+        .expect("run app-servers human");
+    assert!(
+        human_output.status.success(),
+        "app-servers human failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&human_output.stdout),
+        String::from_utf8_lossy(&human_output.stderr)
+    );
+    let human = String::from_utf8_lossy(&human_output.stdout);
+    assert!(human.contains(&format!(
+        "loaded non-bound codex sessions: {other_thread_id}"
+    )));
+
+    let output = wait_with_timeout(child, Duration::from_secs(10));
+    assert!(
+        output.status.success(),
+        "cbth cli run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = stop_server_tx.send(());
+    let server_result = server_done
+        .recv_timeout(Duration::from_secs(2))
+        .expect("fake listing server result");
+    assert!(
+        server_result.is_ok(),
+        "fake server failed: {server_result:?}"
+    );
+    let _ = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("daemon")
+        .arg("stop")
+        .output();
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_app_servers_omits_loaded_non_bound_sessions_when_loaded_list_is_unsupported() {
+    let home = temp_home();
+    let client_cwd = tempfile::tempdir().expect("client cwd");
+    let script_dir = tempfile::tempdir().expect("script dir");
+    let fake_codex = fake_codex_script(&script_dir);
+    let log_path = script_dir.path().join("fake-codex.log");
+    let thread_id = "thread-cli-app-server-list-loaded-unsupported";
+    let thread_cwd = "/tmp/fake-list-cwd-unsupported";
+    let thread_title = "Fake Listing Thread Unsupported Loaded";
+    let (app_server_url, stop_server_tx, server_done) =
+        spawn_fake_app_server_for_listing_with_loaded_list(
+            thread_id,
+            thread_cwd,
+            thread_title,
+            FakeLoadedList::Unsupported,
+        );
+
+    let child = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("run")
+        .arg("--bind-thread-id")
+        .arg(thread_id)
+        .arg("--session-allows-approval")
+        .arg("false")
+        .arg("--session-allows-network")
+        .arg("false")
+        .arg("--session-allows-write-access")
+        .arg("false")
+        .arg("--codex-bin")
+        .arg(&fake_codex)
+        .current_dir(client_cwd.path())
+        .env("FAKE_CODEX_LOG", &log_path)
+        .env("FAKE_CODEX_APP_SERVER_URL", &app_server_url)
+        .env("FAKE_CODEX_FOREGROUND_SLEEP_SECONDS", "3")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cbth cli run");
+
+    wait_for_log_contains(&log_path, "foreground\t--remote");
+    wait_for_cli_activity_state(&home, thread_id, "idle");
+
+    let json_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("app-servers")
+        .output()
+        .expect("run app-servers json");
+    assert!(
+        json_output.status.success(),
+        "app-servers json failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&json_output.stdout),
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&json_output.stdout).expect("app-servers json");
+    let servers = json["cli_app_servers"].as_array().expect("servers array");
+    assert_eq!(servers.len(), 1, "unexpected app-server list: {json}");
+    assert!(
+        servers[0].get("loaded_non_bound_codex_sessions").is_none(),
+        "unsupported loaded-list method should be omitted: {}",
+        servers[0]
+    );
+
+    let human_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("app-servers")
+        .arg("--human")
+        .output()
+        .expect("run app-servers human");
+    assert!(
+        human_output.status.success(),
+        "app-servers human failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&human_output.stdout),
+        String::from_utf8_lossy(&human_output.stderr)
+    );
+    let human = String::from_utf8_lossy(&human_output.stdout);
+    assert!(!human.contains("loaded non-bound codex sessions:"));
 
     let output = wait_with_timeout(child, Duration::from_secs(10));
     assert!(
