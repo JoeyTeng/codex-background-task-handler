@@ -5,7 +5,7 @@ status: completed
 created: 2026-05-13
 updated: 2026-05-13
 branch: codex/review-gate-ack-retry
-pr:
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/79
 supersedes: []
 superseded_by:
 ---
@@ -30,5 +30,6 @@ superseded_by:
 
 ## Evidence
 
+- https://github.com/JoeyTeng/codex-background-task-handler/pull/79
 - `npm --prefix tools/codex-review-gate run check`
 - `npm --prefix tools/codex-review-gate test`
