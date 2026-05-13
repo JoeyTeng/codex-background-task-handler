@@ -994,6 +994,68 @@ fn desktop_bridge_preflight_materializes_ready_entry_and_claim_peeks_it() {
 }
 
 #[test]
+fn desktop_bridge_preflight_caps_reused_ready_marker_after_redelivery_shortens() {
+    let home = temp_home();
+    repair_validated_desktop_installation_and_binding(
+        &home,
+        "thread-ready-cap-reuse",
+        "automation-ready-cap-reuse",
+        3050,
+    );
+    let batch_id = create_desktop_batch(&home, "thread-ready-cap-reuse");
+
+    let first = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-cap-reuse",
+            "--json",
+            "--now",
+            "3060",
+        ],
+    );
+    let ready_path = first["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
+        .as_str()
+        .expect("ready path");
+    let ready = read_json_file(ready_path);
+    let entry = &ready["ready_threads"]["entries"][0];
+    let marker = entry["arm_pending_marker"].as_str().unwrap().to_owned();
+    assert!(entry["marker_expires_at"].as_i64().unwrap() > 3070);
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE batches SET redelivery_window_ends_at = ? WHERE batch_id = ?",
+        params![3070, &batch_id],
+    )
+    .expect("shorten redelivery window");
+    drop(conn);
+
+    let second = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-cap-reuse",
+            "--json",
+            "--now",
+            "3061",
+        ],
+    );
+    let ready_path = second["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
+        .as_str()
+        .expect("ready path");
+    let ready = read_json_file(ready_path);
+    let entry = &ready["ready_threads"]["entries"][0];
+    assert_eq!(entry["arm_pending_marker"], marker);
+    assert_eq!(entry["marker_expires_at"], 3070);
+}
+
+#[test]
 fn desktop_bridge_preflight_abandons_expired_prepared_attempt_before_ready() {
     let home = temp_home();
     repair_validated_desktop_installation_and_binding(

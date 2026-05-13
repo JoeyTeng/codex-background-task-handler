@@ -7026,10 +7026,9 @@ fn find_or_issue_desktop_relay_marker_tx(
             }
             tx.execute(
                 "UPDATE desktop_transcript_relay_markers
-                 SET expires_at = ?,
-                     updated_at = ?
+                 SET expires_at = ?
                  WHERE marker = ?",
-                params![expires_at_cap, now, &marker.marker],
+                params![expires_at_cap, &marker.marker],
             )?;
             return query_desktop_transcript_relay_marker_tx(tx, &marker.marker);
         }
