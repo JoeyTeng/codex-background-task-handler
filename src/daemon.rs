@@ -691,6 +691,7 @@ impl DaemonLifecycleCache {
             || (!maintenance_suppressed && self.status.cli_acceptances_stale_now > 0)
             || (!maintenance_suppressed && self.status.cli_observations_due_now > 0)
             || (!maintenance_suppressed && self.status.active_desktop_relay_markers > 0)
+            || (!maintenance_suppressed && self.status.desktop_attempts_due_within_idle > 0)
             || (!maintenance_suppressed && self.status.open_batches_due_within_idle > 0)
     }
 }

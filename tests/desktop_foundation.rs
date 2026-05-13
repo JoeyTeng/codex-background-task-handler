@@ -11,6 +11,7 @@ use std::os::unix::net::UnixListener;
 use std::process::{Command, Output};
 #[cfg(unix)]
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -4280,6 +4281,15 @@ fn desktop_transcript_relay_consumer_scans_before_daemon_autostart() {
     assert!(!forged_home.path().join("cbth.sqlite3").exists());
 
     let trusted_home = temp_home();
+    let trusted_now: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after Unix epoch")
+        .as_secs()
+        .try_into()
+        .expect("epoch seconds fit i64");
+    let fixture_now = trusted_now.saturating_add(60).to_string();
+    let emit_now = trusted_now.saturating_add(70).to_string();
+    let consume_now = trusted_now.saturating_add(80).to_string();
     let fixture = cbth(
         &trusted_home,
         &[
@@ -4293,7 +4303,7 @@ fn desktop_transcript_relay_consumer_scans_before_daemon_autostart() {
             "--bridge-request-id",
             "bridge-request-relay-daemon",
             "--now",
-            "7250",
+            &fixture_now,
             "--json",
         ],
     );
@@ -4319,7 +4329,7 @@ fn desktop_transcript_relay_consumer_scans_before_daemon_autostart() {
             trusted_marker,
             "--json",
             "--now",
-            "7260",
+            &emit_now,
         ],
         false,
     );
@@ -4338,7 +4348,7 @@ fn desktop_transcript_relay_consumer_scans_before_daemon_autostart() {
             trusted_marker,
             "--json",
             "--now",
-            "7270",
+            &consume_now,
         ],
     );
     assert_eq!(
@@ -4562,6 +4572,29 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
         2402,
     );
     force_desktop_attempt_arm_pending(&degraded_home, "attempt-second-export", 2402);
+    cbth(
+        &degraded_home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-third-export",
+            "--caller-automation-id",
+            "automation-third-export",
+            "--json",
+            "--now",
+            "2402",
+        ],
+    );
+    create_desktop_batch_and_prepared_attempt(
+        &degraded_home,
+        "thread-third-export",
+        "attempt-third-export",
+        1,
+        2402,
+    );
+    force_desktop_attempt_arm_pending(&degraded_home, "attempt-third-export", 2402);
     let current = cbth(
         &degraded_home,
         &[
@@ -4577,7 +4610,7 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
     );
     assert_eq!(
         current["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["count"],
-        1
+        2
     );
     let current_path =
         current["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["path"]
@@ -4588,8 +4621,18 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
         current_arm_pending["arm_pending_bindings"]["entries"][0]["source_thread_id"],
         "thread-second-export"
     );
+    assert_eq!(
+        current_arm_pending["arm_pending_bindings"]["entries"][1]["source_thread_id"],
+        "thread-third-export"
+    );
     assert!(
         current_arm_pending["arm_pending_bindings"]["entries"][0]["arm_accepted_marker"]
+            .as_str()
+            .unwrap()
+            .starts_with("CBTH_DESKTOP_RELAY_ARM_ACCEPTED_")
+    );
+    assert!(
+        current_arm_pending["arm_pending_bindings"]["entries"][1]["arm_accepted_marker"]
             .as_str()
             .unwrap()
             .starts_with("CBTH_DESKTOP_RELAY_ARM_ACCEPTED_")

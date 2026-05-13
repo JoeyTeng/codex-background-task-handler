@@ -607,6 +607,8 @@ pub struct DaemonLifecycleStatus {
     pub active_cli_observations: i64,
     pub cli_observations_due_now: i64,
     pub active_desktop_relay_markers: i64,
+    pub desktop_attempts_due_now: i64,
+    pub desktop_attempts_due_within_idle: i64,
     pub open_batches_due_now: i64,
     pub open_batches_due_within_idle: i64,
 }
@@ -615,6 +617,7 @@ impl DaemonLifecycleStatus {
     pub fn has_due_maintenance(&self) -> bool {
         self.cli_acceptances_stale_now > 0
             || self.cli_observations_due_now > 0
+            || self.desktop_attempts_due_now > 0
             || self.open_batches_due_now > 0
     }
 }

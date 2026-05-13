@@ -3208,8 +3208,7 @@ impl Store {
                AND desktop_bindings.binding_state = 'bound'
              ORDER BY delivery_attempts.arm_pending_deadline ASC,
                       delivery_attempts.updated_at ASC,
-                      delivery_attempts.attempt_id ASC
-             LIMIT 1",
+                      delivery_attempts.attempt_id ASC",
         )?;
         let rows = stmt
             .query_map(params![now, now, now], |row| {
@@ -3346,6 +3345,9 @@ impl Store {
         let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
         let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
         let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let desktop_attempts_due_now = count_desktop_attempts_due_at(&self.conn, now)?;
+        let desktop_attempts_due_within_idle =
+            count_desktop_attempts_due_at(&self.conn, idle_horizon_at)?;
         let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
         let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
         let active_desktop_relay_markers = self.active_desktop_relay_marker_count(now)?;
@@ -3357,6 +3359,8 @@ impl Store {
             active_cli_observations,
             cli_observations_due_now,
             active_desktop_relay_markers,
+            desktop_attempts_due_now,
+            desktop_attempts_due_within_idle,
             open_batches_due_now,
             open_batches_due_within_idle,
         })
@@ -3386,6 +3390,9 @@ impl Store {
         let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
         let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
         let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let desktop_attempts_due_now = count_desktop_attempts_due_at(&self.conn, now)?;
+        let desktop_attempts_due_within_idle =
+            count_desktop_attempts_due_at(&self.conn, idle_horizon_at)?;
         let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
         let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
         let active_desktop_relay_markers = self.active_desktop_relay_marker_count(now)?;
@@ -3397,6 +3404,8 @@ impl Store {
             active_cli_observations,
             cli_observations_due_now,
             active_desktop_relay_markers,
+            desktop_attempts_due_now,
+            desktop_attempts_due_within_idle,
             open_batches_due_now,
             open_batches_due_within_idle,
         })
@@ -3425,6 +3434,9 @@ impl Store {
         let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
         let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
         let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let desktop_attempts_due_now = count_desktop_attempts_due_at(&self.conn, now)?;
+        let desktop_attempts_due_within_idle =
+            count_desktop_attempts_due_at(&self.conn, idle_horizon_at)?;
         let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
         let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
         let active_desktop_relay_markers = self.active_desktop_relay_marker_count(now)?;
@@ -3436,6 +3448,8 @@ impl Store {
             active_cli_observations,
             cli_observations_due_now,
             active_desktop_relay_markers,
+            desktop_attempts_due_now,
+            desktop_attempts_due_within_idle,
             open_batches_due_now,
             open_batches_due_within_idle,
         })
@@ -3490,6 +3504,9 @@ impl Store {
         let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
         let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
         let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let desktop_attempts_due_now = count_desktop_attempts_due_at(&self.conn, now)?;
+        let desktop_attempts_due_within_idle =
+            count_desktop_attempts_due_at(&self.conn, idle_horizon_at)?;
         let open_batches_due_now = count_open_batches_due_at(&self.conn, now)?;
         let open_batches_due_within_idle = count_open_batches_due_at(&self.conn, idle_horizon_at)?;
         let active_desktop_relay_markers = self.active_desktop_relay_marker_count(now)?;
@@ -3501,6 +3518,8 @@ impl Store {
             active_cli_observations,
             cli_observations_due_now,
             active_desktop_relay_markers,
+            desktop_attempts_due_now,
+            desktop_attempts_due_within_idle,
             open_batches_due_now,
             open_batches_due_within_idle,
         })
@@ -5083,6 +5102,30 @@ fn expire_expired_desktop_arm_pending_attempts_tx(tx: &Transaction<'_>, now: i64
         params![now, now, now, now, now],
     )
     .map_err(Into::into)
+}
+
+fn count_desktop_attempts_due_at(conn: &Connection, due_at: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'desktop'
+           AND delivery_attempts.state IN ('prepared', 'arm_pending')
+           AND batches.state = 'open'
+           AND batches.replay_policy = 'automatic'
+           AND (
+             batches.redelivery_window_ends_at <= ?
+             OR (
+               delivery_attempts.state = 'arm_pending'
+               AND (
+                 COALESCE(delivery_attempts.bridge_arm_lease_deadline, 0) <= ?
+                 OR COALESCE(delivery_attempts.arm_pending_deadline, 0) <= ?
+               )
+             )
+           )",
+        params![due_at, due_at, due_at],
+        |row| row.get::<_, i64>(0),
+    )
+    .context("count due Desktop attempts for daemon lifecycle")
 }
 
 fn count_open_batches_due_at(conn: &Connection, due_at: i64) -> Result<i64> {
@@ -9082,6 +9125,77 @@ mod tests {
         assert_eq!(generation_stale.cli_acceptances_stale_now, 1);
         assert_eq!(generation_stale.open_batches_due_now, 0);
         assert!(generation_stale.has_due_maintenance());
+    }
+
+    #[test]
+    fn daemon_lifecycle_reports_due_desktop_attempt_cleanup() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+
+        let prepared = store
+            .prepare_desktop_writeback_fixture(NewDesktopWritebackFixture {
+                source_thread_id: "thread-lifecycle-prepared".to_owned(),
+                caller_automation_id: "automation-lifecycle-prepared".to_owned(),
+                bridge_request_id: "request-lifecycle-prepared".to_owned(),
+                default_validation_fingerprint: "fp-lifecycle-prepared".to_owned(),
+                now: 10,
+            })
+            .expect("prepare Desktop fixture");
+        store
+            .conn
+            .execute(
+                "UPDATE batches SET redelivery_window_ends_at = ? WHERE batch_id = ?",
+                params![20, &prepared.batch.batch_id],
+            )
+            .expect("shorten prepared redelivery window");
+
+        let before_due = store
+            .daemon_lifecycle_status(19, 20)
+            .expect("lifecycle before due");
+        assert_eq!(before_due.desktop_attempts_due_now, 0);
+        assert_eq!(before_due.desktop_attempts_due_within_idle, 1);
+        assert!(!before_due.has_due_maintenance());
+
+        let due = store
+            .daemon_lifecycle_status(20, 21)
+            .expect("lifecycle due");
+        assert_eq!(due.desktop_attempts_due_now, 1);
+        assert!(due.has_due_maintenance());
+        store
+            .sweep(&layout, 20)
+            .expect("sweep due prepared attempt");
+
+        let arm_pending = store
+            .prepare_desktop_writeback_fixture(NewDesktopWritebackFixture {
+                source_thread_id: "thread-lifecycle-arm-pending".to_owned(),
+                caller_automation_id: "automation-lifecycle-arm-pending".to_owned(),
+                bridge_request_id: "request-lifecycle-arm-pending".to_owned(),
+                default_validation_fingerprint: "fp-lifecycle-arm-pending".to_owned(),
+                now: 30,
+            })
+            .expect("prepare arm-pending Desktop fixture");
+        store
+            .note_desktop_arm_pending(
+                &arm_pending.source_thread_id,
+                &arm_pending.attempt.attempt_id,
+                arm_pending.attempt.generation,
+                &arm_pending.bridge_request_id,
+                31,
+            )
+            .expect("arm pending");
+
+        let arm_before_due = store
+            .daemon_lifecycle_status(330, 331)
+            .expect("lifecycle before arm lease due");
+        assert_eq!(arm_before_due.desktop_attempts_due_now, 0);
+        assert_eq!(arm_before_due.desktop_attempts_due_within_idle, 1);
+
+        let arm_due = store
+            .daemon_lifecycle_status(331, 332)
+            .expect("lifecycle arm lease due");
+        assert_eq!(arm_due.desktop_attempts_due_now, 1);
+        assert!(arm_due.has_due_maintenance());
     }
 
     #[test]
