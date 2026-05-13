@@ -1,6 +1,6 @@
 # 真实 E2E 指南
 
-语言：[English (en-GB)](LIVE_E2E.en-GB.md) | [简体中文 (zh-CN)](LIVE_E2E.zh-CN.md)
+语言：[British English (en-GB)](LIVE_E2E.en-GB.md) | [简体中文 (zh-CN)](LIVE_E2E.zh-CN.md)
 
 本文说明需要真实 Codex CLI 登录态、模型访问和网络访问的 opt-in live checks。默认 CI 不运行这些测试；它们用于本地验证和 dogfood。
 

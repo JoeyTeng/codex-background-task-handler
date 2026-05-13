@@ -8,6 +8,7 @@
 - Keep `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md` as concise entrypoints, not giant status files; durable per-workstream state belongs in `docs/project_journal/YYYY/MM/*.md`.
 - Treat generated `docs/project_journal/INDEX.md` as local ignored convenience output; do not commit it.
 - Keep user-facing documentation bilingual once a document is in the public guide set. Use `en-GB` and `zh-CN` language variants with matching structure and bidirectional language links.
+- Write language-switcher labels for the reader who would use that link: in `en-GB` docs, link to Chinese as `简体中文 (zh-CN)`; in `zh-CN` docs, link to English as `British English (en-GB)`.
 - During an explicitly stacked documentation migration, an intermediate PR may introduce or rewrite the `en-GB` guide set first if the follow-up PR adds the matching `zh-CN` files before the migration is considered complete. Do not add bidirectional language links until both files in a pair exist.
 - Keep unsuffixed `README.md` files as the default `en-GB` entrypoints when a platform expects that name; add `README.zh-CN.md` next to them instead of replacing the default README with a symlink.
 - Use language suffixes for other user-facing Markdown guides, for example `docs/USAGE.en-GB.md` and `docs/USAGE.zh-CN.md`.

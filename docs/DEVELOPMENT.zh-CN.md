@@ -1,6 +1,6 @@
 # 开发指南
 
-语言：[English (en-GB)](DEVELOPMENT.en-GB.md) | [简体中文 (zh-CN)](DEVELOPMENT.zh-CN.md)
+语言：[British English (en-GB)](DEVELOPMENT.en-GB.md) | [简体中文 (zh-CN)](DEVELOPMENT.zh-CN.md)
 
 本文说明本仓库的本地开发和确定性检查。
 
