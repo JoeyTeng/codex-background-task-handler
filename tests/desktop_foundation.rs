@@ -1485,6 +1485,76 @@ fn desktop_bridge_preflight_reissues_ready_marker_after_binding_repair() {
 }
 
 #[test]
+fn desktop_bridge_preflight_reissues_ready_marker_after_bridge_rebind() {
+    let home = temp_home();
+    repair_validated_desktop_installation_and_binding(
+        &home,
+        "thread-ready-bridge-rebind",
+        "automation-ready-bridge-rebind",
+        3170,
+    );
+    create_desktop_batch(&home, "thread-ready-bridge-rebind");
+
+    let first = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-rebind-old",
+            "--json",
+            "--now",
+            "3171",
+        ],
+    );
+    let first_ready_path = first["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
+        .as_str()
+        .expect("first ready path");
+    let first_ready = read_json_file(first_ready_path);
+    let first_entry = &first_ready["ready_threads"]["entries"][0];
+    let attempt_id = first_entry["attempt_id"].as_str().unwrap().to_owned();
+    let old_marker = first_entry["arm_pending_marker"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let second = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-rebind-new",
+            "--json",
+            "--now",
+            "3172",
+        ],
+    );
+    let second_ready_path =
+        second["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
+            .as_str()
+            .expect("second ready path");
+    let second_ready = read_json_file(second_ready_path);
+    let second_entries = second_ready["ready_threads"]["entries"].as_array().unwrap();
+    assert_eq!(second_entries.len(), 1);
+    let second_entry = &second_entries[0];
+    assert_eq!(second_entry["attempt_id"], attempt_id);
+    assert_ne!(second_entry["arm_pending_marker"], old_marker);
+    assert_eq!(marker_state(&home, &old_marker), "issued");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let bridge_thread_id: String = conn
+        .query_row(
+            "SELECT bridge_thread_id FROM desktop_transcript_relay_markers WHERE marker = ?",
+            params![second_entry["arm_pending_marker"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .expect("query new marker bridge");
+    assert_eq!(bridge_thread_id, "bridge-ready-rebind-new");
+}
+
+#[test]
 fn desktop_bridge_preflight_abandons_expired_prepared_attempt_before_ready() {
     let home = temp_home();
     repair_validated_desktop_installation_and_binding(
@@ -1768,8 +1838,16 @@ fn desktop_ready_markers_drive_scanner_to_cooldown() {
     );
     assert_eq!(
         other_bridge_ready_preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["count"],
-        0
+        1
     );
+    let other_ready_path = other_bridge_ready_preflight["desktop_bridge_preflight"]["snapshots"]
+        ["ready_threads"]["path"]
+        .as_str()
+        .unwrap();
+    let other_ready = read_json_file(other_ready_path);
+    let other_ready_entry = &other_ready["ready_threads"]["entries"][0];
+    assert_eq!(other_ready_entry["attempt_id"], attempt_id);
+    assert_ne!(other_ready_entry["arm_pending_marker"], pending_marker);
 
     let pending_emit = cbth_output(
         &home,

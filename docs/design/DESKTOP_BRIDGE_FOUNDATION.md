@@ -147,7 +147,7 @@ cbth desktop relay emit-arm-accepted ... --marker <issued-marker> --json
 - 相同的 `created_at`
 - 相同的 `bridge_thread_id`
 
-Ready/arm workflow work changes this foundation boundary: `ready_threads.entries` is no longer permanently empty. `bridge-preflight` may materialize at most one eligible Desktop head batch into a ready entry with an issued `arm_pending_requested` marker, while `arm_pending_bindings.entries` may carry issued `arm_accepted` markers for attempts already durably in `arm_pending`. `pause_due_bindings.entries` continue to export armed, unquiesced bindings with `pause_deadline <= now`.
+Ready/arm workflow work changes this foundation boundary: `ready_threads.entries` is no longer permanently empty. `bridge-preflight` may materialize at most one eligible Desktop head batch into a ready entry with an issued bridge-scoped `arm_pending_requested` marker, while `arm_pending_bindings.entries` may carry issued `arm_accepted` markers for attempts already durably in `arm_pending`. If a heartbeat bridge is replaced before consuming a ready marker, the replacement bridge may reissue its own marker for the same prepared attempt; the durable CAS path still allows only one pending transition. `pause_due_bindings.entries` continue to export armed, unquiesced bindings with `pause_deadline <= now`.
 
 This still does not enable full Desktop automatic delivery. Caller wake, production `automation_update`, pause cleanup, `note-boundary-crossed`, and artifact payload reads remain separate work.
 

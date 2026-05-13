@@ -32,7 +32,7 @@ superseded_by:
 ## Implementation Result
 
 - Added ready materialization in `bridge-preflight`: eligible safe Desktop head batches are converted to a `prepared` Desktop attempt and a ready entry with an issued `arm_pending_requested` marker.
-- Repeated preflight reuses the same current prepared attempt and unexpired issued pending marker instead of creating duplicate attempts or markers.
+- Repeated preflight on the same bridge reuses the same current prepared attempt and unexpired issued pending marker instead of creating duplicate attempts or markers; a replacement bridge can issue its own ready marker for that prepared attempt without waiting for the old bridge marker to expire.
 - Added arm-pending export marker issuance: eligible durable `arm_pending` attempts receive issued `arm_accepted` markers in `arm-pending-bindings.json`; the marker is not issued unless read/writeback capabilities remain validated and the binding still matches installation state.
 - Added daemon capability `desktop-ready-arm-workflow`, so daemon-routed preflight replaces or rejects older daemons that cannot materialize ready entries or issue the new two-phase markers.
 - `claim-next-ready` remains a no-DB read helper over the published ready snapshot.

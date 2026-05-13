@@ -2703,6 +2703,7 @@ impl Store {
                      WHERE current_attempt.batch_id = batches.batch_id
                    )
                    AND ready_marker.envelope_kind = 'arm_pending_requested'
+                   AND ready_marker.bridge_thread_id = ?
                    AND ready_marker.marker_state = 'issued'
                    AND ready_marker.expires_at > ?
                    AND ready_marker.caller_automation_id =
@@ -2724,6 +2725,7 @@ impl Store {
                     &installation_state.read_transport,
                     installation_state.read_transport_generation,
                     &installation_state.validation_fingerprint,
+                    bridge_thread_id,
                     now,
                 ],
                 |row| row.get::<_, String>(0),
