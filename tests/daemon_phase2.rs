@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 use semver::Version;
@@ -1628,6 +1628,14 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
         .join("cbth.sock");
     let mut generation_daemon = spawn_daemon(&home, "300", &["--socket-kind", "generation"]);
     wait_for_path(&generation_socket_path);
+    let now: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_secs()
+        .try_into()
+        .expect("epoch seconds fit in i64");
+    let fixture_now = now.to_string();
+    let consume_now = (now + 20).to_string();
 
     let fixture = cbth(
         &home,
@@ -1642,7 +1650,7 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
             "--bridge-request-id",
             "bridge-request-generation-relay",
             "--now",
-            "8120",
+            &fixture_now,
             "--json",
         ],
     );
@@ -1659,7 +1667,7 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
         "generation": 1,
         "bridge_request_id": "bridge-request-generation-relay",
         "marker": marker,
-        "created_at": 8130,
+        "created_at": now + 10,
     });
     let rollout = home.path().join("generation-relay-rollout.jsonl");
     write_function_call_rollout(
@@ -1682,7 +1690,7 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
             marker,
             "--json",
             "--now",
-            "8140",
+            &consume_now,
         ],
     );
     assert_eq!(

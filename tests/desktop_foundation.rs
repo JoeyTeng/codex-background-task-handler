@@ -1328,6 +1328,14 @@ fn desktop_ready_markers_drive_scanner_to_cooldown() {
     let arm_entry = &arm_pending["arm_pending_bindings"]["entries"][0];
     let arm_marker = arm_entry["arm_accepted_marker"].as_str().unwrap();
     assert!(arm_marker.starts_with("CBTH_DESKTOP_RELAY_ARM_ACCEPTED_"));
+    assert!(
+        arm_entry["marker_expires_at"].as_i64().unwrap()
+            <= arm_entry["bridge_arm_lease_deadline"].as_i64().unwrap()
+    );
+    assert!(
+        arm_entry["marker_expires_at"].as_i64().unwrap()
+            <= arm_entry["arm_pending_deadline"].as_i64().unwrap()
+    );
 
     let arm_emit = cbth_output(
         &home,
@@ -2850,13 +2858,9 @@ fn desktop_transcript_relay_scanner_expired_arm_accepted_abandons_attempt() {
     );
     let expired_scan = &expired_scan["desktop_relay_scanner_scan"];
     assert_eq!(expired_scan["consumed_markers"], 0);
-    assert_eq!(expired_scan["rejected_markers"], 1);
-    assert!(
-        expired_scan["bindings"][0]["rejected_markers"][0]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("bridge arm lease expired")
-    );
+    assert_eq!(expired_scan["rejected_markers"], 0);
+    assert_eq!(expired_scan["expired_markers"], 1);
+    cbth(&home, &["maintenance", "sweep", "--now", &expired_now]);
     let attempt = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
     assert_eq!(attempt["attempt"]["state"], "abandoned");
 }

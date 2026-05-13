@@ -7037,6 +7037,7 @@ fn insert_desktop_transcript_relay_marker_tx(
     if marker.retention_until <= marker.expires_at {
         bail!("marker retention_until must be after expires_at");
     }
+    let mut expires_at = marker.expires_at;
     if marker.envelope_kind != "arm_pending_requested" && marker.envelope_kind != "arm_accepted" {
         bail!(
             "unsupported Desktop transcript relay marker kind {}",
@@ -7063,11 +7064,39 @@ fn insert_desktop_transcript_relay_marker_tx(
         let lease_deadline = attempt
             .bridge_arm_lease_deadline
             .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
+        let arm_pending_deadline = attempt
+            .arm_pending_deadline
+            .context("arm_pending Desktop attempt is missing arm_pending_deadline")?;
+        let batch = query_batch_tx(tx, &attempt.batch_id)?;
         if lease_deadline <= marker.issued_at {
             bail!(
                 "delivery attempt {} bridge arm lease expired at {} before marker issuance",
                 attempt.attempt_id,
                 lease_deadline
+            );
+        }
+        if arm_pending_deadline <= marker.issued_at {
+            bail!(
+                "delivery attempt {} arm pending deadline expired at {} before marker issuance",
+                attempt.attempt_id,
+                arm_pending_deadline
+            );
+        }
+        if batch.redelivery_window_ends_at <= marker.issued_at {
+            bail!(
+                "delivery attempt {} redelivery window expired at {} before marker issuance",
+                attempt.attempt_id,
+                batch.redelivery_window_ends_at
+            );
+        }
+        expires_at = expires_at
+            .min(lease_deadline)
+            .min(arm_pending_deadline)
+            .min(batch.redelivery_window_ends_at);
+        if expires_at <= marker.issued_at {
+            bail!(
+                "Desktop transcript relay marker {} expires before it can be consumed",
+                marker.marker
             );
         }
         attempt
@@ -7096,7 +7125,7 @@ fn insert_desktop_transcript_relay_marker_tx(
             marker.generation,
             &marker.bridge_request_id,
             marker.issued_at,
-            marker.expires_at,
+            expires_at,
             marker.retention_until,
         ],
     )?;
