@@ -2732,6 +2732,7 @@ impl Store {
                     generation: attempt.generation,
                     bridge_request_id: None,
                     marker_prefix: "CBTH_DESKTOP_RELAY_ARM_PENDING",
+                    expires_at_cap: Some(batch.redelivery_window_ends_at),
                 },
                 now,
             )?;
@@ -3282,6 +3283,7 @@ impl Store {
                         generation,
                         bridge_request_id: Some(&bridge_request_id),
                         marker_prefix: "CBTH_DESKTOP_RELAY_ARM_ACCEPTED",
+                        expires_at_cap: None,
                     },
                     now,
                 )?;
@@ -6935,6 +6937,7 @@ struct DesktopRelayMarkerRequest<'a> {
     generation: i64,
     bridge_request_id: Option<&'a str>,
     marker_prefix: &'a str,
+    expires_at_cap: Option<i64>,
 }
 
 fn find_issued_desktop_relay_marker_tx(
@@ -7015,13 +7018,41 @@ fn find_or_issue_desktop_relay_marker_tx(
     now: i64,
 ) -> Result<DesktopTranscriptRelayMarkerRecord> {
     if let Some(marker) = find_issued_desktop_relay_marker_tx(tx, request, now)? {
+        if let Some(expires_at_cap) = request.expires_at_cap
+            && expires_at_cap < marker.expires_at
+        {
+            if expires_at_cap <= now {
+                bail!("Desktop transcript relay marker cap is already expired");
+            }
+            tx.execute(
+                "UPDATE desktop_transcript_relay_markers
+                 SET expires_at = ?,
+                     updated_at = ?
+                 WHERE marker = ?",
+                params![expires_at_cap, now, &marker.marker],
+            )?;
+            return query_desktop_transcript_relay_marker_tx(tx, &marker.marker);
+        }
         return Ok(marker);
     }
     let bridge_request_id = request
         .bridge_request_id
         .map(str::to_owned)
         .unwrap_or_else(new_id);
-    let (expires_at, retention_until) = desktop_relay_marker_deadlines(now)?;
+    let (mut expires_at, mut retention_until) = desktop_relay_marker_deadlines(now)?;
+    if let Some(expires_at_cap) = request.expires_at_cap {
+        if expires_at_cap <= now {
+            bail!("Desktop transcript relay marker cap is already expired");
+        }
+        if expires_at_cap < expires_at {
+            expires_at = expires_at_cap;
+            retention_until = checked_timestamp_add(
+                expires_at,
+                DESKTOP_TRANSCRIPT_RELAY_RETENTION_SECONDS,
+                "desktop_transcript_relay_retention",
+            )?;
+        }
+    }
     insert_desktop_transcript_relay_marker_tx(
         tx,
         NewDesktopTranscriptRelayMarker {

@@ -907,6 +907,13 @@ fn desktop_bridge_preflight_materializes_ready_entry_and_claim_peeks_it() {
         3000,
     );
     let batch_id = create_desktop_batch(&home, "thread-ready-materialize");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE batches SET redelivery_window_ends_at = ? WHERE batch_id = ?",
+        params![3015, &batch_id],
+    )
+    .expect("shorten redelivery window");
+    drop(conn);
 
     let first = cbth(
         &home,
@@ -945,6 +952,7 @@ fn desktop_bridge_preflight_materializes_ready_entry_and_claim_peeks_it() {
             .unwrap()
             .starts_with("CBTH_DESKTOP_RELAY_ARM_PENDING_")
     );
+    assert_eq!(entry["marker_expires_at"], 3015);
     let attempt_id = entry["attempt_id"].as_str().unwrap().to_owned();
     let marker = entry["arm_pending_marker"].as_str().unwrap().to_owned();
 
