@@ -4478,6 +4478,39 @@ fn migrate(conn: &Connection) -> Result<()> {
         "ALTER TABLE desktop_transcript_relay_markers ADD COLUMN validation_fingerprint TEXT NOT NULL DEFAULT ''",
     )?;
     conn.execute(
+        "UPDATE desktop_transcript_relay_markers
+         SET caller_automation_id = (
+               SELECT desktop_bindings.caller_automation_id
+               FROM desktop_bindings
+               WHERE desktop_bindings.source_thread_id =
+                     desktop_transcript_relay_markers.source_thread_id
+             ),
+             read_transport_generation = (
+               SELECT desktop_bindings.read_transport_generation
+               FROM desktop_bindings
+               WHERE desktop_bindings.source_thread_id =
+                     desktop_transcript_relay_markers.source_thread_id
+             ),
+             validation_fingerprint = (
+               SELECT desktop_bindings.validation_fingerprint
+               FROM desktop_bindings
+               WHERE desktop_bindings.source_thread_id =
+                     desktop_transcript_relay_markers.source_thread_id
+             )
+         WHERE (
+             caller_automation_id = ''
+             OR read_transport_generation = 0
+             OR validation_fingerprint = ''
+         )
+           AND EXISTS (
+             SELECT 1
+             FROM desktop_bindings
+             WHERE desktop_bindings.source_thread_id =
+                   desktop_transcript_relay_markers.source_thread_id
+           )",
+        [],
+    )?;
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_desktop_bindings_pause_due
          ON desktop_bindings(binding_state, pause_deadline)",
         [],
@@ -8465,6 +8498,107 @@ mod tests {
             )
             .expect("count consumptions");
         assert_eq!(consumptions, 0);
+    }
+
+    #[test]
+    fn desktop_relay_marker_migration_backfills_binding_snapshot() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let fixture = store
+            .prepare_desktop_writeback_fixture(NewDesktopWritebackFixture {
+                source_thread_id: "thread-marker-backfill".to_owned(),
+                caller_automation_id: "automation-marker-backfill".to_owned(),
+                bridge_request_id: "request-marker-backfill".to_owned(),
+                default_validation_fingerprint: "fp-marker-backfill".to_owned(),
+                now: 40,
+            })
+            .expect("prepare fixture");
+        store
+            .issue_desktop_transcript_relay_marker(NewDesktopTranscriptRelayMarker {
+                marker: "marker-backfill".to_owned(),
+                bridge_thread_id: "bridge-marker-backfill".to_owned(),
+                envelope_kind: "arm_pending_requested".to_owned(),
+                source_thread_id: fixture.source_thread_id.clone(),
+                attempt_id: fixture.attempt.attempt_id.clone(),
+                generation: fixture.attempt.generation,
+                bridge_request_id: fixture.bridge_request_id.clone(),
+                issued_at: 41,
+                expires_at: 100,
+                retention_until: 200,
+            })
+            .expect("issue marker");
+        store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-marker-backfill".to_owned(),
+                rollout_path: "/tmp/marker-backfill.jsonl".to_owned(),
+                rollout_identity: "unix:40:41".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 41,
+            })
+            .expect("bind scanner");
+        store
+            .conn
+            .execute(
+                "UPDATE desktop_transcript_relay_markers
+                 SET caller_automation_id = '',
+                     read_transport_generation = 0,
+                     validation_fingerprint = ''
+                 WHERE marker = ?",
+                params!["marker-backfill"],
+            )
+            .expect("simulate legacy marker columns");
+        drop(store);
+
+        let mut store = Store::open(&layout).expect("reopen store and migrate");
+        let marker = store
+            .conn
+            .query_row(
+                "SELECT * FROM desktop_transcript_relay_markers WHERE marker = ?",
+                params!["marker-backfill"],
+                desktop_transcript_relay_marker_from_row,
+            )
+            .expect("query marker");
+        assert_eq!(marker.caller_automation_id, fixture.caller_automation_id);
+        assert_eq!(
+            marker.read_transport_generation,
+            fixture.binding.read_transport_generation
+        );
+        assert_eq!(
+            marker.validation_fingerprint,
+            fixture.binding.validation_fingerprint
+        );
+        let scanner_binding = store
+            .list_desktop_relay_scanner_bindings(Some("bridge-marker-backfill"))
+            .expect("list scanner bindings")
+            .pop()
+            .expect("scanner binding");
+        let (consumption, _) = store
+            .consume_issued_desktop_transcript_relay_marker(
+                NewDesktopTranscriptRelayConsumption {
+                    marker: "marker-backfill".to_owned(),
+                    envelope_hash: "hash-marker-backfill".to_owned(),
+                    envelope_kind: "arm_pending_requested".to_owned(),
+                    envelope_json: "{}".to_owned(),
+                    source_thread_id: fixture.source_thread_id.clone(),
+                    attempt_id: fixture.attempt.attempt_id.clone(),
+                    generation: fixture.attempt.generation,
+                    bridge_request_id: fixture.bridge_request_id.clone(),
+                    bridge_arm_lease_id: None,
+                    now: 42,
+                },
+                &scanner_binding,
+            )
+            .expect("consume backfilled marker");
+        assert_eq!(consumption.replay_state, "fresh");
+        assert_eq!(
+            store
+                .inspect_attempt(&fixture.attempt.attempt_id)
+                .expect("inspect attempt")
+                .state,
+            "arm_pending"
+        );
     }
 
     #[test]
