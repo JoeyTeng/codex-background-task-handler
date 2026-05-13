@@ -27,7 +27,7 @@ cbth doctor cli
 Install a specific release or directory:
 
 ```bash
-CBTH_VERSION=v0.2.0 CBTH_INSTALL_DIR="$HOME/.local/bin" \
+CBTH_VERSION=v0.2.1 CBTH_INSTALL_DIR="$HOME/.local/bin" \
   sh scripts/install.sh
 ```
 
