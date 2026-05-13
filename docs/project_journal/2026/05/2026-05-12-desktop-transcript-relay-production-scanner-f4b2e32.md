@@ -72,7 +72,7 @@ superseded_by:
 - `cargo check` passed during implementation.
 - `cargo fmt --all -- --check` passed after formatting.
 - `cargo clippy --locked --all-targets -- -D warnings` passed.
-- `cargo test --test desktop_foundation --locked` passed with scanner coverage for issued marker consumption, scanner-resolved arm acceptance, rejected premature `arm-accepted` marker issuance, expired arm-accepted abandonment, partial trailing line deferral, tick-start EOF read limiting, marker evidence before tick-start EOF degradation, trusted carrier marker-mention rejection, oversized tick record degradation, duplicate trusted envelope rejection, and no duplicate `delivery_attempt_count`.
+- `cargo test --test desktop_foundation --locked` passed with scanner coverage for issued marker consumption, scanner-resolved arm acceptance, rejected premature `arm-accepted` marker issuance, expired arm-accepted abandonment, partial trailing line deferral, tick-start EOF read limiting, marker evidence before tick-start EOF degradation, trusted carrier marker-mention rejection, oversized tick record degradation, conflicting duplicate trusted envelope rejection, same-hash duplicate trusted evidence deduplication, and no duplicate `delivery_attempt_count`.
 - Store unit coverage includes atomic non-issued marker rejection before CAS and scanner binding guard before CAS, proving a rejected marker or stale scanner tick cannot still advance the prepared attempt or write a consumption fence.
 - `cargo test --test daemon_phase2 --locked` passed with the new daemon capability included in compatibility expectations.
 - `cargo test --locked` passed when rerun as a standalone full gate.
