@@ -123,6 +123,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-writeback-live-validation-fixture",
     "desktop-transcript-relay-consumer",
     "desktop-transcript-relay-scanner",
+    "desktop-ready-arm-workflow",
     "daemon-handoff-v1",
 ];
 

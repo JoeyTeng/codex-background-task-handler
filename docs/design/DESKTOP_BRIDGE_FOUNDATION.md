@@ -64,7 +64,7 @@ cbth desktop relay emit-arm-pending ... --marker <issued-marker> --json
 cbth desktop relay emit-arm-accepted ... --marker <issued-marker> --json
 ```
 
-所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation`、validation-only `desktop-writeback-live-validation-fixture`、`desktop-transcript-relay-consumer` 或 `desktop-transcript-relay-scanner` capability 时会按现有 capability gate fail closed 或重启。`read-snapshot` / `list-*` / `claim-next-ready` 是 no-DB read helpers：它们只读取已经发布的 inbox JSON，不打开 SQLite、不连接 daemon、不写文件。
+所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation`、validation-only `desktop-writeback-live-validation-fixture`、`desktop-transcript-relay-consumer`、`desktop-transcript-relay-scanner` 或 `desktop-ready-arm-workflow` capability 时会按现有 capability gate fail closed 或重启。`read-snapshot` / `list-*` / `claim-next-ready` 是 no-DB read helpers：它们只读取已经发布的 inbox JSON，不打开 SQLite、不连接 daemon、不写文件。
 
 另有一个 hidden validation-only probe：`cbth desktop validation writeback-dropbox-probe ...`。它不属于稳定 operator surface，只用于验证真实 Desktop heartbeat 能否在不打开 SQLite、不连接 daemon、不触碰 `startup.lock` 的情况下创建或 append `~/.cbth/inbox/writeback-dropbox/probes/<probe_id>.json`。
 
@@ -202,7 +202,7 @@ Production scanner foundation 在手动 consumer 之上增加了三层约束：
 
 - 未 validated 的 installation state 不允许 automatic Desktop delivery。
 - `degraded` binding 不允许 automatic Desktop delivery。
-- 默认 daemon-routed preflight / writeback 缺少 daemon capability `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation`、validation-only `desktop-writeback-live-validation-fixture` 或 `desktop-transcript-relay-consumer` 时不执行 preflight / repair / writeback / fixture setup / relay consume。
+- 默认 daemon-routed preflight / writeback 缺少 daemon capability `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation`、validation-only `desktop-writeback-live-validation-fixture`、`desktop-transcript-relay-consumer`、`desktop-transcript-relay-scanner` 或 `desktop-ready-arm-workflow` 时不执行 preflight / repair / writeback / fixture setup / relay consume / ready materialization。
 - preflight 失败时 bridge 不得读取旧 snapshot 继续 arm。
 - no-DB read helper 发现 manifest / snapshot 不一致时不得继续 delivery。
 - writeback helper 发现 CAS token、binding、batch、attempt 或 policy 不匹配时不得推进 durable state。

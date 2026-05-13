@@ -104,6 +104,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-writeback-live-validation-fixture",
     "desktop-transcript-relay-consumer",
     "desktop-transcript-relay-scanner",
+    "desktop-ready-arm-workflow",
     DAEMON_HANDOFF_CAPABILITY,
 ];
 const CLI_THREAD_START_BOOTSTRAP_BOUND_THREAD_ID: &str = "__cbth_thread_start_bootstrap__";

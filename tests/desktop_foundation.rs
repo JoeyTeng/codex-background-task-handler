@@ -6100,6 +6100,7 @@ fn desktop_bridge_preflight_require_existing_daemon_does_not_forward_client_only
                     "desktop-writeback-live-validation-fixture",
                     "desktop-transcript-relay-consumer",
                     "desktop-transcript-relay-scanner",
+                    "desktop-ready-arm-workflow",
                     "daemon-handoff-v1"
                 ],
                 "message": "pong"
