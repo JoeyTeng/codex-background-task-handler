@@ -1404,6 +1404,87 @@ fn desktop_bridge_preflight_rotates_past_active_ready_marker() {
 }
 
 #[test]
+fn desktop_bridge_preflight_reissues_ready_marker_after_binding_repair() {
+    let home = temp_home();
+    repair_validated_desktop_installation_and_binding(
+        &home,
+        "thread-ready-repair",
+        "automation-ready-repair-old",
+        3150,
+    );
+    create_desktop_batch(&home, "thread-ready-repair");
+
+    let first = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-repair",
+            "--json",
+            "--now",
+            "3160",
+        ],
+    );
+    let first_ready_path = first["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
+        .as_str()
+        .expect("first ready path");
+    let first_ready = read_json_file(first_ready_path);
+    let first_entry = &first_ready["ready_threads"]["entries"][0];
+    let attempt_id = first_entry["attempt_id"].as_str().unwrap().to_owned();
+    let old_marker = first_entry["arm_pending_marker"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-ready-repair",
+            "--caller-automation-id",
+            "automation-ready-repair-new",
+            "--json",
+            "--now",
+            "3161",
+        ],
+    );
+
+    let second = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-repair",
+            "--json",
+            "--now",
+            "3162",
+        ],
+    );
+    let second_ready_path =
+        second["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
+            .as_str()
+            .expect("second ready path");
+    let second_ready = read_json_file(second_ready_path);
+    let second_entries = second_ready["ready_threads"]["entries"].as_array().unwrap();
+    assert_eq!(second_entries.len(), 1);
+    let second_entry = &second_entries[0];
+    assert_eq!(second_entry["attempt_id"], attempt_id);
+    assert_eq!(
+        second_entry["caller_automation_id"],
+        "automation-ready-repair-new"
+    );
+    assert_ne!(second_entry["arm_pending_marker"], old_marker);
+    assert_eq!(marker_state(&home, &old_marker), "issued");
+}
+
+#[test]
 fn desktop_bridge_preflight_abandons_expired_prepared_attempt_before_ready() {
     let home = temp_home();
     repair_validated_desktop_installation_and_binding(

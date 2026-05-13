@@ -2705,6 +2705,12 @@ impl Store {
                    AND ready_marker.envelope_kind = 'arm_pending_requested'
                    AND ready_marker.marker_state = 'issued'
                    AND ready_marker.expires_at > ?
+                   AND ready_marker.caller_automation_id =
+                       desktop_bindings.caller_automation_id
+                   AND ready_marker.read_transport_generation =
+                       desktop_bindings.read_transport_generation
+                   AND ready_marker.validation_fingerprint =
+                       desktop_bindings.validation_fingerprint
                )
              ORDER BY batches.created_at ASC,
                       batches.source_thread_id ASC,
