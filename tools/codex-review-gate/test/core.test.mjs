@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  activeMarkerAckTimedOut,
   activeMarkerIsObsolete,
   buildMarkerCommentBody,
   buildStateCommentBody,
@@ -17,8 +18,10 @@ import {
   isCurrentHeadCodexReviewBodyFinding,
   isRetryableHttpStatus,
   issueCommentIdentity,
+  markerAckTimeoutSecondsForHistory,
   markerFromComment,
   NonJsonResponseError,
+  normalizeMarkerAckTimeoutSeconds,
   parseJsonResponseText,
   parseStateCommentBody,
   reconcileStateWithMarkerComment,
@@ -78,6 +81,30 @@ test("accepts a new +1 identity after the marker", () => {
   );
 });
 
+test("accepts a same-second new +1 identity at the marker boundary", () => {
+  const baseline = {
+    id: "1",
+    content: "+1",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+  };
+  const current = {
+    id: "2",
+    content: "+1",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+  };
+
+  assert.equal(
+    hasNewPlusOneTransition(baseline, current, "2026-04-26T10:01:00Z"),
+    true,
+  );
+  assert.equal(
+    hasNewPlusOneTransition(current, current, "2026-04-26T10:01:00Z"),
+    false,
+  );
+});
+
 test("accepts a new Codex completion comment after the marker", () => {
   const baseline = {
     id: "1",
@@ -95,6 +122,161 @@ test("accepts a new Codex completion comment after the marker", () => {
   assert.equal(
     hasNewCompletionComment(baseline, current, "2026-04-26T10:01:00Z"),
     true,
+  );
+});
+
+test("accepts a same-second new Codex completion comment at the marker boundary", () => {
+  const baseline = {
+    id: "1",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/1",
+  };
+  const current = {
+    id: "2",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+    url: "https://example.invalid/comments/2",
+  };
+
+  assert.equal(
+    hasNewCompletionComment(baseline, current, "2026-04-26T10:01:00Z"),
+    true,
+  );
+  assert.equal(
+    hasNewCompletionComment(current, current, "2026-04-26T10:01:00Z"),
+    false,
+  );
+});
+
+test("starts marker ack timeout at the configured base", () => {
+  assert.equal(markerAckTimeoutSecondsForHistory([], "head", 300, 1800), 300);
+});
+
+test("backs off marker ack timeout for consecutive missed acks on the same head", () => {
+  const history = [];
+  const observed = [];
+
+  for (let index = 0; index < 5; index += 1) {
+    observed.push(markerAckTimeoutSecondsForHistory(history, "head", 300, 1800));
+    history.push({
+      headSha: "head",
+      outcome: "missed_ack",
+    });
+  }
+
+  assert.deepEqual(observed, [300, 600, 1200, 1800, 1800]);
+});
+
+test("resets marker ack backoff after a different head or non-missed marker", () => {
+  assert.equal(
+    markerAckTimeoutSecondsForHistory(
+      [
+        { headSha: "head", outcome: "missed_ack" },
+        { headSha: "other", outcome: "missed_ack" },
+      ],
+      "head",
+      300,
+      1800,
+    ),
+    300,
+  );
+  assert.equal(
+    markerAckTimeoutSecondsForHistory(
+      [
+        { headSha: "head", outcome: "missed_ack" },
+        { headSha: "head", outcome: "stalled" },
+      ],
+      "head",
+      300,
+      1800,
+    ),
+    300,
+  );
+});
+
+test("caps default marker ack timeouts to shorter marker result timeout", () => {
+  assert.deepEqual(
+    normalizeMarkerAckTimeoutSeconds({
+      markerTimeoutSeconds: 120,
+      markerAckTimeoutSeconds: 300,
+      markerAckTimeoutMaxSeconds: 1800,
+    }),
+    {
+      markerAckTimeoutSeconds: 120,
+      markerAckTimeoutMaxSeconds: 120,
+    },
+  );
+});
+
+test("keeps marker ack timeouts when they already fit within marker result timeout", () => {
+  assert.deepEqual(
+    normalizeMarkerAckTimeoutSeconds({
+      markerTimeoutSeconds: 3600,
+      markerAckTimeoutSeconds: 300,
+      markerAckTimeoutMaxSeconds: 1800,
+    }),
+    {
+      markerAckTimeoutSeconds: 300,
+      markerAckTimeoutMaxSeconds: 1800,
+    },
+  );
+});
+
+test("times out only waiting-ack markers", () => {
+  const createdAt = "2026-04-26T10:00:00Z";
+  const nowMs = Date.parse("2026-04-26T10:05:00Z");
+
+  assert.equal(
+    activeMarkerAckTimedOut(
+      { state: "waiting_ack", createdAt, ackTimeoutSeconds: 300 },
+      nowMs,
+      300,
+    ),
+    true,
+  );
+  assert.equal(
+    activeMarkerAckTimedOut(
+      { state: "waiting_result", createdAt, ackTimeoutSeconds: 300 },
+      nowMs,
+      300,
+    ),
+    false,
+  );
+});
+
+test("uses fallback ack timeout for older active marker state", () => {
+  assert.equal(
+    activeMarkerAckTimedOut(
+      { state: "waiting_ack", createdAt: "2026-04-26T10:00:00Z" },
+      Date.parse("2026-04-26T10:05:00Z"),
+      300,
+    ),
+    true,
+  );
+});
+
+test("new eyes transition prevents marker ack timeout once state is waiting-result", () => {
+  const activeMarker = {
+    state: "waiting_ack",
+    createdAt: "2026-04-26T10:00:00Z",
+    ackTimeoutSeconds: 300,
+  };
+  const currentEyes = {
+    id: "5",
+    content: "eyes",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+  };
+
+  assert.equal(hasNewEyesTransition(null, currentEyes, activeMarker.createdAt), true);
+  assert.equal(
+    activeMarkerAckTimedOut(
+      { ...activeMarker, state: "waiting_result", observedEyes: currentEyes },
+      Date.parse("2026-04-26T10:05:00Z"),
+      300,
+    ),
+    false,
   );
 });
 
@@ -127,6 +309,24 @@ test("treats eyes as liveness only after the marker", () => {
   };
 
   assert.equal(hasNewEyesTransition(null, current, "2026-04-26T10:01:00Z"), true);
+});
+
+test("accepts same-second eyes when the reaction identity changed", () => {
+  const baseline = {
+    id: "4",
+    content: "eyes",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+  };
+  const current = {
+    id: "5",
+    content: "eyes",
+    createdAt: "2026-04-26T10:01:00Z",
+    user: "chatgpt-codex-connector[bot]",
+  };
+
+  assert.equal(hasNewEyesTransition(baseline, current, "2026-04-26T10:01:00Z"), true);
+  assert.equal(hasNewEyesTransition(current, current, "2026-04-26T10:01:00Z"), false);
 });
 
 test("summarizes only Codex bot PR-body reactions", () => {
@@ -284,6 +484,29 @@ test("finds the latest trusted marker comment", () => {
     url: "https://example.invalid/comments/2",
     createdAt: "2026-04-26T10:01:00Z",
   });
+});
+
+test("persists marker ack timeout when present", () => {
+  const markerBody = buildMarkerCommentBody({
+    headSha: "abc123",
+    runUrl: "https://example.invalid/runs/1",
+    runId: "1",
+    runAttempt: "1",
+    attempt: 1,
+    baseline: { plusOne: null, eyes: null },
+    state: "waiting_ack",
+    ackTimeoutSeconds: 300,
+  });
+
+  assert.equal(
+    markerFromComment({
+      id: 2,
+      body: markerBody,
+      created_at: "2026-04-26T10:01:00Z",
+      user: { login: "github-actions[bot]" },
+    }).ackTimeoutSeconds,
+    300,
+  );
 });
 
 test("collects only current-head Codex inline findings", () => {
