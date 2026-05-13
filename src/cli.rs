@@ -11261,17 +11261,27 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
             let fingerprint =
                 desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
             let state = store.desktop_installation_state(&fingerprint)?;
-            let arm_pending_bindings = store.list_desktop_arm_pending_bindings(now)?;
-            let pause_due_bindings = store.list_desktop_pause_due_bindings(now)?;
-            let preflight = publish_desktop_bridge_preflight(
-                layout,
+            let snapshot_revision = new_id();
+            let ready_threads = store.materialize_desktop_ready_entries(
                 &args.bridge_thread_id,
+                &snapshot_revision,
                 &state,
+                now,
+            )?;
+            let arm_pending_bindings =
+                store.list_desktop_arm_pending_bindings(&args.bridge_thread_id, &state, now)?;
+            let pause_due_bindings = store.list_desktop_pause_due_bindings(now)?;
+            let preflight = publish_desktop_bridge_preflight(DesktopBridgePreflightPublish {
+                layout,
+                bridge_thread_id: &args.bridge_thread_id,
+                snapshot_revision: &snapshot_revision,
+                installation_state: &state,
+                ready_threads,
                 arm_pending_bindings,
                 pause_due_bindings,
                 sweep,
                 now,
-            )?;
+            })?;
             Ok(json!({ "desktop_bridge_preflight": preflight }))
         }
     }
@@ -13252,48 +13262,60 @@ fn write_desktop_probe_bytes(path: &Path, file: &mut fs::File, bytes: &[u8]) -> 
     Ok(())
 }
 
-fn publish_desktop_bridge_preflight(
-    layout: &FsLayout,
-    bridge_thread_id: &str,
-    installation_state: &DesktopInstallationStateRecord,
+struct DesktopBridgePreflightPublish<'a> {
+    layout: &'a FsLayout,
+    bridge_thread_id: &'a str,
+    snapshot_revision: &'a str,
+    installation_state: &'a DesktopInstallationStateRecord,
+    ready_threads: Vec<Value>,
     arm_pending_bindings: Vec<Value>,
     pause_due_bindings: Vec<Value>,
     sweep: SweepReport,
     now: i64,
-) -> Result<Value> {
-    let snapshot_revision = new_id();
-    let ready_threads_path = layout.desktop_ready_threads_path(&snapshot_revision);
-    let arm_pending_path = layout.desktop_arm_pending_bindings_path(&snapshot_revision);
-    let pause_due_path = layout.desktop_pause_due_bindings_path(&snapshot_revision);
-    let manifest_path = layout.desktop_current_snapshot_path();
-    let latest_installation_state_path = layout.desktop_installation_state_path();
-    let installation_state_path =
-        layout.desktop_snapshot_installation_state_path(&snapshot_revision);
-    let arm_pending_count =
-        i64::try_from(arm_pending_bindings.len()).context("arm_pending_bindings count overflow")?;
-    let pause_due_count =
-        i64::try_from(pause_due_bindings.len()).context("pause_due_bindings count overflow")?;
+}
+
+fn publish_desktop_bridge_preflight(input: DesktopBridgePreflightPublish<'_>) -> Result<Value> {
+    let ready_threads_path = input
+        .layout
+        .desktop_ready_threads_path(input.snapshot_revision);
+    let arm_pending_path = input
+        .layout
+        .desktop_arm_pending_bindings_path(input.snapshot_revision);
+    let pause_due_path = input
+        .layout
+        .desktop_pause_due_bindings_path(input.snapshot_revision);
+    let manifest_path = input.layout.desktop_current_snapshot_path();
+    let latest_installation_state_path = input.layout.desktop_installation_state_path();
+    let installation_state_path = input
+        .layout
+        .desktop_snapshot_installation_state_path(input.snapshot_revision);
+    let ready_count =
+        i64::try_from(input.ready_threads.len()).context("ready_threads count overflow")?;
+    let arm_pending_count = i64::try_from(input.arm_pending_bindings.len())
+        .context("arm_pending_bindings count overflow")?;
+    let pause_due_count = i64::try_from(input.pause_due_bindings.len())
+        .context("pause_due_bindings count overflow")?;
 
     let base = json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-        "snapshot_revision": snapshot_revision,
-        "created_at": now,
-        "bridge_thread_id": bridge_thread_id,
+        "snapshot_revision": input.snapshot_revision,
+        "created_at": input.now,
+        "bridge_thread_id": input.bridge_thread_id,
         "installation_state": {
-            "read_transport": &installation_state.read_transport,
-            "read_transport_generation": installation_state.read_transport_generation,
-            "read_transport_capability": &installation_state.read_transport_capability,
-            "artifact_read_capability": &installation_state.artifact_read_capability,
-            "writeback_capability": &installation_state.writeback_capability,
-            "validation_fingerprint": &installation_state.validation_fingerprint,
+            "read_transport": &input.installation_state.read_transport,
+            "read_transport_generation": input.installation_state.read_transport_generation,
+            "read_transport_capability": &input.installation_state.read_transport_capability,
+            "artifact_read_capability": &input.installation_state.artifact_read_capability,
+            "writeback_capability": &input.installation_state.writeback_capability,
+            "validation_fingerprint": &input.installation_state.validation_fingerprint,
         }
     });
     let installation_state_export = json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-        "snapshot_revision": snapshot_revision,
-        "published_at": now,
-        "bridge_thread_id": bridge_thread_id,
-        "desktop_installation_state": installation_state,
+        "snapshot_revision": input.snapshot_revision,
+        "published_at": input.now,
+        "bridge_thread_id": input.bridge_thread_id,
+        "desktop_installation_state": input.installation_state,
     });
     write_desktop_snapshot(&installation_state_path, installation_state_export.clone())?;
     write_desktop_snapshot(&latest_installation_state_path, installation_state_export)?;
@@ -13301,12 +13323,12 @@ fn publish_desktop_bridge_preflight(
         &ready_threads_path,
         json!({
             "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-            "snapshot_revision": snapshot_revision,
-            "created_at": now,
-            "bridge_thread_id": bridge_thread_id,
+            "snapshot_revision": input.snapshot_revision,
+            "created_at": input.now,
+            "bridge_thread_id": input.bridge_thread_id,
             "ready_threads": {
-                "entries": [],
-                "count": 0,
+                "entries": input.ready_threads,
+                "count": ready_count,
             },
             "base": base.clone(),
         }),
@@ -13315,11 +13337,11 @@ fn publish_desktop_bridge_preflight(
         &arm_pending_path,
         json!({
             "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-            "snapshot_revision": snapshot_revision,
-            "created_at": now,
-            "bridge_thread_id": bridge_thread_id,
+            "snapshot_revision": input.snapshot_revision,
+            "created_at": input.now,
+            "bridge_thread_id": input.bridge_thread_id,
             "arm_pending_bindings": {
-                "entries": arm_pending_bindings,
+                "entries": input.arm_pending_bindings,
                 "count": arm_pending_count,
             },
             "base": base.clone(),
@@ -13329,11 +13351,11 @@ fn publish_desktop_bridge_preflight(
         &pause_due_path,
         json!({
             "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-            "snapshot_revision": snapshot_revision,
-            "created_at": now,
-            "bridge_thread_id": bridge_thread_id,
+            "snapshot_revision": input.snapshot_revision,
+            "created_at": input.now,
+            "bridge_thread_id": input.bridge_thread_id,
             "pause_due_bindings": {
-                "entries": pause_due_bindings,
+                "entries": input.pause_due_bindings,
                 "count": pause_due_count,
             },
             "base": base,
@@ -13341,15 +13363,15 @@ fn publish_desktop_bridge_preflight(
     )?;
     let manifest = json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-        "snapshot_revision": snapshot_revision,
-        "created_at": now,
-        "bridge_thread_id": bridge_thread_id,
+        "snapshot_revision": input.snapshot_revision,
+        "created_at": input.now,
+        "bridge_thread_id": input.bridge_thread_id,
         "snapshot_manifest_path": manifest_path.display().to_string(),
         "installation_state_path": installation_state_path.display().to_string(),
         "snapshots": {
             "ready_threads": {
                 "path": ready_threads_path.display().to_string(),
-                "count": 0,
+                "count": ready_count,
             },
             "arm_pending_bindings": {
                 "path": arm_pending_path.display().to_string(),
@@ -13360,11 +13382,11 @@ fn publish_desktop_bridge_preflight(
                 "count": pause_due_count,
             },
         },
-        "installation_state": installation_state,
-        "sweep": sweep,
+        "installation_state": input.installation_state,
+        "sweep": input.sweep,
     });
     write_desktop_snapshot(&manifest_path, manifest.clone())?;
-    prune_desktop_snapshot_revisions(layout, &snapshot_revision)?;
+    prune_desktop_snapshot_revisions(input.layout, input.snapshot_revision)?;
     Ok(manifest)
 }
 

@@ -203,6 +203,90 @@ fn create_desktop_batch_and_prepared_attempt(
     batch_id
 }
 
+fn create_desktop_batch(home: &TempDir, source_thread_id: &str) -> String {
+    let submitted = cbth(
+        home,
+        &[
+            "job",
+            "submit",
+            "--source-thread-id",
+            source_thread_id,
+            "--summary",
+            "desktop ready fixture",
+            "--delivery-read-only",
+            "true",
+            "--delivery-requires-approval",
+            "false",
+            "--delivery-requires-network",
+            "false",
+            "--delivery-requires-write-access",
+            "false",
+        ],
+    );
+    let job_id = submitted["job"]["job_id"].as_str().expect("job id");
+    let failed = cbth(
+        home,
+        &[
+            "job",
+            "fail",
+            "--job-id",
+            job_id,
+            "--reason",
+            "ready for Desktop materialization",
+            "--max-delivery-attempts",
+            "3",
+            "--redelivery-window-seconds",
+            "3600",
+        ],
+    );
+    failed["batch"]["batch"]["batch_id"]
+        .as_str()
+        .expect("batch id")
+        .to_owned()
+}
+
+fn repair_validated_desktop_installation_and_binding(
+    home: &TempDir,
+    source_thread_id: &str,
+    caller_automation_id: &str,
+    now: i64,
+) {
+    cbth(
+        home,
+        &[
+            "desktop",
+            "installation-state",
+            "repair",
+            "--read-transport",
+            "direct-file-read",
+            "--read-transport-capability",
+            "validated",
+            "--artifact-read-capability",
+            "unknown",
+            "--writeback-capability",
+            "validated",
+            "--json",
+            "--now",
+            &now.to_string(),
+        ],
+    );
+    cbth(
+        home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            source_thread_id,
+            "--caller-automation-id",
+            caller_automation_id,
+            "--json",
+            "--now",
+            &(now + 1).to_string(),
+        ],
+    );
+}
+
 fn insert_desktop_prepared_attempt(
     home: &TempDir,
     source_thread_id: &str,
@@ -810,6 +894,413 @@ fn desktop_note_arm_pending_and_note_arm_are_idempotent_and_exported() {
         ],
     );
     assert!(unquiesced_retry.contains("still has unquiesced armed_generation 1"));
+}
+
+#[test]
+fn desktop_bridge_preflight_materializes_ready_entry_and_claim_peeks_it() {
+    let home = temp_home();
+    repair_validated_desktop_installation_and_binding(
+        &home,
+        "thread-ready-materialize",
+        "automation-ready-materialize",
+        3000,
+    );
+    let batch_id = create_desktop_batch(&home, "thread-ready-materialize");
+
+    let first = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-materialize",
+            "--json",
+            "--now",
+            "3010",
+        ],
+    );
+    let first = &first["desktop_bridge_preflight"];
+    assert_eq!(first["snapshots"]["ready_threads"]["count"], 1);
+    let ready_path = first["snapshots"]["ready_threads"]["path"]
+        .as_str()
+        .expect("ready path");
+    let ready = read_json_file(ready_path);
+    let entries = ready["ready_threads"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry["source_thread_id"], "thread-ready-materialize");
+    assert_eq!(
+        entry["caller_automation_id"],
+        "automation-ready-materialize"
+    );
+    assert_eq!(entry["batch_id"], batch_id);
+    assert_eq!(entry["generation"], 1);
+    assert_eq!(entry["snapshot_revision"], first["snapshot_revision"]);
+    assert_eq!(entry["requires_artifact_read"], false);
+    assert!(
+        entry["arm_pending_marker"]
+            .as_str()
+            .unwrap()
+            .starts_with("CBTH_DESKTOP_RELAY_ARM_PENDING_")
+    );
+    let attempt_id = entry["attempt_id"].as_str().unwrap().to_owned();
+    let marker = entry["arm_pending_marker"].as_str().unwrap().to_owned();
+
+    let claim = cbth(
+        &home,
+        &[
+            "desktop",
+            "claim-next-ready",
+            "--bridge-thread-id",
+            "bridge-ready-materialize",
+            "--json",
+        ],
+    );
+    assert_eq!(claim["desktop_ready_claim"]["entry"], *entry);
+
+    let second = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-materialize",
+            "--json",
+            "--now",
+            "3011",
+        ],
+    );
+    let second = &second["desktop_bridge_preflight"];
+    assert_eq!(second["snapshots"]["ready_threads"]["count"], 1);
+    let second_ready = read_json_file(
+        second["snapshots"]["ready_threads"]["path"]
+            .as_str()
+            .unwrap(),
+    );
+    let second_entry = &second_ready["ready_threads"]["entries"][0];
+    assert_eq!(second_entry["attempt_id"], attempt_id);
+    assert_eq!(second_entry["arm_pending_marker"], marker);
+}
+
+#[test]
+fn desktop_bridge_preflight_filters_ineligible_ready_candidates() {
+    for (case, mutate) in [
+        ("unknown-capability", "none"),
+        ("requires-artifact-read", "artifact"),
+        ("unsafe-network", "network"),
+        ("degraded-binding", "degraded"),
+        ("unquiesced-binding", "unquiesced"),
+        ("active-arm-pending", "arm-pending"),
+        ("attempt-budget", "budget"),
+    ] {
+        let home = temp_home();
+        let source_thread_id = format!("thread-ready-filter-{case}");
+        let automation_id = format!("automation-ready-filter-{case}");
+        if mutate != "none" {
+            repair_validated_desktop_installation_and_binding(
+                &home,
+                &source_thread_id,
+                &automation_id,
+                3200,
+            );
+        } else {
+            cbth(
+                &home,
+                &[
+                    "desktop",
+                    "binding",
+                    "repair",
+                    "--source-thread-id",
+                    &source_thread_id,
+                    "--caller-automation-id",
+                    &automation_id,
+                    "--json",
+                    "--now",
+                    "3201",
+                ],
+            );
+        }
+        let batch_id = create_desktop_batch(&home, &source_thread_id);
+        let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+        match mutate {
+            "artifact" => {
+                conn.execute(
+                    "UPDATE batches SET requires_artifact_read = 1 WHERE batch_id = ?",
+                    params![&batch_id],
+                )
+                .unwrap();
+            }
+            "network" => {
+                conn.execute(
+                    "UPDATE batches SET delivery_requires_network = 1 WHERE batch_id = ?",
+                    params![&batch_id],
+                )
+                .unwrap();
+            }
+            "degraded" => {
+                conn.execute(
+                    "UPDATE desktop_bindings SET binding_state = 'degraded' WHERE source_thread_id = ?",
+                    params![&source_thread_id],
+                )
+                .unwrap();
+            }
+            "unquiesced" => {
+                conn.execute(
+                    "UPDATE desktop_bindings
+                     SET armed_generation = 7,
+                         armed_generation_quiesced_at = NULL,
+                         pause_deadline = 3300
+                     WHERE source_thread_id = ?",
+                    params![&source_thread_id],
+                )
+                .unwrap();
+            }
+            "arm-pending" => {
+                insert_desktop_prepared_attempt(
+                    &home,
+                    &source_thread_id,
+                    &batch_id,
+                    "attempt-ready-filter-arm-pending",
+                    1,
+                    3202,
+                );
+                force_desktop_attempt_arm_pending(&home, "attempt-ready-filter-arm-pending", 3203);
+            }
+            "budget" => {
+                conn.execute(
+                    "UPDATE batches
+                     SET delivery_attempt_count = max_delivery_attempts
+                     WHERE batch_id = ?",
+                    params![&batch_id],
+                )
+                .unwrap();
+            }
+            "none" => {}
+            other => panic!("unknown mutate case {other}"),
+        }
+        drop(conn);
+
+        let preflight = cbth(
+            &home,
+            &[
+                "desktop",
+                "bridge-preflight",
+                "--helper-direct-store",
+                "--bridge-thread-id",
+                "bridge-ready-filter",
+                "--json",
+                "--now",
+                "3210",
+            ],
+        );
+        assert_eq!(
+            preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["count"], 0,
+            "case {case}"
+        );
+    }
+}
+
+#[test]
+fn desktop_ready_markers_drive_scanner_to_cooldown() {
+    let home = temp_home();
+    repair_validated_desktop_installation_and_binding(
+        &home,
+        "thread-ready-scanner",
+        "automation-ready-scanner",
+        3400,
+    );
+    let batch_id = create_desktop_batch(&home, "thread-ready-scanner");
+    let rollout = home.path().join("ready-scanner-rollout.jsonl");
+    fs::write(&rollout, "").expect("create rollout");
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "scanner",
+            "bind",
+            "--bridge-thread-id",
+            "bridge-ready-scanner",
+            "--rollout-path",
+            rollout.to_str().unwrap(),
+            "--from-start",
+            "--json",
+            "--now",
+            "3401",
+        ],
+    );
+
+    let ready_preflight = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-scanner",
+            "--json",
+            "--now",
+            "3410",
+        ],
+    );
+    let ready_path =
+        ready_preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
+            .as_str()
+            .unwrap();
+    let ready = read_json_file(ready_path);
+    let ready_entry = &ready["ready_threads"]["entries"][0];
+    let attempt_id = ready_entry["attempt_id"].as_str().unwrap();
+    let generation = ready_entry["generation"].as_i64().unwrap().to_string();
+    let bridge_request_id = ready_entry["bridge_request_id"].as_str().unwrap();
+    let pending_marker = ready_entry["arm_pending_marker"].as_str().unwrap();
+
+    let pending_emit = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "emit-arm-pending",
+            "--source-thread-id",
+            "thread-ready-scanner",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            &generation,
+            "--bridge-request-id",
+            bridge_request_id,
+            "--marker",
+            pending_marker,
+            "--json",
+            "--now",
+            "3411",
+        ],
+        false,
+    );
+    assert!(pending_emit.status.success());
+    append_function_call_rollout_line(&rollout, &String::from_utf8(pending_emit.stdout).unwrap());
+    let pending_scan = cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "scanner",
+            "scan-once",
+            "--bridge-thread-id",
+            "bridge-ready-scanner",
+            "--json",
+            "--now",
+            "3420",
+        ],
+    );
+    assert_eq!(
+        pending_scan["desktop_relay_scanner_scan"]["consumed_markers"],
+        1
+    );
+    let pending_attempt = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
+    assert_eq!(pending_attempt["attempt"]["state"], "arm_pending");
+
+    let arm_preflight = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-scanner",
+            "--json",
+            "--now",
+            "3421",
+        ],
+    );
+    assert_eq!(
+        arm_preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["count"],
+        0
+    );
+    assert_eq!(
+        arm_preflight["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["count"],
+        1
+    );
+    let arm_path =
+        arm_preflight["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["path"]
+            .as_str()
+            .unwrap();
+    let arm_pending = read_json_file(arm_path);
+    let arm_entry = &arm_pending["arm_pending_bindings"]["entries"][0];
+    let arm_marker = arm_entry["arm_accepted_marker"].as_str().unwrap();
+    assert!(arm_marker.starts_with("CBTH_DESKTOP_RELAY_ARM_ACCEPTED_"));
+
+    let arm_emit = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "emit-arm-accepted",
+            "--source-thread-id",
+            "thread-ready-scanner",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            &generation,
+            "--bridge-request-id",
+            bridge_request_id,
+            "--marker",
+            arm_marker,
+            "--json",
+            "--now",
+            "3422",
+        ],
+        false,
+    );
+    assert!(arm_emit.status.success());
+    append_function_call_rollout_line(&rollout, &String::from_utf8(arm_emit.stdout).unwrap());
+    let arm_scan = cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "scanner",
+            "scan-once",
+            "--bridge-thread-id",
+            "bridge-ready-scanner",
+            "--json",
+            "--now",
+            "3430",
+        ],
+    );
+    assert_eq!(
+        arm_scan["desktop_relay_scanner_scan"]["consumed_markers"],
+        1
+    );
+    let final_attempt = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
+    assert_eq!(final_attempt["attempt"]["state"], "cooldown");
+    let final_batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(final_batch["batch"]["batch"]["delivery_attempt_count"], 1);
+
+    let repeat_scan = cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "scanner",
+            "scan-once",
+            "--bridge-thread-id",
+            "bridge-ready-scanner",
+            "--json",
+            "--now",
+            "3431",
+        ],
+    );
+    assert_eq!(
+        repeat_scan["desktop_relay_scanner_scan"]["scanned_bindings"],
+        0
+    );
+    let repeated_batch = cbth(&home, &["batch", "inspect", "--batch-id", &batch_id]);
+    assert_eq!(
+        repeated_batch["batch"]["batch"]["delivery_attempt_count"],
+        1
+    );
 }
 
 #[test]

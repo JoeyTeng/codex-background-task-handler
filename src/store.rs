@@ -42,6 +42,7 @@ const DESKTOP_BRIDGE_ARM_LEASE_TTL_SECONDS: i64 = 5 * 60;
 const DESKTOP_ARM_PENDING_TIMEOUT_SECONDS: i64 = 5 * 60;
 const DESKTOP_PAUSE_NOT_BEFORE_SECONDS: i64 = 90;
 const DESKTOP_PAUSE_DEADLINE_GRACE_SECONDS: i64 = 90;
+const DESKTOP_TRANSCRIPT_RELAY_MARKER_TTL_SECONDS: i64 = 6 * 60 * 60;
 const DESKTOP_TRANSCRIPT_RELAY_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -2574,80 +2575,165 @@ impl Store {
         &mut self,
         marker: NewDesktopTranscriptRelayMarker,
     ) -> Result<DesktopTranscriptRelayMarkerRecord> {
-        ensure_nonempty_value("marker", &marker.marker)?;
-        ensure_nonempty_value("bridge_thread_id", &marker.bridge_thread_id)?;
-        ensure_nonempty_value("envelope_kind", &marker.envelope_kind)?;
-        ensure_nonempty_value("source_thread_id", &marker.source_thread_id)?;
-        ensure_nonempty_value("attempt_id", &marker.attempt_id)?;
-        ensure_positive_value("generation", marker.generation)?;
-        ensure_nonempty_value("bridge_request_id", &marker.bridge_request_id)?;
-        if marker.expires_at <= marker.issued_at {
-            bail!("marker expires_at must be after issued_at");
-        }
-        if marker.retention_until <= marker.expires_at {
-            bail!("marker retention_until must be after expires_at");
-        }
-        if marker.envelope_kind != "arm_pending_requested" && marker.envelope_kind != "arm_accepted"
-        {
-            bail!(
-                "unsupported Desktop transcript relay marker kind {}",
-                marker.envelope_kind
-            );
-        }
         let tx = self.conn.transaction()?;
-        if marker.envelope_kind == "arm_accepted" {
-            let attempt = query_delivery_attempt_tx(&tx, &marker.attempt_id)?;
-            ensure_desktop_attempt_tokens(&attempt, &marker.source_thread_id, marker.generation)?;
-            if attempt.state != "arm_pending" {
-                bail!(
-                    "delivery attempt {} is not arm_pending for Desktop arm-accepted marker issuance",
-                    attempt.attempt_id
-                );
-            }
-            if attempt.bridge_request_id.as_deref() != Some(marker.bridge_request_id.as_str()) {
-                bail!(
-                    "delivery attempt {} bridge_request_id does not match marker issuance",
-                    attempt.attempt_id
-                );
-            }
-            let lease_deadline = attempt
-                .bridge_arm_lease_deadline
-                .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
-            if lease_deadline <= marker.issued_at {
-                bail!(
-                    "delivery attempt {} bridge arm lease expired at {} before marker issuance",
-                    attempt.attempt_id,
-                    lease_deadline
-                );
-            }
-            attempt
-                .bridge_arm_lease_id
-                .as_ref()
-                .context("arm_pending Desktop attempt is missing bridge_arm_lease_id")?;
-        }
-        tx.execute(
-            "INSERT INTO desktop_transcript_relay_markers (
-                marker, bridge_thread_id, envelope_kind,
-                source_thread_id, attempt_id, generation, bridge_request_id,
-                marker_state, issued_at, expires_at, retention_until,
-                consumed_at, rejected_at, rejection_reason, envelope_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', ?, ?, ?, NULL, NULL, NULL, NULL)",
-            params![
-                marker.marker,
-                marker.bridge_thread_id,
-                marker.envelope_kind,
-                marker.source_thread_id,
-                marker.attempt_id,
-                marker.generation,
-                marker.bridge_request_id,
-                marker.issued_at,
-                marker.expires_at,
-                marker.retention_until,
-            ],
-        )?;
-        let record = query_desktop_transcript_relay_marker_tx(&tx, &marker.marker)?;
+        let record = insert_desktop_transcript_relay_marker_tx(&tx, marker)?;
         tx.commit()?;
         Ok(record)
+    }
+
+    pub fn materialize_desktop_ready_entries(
+        &mut self,
+        bridge_thread_id: &str,
+        snapshot_revision: &str,
+        installation_state: &DesktopInstallationStateRecord,
+        now: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        ensure_nonempty_value("bridge_thread_id", bridge_thread_id)?;
+        ensure_nonempty_value("snapshot_revision", snapshot_revision)?;
+        if installation_state.read_transport_capability != "validated"
+            || installation_state.writeback_capability != "validated"
+        {
+            return Ok(Vec::new());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut stmt = tx.prepare(
+            "SELECT batches.batch_id
+             FROM batches
+             JOIN desktop_bindings
+               ON desktop_bindings.source_thread_id = batches.source_thread_id
+             WHERE batches.state = 'open'
+               AND batches.replay_policy = 'automatic'
+               AND batches.delivery_read_only = 1
+               AND batches.delivery_requires_approval = 0
+               AND batches.delivery_requires_network = 0
+               AND batches.delivery_requires_write_access = 0
+               AND batches.requires_artifact_read = 0
+               AND batches.delivery_attempt_count < batches.max_delivery_attempts
+               AND batches.batch_id = (
+                 SELECT head.batch_id
+                 FROM batches AS head
+                 WHERE head.source_thread_id = batches.source_thread_id
+                   AND head.state = 'open'
+                 ORDER BY head.created_at ASC, head.batch_id ASC
+                 LIMIT 1
+               )
+               AND desktop_bindings.binding_state = 'bound'
+               AND desktop_bindings.read_transport = ?
+               AND desktop_bindings.read_transport_generation = ?
+               AND desktop_bindings.validation_fingerprint = ?
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM delivery_attempts AS active_attempt
+                 WHERE active_attempt.source_thread_id = batches.source_thread_id
+                   AND active_attempt.adapter_kind = 'desktop'
+                   AND active_attempt.state IN ('accept_pending', 'arm_pending', 'cooldown')
+               )
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM delivery_attempts AS prepared_attempt
+                 WHERE prepared_attempt.source_thread_id = batches.source_thread_id
+                   AND prepared_attempt.adapter_kind = 'desktop'
+                   AND prepared_attempt.state = 'prepared'
+                   AND (
+                     prepared_attempt.batch_id != batches.batch_id
+                     OR prepared_attempt.generation != (
+                       SELECT MAX(current_attempt.generation)
+                       FROM delivery_attempts AS current_attempt
+                       WHERE current_attempt.batch_id = batches.batch_id
+                     )
+                   )
+               )
+               AND (
+                 SELECT COUNT(*)
+                 FROM delivery_attempts AS prepared_count
+                 WHERE prepared_count.source_thread_id = batches.source_thread_id
+                   AND prepared_count.adapter_kind = 'desktop'
+                   AND prepared_count.state = 'prepared'
+               ) <= 1
+               AND (
+                 desktop_bindings.armed_generation IS NULL
+                 OR desktop_bindings.armed_generation_quiesced_at IS NOT NULL
+               )
+             ORDER BY batches.created_at ASC,
+                      batches.source_thread_id ASC,
+                      batches.batch_id ASC
+             LIMIT 1",
+        )?;
+        let candidate_ids = stmt
+            .query_map(
+                params![
+                    &installation_state.read_transport,
+                    installation_state.read_transport_generation,
+                    &installation_state.validation_fingerprint,
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        for batch_id in candidate_ids {
+            let batch = query_batch_tx(&tx, &batch_id)?;
+            let binding = query_desktop_binding_tx(&tx, &batch.source_thread_id)?;
+            if !desktop_binding_matches_installation(&binding, installation_state)
+                || ensure_desktop_binding_quiesced_for_fresh_arm(&binding).is_err()
+                || ensure_batch_allows_desktop_delivery(&batch).is_err()
+                || ensure_attempt_budget_remaining(&batch).is_err()
+            {
+                continue;
+            }
+            if let Some(pause_deadline) = binding.pause_deadline
+                && binding.armed_generation.is_some()
+                && binding.armed_generation_quiesced_at.is_none()
+                && pause_deadline <= now
+            {
+                continue;
+            }
+
+            let active_attempts =
+                query_active_desktop_attempts_for_thread_tx(&tx, &batch.source_thread_id)?;
+            let attempt = match active_attempts.as_slice() {
+                [] => create_desktop_prepared_attempt_tx(&tx, &batch, now)?,
+                [attempt]
+                    if attempt.batch_id == batch.batch_id
+                        && attempt.state == "prepared"
+                        && ensure_attempt_is_current_generation_tx(&tx, attempt).is_ok() =>
+                {
+                    attempt.clone()
+                }
+                _ => continue,
+            };
+            let marker = find_or_issue_desktop_relay_marker_tx(
+                &tx,
+                &DesktopRelayMarkerRequest {
+                    bridge_thread_id,
+                    envelope_kind: "arm_pending_requested",
+                    source_thread_id: &batch.source_thread_id,
+                    attempt_id: &attempt.attempt_id,
+                    generation: attempt.generation,
+                    bridge_request_id: None,
+                    marker_prefix: "CBTH_DESKTOP_RELAY_ARM_PENDING",
+                },
+                now,
+            )?;
+            tx.commit()?;
+            return Ok(vec![serde_json::json!({
+                "source_thread_id": batch.source_thread_id,
+                "caller_automation_id": binding.caller_automation_id,
+                "batch_id": batch.batch_id,
+                "attempt_id": attempt.attempt_id,
+                "generation": attempt.generation,
+                "bridge_request_id": marker.bridge_request_id,
+                "arm_pending_marker": marker.marker,
+                "marker_expires_at": marker.expires_at,
+                "snapshot_revision": snapshot_revision,
+                "requires_artifact_read": false,
+            })]);
+        }
+        tx.commit()?;
+        Ok(Vec::new())
     }
 
     pub fn list_active_desktop_transcript_relay_markers(
@@ -3057,8 +3143,17 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn list_desktop_arm_pending_bindings(&self, now: i64) -> Result<Vec<serde_json::Value>> {
-        let mut stmt = self.conn.prepare(
+    pub fn list_desktop_arm_pending_bindings(
+        &mut self,
+        bridge_thread_id: &str,
+        installation_state: &DesktopInstallationStateRecord,
+        now: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        ensure_nonempty_value("bridge_thread_id", bridge_thread_id)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut stmt = tx.prepare(
             "SELECT desktop_bindings.source_thread_id,
                     desktop_bindings.caller_automation_id,
                     desktop_bindings.binding_state,
@@ -3099,24 +3194,90 @@ impl Store {
                       delivery_attempts.updated_at ASC,
                       delivery_attempts.attempt_id ASC",
         )?;
-        stmt.query_map([], |row| {
-            let deadline: Option<i64> = row.get(9)?;
-            Ok(serde_json::json!({
-                "source_thread_id": row.get::<_, String>(0)?,
-                "caller_automation_id": row.get::<_, String>(1)?,
-                "binding_state": row.get::<_, String>(2)?,
-                "batch_id": row.get::<_, String>(3)?,
-                "attempt_id": row.get::<_, String>(4)?,
-                "generation": row.get::<_, i64>(5)?,
-                "bridge_request_id": row.get::<_, Option<String>>(6)?,
-                "bridge_arm_lease_deadline": row.get::<_, Option<i64>>(7)?,
-                "arm_pending_since": row.get::<_, Option<i64>>(8)?,
-                "arm_pending_deadline": deadline,
-                "overdue": deadline.is_some_and(|deadline| deadline <= now),
-            }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+        let rows = stmt
+            .query_map([], |row| {
+                let deadline: Option<i64> = row.get(9)?;
+                Ok(serde_json::json!({
+                    "source_thread_id": row.get::<_, String>(0)?,
+                    "caller_automation_id": row.get::<_, String>(1)?,
+                    "binding_state": row.get::<_, String>(2)?,
+                    "batch_id": row.get::<_, String>(3)?,
+                    "attempt_id": row.get::<_, String>(4)?,
+                    "generation": row.get::<_, i64>(5)?,
+                    "bridge_request_id": row.get::<_, Option<String>>(6)?,
+                    "bridge_arm_lease_deadline": row.get::<_, Option<i64>>(7)?,
+                    "arm_pending_since": row.get::<_, Option<i64>>(8)?,
+                    "arm_pending_deadline": deadline,
+                    "overdue": deadline.is_some_and(|deadline| deadline <= now),
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(anyhow::Error::from)?;
+        drop(stmt);
+
+        let mut entries = Vec::with_capacity(rows.len());
+        for mut entry in rows {
+            let source_thread_id = entry
+                .get("source_thread_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("arm_pending entry missing source_thread_id"))?
+                .to_owned();
+            let attempt_id = entry
+                .get("attempt_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("arm_pending entry missing attempt_id"))?
+                .to_owned();
+            let generation = entry
+                .get("generation")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| anyhow!("arm_pending entry missing generation"))?;
+            let bridge_request_id = entry
+                .get("bridge_request_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("arm_pending entry missing bridge_request_id"))?
+                .to_owned();
+            let lease_deadline = entry
+                .get("bridge_arm_lease_deadline")
+                .and_then(serde_json::Value::as_i64);
+            let arm_pending_deadline = entry
+                .get("arm_pending_deadline")
+                .and_then(serde_json::Value::as_i64);
+            let binding = query_desktop_binding_tx(&tx, &source_thread_id)?;
+            if lease_deadline.is_some_and(|deadline| deadline > now)
+                && arm_pending_deadline.is_some_and(|deadline| deadline > now)
+                && installation_state.read_transport_capability == "validated"
+                && installation_state.writeback_capability == "validated"
+                && desktop_binding_matches_installation(&binding, installation_state)
+            {
+                let marker = find_or_issue_desktop_relay_marker_tx(
+                    &tx,
+                    &DesktopRelayMarkerRequest {
+                        bridge_thread_id,
+                        envelope_kind: "arm_accepted",
+                        source_thread_id: &source_thread_id,
+                        attempt_id: &attempt_id,
+                        generation,
+                        bridge_request_id: Some(&bridge_request_id),
+                        marker_prefix: "CBTH_DESKTOP_RELAY_ARM_ACCEPTED",
+                    },
+                    now,
+                )?;
+                let object = entry
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow!("arm_pending entry is not an object"))?;
+                object.insert(
+                    "arm_accepted_marker".to_owned(),
+                    serde_json::Value::String(marker.marker),
+                );
+                object.insert(
+                    "marker_expires_at".to_owned(),
+                    serde_json::Value::Number(marker.expires_at.into()),
+                );
+            }
+            entries.push(entry);
+        }
+        tx.commit()?;
+        Ok(entries)
     }
 
     pub fn list_desktop_pause_due_bindings(&self, now: i64) -> Result<Vec<serde_json::Value>> {
@@ -5587,6 +5748,53 @@ fn query_active_delivery_attempt_for_cli_session_tx(
     .map_err(Into::into)
 }
 
+fn query_active_desktop_attempts_for_thread_tx(
+    tx: &Transaction<'_>,
+    source_thread_id: &str,
+) -> Result<Vec<DeliveryAttemptRecord>> {
+    let mut stmt = tx.prepare(
+        "SELECT *
+         FROM delivery_attempts
+         WHERE adapter_kind = 'desktop'
+           AND source_thread_id = ?
+           AND state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown')
+         ORDER BY generation DESC, attempt_id DESC",
+    )?;
+    stmt.query_map(params![source_thread_id], delivery_attempt_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn create_desktop_prepared_attempt_tx(
+    tx: &Transaction<'_>,
+    batch: &BatchRecord,
+    now: i64,
+) -> Result<DeliveryAttemptRecord> {
+    let generation = tx.query_row(
+        "SELECT COALESCE(MAX(generation), 0) + 1
+         FROM delivery_attempts
+         WHERE batch_id = ?",
+        params![&batch.batch_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let attempt_id = new_id();
+    tx.execute(
+        "INSERT INTO delivery_attempts (
+            attempt_id, batch_id, source_thread_id, adapter_kind,
+            authorization_mode, state, generation, created_at, updated_at
+        ) VALUES (?, ?, ?, 'desktop', 'strict_safe', 'prepared', ?, ?, ?)",
+        params![
+            &attempt_id,
+            &batch.batch_id,
+            &batch.source_thread_id,
+            generation,
+            now,
+            now,
+        ],
+    )?;
+    query_delivery_attempt_tx(tx, &attempt_id)
+}
+
 fn query_open_manual_head_batch_for_thread_tx(
     tx: &Transaction<'_>,
     source_thread_id: &str,
@@ -6510,6 +6718,197 @@ fn query_desktop_transcript_relay_marker_tx(
     .ok_or_else(|| anyhow!("desktop transcript relay marker not found: {marker}"))
 }
 
+struct DesktopRelayMarkerRequest<'a> {
+    bridge_thread_id: &'a str,
+    envelope_kind: &'a str,
+    source_thread_id: &'a str,
+    attempt_id: &'a str,
+    generation: i64,
+    bridge_request_id: Option<&'a str>,
+    marker_prefix: &'a str,
+}
+
+fn find_issued_desktop_relay_marker_tx(
+    tx: &Transaction<'_>,
+    request: &DesktopRelayMarkerRequest<'_>,
+    now: i64,
+) -> Result<Option<DesktopTranscriptRelayMarkerRecord>> {
+    if let Some(bridge_request_id) = request.bridge_request_id {
+        return tx
+            .query_row(
+                "SELECT *
+                 FROM desktop_transcript_relay_markers
+                 WHERE bridge_thread_id = ?
+                   AND envelope_kind = ?
+                   AND source_thread_id = ?
+                   AND attempt_id = ?
+                   AND generation = ?
+                   AND bridge_request_id = ?
+                   AND marker_state = 'issued'
+                   AND expires_at > ?
+                 ORDER BY issued_at ASC, marker ASC
+                 LIMIT 1",
+                params![
+                    request.bridge_thread_id,
+                    request.envelope_kind,
+                    request.source_thread_id,
+                    request.attempt_id,
+                    request.generation,
+                    bridge_request_id,
+                    now,
+                ],
+                desktop_transcript_relay_marker_from_row,
+            )
+            .optional()
+            .map_err(Into::into);
+    }
+    tx.query_row(
+        "SELECT *
+         FROM desktop_transcript_relay_markers
+         WHERE bridge_thread_id = ?
+           AND envelope_kind = ?
+           AND source_thread_id = ?
+           AND attempt_id = ?
+           AND generation = ?
+           AND marker_state = 'issued'
+           AND expires_at > ?
+         ORDER BY issued_at ASC, marker ASC
+         LIMIT 1",
+        params![
+            request.bridge_thread_id,
+            request.envelope_kind,
+            request.source_thread_id,
+            request.attempt_id,
+            request.generation,
+            now,
+        ],
+        desktop_transcript_relay_marker_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn find_or_issue_desktop_relay_marker_tx(
+    tx: &Transaction<'_>,
+    request: &DesktopRelayMarkerRequest<'_>,
+    now: i64,
+) -> Result<DesktopTranscriptRelayMarkerRecord> {
+    if let Some(marker) = find_issued_desktop_relay_marker_tx(tx, request, now)? {
+        return Ok(marker);
+    }
+    let bridge_request_id = request
+        .bridge_request_id
+        .map(str::to_owned)
+        .unwrap_or_else(new_id);
+    let (expires_at, retention_until) = desktop_relay_marker_deadlines(now)?;
+    insert_desktop_transcript_relay_marker_tx(
+        tx,
+        NewDesktopTranscriptRelayMarker {
+            marker: format!("{}_{}", request.marker_prefix, new_id()),
+            bridge_thread_id: request.bridge_thread_id.to_owned(),
+            envelope_kind: request.envelope_kind.to_owned(),
+            source_thread_id: request.source_thread_id.to_owned(),
+            attempt_id: request.attempt_id.to_owned(),
+            generation: request.generation,
+            bridge_request_id,
+            issued_at: now,
+            expires_at,
+            retention_until,
+        },
+    )
+}
+
+fn desktop_relay_marker_deadlines(now: i64) -> Result<(i64, i64)> {
+    let expires_at = checked_timestamp_add(
+        now,
+        DESKTOP_TRANSCRIPT_RELAY_MARKER_TTL_SECONDS,
+        "desktop_transcript_relay_marker_ttl",
+    )?;
+    let retention_until = checked_timestamp_add(
+        expires_at,
+        DESKTOP_TRANSCRIPT_RELAY_RETENTION_SECONDS,
+        "desktop_transcript_relay_retention",
+    )?;
+    Ok((expires_at, retention_until))
+}
+
+fn insert_desktop_transcript_relay_marker_tx(
+    tx: &Transaction<'_>,
+    marker: NewDesktopTranscriptRelayMarker,
+) -> Result<DesktopTranscriptRelayMarkerRecord> {
+    ensure_nonempty_value("marker", &marker.marker)?;
+    ensure_nonempty_value("bridge_thread_id", &marker.bridge_thread_id)?;
+    ensure_nonempty_value("envelope_kind", &marker.envelope_kind)?;
+    ensure_nonempty_value("source_thread_id", &marker.source_thread_id)?;
+    ensure_nonempty_value("attempt_id", &marker.attempt_id)?;
+    ensure_positive_value("generation", marker.generation)?;
+    ensure_nonempty_value("bridge_request_id", &marker.bridge_request_id)?;
+    if marker.expires_at <= marker.issued_at {
+        bail!("marker expires_at must be after issued_at");
+    }
+    if marker.retention_until <= marker.expires_at {
+        bail!("marker retention_until must be after expires_at");
+    }
+    if marker.envelope_kind != "arm_pending_requested" && marker.envelope_kind != "arm_accepted" {
+        bail!(
+            "unsupported Desktop transcript relay marker kind {}",
+            marker.envelope_kind
+        );
+    }
+    if marker.envelope_kind == "arm_accepted" {
+        let attempt = query_delivery_attempt_tx(tx, &marker.attempt_id)?;
+        ensure_desktop_attempt_tokens(&attempt, &marker.source_thread_id, marker.generation)?;
+        if attempt.state != "arm_pending" {
+            bail!(
+                "delivery attempt {} is not arm_pending for Desktop arm-accepted marker issuance",
+                attempt.attempt_id
+            );
+        }
+        if attempt.bridge_request_id.as_deref() != Some(marker.bridge_request_id.as_str()) {
+            bail!(
+                "delivery attempt {} bridge_request_id does not match marker issuance",
+                attempt.attempt_id
+            );
+        }
+        let lease_deadline = attempt
+            .bridge_arm_lease_deadline
+            .context("arm_pending Desktop attempt is missing bridge_arm_lease_deadline")?;
+        if lease_deadline <= marker.issued_at {
+            bail!(
+                "delivery attempt {} bridge arm lease expired at {} before marker issuance",
+                attempt.attempt_id,
+                lease_deadline
+            );
+        }
+        attempt
+            .bridge_arm_lease_id
+            .as_ref()
+            .context("arm_pending Desktop attempt is missing bridge_arm_lease_id")?;
+    }
+    let marker_id = marker.marker.clone();
+    tx.execute(
+        "INSERT INTO desktop_transcript_relay_markers (
+            marker, bridge_thread_id, envelope_kind,
+            source_thread_id, attempt_id, generation, bridge_request_id,
+            marker_state, issued_at, expires_at, retention_until,
+            consumed_at, rejected_at, rejection_reason, envelope_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', ?, ?, ?, NULL, NULL, NULL, NULL)",
+        params![
+            &marker.marker,
+            &marker.bridge_thread_id,
+            &marker.envelope_kind,
+            &marker.source_thread_id,
+            &marker.attempt_id,
+            marker.generation,
+            &marker.bridge_request_id,
+            marker.issued_at,
+            marker.expires_at,
+            marker.retention_until,
+        ],
+    )?;
+    query_desktop_transcript_relay_marker_tx(tx, &marker_id)
+}
+
 fn desktop_transcript_relay_marker_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<DesktopTranscriptRelayMarkerRecord> {
@@ -6623,6 +7022,16 @@ fn ensure_desktop_binding_bound_for_arm(binding: &DesktopBindingRecord) -> Resul
             binding.binding_state
         )
     }
+}
+
+fn desktop_binding_matches_installation(
+    binding: &DesktopBindingRecord,
+    installation_state: &DesktopInstallationStateRecord,
+) -> bool {
+    binding.binding_state == "bound"
+        && binding.read_transport == installation_state.read_transport
+        && binding.read_transport_generation == installation_state.read_transport_generation
+        && binding.validation_fingerprint == installation_state.validation_fingerprint
 }
 
 fn ensure_desktop_binding_quiesced_for_fresh_arm(binding: &DesktopBindingRecord) -> Result<()> {
