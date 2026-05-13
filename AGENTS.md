@@ -13,6 +13,7 @@
 - Keep unsuffixed `README.md` files as the default `en-GB` entrypoints when a platform expects that name; add `README.zh-CN.md` next to them instead of replacing the default README with a symlink.
 - Use language suffixes for other user-facing Markdown guides, for example `docs/USAGE.en-GB.md` and `docs/USAGE.zh-CN.md`.
 - Keep internal documentation under `docs/design/`, `docs/plans/`, and `docs/validation/` unless it is promoted into the user-facing guide set. Internal design records, plans, validation notes, `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/**` are not required to be bilingual.
+- Use `$cbth-change-checklist` for repo changes that affect user-facing CLI/docs, public output/schema, architecture/design docs, validation docs, or PR delivery checks.
 - This repo is squash-merge-only. Tracked journal docs should describe target-branch state after the PR lands: if the PR completes the workstream, mark the journal `status: completed` before merge and use the PR link as evidence.
 - Keep transient PR states such as "waiting for merge", "not merged yet", or "ready for review" in the PR body/checklist/comments, not tracked docs. If a PR only completes part of a workstream, keep the journal `active` or `blocked` and record the real remaining next steps.
 - If a journal entry is marked as a legacy or verbatim snapshot, preserve copied historical content exactly; add navigational summaries beside it instead of rewriting archived relative links.
