@@ -25,7 +25,7 @@ Release PR 单独 bump `0.2.0`，同步 changelog、README install examples 和 
 - Generation daemon 使用 `run/daemons/<generation>/cbth.sock`，基础 owner 是当前 binary version，也就是 `CARGO_PKG_VERSION`。
 - `daemon ensure` 在 legacy default daemon incompatible 且未显式 `--replace-incompatible` 时启动或复用 generation daemon；legacy daemon 不会被 stop。
 - `--replace-incompatible` 仍表示替换 legacy default daemon，但 default daemon startup recovery 不会扫描 generation-owned tasks。
-- `daemon status --all` 和 `cli app-servers --all-daemons` 枚举 default socket 与 generation socket，供 operator 观察并存状态。
+- `daemon status --all`、`cli app-servers` 和兼容保留的 `cli app-servers --all-daemons` 枚举 default socket 与 generation socket，供 operator 观察并存状态；`cli app-servers --latest-generation` 只检查最新 generation。
 
 ## Recovery Ownership
 
