@@ -1,6 +1,6 @@
 # 使用指南
 
-语言：[English (en-GB)](USAGE.en-GB.md) | [简体中文 (zh-CN)](USAGE.zh-CN.md)
+语言：[British English (en-GB)](USAGE.en-GB.md) | [简体中文 (zh-CN)](USAGE.zh-CN.md)
 
 本文说明 `cbth` CLI 的常规本地 dogfood 流程。它假设你使用专用 macOS 或 Linux 单用户工作站，并且本机 `codex` CLI 已登录。
 

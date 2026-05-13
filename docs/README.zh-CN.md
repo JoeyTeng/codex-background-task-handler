@@ -1,6 +1,6 @@
 # 文档
 
-语言：[English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
+语言：[British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
 本目录包含 user-facing guides、内部设计记录、实现计划、验证记录和项目 tracking 入口。
 

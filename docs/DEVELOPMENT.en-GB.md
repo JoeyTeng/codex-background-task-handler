@@ -1,6 +1,6 @@
 # Development Guide
 
-Languages: [English (en-GB)](DEVELOPMENT.en-GB.md) | [Simplified Chinese (zh-CN)](DEVELOPMENT.zh-CN.md)
+Languages: [English (en-GB)](DEVELOPMENT.en-GB.md) | [简体中文 (zh-CN)](DEVELOPMENT.zh-CN.md)
 
 This guide covers local development and deterministic checks for this repository.
 
