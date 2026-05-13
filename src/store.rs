@@ -3186,6 +3186,7 @@ impl Store {
                AND batches.delivery_requires_network = 0
                AND batches.delivery_requires_write_access = 0
                AND batches.requires_artifact_read = 0
+               AND batches.redelivery_window_ends_at > ?
                AND delivery_attempts.generation = (
                  SELECT MAX(current_attempt.generation)
                  FROM delivery_attempts AS current_attempt
@@ -3194,10 +3195,11 @@ impl Store {
                AND desktop_bindings.binding_state = 'bound'
              ORDER BY delivery_attempts.arm_pending_deadline ASC,
                       delivery_attempts.updated_at ASC,
-                      delivery_attempts.attempt_id ASC",
+                      delivery_attempts.attempt_id ASC
+             LIMIT 1",
         )?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params![now], |row| {
                 let deadline: Option<i64> = row.get(9)?;
                 Ok(serde_json::json!({
                     "source_thread_id": row.get::<_, String>(0)?,
@@ -6005,6 +6007,7 @@ fn note_desktop_arm_pending_tx(
             ensure_desktop_binding_quiesced_for_fresh_arm(&binding)?;
             ensure_no_other_active_attempt_for_thread_tx(tx, source_thread_id, attempt_id)?;
             ensure_attempt_budget_remaining(&batch)?;
+            ensure_batch_redelivery_window_open(&batch, now)?;
             let bridge_arm_lease_id = new_id();
             let bridge_arm_lease_deadline = checked_timestamp_add(
                 now,
@@ -6119,6 +6122,7 @@ fn note_desktop_arm_tx(
         ));
     }
     ensure_attempt_budget_remaining(&batch)?;
+    ensure_batch_redelivery_window_open(&batch, now)?;
     let pause_not_before =
         checked_timestamp_add(now, DESKTOP_PAUSE_NOT_BEFORE_SECONDS, "pause_not_before")?;
     let pause_deadline = checked_timestamp_add(

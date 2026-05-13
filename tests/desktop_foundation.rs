@@ -2932,7 +2932,7 @@ fn desktop_transcript_relay_marker_issue_rejects_arm_accepted_before_pending() {
 }
 
 #[test]
-fn desktop_transcript_relay_scanner_defers_partial_lines_and_rejects_duplicates() {
+fn desktop_transcript_relay_scanner_defers_partial_lines_and_dedupes_retries() {
     let home = temp_home();
     let fixture = cbth(
         &home,
@@ -3167,33 +3167,8 @@ fn desktop_transcript_relay_scanner_defers_partial_lines_and_rejects_duplicates(
         ],
         false,
     );
-    let second = cbth_output(
-        &home,
-        &[
-            "desktop",
-            "relay",
-            "emit-arm-pending",
-            "--source-thread-id",
-            "thread-relay-scanner-duplicate",
-            "--attempt-id",
-            duplicate_attempt,
-            "--generation",
-            "1",
-            "--bridge-request-id",
-            "bridge-request-relay-scanner-duplicate",
-            "--marker",
-            &duplicate_marker,
-            "--json",
-            "--now",
-            "7742",
-        ],
-        false,
-    );
-    let output = format!(
-        "{}{}",
-        String::from_utf8(first.stdout).unwrap(),
-        String::from_utf8(second.stdout).unwrap()
-    );
+    let first_stdout = String::from_utf8(first.stdout).unwrap();
+    let output = format!("{}{}", first_stdout, first_stdout);
     append_function_call_rollout_line(&duplicate_rollout, &output);
     let duplicate_scan = cbth(
         &home,
@@ -3210,13 +3185,13 @@ fn desktop_transcript_relay_scanner_defers_partial_lines_and_rejects_duplicates(
         ],
     );
     let duplicate_scan = &duplicate_scan["desktop_relay_scanner_scan"];
-    assert_eq!(duplicate_scan["consumed_markers"], 0);
-    assert_eq!(duplicate_scan["rejected_markers"], 1);
+    assert_eq!(duplicate_scan["consumed_markers"], 1);
+    assert_eq!(duplicate_scan["rejected_markers"], 0);
     let duplicate_attempt_state = cbth(
         &home,
         &["attempt", "inspect", "--attempt-id", duplicate_attempt],
     );
-    assert_eq!(duplicate_attempt_state["attempt"]["state"], "prepared");
+    assert_eq!(duplicate_attempt_state["attempt"]["state"], "arm_pending");
 }
 
 #[test]
@@ -4564,6 +4539,29 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
         2401,
     );
     force_desktop_attempt_arm_pending(&degraded_home, "attempt-degraded-export", 2402);
+    cbth(
+        &degraded_home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-second-export",
+            "--caller-automation-id",
+            "automation-second-export",
+            "--json",
+            "--now",
+            "2402",
+        ],
+    );
+    create_desktop_batch_and_prepared_attempt(
+        &degraded_home,
+        "thread-second-export",
+        "attempt-second-export",
+        1,
+        2402,
+    );
+    force_desktop_attempt_arm_pending(&degraded_home, "attempt-second-export", 2402);
     let current = cbth(
         &degraded_home,
         &[
@@ -4893,6 +4891,55 @@ fn desktop_writeback_helpers_fail_closed_for_stale_or_unsafe_inputs() {
         active_conflict
             .contains("thread thread-active-conflict already has active delivery attempt")
     );
+
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-expired-ready",
+            "--caller-automation-id",
+            "automation-expired-ready",
+            "--json",
+            "--now",
+            "3007",
+        ],
+    );
+    let expired_batch = create_desktop_batch_and_prepared_attempt(
+        &home,
+        "thread-expired-ready",
+        "attempt-expired-ready",
+        1,
+        3008,
+    );
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE batches SET redelivery_window_ends_at = ? WHERE batch_id = ?",
+        params![3009, expired_batch],
+    )
+    .unwrap();
+    drop(conn);
+    let expired_ready = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-expired-ready",
+            "--attempt-id",
+            "attempt-expired-ready",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-expired-ready",
+            "--json",
+            "--now",
+            "3010",
+        ],
+    );
+    assert!(expired_ready.contains("redelivery window is closed"));
 
     cbth(
         &home,

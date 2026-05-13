@@ -12637,8 +12637,19 @@ fn scan_desktop_relay_binding_once(
         let Some(matches) = trusted.remove(&marker) else {
             continue;
         };
-        if matches.len() != 1 {
-            let reason = format!("duplicate trusted envelopes: {}", matches.len());
+        let entry = if matches.len() == 1 {
+            matches.into_iter().next().expect("single trusted match")
+        } else if matches.first().is_some_and(|first| {
+            matches
+                .iter()
+                .all(|entry| entry.envelope_hash == first.envelope_hash)
+        }) {
+            matches
+                .into_iter()
+                .next()
+                .expect("duplicate trusted matches share an envelope hash")
+        } else {
+            let reason = format!("conflicting duplicate trusted envelopes: {}", matches.len());
             let envelope_hash = matches.first().map(|entry| entry.envelope_hash.as_str());
             let record = store.mark_desktop_transcript_relay_marker_rejected_for_scanner(
                 &marker,
@@ -12653,8 +12664,7 @@ fn scan_desktop_relay_binding_once(
                 "record": record,
             }));
             continue;
-        }
-        let entry = matches.into_iter().next().expect("single trusted match");
+        };
         match consume_desktop_relay_scanner_envelope(store, binding, &marker_record, entry, now) {
             Ok(report) => consumed_reports.push(report),
             Err(error) => {
