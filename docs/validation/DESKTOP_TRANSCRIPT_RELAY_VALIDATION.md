@@ -126,7 +126,7 @@ The daemon scans only while issued markers with active scanner bindings, issued 
 3. In the Desktop heartbeat thread, run the emit command once and ask the agent not to run cleanup or capability repair.
 4. From an operator shell, scan the known rollout path for that marker.
 5. Success requires `auto_decision.trusted=true`, `reason=single_trusted_auto_envelope`, and `counts.trusted_auto=1`.
-6. Record marker, rollout path, carrier, scanner JSON, and thread id in `DESKTOP_LIVE_PREFLIGHT_EVIDENCE.md`.
+6. Record marker, rollout path, carrier, scanner JSON, and thread id in the focused Desktop relay scanner live-validation journal.
 
 An interactive Desktop tool-output probe is useful as a lower-level transport sanity check when heartbeat scheduling cannot be triggered immediately. It proves that a real Desktop thread stores helper stdout in a `response_item.payload.type=function_call_output` carrier and that the scanner accepts that carrier.
 
@@ -134,7 +134,7 @@ The 2026-05-11 heartbeat automation validation used the same helper and proved t
 
 The initial transport validation did not set `writeback_capability=validated`. A later live validation completed the missing consumer step: a real Desktop heartbeat emitted arm-pending and arm envelopes, a non-Desktop consumer applied them through durable CAS, and an operator recorded the result with `installation-state repair`. The local installation now has `writeback_capability=validated`; `artifact_read_capability` remains `unknown`.
 
-The remaining production work is ready materialization, bridge heartbeat arm workflow, caller wake, pause reconcile, continuation-boundary handling, and artifact-read policy. The scanner foundation still needs opt-in live validation in a real heartbeat thread before Desktop automatic delivery can use it end to end.
+The 2026-05-13 production scanner live validation completed the next step: a real Desktop heartbeat emitted production `arm_pending_requested` and `arm_accepted` envelopes into trusted `function_call_output` carriers, and the daemon-owned scanner consumed issued markers from a bound rollout cursor to advance durable state from `prepared` to `arm_pending` to `cooldown`. The remaining production work is ready materialization, bridge heartbeat arm workflow, caller wake, pause reconcile, continuation-boundary handling, and artifact-read policy.
 
 ## Failure Interpretation
 
