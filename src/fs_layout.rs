@@ -45,6 +45,35 @@ impl FsLayout {
         self.home.join("run")
     }
 
+    pub fn service_socket_path(&self) -> PathBuf {
+        self.run_dir().join("plugin-rpc.sock")
+    }
+
+    pub fn plugin_registry_path(&self) -> PathBuf {
+        self.plugins_dir().join("registry.json")
+    }
+
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.home.join("plugins")
+    }
+
+    pub fn plugin_home_dir(&self, plugin_name: &str) -> PathBuf {
+        self.plugins_dir().join(plugin_name)
+    }
+
+    pub fn plugin_state_dir(&self, plugin_name: &str) -> PathBuf {
+        self.plugin_home_dir(plugin_name).join("state")
+    }
+
+    pub fn plugin_logs_dir(&self, plugin_name: &str) -> PathBuf {
+        self.plugin_home_dir(plugin_name).join("logs")
+    }
+
+    pub fn plugin_status_path(&self, plugin_name: &str) -> PathBuf {
+        self.plugin_state_dir(plugin_name)
+            .join("supervisor-status.json")
+    }
+
     pub fn daemon_socket_path(&self) -> PathBuf {
         self.run_dir().join("cbth.sock")
     }
@@ -143,12 +172,22 @@ impl FsLayout {
         ensure_private_dir(&self.home)?;
         ensure_private_dir(&self.artifacts_dir())?;
         ensure_private_dir(&self.tasks_dir())?;
+        ensure_private_dir(&self.plugins_dir())?;
         Ok(())
     }
 
     pub fn ensure_run_dir(&self) -> Result<()> {
         ensure_private_dir(&self.home)?;
         ensure_private_dir(&self.run_dir())
+    }
+
+    pub fn ensure_plugin_home(&self, plugin_name: &str) -> Result<()> {
+        validate_id_path_component(plugin_name, "plugin name")?;
+        ensure_private_dir(&self.home)?;
+        ensure_private_dir(&self.plugins_dir())?;
+        ensure_private_dir(&self.plugin_home_dir(plugin_name))?;
+        ensure_private_dir(&self.plugin_state_dir(plugin_name))?;
+        ensure_private_dir(&self.plugin_logs_dir(plugin_name))
     }
 
     pub fn ensure_daemon_generation_dir(&self, generation_id: &str) -> Result<()> {

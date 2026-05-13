@@ -7,6 +7,7 @@ mod models;
 #[allow(dead_code)]
 mod plugin_rpc;
 mod self_update;
+pub(crate) mod service;
 mod store;
 
 use anyhow::Result;
