@@ -2604,6 +2604,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        reconcile_desktop_transcript_relay_consumed_markers_tx(&tx, now)?;
         let ready_entries = Self::materialize_desktop_ready_entries_tx(
             &tx,
             bridge_thread_id,
@@ -2909,71 +2910,9 @@ impl Store {
         now: i64,
     ) -> Result<usize> {
         let tx = self.conn.transaction()?;
-        let reconciliations = {
-            let mut stmt = tx.prepare(
-                "SELECT desktop_transcript_relay_markers.marker,
-                        desktop_transcript_relay_consumptions.envelope_hash,
-                        desktop_transcript_relay_consumptions.consumed_at,
-                        desktop_transcript_relay_consumptions.outcome_json
-                 FROM desktop_transcript_relay_markers
-                 JOIN desktop_transcript_relay_consumptions
-                   ON desktop_transcript_relay_consumptions.marker =
-                      desktop_transcript_relay_markers.marker
-                 WHERE desktop_transcript_relay_markers.marker_state = 'issued'",
-            )?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut reconciliations = Vec::with_capacity(rows.len());
-            for (marker, envelope_hash, consumed_at, outcome_json) in rows {
-                let outcome: serde_json::Value = serde_json::from_str(&outcome_json)
-                    .context("parse stored relay outcome JSON for marker reconciliation")?;
-                let failed_cas = outcome.get("outcome").and_then(serde_json::Value::as_str)
-                    == Some("cas_failed");
-                let rejection_reason = failed_cas.then(|| {
-                    let error = outcome
-                        .get("error")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("stored CAS failure");
-                    format!("replayed failed CAS: {error}")
-                });
-                reconciliations.push((marker, envelope_hash, consumed_at, rejection_reason));
-            }
-            reconciliations
-        };
-        for (marker, envelope_hash, consumed_at, rejection_reason) in &reconciliations {
-            if let Some(reason) = rejection_reason {
-                tx.execute(
-                    "UPDATE desktop_transcript_relay_markers
-                     SET marker_state = 'rejected',
-                         rejected_at = COALESCE(rejected_at, ?),
-                         rejection_reason = COALESCE(rejection_reason, ?),
-                         envelope_hash = COALESCE(envelope_hash, ?)
-                     WHERE marker = ?
-                       AND marker_state = 'issued'",
-                    params![now, reason, envelope_hash, marker],
-                )?;
-            } else {
-                tx.execute(
-                    "UPDATE desktop_transcript_relay_markers
-                     SET marker_state = 'consumed',
-                         consumed_at = COALESCE(consumed_at, ?),
-                         envelope_hash = COALESCE(envelope_hash, ?)
-                     WHERE marker = ?
-                       AND marker_state = 'issued'",
-                    params![consumed_at, envelope_hash, marker],
-                )?;
-            }
-        }
+        let reconciliations = reconcile_desktop_transcript_relay_consumed_markers_tx(&tx, now)?;
         tx.commit()?;
-        Ok(reconciliations.len())
+        Ok(reconciliations)
     }
 
     pub fn expire_desktop_transcript_relay_markers(&mut self, now: i64) -> Result<usize> {
@@ -5741,6 +5680,76 @@ fn insert_desktop_transcript_relay_consumption_tx(
         ],
     )?;
     Ok(())
+}
+
+fn reconcile_desktop_transcript_relay_consumed_markers_tx(
+    tx: &Transaction<'_>,
+    now: i64,
+) -> Result<usize> {
+    let reconciliations = {
+        let mut stmt = tx.prepare(
+            "SELECT desktop_transcript_relay_markers.marker,
+                    desktop_transcript_relay_consumptions.envelope_hash,
+                    desktop_transcript_relay_consumptions.consumed_at,
+                    desktop_transcript_relay_consumptions.outcome_json
+             FROM desktop_transcript_relay_markers
+             JOIN desktop_transcript_relay_consumptions
+               ON desktop_transcript_relay_consumptions.marker =
+                  desktop_transcript_relay_markers.marker
+             WHERE desktop_transcript_relay_markers.marker_state = 'issued'",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut reconciliations = Vec::with_capacity(rows.len());
+        for (marker, envelope_hash, consumed_at, outcome_json) in rows {
+            let outcome: serde_json::Value = serde_json::from_str(&outcome_json)
+                .context("parse stored relay outcome JSON for marker reconciliation")?;
+            let failed_cas =
+                outcome.get("outcome").and_then(serde_json::Value::as_str) == Some("cas_failed");
+            let rejection_reason = failed_cas.then(|| {
+                let error = outcome
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("stored CAS failure");
+                format!("replayed failed CAS: {error}")
+            });
+            reconciliations.push((marker, envelope_hash, consumed_at, rejection_reason));
+        }
+        reconciliations
+    };
+    for (marker, envelope_hash, consumed_at, rejection_reason) in &reconciliations {
+        if let Some(reason) = rejection_reason {
+            tx.execute(
+                "UPDATE desktop_transcript_relay_markers
+                 SET marker_state = 'rejected',
+                     rejected_at = COALESCE(rejected_at, ?),
+                     rejection_reason = COALESCE(rejection_reason, ?),
+                     envelope_hash = COALESCE(envelope_hash, ?)
+                 WHERE marker = ?
+                   AND marker_state = 'issued'",
+                params![now, reason, envelope_hash, marker],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE desktop_transcript_relay_markers
+                 SET marker_state = 'consumed',
+                     consumed_at = COALESCE(consumed_at, ?),
+                     envelope_hash = COALESCE(envelope_hash, ?)
+                 WHERE marker = ?
+                   AND marker_state = 'issued'",
+                params![consumed_at, envelope_hash, marker],
+            )?;
+        }
+    }
+    Ok(reconciliations.len())
 }
 
 enum DesktopTranscriptRelayConsumeTxResult {

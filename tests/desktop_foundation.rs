@@ -104,6 +104,19 @@ fn read_json_file(path: &str) -> Value {
         .unwrap_or_else(|error| panic!("parse {path}: {error}"))
 }
 
+fn marker_state(home: &TempDir, marker: &str) -> String {
+    Connection::open(home.path().join("cbth.sqlite3"))
+        .expect("open db")
+        .query_row(
+            "SELECT marker_state
+             FROM desktop_transcript_relay_markers
+             WHERE marker = ?",
+            params![marker],
+            |row| row.get(0),
+        )
+        .expect("query marker state")
+}
+
 fn write_json_file(path: &str, value: &Value) {
     let bytes = serde_json::to_vec_pretty(value).expect("serialize json");
     fs::write(path, bytes).unwrap_or_else(|error| panic!("write {path}: {error}"));
@@ -1816,6 +1829,127 @@ fn desktop_ready_markers_drive_scanner_to_cooldown() {
     assert_eq!(
         repeated_batch["batch"]["batch"]["delivery_attempt_count"],
         1
+    );
+}
+
+#[test]
+fn desktop_bridge_preflight_reconciles_manual_consumed_pending_marker() {
+    let home = temp_home();
+    repair_validated_desktop_installation_and_binding(
+        &home,
+        "thread-ready-manual-consume",
+        "automation-ready-manual-consume",
+        3440,
+    );
+    create_desktop_batch(&home, "thread-ready-manual-consume");
+
+    let ready_preflight = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-manual-consume",
+            "--json",
+            "--now",
+            "3441",
+        ],
+    );
+    let ready_path =
+        ready_preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
+            .as_str()
+            .unwrap();
+    let ready = read_json_file(ready_path);
+    let ready_entry = &ready["ready_threads"]["entries"][0];
+    let attempt_id = ready_entry["attempt_id"].as_str().unwrap();
+    let generation = ready_entry["generation"].as_i64().unwrap().to_string();
+    let bridge_request_id = ready_entry["bridge_request_id"].as_str().unwrap();
+    let pending_marker = ready_entry["arm_pending_marker"].as_str().unwrap();
+
+    let pending_emit = cbth_output(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "emit-arm-pending",
+            "--source-thread-id",
+            "thread-ready-manual-consume",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            &generation,
+            "--bridge-request-id",
+            bridge_request_id,
+            "--marker",
+            pending_marker,
+            "--json",
+            "--now",
+            "3442",
+        ],
+        false,
+    );
+    assert!(pending_emit.status.success());
+    let pending_rollout = home.path().join("manual-consume-pending-rollout.jsonl");
+    write_function_call_rollout(
+        &pending_rollout,
+        &String::from_utf8(pending_emit.stdout).unwrap(),
+    );
+    let pending = cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "consume-transcript",
+            "--rollout-path",
+            pending_rollout.to_str().unwrap(),
+            "--marker",
+            pending_marker,
+            "--json",
+            "--now",
+            "3443",
+        ],
+    );
+    assert_eq!(
+        pending["desktop_transcript_relay_consumption"]["record"]["outcome"]["outcome"],
+        "arm_pending"
+    );
+    assert_eq!(
+        marker_state(&home, pending_marker),
+        "issued",
+        "manual consume writes the replay fence before marker reconciliation"
+    );
+
+    let arm_preflight = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-manual-consume",
+            "--json",
+            "--now",
+            "3444",
+        ],
+    );
+    assert_eq!(
+        arm_preflight["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["count"],
+        1
+    );
+    assert_eq!(marker_state(&home, pending_marker), "consumed");
+    let arm_path =
+        arm_preflight["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["path"]
+            .as_str()
+            .unwrap();
+    let arm_pending = read_json_file(arm_path);
+    let arm_entry = &arm_pending["arm_pending_bindings"]["entries"][0];
+    assert_eq!(arm_entry["attempt_id"], attempt_id);
+    assert!(
+        arm_entry["arm_accepted_marker"]
+            .as_str()
+            .unwrap()
+            .starts_with("CBTH_DESKTOP_RELAY_ARM_ACCEPTED_")
     );
 }
 
