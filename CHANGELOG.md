@@ -2,6 +2,21 @@
 
 All notable release changes for `cbth` are documented here.
 
+## v0.2.1 - 2026-05-13
+
+### Added
+
+- Added Desktop transcript relay production scanner support, including explicit rollout binding, marker issuance, daemon-owned bounded cursor scanning, and replay/marker retention cleanup.
+- Added live Desktop relay scanner validation evidence for the real heartbeat carrier path.
+- Added best-effort loaded non-bound Codex session diagnostics to `cbth cli app-servers` JSON output and `--human` / `-H` summaries.
+- Added host-level plugin runtime / generic delivery design documentation.
+- Added retry support and coverage for the Codex review gate acknowledgement path.
+
+### Changed
+
+- Reorganised user-facing documentation into paired `en-GB` and `zh-CN` guides with language-switcher labels.
+- Updated operator recovery and usage docs to clarify that loaded non-bound session diagnostics do not retarget delivery.
+
 ## v0.2.0 - 2026-05-12
 
 ### Added
