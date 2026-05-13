@@ -21,6 +21,7 @@ import {
   markerAckTimeoutSecondsForHistory,
   markerFromComment,
   NonJsonResponseError,
+  normalizeMarkerAckTimeoutSeconds,
   parseJsonResponseText,
   parseStateCommentBody,
   reconcileStateWithMarkerComment,
@@ -143,6 +144,34 @@ test("resets marker ack backoff after a different head or non-missed marker", ()
       1800,
     ),
     300,
+  );
+});
+
+test("caps default marker ack timeouts to shorter marker result timeout", () => {
+  assert.deepEqual(
+    normalizeMarkerAckTimeoutSeconds({
+      markerTimeoutSeconds: 120,
+      markerAckTimeoutSeconds: 300,
+      markerAckTimeoutMaxSeconds: 1800,
+    }),
+    {
+      markerAckTimeoutSeconds: 120,
+      markerAckTimeoutMaxSeconds: 120,
+    },
+  );
+});
+
+test("keeps marker ack timeouts when they already fit within marker result timeout", () => {
+  assert.deepEqual(
+    normalizeMarkerAckTimeoutSeconds({
+      markerTimeoutSeconds: 3600,
+      markerAckTimeoutSeconds: 300,
+      markerAckTimeoutMaxSeconds: 1800,
+    }),
+    {
+      markerAckTimeoutSeconds: 300,
+      markerAckTimeoutMaxSeconds: 1800,
+    },
   );
 });
 

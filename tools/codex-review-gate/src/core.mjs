@@ -222,6 +222,18 @@ export function markerAckTimeoutSecondsForHistory(history, headSha, baseSeconds,
   return timeoutSeconds;
 }
 
+export function normalizeMarkerAckTimeoutSeconds({
+  markerTimeoutSeconds,
+  markerAckTimeoutSeconds,
+  markerAckTimeoutMaxSeconds,
+}) {
+  const effectiveMaxSeconds = Math.min(markerAckTimeoutMaxSeconds, markerTimeoutSeconds);
+  return {
+    markerAckTimeoutSeconds: Math.min(markerAckTimeoutSeconds, effectiveMaxSeconds),
+    markerAckTimeoutMaxSeconds: effectiveMaxSeconds,
+  };
+}
+
 export function activeMarkerAckTimedOut(activeMarker, nowMs, fallbackAckTimeoutSeconds) {
   if (!activeMarker || activeMarker.state !== "waiting_ack") {
     return false;

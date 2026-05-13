@@ -79,7 +79,7 @@ The gate separates "Codex did not acknowledge the marker" from "Codex acknowledg
 
 While a marker is still `waiting_ack`, the runner waits only for the marker's ack timeout. The default first timeout is 300 seconds. If no new Codex `eyes`, `+1`, or top-level completion comment appears in that window, the marker is closed as `missed_ack`, the latest visible Codex signals are recorded, and the runner immediately creates a fresh marker.
 
-Consecutive `missed_ack` outcomes on the same head use exponential backoff to avoid comment spam: 300 seconds, 600 seconds, 1200 seconds, then a default cap of 1800 seconds. A head change or any non-`missed_ack` marker outcome resets this ack backoff.
+Consecutive `missed_ack` outcomes on the same head use exponential backoff to avoid comment spam: 300 seconds, 600 seconds, 1200 seconds, then a default cap of 1800 seconds. The effective ack timeout and cap are also capped by the marker result timeout, so existing workflows with shorter `marker-timeout-seconds` continue to use their shorter wait window. A head change or any non-`missed_ack` marker outcome resets this ack backoff.
 
 Once Codex posts `eyes`, the marker moves to `waiting_result` and the fast ack retry no longer applies. That path uses the longer marker result timeout.
 

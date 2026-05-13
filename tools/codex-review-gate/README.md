@@ -17,7 +17,7 @@ The checked-in runner implements a reaction-driven serialized marker flow:
 - Treats PR-open automatic review output as first-round baseline only.
 - Serializes controlled `@codex review` marker comments.
 - Treats Codex `eyes` reactions as liveness only.
-- Retries unacknowledged markers after a 300 second ack timeout with exponential backoff capped at 1800 seconds.
+- Retries unacknowledged markers after a 300 second ack timeout with exponential backoff capped at 1800 seconds and by the marker result timeout.
 - Passes only after a new Codex PR-body `+1` reaction identity or Codex top-level completion comment appears after the active marker baseline and the current head has no Codex findings.
 - Keeps unchanged old `+1` reactions pending or stalled instead of reusing them.
 
@@ -62,4 +62,4 @@ Do not require `codex/review-gate` before the workflow exists on the protected d
 - For the cleanest signal, disable Codex automatic review-on-push and let the gate marker comment trigger the current-head review.
 - The runner uses REST pull request comments plus GraphQL `reviewThreads` metadata to avoid treating resolved or outdated Codex inline threads as current findings.
 - Review-body findings do not have resolvable review threads, so the runner matches them by `PullRequestReview.commit_id` and current-head blob links.
-- Default timeouts are currently 2 hours overall, 5 minutes for first marker ack, 30 minutes maximum ack backoff, 1 hour per marker result, and 60 seconds bootstrap grace.
+- Default timeouts are currently 2 hours overall, 5 minutes for first marker ack, 30 minutes maximum ack backoff capped by the marker result timeout, 1 hour per marker result, and 60 seconds bootstrap grace.

@@ -24,6 +24,7 @@ import {
   markerAckTimeoutSecondsForHistory,
   markerFromComment,
   normalizeState,
+  normalizeMarkerAckTimeoutSeconds,
   parseLoginSet,
   parseJsonResponseText,
   parseStateCommentBody,
@@ -525,21 +526,13 @@ function readConfig() {
   const apiUrl = stripTrailingSlash(process.env.GITHUB_API_URL || "https://api.github.com");
   const serverUrl = stripTrailingSlash(process.env.GITHUB_SERVER_URL || "https://github.com");
   const markerTimeoutSeconds = secondsEnv("MARKER_TIMEOUT_SECONDS", 3600, { allowZero: false });
-  const markerAckTimeoutSeconds = secondsEnv("MARKER_ACK_TIMEOUT_SECONDS", 300, { allowZero: false });
-  const markerAckTimeoutMaxSeconds = secondsEnv("MARKER_ACK_TIMEOUT_MAX_SECONDS", 1800, {
-    allowZero: false,
+  const markerAckTimeoutConfig = normalizeMarkerAckTimeoutSeconds({
+    markerTimeoutSeconds,
+    markerAckTimeoutSeconds: secondsEnv("MARKER_ACK_TIMEOUT_SECONDS", 300, { allowZero: false }),
+    markerAckTimeoutMaxSeconds: secondsEnv("MARKER_ACK_TIMEOUT_MAX_SECONDS", 1800, {
+      allowZero: false,
+    }),
   });
-
-  if (markerAckTimeoutSeconds > markerAckTimeoutMaxSeconds) {
-    throw new Error(
-      "MARKER_ACK_TIMEOUT_SECONDS must be less than or equal to MARKER_ACK_TIMEOUT_MAX_SECONDS",
-    );
-  }
-  if (markerAckTimeoutMaxSeconds > markerTimeoutSeconds) {
-    throw new Error(
-      "MARKER_ACK_TIMEOUT_MAX_SECONDS must be less than or equal to MARKER_TIMEOUT_SECONDS",
-    );
-  }
 
   return {
     token,
@@ -553,8 +546,8 @@ function readConfig() {
     runAttempt: process.env.GITHUB_RUN_ATTEMPT || "1",
     maxWaitMs: secondsEnv("MAX_WAIT_SECONDS", 7200, { allowZero: false }) * 1000,
     markerTimeoutMs: markerTimeoutSeconds * 1000,
-    markerAckTimeoutSeconds,
-    markerAckTimeoutMaxSeconds,
+    markerAckTimeoutSeconds: markerAckTimeoutConfig.markerAckTimeoutSeconds,
+    markerAckTimeoutMaxSeconds: markerAckTimeoutConfig.markerAckTimeoutMaxSeconds,
     pollIntervalMs: secondsEnv("POLL_INTERVAL_SECONDS", 30, { allowZero: false }) * 1000,
     bootstrapGraceSeconds: secondsEnv("BOOTSTRAP_GRACE_SECONDS", 60, { allowZero: true }),
     codexBotLogins: parseLoginSet(process.env.CODEX_BOT_LOGINS || "", DEFAULT_CODEX_BOT_LOGINS),
