@@ -1,0 +1,4 @@
+interface:
+  display_name: "CBTH Change Checklist"
+  short_description: "Repo-specific change closeout checklist"
+  default_prompt: "Use $cbth-change-checklist to classify this cbth repo change and identify required docs, help, tests, validation, and PR checks."

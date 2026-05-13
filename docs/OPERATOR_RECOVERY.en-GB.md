@@ -1,6 +1,6 @@
 # Operator Recovery
 
-Languages: [English (en-GB)](OPERATOR_RECOVERY.en-GB.md) | [Simplified Chinese (zh-CN)](OPERATOR_RECOVERY.zh-CN.md)
+Languages: [English (en-GB)](OPERATOR_RECOVERY.en-GB.md) | [简体中文 (zh-CN)](OPERATOR_RECOVERY.zh-CN.md)
 
 This guide covers manual recovery for CLI dogfood v1. It assumes a macOS or Linux single-user workstation and a trusted local `CBTH_HOME` or `~/.cbth`.
 

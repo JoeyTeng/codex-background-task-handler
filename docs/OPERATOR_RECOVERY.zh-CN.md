@@ -1,6 +1,6 @@
 # 操作恢复
 
-语言：[English (en-GB)](OPERATOR_RECOVERY.en-GB.md) | [简体中文 (zh-CN)](OPERATOR_RECOVERY.zh-CN.md)
+语言：[British English (en-GB)](OPERATOR_RECOVERY.en-GB.md) | [简体中文 (zh-CN)](OPERATOR_RECOVERY.zh-CN.md)
 
 本文说明 CLI dogfood v1 的手动恢复流程。它假设你使用 macOS 或 Linux 单用户工作站，并且本地 `CBTH_HOME` 或 `~/.cbth` 可信。
 

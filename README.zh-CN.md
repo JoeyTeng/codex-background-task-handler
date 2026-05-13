@@ -1,6 +1,6 @@
 # codex-background-task-handler
 
-语言：[English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
+语言：[British English (en-GB)](README.md) | [简体中文 (zh-CN)](README.zh-CN.md)
 
 `codex-background-task-handler` 提供 `cbth` companion CLI，用于在不修改上游 `codex` 仓库的前提下，让 Codex 周边的长时间后台工作更可控。它是一个本地、同用户的辅助工具，可以启动受管理的 Codex CLI session、托管长时间运行的 shell task，并在本地安全检查允许时把 task 结果投递回绑定的 Codex thread。
 

@@ -1,6 +1,6 @@
 # Usage Guide
 
-Languages: [English (en-GB)](USAGE.en-GB.md) | [Simplified Chinese (zh-CN)](USAGE.zh-CN.md)
+Languages: [English (en-GB)](USAGE.en-GB.md) | [简体中文 (zh-CN)](USAGE.zh-CN.md)
 
 This guide covers the normal `cbth` CLI workflow for local dogfooding. It assumes a dedicated macOS or Linux single-user workstation with a working `codex` CLI login.
 
