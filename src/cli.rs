@@ -1,3 +1,4 @@
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{CStr, OsStr, OsString};
@@ -1294,7 +1295,7 @@ enum CliCommand {
     #[command(
         name = "app-servers",
         about = "List running daemon-owned Codex app-servers",
-        long_about = "List running daemon-owned Codex app-servers without starting a daemon. JSON output is intended for tools; --human/-H prints a compact operator summary with the websocket URL, Codex session id, cwd, title, and local start time."
+        long_about = "List running daemon-owned Codex app-servers across known daemon generations without starting a daemon. Newer generations are shown first. JSON output is intended for tools; --human/-H prints a compact operator summary with the websocket URL, Codex session id, cwd, title, and local start time. Use --latest-generation to inspect only the newest known generation, or the default daemon when no generation exists."
     )]
     AppServers(CliAppServersArgs),
     #[command(about = "Inspect and recover managed CLI sessions")]
@@ -1323,8 +1324,19 @@ struct CliAppServersArgs {
     )]
     human: bool,
 
-    #[arg(long, help = "Inspect all known daemon endpoints")]
+    #[arg(
+        long,
+        help = "Inspect all known daemon endpoints (default compatibility alias)",
+        conflicts_with = "latest_generation"
+    )]
     all_daemons: bool,
+
+    #[arg(
+        long,
+        help = "Inspect only the newest known daemon generation, or the default daemon when none exists",
+        conflicts_with = "all_daemons"
+    )]
+    latest_generation: bool,
 }
 
 impl CliAppServersArgs {
@@ -1334,6 +1346,10 @@ impl CliAppServersArgs {
         } else {
             self.format
         }
+    }
+
+    fn latest_generation_only(&self) -> bool {
+        self.latest_generation
     }
 }
 
@@ -2377,7 +2393,7 @@ pub fn run() -> Result<()> {
         Commands::Cli {
             command: CliCommand::AppServers(args),
         } if args.effective_format() == OutputFormat::Human => {
-            let report = collect_cli_app_servers(&layout, args.all_daemons);
+            let report = collect_cli_app_servers(&layout, args.latest_generation_only());
             write_cli_app_servers_human(&report)?;
             return Ok(());
         }
@@ -3177,6 +3193,7 @@ struct CliAppServersDaemonSummary {
 
 #[derive(Debug, Serialize)]
 struct CliAppServersDaemonReport {
+    socket_path: String,
     daemon: Option<CliAppServersDaemonSummary>,
     cli_app_servers: Vec<CliAppServerSummary>,
     error: Option<String>,
@@ -3207,21 +3224,27 @@ struct CliAppServerThreadInfo {
     error: Option<String>,
 }
 
-fn collect_cli_app_servers(layout: &FsLayout, all_daemons: bool) -> CliAppServersReport {
-    if all_daemons {
-        return collect_cli_app_servers_all_daemons(layout);
+fn collect_cli_app_servers(layout: &FsLayout, latest_generation_only: bool) -> CliAppServersReport {
+    if latest_generation_only {
+        let endpoint = latest_cli_app_server_endpoint(layout);
+        return collect_cli_app_servers_for_endpoint(layout, &endpoint);
     }
-    let endpoint = DaemonEndpoint::default(layout);
-    collect_cli_app_servers_for_endpoint(layout, &endpoint)
+    collect_cli_app_servers_all_generations(layout)
 }
 
-fn collect_cli_app_servers_all_daemons(layout: &FsLayout) -> CliAppServersReport {
+fn collect_cli_app_servers_all_generations(layout: &FsLayout) -> CliAppServersReport {
+    let endpoints = known_cli_app_server_endpoints(layout);
+    if endpoints.len() == 1 && endpoints[0].socket_path() == layout.daemon_socket_path() {
+        return collect_cli_app_servers_for_endpoint(layout, &endpoints[0]);
+    }
+
     let mut reports = Vec::new();
     let mut all_servers = Vec::new();
-    for endpoint in known_daemon_endpoints(layout) {
+    for endpoint in endpoints {
         let report = collect_cli_app_servers_for_endpoint(layout, &endpoint);
         all_servers.extend(report.cli_app_servers.clone());
         reports.push(CliAppServersDaemonReport {
+            socket_path: endpoint.socket_path().display().to_string(),
             daemon: report.daemon,
             cli_app_servers: report.cli_app_servers,
             error: report.daemon_error,
@@ -3280,6 +3303,64 @@ fn collect_cli_app_servers_for_endpoint(
         daemons: Vec::new(),
         daemon_error: None,
     }
+}
+
+fn latest_cli_app_server_endpoint(layout: &FsLayout) -> DaemonEndpoint {
+    generation_socket_paths_newest_first(layout)
+        .into_iter()
+        .next()
+        .map(DaemonEndpoint::from_socket_path)
+        .unwrap_or_else(|| DaemonEndpoint::default(layout))
+}
+
+fn known_cli_app_server_endpoints(layout: &FsLayout) -> Vec<DaemonEndpoint> {
+    let mut endpoints = generation_socket_paths_newest_first(layout)
+        .into_iter()
+        .map(DaemonEndpoint::from_socket_path)
+        .collect::<Vec<_>>();
+    let default_endpoint = DaemonEndpoint::default(layout);
+    if default_endpoint.socket_path().exists() || endpoints.is_empty() {
+        endpoints.push(default_endpoint);
+    }
+    endpoints
+}
+
+fn generation_socket_paths_newest_first(layout: &FsLayout) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(layout.daemon_generations_dir()) else {
+        return Vec::new();
+    };
+    let mut generation_sockets = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("cbth.sock"))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    generation_sockets
+        .sort_by(|left, right| compare_generation_socket_paths_newest_first(left, right));
+    generation_sockets
+}
+
+fn compare_generation_socket_paths_newest_first(left: &Path, right: &Path) -> CmpOrdering {
+    let left_name = generation_name_from_socket_path(left);
+    let right_name = generation_name_from_socket_path(right);
+    match (
+        Version::parse(left_name.as_ref()),
+        Version::parse(right_name.as_ref()),
+    ) {
+        (Ok(left_version), Ok(right_version)) => right_version
+            .cmp(&left_version)
+            .then_with(|| right_name.cmp(&left_name)),
+        (Ok(_), Err(_)) => CmpOrdering::Less,
+        (Err(_), Ok(_)) => CmpOrdering::Greater,
+        (Err(_), Err(_)) => right_name.cmp(&left_name),
+    }
+}
+
+fn generation_name_from_socket_path(path: &Path) -> String {
+    path.parent()
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn known_daemon_endpoints(layout: &FsLayout) -> Vec<DaemonEndpoint> {
@@ -3475,7 +3556,10 @@ fn write_cli_app_servers_human(report: &CliAppServersReport) -> Result<()> {
                 writeln!(
                     out,
                     "Daemon {}",
-                    daemon.socket_path.as_deref().unwrap_or("<unknown socket>")
+                    daemon
+                        .socket_path
+                        .as_deref()
+                        .unwrap_or(daemon_report.socket_path.as_str())
                 )?;
                 if let Some(pid) = daemon.pid {
                     writeln!(out, "  pid: {pid}")?;
@@ -3499,18 +3583,33 @@ fn write_cli_app_servers_human(report: &CliAppServersReport) -> Result<()> {
             for server in &daemon_report.cli_app_servers {
                 writeln!(
                     out,
-                    "  app-server {} ({}) pid={} lease={}s",
-                    server.codex_session_id,
-                    server.ws_url,
-                    server.pid,
-                    server.lease_seconds_remaining
+                    "  app-server pid={} lease={}s",
+                    server.pid, server.lease_seconds_remaining
                 )?;
+                writeln!(out, "    codex session: {}", server.codex_session_id)?;
+                writeln!(out, "    managed session: {}", server.managed_session_id)?;
+                writeln!(out, "    epoch: {}", server.session_epoch)?;
+                writeln!(out, "    ws: {}", server.ws_url)?;
+                writeln!(
+                    out,
+                    "    title: {}",
+                    server.title.as_deref().unwrap_or("<unknown title>")
+                )?;
+                writeln!(
+                    out,
+                    "    cwd: {}",
+                    server.cwd.as_deref().unwrap_or("<unknown>")
+                )?;
+                writeln!(out, "    started: {}", server.started_at_local)?;
                 if let Some(loaded) = &server.loaded_non_bound_codex_sessions {
                     writeln!(
                         out,
                         "    loaded non-bound codex sessions: {}",
                         loaded.join(", ")
                     )?;
+                }
+                if let Some(error) = &server.thread_info_error {
+                    writeln!(out, "    thread info: unavailable ({error})")?;
                 }
             }
         }
@@ -10876,7 +10975,10 @@ fn dispatch_audit(command: AuditCommand, layout: &FsLayout) -> Result<Value> {
 
 fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
     if let CliCommand::AppServers(args) = &command {
-        return Ok(json!(collect_cli_app_servers(layout, args.all_daemons)));
+        return Ok(json!(collect_cli_app_servers(
+            layout,
+            args.latest_generation_only()
+        )));
     }
     let mut store = if cli_command_uses_lifecycle_store_timeout(&command) {
         Store::open_for_daemon_lifecycle(layout)?
@@ -13826,6 +13928,48 @@ mod tests {
         let updated =
             follow_cli_app_server_handoff_endpoint(&endpoint, &response).expect("stop redirect");
         assert_eq!(updated.socket_path(), Path::new("/tmp/newer-cbth.sock"));
+    }
+
+    #[test]
+    fn cli_app_server_endpoints_put_newest_generation_first() {
+        let home = tempfile::tempdir().expect("temp cbth home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        fs::create_dir_all(layout.run_dir()).expect("create run dir");
+        fs::File::create(layout.daemon_socket_path()).expect("create default socket marker");
+        for generation in ["0.1.0", "0.10.0", "0.2.0", "dev"] {
+            let generation_dir = layout.daemon_generation_dir(generation);
+            fs::create_dir_all(&generation_dir).expect("create generation dir");
+            fs::File::create(generation_dir.join("cbth.sock"))
+                .expect("create generation socket marker");
+        }
+
+        let endpoints = known_cli_app_server_endpoints(&layout);
+        let relative_paths = endpoints
+            .iter()
+            .map(|endpoint| {
+                endpoint
+                    .socket_path()
+                    .strip_prefix(home.path())
+                    .expect("endpoint under home")
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            relative_paths,
+            vec![
+                "run/daemons/0.10.0/cbth.sock",
+                "run/daemons/0.2.0/cbth.sock",
+                "run/daemons/0.1.0/cbth.sock",
+                "run/daemons/dev/cbth.sock",
+                "run/cbth.sock",
+            ]
+        );
+        assert_eq!(
+            latest_cli_app_server_endpoint(&layout).socket_path(),
+            layout.daemon_generation_socket_path("0.10.0")
+        );
     }
 
     #[cfg(unix)]

@@ -784,15 +784,39 @@ fn daemon_ensure_coexists_with_incompatible_default_without_stop() {
         }),
         "generation daemon endpoint should be visible in status --all: {all_status}"
     );
-    let app_servers = cbth(&home, &["cli", "app-servers", "--all-daemons"]);
+    let app_servers = cbth(&home, &["cli", "app-servers"]);
     let app_server_daemons = app_servers["daemons"]
         .as_array()
         .expect("app-server daemon reports");
     assert!(
         app_server_daemons.len() >= 2,
-        "app-servers --all-daemons should include both endpoints: {app_servers}"
+        "app-servers should include all known daemon endpoints by default: {app_servers}"
+    );
+    assert_eq!(
+        app_server_daemons[0]["socket_path"],
+        generation_socket_path.display().to_string(),
+        "newest generation daemon should be listed first: {app_servers}"
+    );
+    assert_eq!(
+        app_server_daemons[app_server_daemons.len() - 1]["socket_path"],
+        socket_path.display().to_string(),
+        "legacy default daemon should be listed last: {app_servers}"
     );
     assert_eq!(app_servers["cli_app_servers"], json!([]));
+
+    let latest_app_servers = cbth(&home, &["cli", "app-servers", "--latest-generation"]);
+    assert!(
+        latest_app_servers["daemons"]
+            .as_array()
+            .expect("latest-generation daemon reports")
+            .is_empty(),
+        "latest-generation should use the single-endpoint report shape: {latest_app_servers}"
+    );
+    assert_eq!(
+        latest_app_servers["daemon"]["socket_path"],
+        generation_socket_path.display().to_string(),
+        "latest-generation should inspect the newest generation socket: {latest_app_servers}"
+    );
 
     done_tx.send(()).expect("signal old daemon");
     handle.join().expect("old daemon thread");

@@ -2818,6 +2818,16 @@ fn cli_app_servers_lists_running_managed_app_server_as_json_and_human() {
         serde_json::from_slice(&json_output.stdout).expect("app-servers json");
     let servers = json["cli_app_servers"].as_array().expect("servers array");
     assert_eq!(servers.len(), 1, "unexpected app-server list: {json}");
+    assert!(
+        json["daemon"].is_object(),
+        "default-only app-servers should keep the single-endpoint daemon field: {json}"
+    );
+    let daemons = json["daemons"].as_array().expect("daemons array");
+    assert_eq!(
+        daemons.len(),
+        0,
+        "default-only app-servers should not switch to grouped generations: {json}"
+    );
     let server = &servers[0];
     assert_eq!(server["codex_session_id"], thread_id);
     assert_eq!(server["ws_url"], app_server_url);
@@ -2854,12 +2864,67 @@ fn cli_app_servers_lists_running_managed_app_server_as_json_and_human() {
         String::from_utf8_lossy(&human_output.stderr)
     );
     let human = String::from_utf8_lossy(&human_output.stdout);
+    assert!(human.contains("1 managed CLI app-server"));
+    assert!(!human.contains("daemon endpoint"));
+    assert!(human.contains("codex session:"));
+    assert!(human.contains("ws:"));
     assert!(human.contains(thread_title));
     assert!(human.contains(thread_id));
     assert!(human.contains(&app_server_url));
     assert!(human.contains(thread_cwd));
     assert!(human.contains("started:"));
     assert!(!human.contains("loaded non-bound codex sessions:"));
+
+    let latest_human_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("app-servers")
+        .arg("--latest-generation")
+        .arg("--human")
+        .output()
+        .expect("run latest app-servers human");
+    assert!(
+        latest_human_output.status.success(),
+        "latest app-servers human failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&latest_human_output.stdout),
+        String::from_utf8_lossy(&latest_human_output.stderr)
+    );
+    let latest_human = String::from_utf8_lossy(&latest_human_output.stdout);
+    assert!(latest_human.contains("1 managed CLI app-server"));
+    assert!(!latest_human.contains("daemon endpoint"));
+    assert!(latest_human.contains(thread_title));
+    assert!(latest_human.contains(thread_id));
+    assert!(latest_human.contains(&app_server_url));
+
+    let latest_json_output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("cli")
+        .arg("app-servers")
+        .arg("--latest-generation")
+        .output()
+        .expect("run latest app-servers json");
+    assert!(
+        latest_json_output.status.success(),
+        "latest app-servers json failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&latest_json_output.stdout),
+        String::from_utf8_lossy(&latest_json_output.stderr)
+    );
+    let latest_json: serde_json::Value =
+        serde_json::from_slice(&latest_json_output.stdout).expect("latest app-servers json");
+    assert!(
+        latest_json["daemon"].is_object(),
+        "latest-generation should fall back to the default daemon when no generations exist: {latest_json}"
+    );
+    assert_eq!(
+        latest_json["daemons"]
+            .as_array()
+            .expect("latest daemons array")
+            .len(),
+        0,
+        "latest-generation fallback should keep the single-endpoint shape: {latest_json}"
+    );
 
     let output = wait_with_timeout(child, Duration::from_secs(10));
     assert!(
