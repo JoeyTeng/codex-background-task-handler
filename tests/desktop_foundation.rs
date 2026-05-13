@@ -1183,6 +1183,14 @@ fn desktop_bridge_preflight_refuses_stale_installation_fingerprint() {
         preflight["desktop_bridge_preflight"]["installation_state"]["validation_fingerprint"],
         "stale-helper-fingerprint"
     );
+    assert_eq!(
+        preflight["desktop_bridge_preflight"]["installation_state"]["read_transport_capability"],
+        "unknown"
+    );
+    assert_eq!(
+        preflight["desktop_bridge_preflight"]["installation_state"]["writeback_capability"],
+        "unknown"
+    );
     let ready_path = preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
         .as_str()
         .expect("ready path");
@@ -1191,6 +1199,89 @@ fn desktop_bridge_preflight_refuses_stale_installation_fingerprint() {
         ready["ready_threads"]["entries"].as_array().unwrap().len(),
         0
     );
+}
+
+#[test]
+fn desktop_marker_migration_preserves_valid_generation_zero_snapshot() {
+    let home = temp_home();
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-marker-generation-zero",
+            "--caller-automation-id",
+            "automation-marker-generation-zero-a",
+            "--json",
+            "--now",
+            "3120",
+        ],
+    );
+    create_desktop_batch_and_prepared_attempt(
+        &home,
+        "thread-marker-generation-zero",
+        "attempt-marker-generation-zero",
+        1,
+        3121,
+    );
+    let marker = cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "marker",
+            "issue",
+            "--bridge-thread-id",
+            "bridge-marker-generation-zero",
+            "--kind",
+            "arm-pending",
+            "--source-thread-id",
+            "thread-marker-generation-zero",
+            "--attempt-id",
+            "attempt-marker-generation-zero",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-marker-generation-zero",
+            "--json",
+            "--now",
+            "3122",
+        ],
+    );
+    let marker = marker["desktop_transcript_relay_marker"]["record"]["marker"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-marker-generation-zero",
+            "--caller-automation-id",
+            "automation-marker-generation-zero-b",
+            "--json",
+            "--now",
+            "3123",
+        ],
+    );
+
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let (caller_automation_id, read_transport_generation): (String, i64) = conn
+        .query_row(
+            "SELECT caller_automation_id, read_transport_generation
+             FROM desktop_transcript_relay_markers
+             WHERE marker = ?",
+            params![marker],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query marker snapshot");
+    assert_eq!(caller_automation_id, "automation-marker-generation-zero-a");
+    assert_eq!(read_transport_generation, 0);
 }
 
 #[test]
@@ -6819,7 +6910,7 @@ fn desktop_bridge_preflight_require_existing_daemon_does_not_forward_client_only
 fn desktop_bridge_preflight_exports_repaired_installation_state_for_direct_read() {
     let home = temp_home();
 
-    cbth(
+    let repair = cbth(
         &home,
         &[
             "desktop",
@@ -6829,13 +6920,16 @@ fn desktop_bridge_preflight_exports_repaired_installation_state_for_direct_read(
             "direct-file-read",
             "--read-transport-capability",
             "validated",
-            "--validation-fingerprint",
-            "desktop-live-preflight",
             "--json",
             "--now",
             "2100",
         ],
     );
+    let validation_fingerprint =
+        repair["desktop_installation_state"]["state"]["validation_fingerprint"]
+            .as_str()
+            .expect("validation fingerprint")
+            .to_owned();
 
     let preflight = cbth(
         &home,
@@ -6891,7 +6985,7 @@ fn desktop_bridge_preflight_exports_repaired_installation_state_for_direct_read(
     );
     assert_eq!(
         installation_state["desktop_installation_state"]["validation_fingerprint"],
-        "desktop-live-preflight"
+        validation_fingerprint
     );
     assert_eq!(
         installation_state["desktop_installation_state"]["validated_at"],

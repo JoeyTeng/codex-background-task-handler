@@ -11277,7 +11277,7 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
                 layout,
                 bridge_thread_id: &args.bridge_thread_id,
                 snapshot_revision: &snapshot_revision,
-                installation_state: &state,
+                installation_state: &delivery_state,
                 ready_threads,
                 arm_pending_bindings,
                 pause_due_bindings,

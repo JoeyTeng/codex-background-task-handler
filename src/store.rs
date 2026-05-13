@@ -3264,6 +3264,12 @@ impl Store {
                    AND pending_marker.marker_state = 'consumed'
                    AND pending_marker.attempt_id = delivery_attempts.attempt_id
                    AND pending_marker.generation = delivery_attempts.generation
+                   AND pending_marker.caller_automation_id =
+                       desktop_bindings.caller_automation_id
+                   AND pending_marker.read_transport_generation =
+                       desktop_bindings.read_transport_generation
+                   AND pending_marker.validation_fingerprint =
+                       desktop_bindings.validation_fingerprint
                    AND pending_marker.bridge_request_id =
                        delivery_attempts.bridge_request_id
                )
@@ -4557,7 +4563,6 @@ fn migrate(conn: &Connection) -> Result<()> {
              )
          WHERE (
              caller_automation_id = ''
-             OR read_transport_generation = 0
              OR validation_fingerprint = ''
          )
            AND EXISTS (
