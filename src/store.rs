@@ -2628,29 +2628,27 @@ impl Store {
                  SELECT 1
                  FROM delivery_attempts AS active_attempt
                  WHERE active_attempt.source_thread_id = batches.source_thread_id
-                   AND active_attempt.adapter_kind = 'desktop'
                    AND active_attempt.state IN ('accept_pending', 'arm_pending', 'cooldown')
                )
                AND NOT EXISTS (
                  SELECT 1
                  FROM delivery_attempts AS prepared_attempt
                  WHERE prepared_attempt.source_thread_id = batches.source_thread_id
-                   AND prepared_attempt.adapter_kind = 'desktop'
                    AND prepared_attempt.state = 'prepared'
-                   AND (
-                     prepared_attempt.batch_id != batches.batch_id
-                     OR prepared_attempt.generation != (
-                       SELECT MAX(current_attempt.generation)
-                       FROM delivery_attempts AS current_attempt
-                       WHERE current_attempt.batch_id = batches.batch_id
-                     )
+                   AND NOT (
+                     prepared_attempt.adapter_kind = 'desktop'
+                     AND prepared_attempt.batch_id = batches.batch_id
+                     AND prepared_attempt.generation = (
+                         SELECT MAX(current_attempt.generation)
+                         FROM delivery_attempts AS current_attempt
+                         WHERE current_attempt.batch_id = batches.batch_id
+                       )
                    )
                )
                AND (
                  SELECT COUNT(*)
                  FROM delivery_attempts AS prepared_count
                  WHERE prepared_count.source_thread_id = batches.source_thread_id
-                   AND prepared_count.adapter_kind = 'desktop'
                    AND prepared_count.state = 'prepared'
                ) <= 1
                AND (
@@ -2693,11 +2691,12 @@ impl Store {
             }
 
             let active_attempts =
-                query_active_desktop_attempts_for_thread_tx(&tx, &batch.source_thread_id)?;
+                query_active_delivery_attempts_for_thread_tx(&tx, &batch.source_thread_id)?;
             let attempt = match active_attempts.as_slice() {
                 [] => create_desktop_prepared_attempt_tx(&tx, &batch, now)?,
                 [attempt]
                     if attempt.batch_id == batch.batch_id
+                        && attempt.adapter_kind == "desktop"
                         && attempt.state == "prepared"
                         && ensure_attempt_is_current_generation_tx(&tx, attempt).is_ok() =>
                 {
@@ -5748,15 +5747,14 @@ fn query_active_delivery_attempt_for_cli_session_tx(
     .map_err(Into::into)
 }
 
-fn query_active_desktop_attempts_for_thread_tx(
+fn query_active_delivery_attempts_for_thread_tx(
     tx: &Transaction<'_>,
     source_thread_id: &str,
 ) -> Result<Vec<DeliveryAttemptRecord>> {
     let mut stmt = tx.prepare(
         "SELECT *
          FROM delivery_attempts
-         WHERE adapter_kind = 'desktop'
-           AND source_thread_id = ?
+         WHERE source_thread_id = ?
            AND state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown')
          ORDER BY generation DESC, attempt_id DESC",
     )?;

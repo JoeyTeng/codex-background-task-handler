@@ -993,6 +993,7 @@ fn desktop_bridge_preflight_filters_ineligible_ready_candidates() {
         ("degraded-binding", "degraded"),
         ("unquiesced-binding", "unquiesced"),
         ("active-arm-pending", "arm-pending"),
+        ("active-cli-attempt", "cli-active"),
         ("attempt-budget", "budget"),
     ] {
         let home = temp_home();
@@ -1067,6 +1068,20 @@ fn desktop_bridge_preflight_filters_ineligible_ready_candidates() {
                     3202,
                 );
                 force_desktop_attempt_arm_pending(&home, "attempt-ready-filter-arm-pending", 3203);
+            }
+            "cli-active" => {
+                conn.execute(
+                    "INSERT INTO delivery_attempts (
+                        attempt_id, batch_id, source_thread_id, adapter_kind,
+                        authorization_mode, state, generation, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'cli', 'strict_safe', 'accept_pending', 1, 3202, 3202)",
+                    params![
+                        format!("attempt-ready-filter-cli-active-{case}"),
+                        &batch_id,
+                        &source_thread_id
+                    ],
+                )
+                .unwrap();
             }
             "budget" => {
                 conn.execute(
