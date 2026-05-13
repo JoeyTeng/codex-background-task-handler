@@ -21,8 +21,8 @@ superseded_by:
 
 ## Validation Target
 
-- Use the existing Desktop bridge heartbeat thread `019db5e6-ba6a-7b80-95d2-a6867163281a`.
-- Bind the current heartbeat rollout path with `cbth desktop relay scanner bind`.
+- Use the clean Desktop test heartbeat thread `019db49a-de4e-7d61-93ab-5d70a8905cc3`.
+- Bind the current heartbeat rollout path with `cbth desktop relay scanner bind`. The historical bridge heartbeat thread `019db5e6-ba6a-7b80-95d2-a6867163281a` is useful as prior transport evidence but is no longer a suitable repeat-validation target because it has grown to the model context limit.
 - Create a validation-only Desktop writeback fixture from an operator shell.
 - Issue an `arm-pending` marker, trigger heartbeat to run `cbth desktop relay emit-arm-pending`, and let the daemon scanner advance the fixture from `prepared` to `arm_pending`.
 - Issue an `arm-accepted` marker, trigger heartbeat to run `cbth desktop relay emit-arm-accepted`, and let the daemon scanner advance the fixture from `arm_pending` to `cooldown`.
@@ -54,12 +54,12 @@ cbth desktop validation prepare-writeback-fixture \
   --json
 
 cbth desktop relay scanner bind \
-  --bridge-thread-id 019db5e6-ba6a-7b80-95d2-a6867163281a \
+  --bridge-thread-id 019db49a-de4e-7d61-93ab-5d70a8905cc3 \
   --rollout-path <heartbeat-rollout-path> \
   --json
 
 cbth desktop relay marker issue \
-  --bridge-thread-id 019db5e6-ba6a-7b80-95d2-a6867163281a \
+  --bridge-thread-id 019db49a-de4e-7d61-93ab-5d70a8905cc3 \
   --kind arm-pending \
   --source-thread-id <source-thread-id> \
   --attempt-id <attempt-id> \
@@ -68,7 +68,7 @@ cbth desktop relay marker issue \
   --json
 
 cbth desktop relay marker issue \
-  --bridge-thread-id 019db5e6-ba6a-7b80-95d2-a6867163281a \
+  --bridge-thread-id 019db49a-de4e-7d61-93ab-5d70a8905cc3 \
   --kind arm-accepted \
   --source-thread-id <source-thread-id> \
   --attempt-id <attempt-id> \
