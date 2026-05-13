@@ -11262,15 +11262,20 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
             let fingerprint =
                 desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
             let state = store.desktop_installation_state(&fingerprint)?;
+            let delivery_state =
+                desktop_installation_state_for_current_helper(&state, &fingerprint);
             let snapshot_revision = new_id();
             let ready_threads = store.materialize_desktop_ready_entries(
                 &args.bridge_thread_id,
                 &snapshot_revision,
-                &state,
+                &delivery_state,
                 now,
             )?;
-            let arm_pending_bindings =
-                store.list_desktop_arm_pending_bindings(&args.bridge_thread_id, &state, now)?;
+            let arm_pending_bindings = store.list_desktop_arm_pending_bindings(
+                &args.bridge_thread_id,
+                &delivery_state,
+                now,
+            )?;
             let pause_due_bindings = store.list_desktop_pause_due_bindings(now)?;
             let preflight = publish_desktop_bridge_preflight(DesktopBridgePreflightPublish {
                 layout,
@@ -11286,6 +11291,22 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
             Ok(json!({ "desktop_bridge_preflight": preflight }))
         }
     }
+}
+
+fn desktop_installation_state_for_current_helper(
+    state: &DesktopInstallationStateRecord,
+    current_fingerprint: &str,
+) -> DesktopInstallationStateRecord {
+    let mut state = state.clone();
+    if state.read_transport != DesktopReadTransport::DirectFileRead.as_str()
+        || state.validation_fingerprint != current_fingerprint
+    {
+        state.read_transport_capability = "unknown".to_owned();
+        state.artifact_read_capability = "unknown".to_owned();
+        state.writeback_capability = "unknown".to_owned();
+        state.validated_at = None;
+    }
+    state
 }
 
 struct DesktopInboxSnapshot {

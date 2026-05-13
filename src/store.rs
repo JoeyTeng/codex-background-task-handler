@@ -2611,6 +2611,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cap_desktop_ready_marker_expiries_tx(&tx, bridge_thread_id)?;
         let mut stmt = tx.prepare(
             "SELECT batches.batch_id
              FROM batches
@@ -2668,6 +2669,25 @@ impl Store {
                  desktop_bindings.armed_generation IS NULL
                  OR desktop_bindings.armed_generation_quiesced_at IS NOT NULL
                )
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM delivery_attempts AS ready_attempt
+                 JOIN desktop_transcript_relay_markers AS ready_marker
+                   ON ready_marker.attempt_id = ready_attempt.attempt_id
+                  AND ready_marker.generation = ready_attempt.generation
+                 WHERE ready_attempt.batch_id = batches.batch_id
+                   AND ready_attempt.adapter_kind = 'desktop'
+                   AND ready_attempt.state = 'prepared'
+                   AND ready_attempt.generation = (
+                     SELECT MAX(current_attempt.generation)
+                     FROM delivery_attempts AS current_attempt
+                     WHERE current_attempt.batch_id = batches.batch_id
+                   )
+                   AND ready_marker.bridge_thread_id = ?
+                   AND ready_marker.envelope_kind = 'arm_pending_requested'
+                   AND ready_marker.marker_state = 'issued'
+                   AND ready_marker.expires_at > ?
+               )
              ORDER BY batches.created_at ASC,
                       batches.source_thread_id ASC,
                       batches.batch_id ASC
@@ -2680,6 +2700,8 @@ impl Store {
                     &installation_state.read_transport,
                     installation_state.read_transport_generation,
                     &installation_state.validation_fingerprint,
+                    bridge_thread_id,
+                    now,
                 ],
                 |row| row.get::<_, String>(0),
             )?
@@ -6924,6 +6946,43 @@ fn query_desktop_transcript_relay_marker_tx(
     )
     .optional()?
     .ok_or_else(|| anyhow!("desktop transcript relay marker not found: {marker}"))
+}
+
+fn cap_desktop_ready_marker_expiries_tx(
+    tx: &Transaction<'_>,
+    bridge_thread_id: &str,
+) -> Result<()> {
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT desktop_transcript_relay_markers.marker,
+                    batches.redelivery_window_ends_at
+             FROM desktop_transcript_relay_markers
+             JOIN delivery_attempts
+               ON delivery_attempts.attempt_id =
+                  desktop_transcript_relay_markers.attempt_id
+              AND delivery_attempts.generation =
+                  desktop_transcript_relay_markers.generation
+             JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+             WHERE desktop_transcript_relay_markers.bridge_thread_id = ?
+               AND desktop_transcript_relay_markers.envelope_kind = 'arm_pending_requested'
+               AND desktop_transcript_relay_markers.marker_state = 'issued'
+               AND desktop_transcript_relay_markers.expires_at >
+                   batches.redelivery_window_ends_at",
+        )?;
+        stmt.query_map(params![bridge_thread_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (marker, expires_at) in rows {
+        tx.execute(
+            "UPDATE desktop_transcript_relay_markers
+             SET expires_at = ?
+             WHERE marker = ?",
+            params![expires_at, marker],
+        )?;
+    }
+    Ok(())
 }
 
 struct DesktopRelayMarkerRequest<'a> {

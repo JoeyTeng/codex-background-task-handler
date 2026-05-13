@@ -953,9 +953,6 @@ fn desktop_bridge_preflight_materializes_ready_entry_and_claim_peeks_it() {
             .starts_with("CBTH_DESKTOP_RELAY_ARM_PENDING_")
     );
     assert_eq!(entry["marker_expires_at"], 3015);
-    let attempt_id = entry["attempt_id"].as_str().unwrap().to_owned();
-    let marker = entry["arm_pending_marker"].as_str().unwrap().to_owned();
-
     let claim = cbth(
         &home,
         &[
@@ -982,15 +979,19 @@ fn desktop_bridge_preflight_materializes_ready_entry_and_claim_peeks_it() {
         ],
     );
     let second = &second["desktop_bridge_preflight"];
-    assert_eq!(second["snapshots"]["ready_threads"]["count"], 1);
+    assert_eq!(second["snapshots"]["ready_threads"]["count"], 0);
     let second_ready = read_json_file(
         second["snapshots"]["ready_threads"]["path"]
             .as_str()
             .unwrap(),
     );
-    let second_entry = &second_ready["ready_threads"]["entries"][0];
-    assert_eq!(second_entry["attempt_id"], attempt_id);
-    assert_eq!(second_entry["arm_pending_marker"], marker);
+    assert_eq!(
+        second_ready["ready_threads"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 #[test]
@@ -1050,9 +1051,155 @@ fn desktop_bridge_preflight_caps_reused_ready_marker_after_redelivery_shortens()
         .as_str()
         .expect("ready path");
     let ready = read_json_file(ready_path);
-    let entry = &ready["ready_threads"]["entries"][0];
-    assert_eq!(entry["arm_pending_marker"], marker);
-    assert_eq!(entry["marker_expires_at"], 3070);
+    assert_eq!(
+        ready["ready_threads"]["entries"].as_array().unwrap().len(),
+        0
+    );
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    let expires_at: i64 = conn
+        .query_row(
+            "SELECT expires_at FROM desktop_transcript_relay_markers WHERE marker = ?",
+            params![marker],
+            |row| row.get(0),
+        )
+        .expect("query marker expiry");
+    assert_eq!(expires_at, 3070);
+}
+
+#[test]
+fn desktop_bridge_preflight_refuses_stale_installation_fingerprint() {
+    let home = temp_home();
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "installation-state",
+            "repair",
+            "--read-transport",
+            "direct-file-read",
+            "--read-transport-capability",
+            "validated",
+            "--artifact-read-capability",
+            "unknown",
+            "--writeback-capability",
+            "validated",
+            "--validation-fingerprint",
+            "stale-helper-fingerprint",
+            "--json",
+            "--now",
+            "3090",
+        ],
+    );
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
+            "thread-ready-stale-fingerprint",
+            "--caller-automation-id",
+            "automation-ready-stale-fingerprint",
+            "--json",
+            "--now",
+            "3091",
+        ],
+    );
+    create_desktop_batch(&home, "thread-ready-stale-fingerprint");
+
+    let preflight = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-stale-fingerprint",
+            "--json",
+            "--now",
+            "3092",
+        ],
+    );
+    assert_eq!(
+        preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["count"],
+        0
+    );
+    assert_eq!(
+        preflight["desktop_bridge_preflight"]["installation_state"]["validation_fingerprint"],
+        "stale-helper-fingerprint"
+    );
+    let ready_path = preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
+        .as_str()
+        .expect("ready path");
+    let ready = read_json_file(ready_path);
+    assert_eq!(
+        ready["ready_threads"]["entries"].as_array().unwrap().len(),
+        0
+    );
+}
+
+#[test]
+fn desktop_bridge_preflight_rotates_past_active_ready_marker() {
+    let home = temp_home();
+    repair_validated_desktop_installation_and_binding(
+        &home,
+        "thread-ready-rotate-a",
+        "automation-ready-rotate-a",
+        3130,
+    );
+    repair_validated_desktop_installation_and_binding(
+        &home,
+        "thread-ready-rotate-b",
+        "automation-ready-rotate-b",
+        3132,
+    );
+    create_desktop_batch(&home, "thread-ready-rotate-a");
+    create_desktop_batch(&home, "thread-ready-rotate-b");
+
+    let first = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-rotate",
+            "--json",
+            "--now",
+            "3140",
+        ],
+    );
+    let first_ready_path = first["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
+        .as_str()
+        .expect("first ready path");
+    let first_ready = read_json_file(first_ready_path);
+    let first_entry = &first_ready["ready_threads"]["entries"][0];
+    assert_eq!(first_entry["source_thread_id"], "thread-ready-rotate-a");
+
+    let second = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-rotate",
+            "--json",
+            "--now",
+            "3141",
+        ],
+    );
+    let second_ready_path =
+        second["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["path"]
+            .as_str()
+            .expect("second ready path");
+    let second_ready = read_json_file(second_ready_path);
+    let second_entry = &second_ready["ready_threads"]["entries"][0];
+    assert_eq!(second_entry["source_thread_id"], "thread-ready-rotate-b");
+    assert_ne!(
+        second_entry["arm_pending_marker"],
+        first_entry["arm_pending_marker"]
+    );
 }
 
 #[test]
