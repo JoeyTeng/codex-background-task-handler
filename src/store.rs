@@ -71,6 +71,17 @@ fn desktop_arm_lease_expired_error(attempt_id: &str, lease_deadline: i64) -> any
     })
 }
 
+fn desktop_redelivery_window_closed_error(
+    batch_id: &str,
+    redelivery_window_ends_at: i64,
+) -> anyhow::Error {
+    anyhow::Error::new(DurableDesktopArmFailure {
+        message: format!(
+            "batch {batch_id} redelivery window is closed at {redelivery_window_ends_at}"
+        ),
+    })
+}
+
 fn is_durable_desktop_arm_failure(error: &anyhow::Error) -> bool {
     error.downcast_ref::<DurableDesktopArmFailure>().is_some()
 }
@@ -5970,6 +5981,14 @@ fn note_desktop_arm_pending_tx(
                 lease_deadline,
             ));
         }
+        let batch = query_batch_tx(tx, &attempt.batch_id)?;
+        if batch.redelivery_window_ends_at <= now {
+            abandon_desktop_arm_pending_tx(tx, &attempt.attempt_id, now)?;
+            return Err(desktop_redelivery_window_closed_error(
+                &batch.batch_id,
+                batch.redelivery_window_ends_at,
+            ));
+        }
         let lease_id = attempt
             .bridge_arm_lease_id
             .as_ref()
@@ -6124,7 +6143,13 @@ fn note_desktop_arm_tx(
         ));
     }
     ensure_attempt_budget_remaining(&batch)?;
-    ensure_batch_redelivery_window_open(&batch, now)?;
+    if batch.redelivery_window_ends_at <= now {
+        abandon_desktop_arm_pending_tx(tx, &attempt.attempt_id, now)?;
+        return Err(desktop_redelivery_window_closed_error(
+            &batch.batch_id,
+            batch.redelivery_window_ends_at,
+        ));
+    }
     let pause_not_before =
         checked_timestamp_add(now, DESKTOP_PAUSE_NOT_BEFORE_SECONDS, "pause_not_before")?;
     let pause_deadline = checked_timestamp_add(

@@ -5160,6 +5160,90 @@ fn desktop_writeback_helpers_fail_closed_for_stale_or_unsafe_inputs() {
             "binding",
             "repair",
             "--source-thread-id",
+            "thread-expired-redelivery-after-pending",
+            "--caller-automation-id",
+            "automation-expired-redelivery-after-pending",
+            "--json",
+            "--now",
+            "3306",
+        ],
+    );
+    let expired_redelivery_batch = create_desktop_batch_and_prepared_attempt(
+        &home,
+        "thread-expired-redelivery-after-pending",
+        "attempt-expired-redelivery-after-pending",
+        1,
+        3307,
+    );
+    let expired_redelivery_pending = cbth(
+        &home,
+        &[
+            "desktop",
+            "note-arm-pending",
+            "--source-thread-id",
+            "thread-expired-redelivery-after-pending",
+            "--attempt-id",
+            "attempt-expired-redelivery-after-pending",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-expired-redelivery-after-pending",
+            "--json",
+            "--now",
+            "3308",
+        ],
+    );
+    let expired_redelivery_lease =
+        expired_redelivery_pending["desktop_arm_pending"]["bridge_arm_lease_id"]
+            .as_str()
+            .expect("expired redelivery lease id");
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE batches SET redelivery_window_ends_at = ? WHERE batch_id = ?",
+        params![3309, expired_redelivery_batch],
+    )
+    .unwrap();
+    drop(conn);
+    let expired_redelivery_arm = cbth_failure(
+        &home,
+        &[
+            "desktop",
+            "note-arm",
+            "--source-thread-id",
+            "thread-expired-redelivery-after-pending",
+            "--attempt-id",
+            "attempt-expired-redelivery-after-pending",
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-expired-redelivery-after-pending",
+            "--bridge-arm-lease-id",
+            expired_redelivery_lease,
+            "--json",
+            "--now",
+            "3310",
+        ],
+    );
+    assert!(expired_redelivery_arm.contains("redelivery window is closed at 3309"));
+    let expired_redelivery_attempt = cbth(
+        &home,
+        &[
+            "attempt",
+            "inspect",
+            "--attempt-id",
+            "attempt-expired-redelivery-after-pending",
+        ],
+    );
+    assert_eq!(expired_redelivery_attempt["attempt"]["state"], "abandoned");
+    assert_eq!(expired_redelivery_attempt["attempt"]["abandoned_at"], 3310);
+
+    cbth(
+        &home,
+        &[
+            "desktop",
+            "binding",
+            "repair",
+            "--source-thread-id",
             "thread-expired-pending-retry",
             "--caller-automation-id",
             "automation-expired-pending-retry",
