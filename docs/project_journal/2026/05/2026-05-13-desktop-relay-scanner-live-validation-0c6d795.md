@@ -5,7 +5,7 @@ status: completed
 created: 2026-05-13
 updated: 2026-05-13
 branch: codex/desktop-relay-scanner-live-validation
-pr:
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/75
 supersedes:
   - 20260512-f4b2e32-desktop-transcript-relay-production-scanner
 superseded_by:
