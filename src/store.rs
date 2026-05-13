@@ -2718,7 +2718,6 @@ impl Store {
                      FROM delivery_attempts AS current_attempt
                      WHERE current_attempt.batch_id = batches.batch_id
                    )
-                   AND ready_marker.bridge_thread_id = ?
                    AND ready_marker.envelope_kind = 'arm_pending_requested'
                    AND ready_marker.marker_state = 'issued'
                    AND ready_marker.expires_at > ?
@@ -2735,7 +2734,6 @@ impl Store {
                     &installation_state.read_transport,
                     installation_state.read_transport_generation,
                     &installation_state.validation_fingerprint,
-                    bridge_thread_id,
                     now,
                 ],
                 |row| row.get::<_, String>(0),
@@ -3258,13 +3256,24 @@ impl Store {
                  FROM delivery_attempts AS current_attempt
                  WHERE current_attempt.batch_id = delivery_attempts.batch_id
                )
+               AND EXISTS (
+                 SELECT 1
+                 FROM desktop_transcript_relay_markers AS pending_marker
+                 WHERE pending_marker.bridge_thread_id = ?
+                   AND pending_marker.envelope_kind = 'arm_pending_requested'
+                   AND pending_marker.marker_state = 'consumed'
+                   AND pending_marker.attempt_id = delivery_attempts.attempt_id
+                   AND pending_marker.generation = delivery_attempts.generation
+                   AND pending_marker.bridge_request_id =
+                       delivery_attempts.bridge_request_id
+               )
                AND desktop_bindings.binding_state = 'bound'
              ORDER BY delivery_attempts.arm_pending_deadline ASC,
                       delivery_attempts.updated_at ASC,
                       delivery_attempts.attempt_id ASC",
         )?;
         let rows = stmt
-            .query_map(params![now, now, now], |row| {
+            .query_map(params![now, now, now, bridge_thread_id], |row| {
                 let deadline: Option<i64> = row.get(9)?;
                 Ok(serde_json::json!({
                     "source_thread_id": row.get::<_, String>(0)?,

@@ -332,6 +332,55 @@ fn force_desktop_attempt_arm_pending(home: &TempDir, attempt_id: &str, now: i64)
     .expect("force Desktop arm_pending attempt");
 }
 
+fn mark_consumed_pending_marker_for_bridge(
+    home: &TempDir,
+    bridge_thread_id: &str,
+    source_thread_id: &str,
+    attempt_id: &str,
+    generation: i64,
+    bridge_request_id: &str,
+    now: i64,
+) {
+    let marker = cbth(
+        home,
+        &[
+            "desktop",
+            "relay",
+            "marker",
+            "issue",
+            "--bridge-thread-id",
+            bridge_thread_id,
+            "--kind",
+            "arm-pending",
+            "--source-thread-id",
+            source_thread_id,
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            &generation.to_string(),
+            "--bridge-request-id",
+            bridge_request_id,
+            "--json",
+            "--now",
+            &now.to_string(),
+        ],
+    );
+    let marker = marker["desktop_transcript_relay_marker"]["record"]["marker"]
+        .as_str()
+        .expect("marker")
+        .to_owned();
+    let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE desktop_transcript_relay_markers
+         SET marker_state = 'consumed',
+             consumed_at = ?,
+             envelope_hash = ?
+         WHERE marker = ?",
+        params![now + 1, format!("hash-{marker}"), marker],
+    )
+    .expect("mark pending marker consumed");
+}
+
 #[test]
 fn desktop_installation_state_defaults_and_repairs_without_extra_writes() {
     let home = temp_home();
@@ -657,6 +706,15 @@ fn desktop_note_arm_pending_and_note_arm_are_idempotent_and_exported() {
     );
     assert!(busy.contains("already arm_pending for another bridge request"));
 
+    mark_consumed_pending_marker_for_bridge(
+        &home,
+        "bridge-thread",
+        "thread-desktop-writeback",
+        "attempt-desktop-writeback",
+        1,
+        "bridge-request-1",
+        2140,
+    );
     let preflight = cbth(
         &home,
         &[
@@ -1478,6 +1536,24 @@ fn desktop_ready_markers_drive_scanner_to_cooldown() {
     let bridge_request_id = ready_entry["bridge_request_id"].as_str().unwrap();
     let pending_marker = ready_entry["arm_pending_marker"].as_str().unwrap();
 
+    let other_bridge_ready_preflight = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-scanner-other",
+            "--json",
+            "--now",
+            "3410",
+        ],
+    );
+    assert_eq!(
+        other_bridge_ready_preflight["desktop_bridge_preflight"]["snapshots"]["ready_threads"]["count"],
+        0
+    );
+
     let pending_emit = cbth_output(
         &home,
         &[
@@ -1522,6 +1598,25 @@ fn desktop_ready_markers_drive_scanner_to_cooldown() {
     );
     let pending_attempt = cbth(&home, &["attempt", "inspect", "--attempt-id", attempt_id]);
     assert_eq!(pending_attempt["attempt"]["state"], "arm_pending");
+
+    let other_bridge_arm_preflight = cbth(
+        &home,
+        &[
+            "desktop",
+            "bridge-preflight",
+            "--helper-direct-store",
+            "--bridge-thread-id",
+            "bridge-ready-scanner-other",
+            "--json",
+            "--now",
+            "3421",
+        ],
+    );
+    assert_eq!(
+        other_bridge_arm_preflight["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]
+            ["count"],
+        0
+    );
 
     let arm_preflight = cbth(
         &home,
@@ -4800,6 +4895,15 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
         2402,
     );
     force_desktop_attempt_arm_pending(&degraded_home, "attempt-second-export", 2402);
+    mark_consumed_pending_marker_for_bridge(
+        &degraded_home,
+        "bridge-thread",
+        "thread-second-export",
+        "attempt-second-export",
+        1,
+        "bridge-request-attempt-second-export",
+        2402,
+    );
     cbth(
         &degraded_home,
         &[
@@ -4823,6 +4927,15 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
         2402,
     );
     force_desktop_attempt_arm_pending(&degraded_home, "attempt-third-export", 2402);
+    mark_consumed_pending_marker_for_bridge(
+        &degraded_home,
+        "bridge-thread",
+        "thread-third-export",
+        "attempt-third-export",
+        1,
+        "bridge-request-attempt-third-export",
+        2402,
+    );
     let current = cbth(
         &degraded_home,
         &[
