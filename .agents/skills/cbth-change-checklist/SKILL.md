@@ -21,7 +21,7 @@ Start by naming every affected surface:
 
 ## Apply The Checklist
 
-- For `user-facing-cli`, update help text when behavior changes, add or adjust help/integration tests, and update matching `en-GB` and `zh-CN` user-facing guides when the behavior is documented.
+- For `user-facing-cli`, update help text when behavior changes, add or adjust help/integration tests, and update matching `en-GB` and `zh-CN` user-facing guides when the behavior is documented. Keep paired guide structure, bidirectional language links, and native-language switcher labels aligned with repo policy.
 - For `public-output`, test the normal shape plus empty/omitted and unsupported/error fallback cases. Cover human output separately when the field or wording is visible to operators.
 - For `design-contract`, update the relevant `docs/design/` or `docs/plans/` record when the contract or architecture changes. Do not update design docs for cosmetic or purely diagnostic changes that leave the contract unchanged.
 - For `validation-evidence`, update `docs/validation/` only when the validation procedure or durable evidence changes. Do not use validation docs as a generic changelog.
@@ -31,4 +31,4 @@ Start by naming every affected surface:
 
 Do not let this checklist conflict with the project journal convention. `docs/PROJECT_STATE.md`, `docs/PROJECT_TODO.md`, and `docs/project_journal/**` are for durable workstream state, blockers, and post-merge target-branch truth. Keep transient PR states, checklist notes, "ready for review", "waiting for merge", and CI progress in the PR body, comments, or final response instead.
 
-Only update project tracking when the current change genuinely changes durable project state or completes/blocks a tracked workstream. When in doubt, leave project journal files untouched and make the durable status explicit in the PR body instead.
+Only update project tracking when the current change genuinely changes durable project state or completes/blocks a tracked workstream, not merely because this checklist ran or a PR moved through review. When in doubt, leave project journal files untouched and make the durable status explicit in the PR body instead.
