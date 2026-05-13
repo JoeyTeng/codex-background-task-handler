@@ -20,6 +20,14 @@ inputs:
     description: Time to wait for a controlled marker before marking it stalled and retrying.
     required: false
     default: "3600"
+  marker-ack-timeout-seconds:
+    description: Initial time to wait for Codex to acknowledge a marker before retrying.
+    required: false
+    default: "300"
+  marker-ack-timeout-max-seconds:
+    description: Maximum exponential backoff wait for unacknowledged markers.
+    required: false
+    default: "1800"
   poll-interval-seconds:
     description: Poll interval for GitHub PR review signals.
     required: false
@@ -57,6 +65,8 @@ runs:
         HEAD_SHA: ${{ inputs.head-sha }}
         MAX_WAIT_SECONDS: ${{ inputs.max-wait-seconds }}
         MARKER_TIMEOUT_SECONDS: ${{ inputs.marker-timeout-seconds }}
+        MARKER_ACK_TIMEOUT_SECONDS: ${{ inputs.marker-ack-timeout-seconds }}
+        MARKER_ACK_TIMEOUT_MAX_SECONDS: ${{ inputs.marker-ack-timeout-max-seconds }}
         POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
         BOOTSTRAP_GRACE_SECONDS: ${{ inputs.bootstrap-grace-seconds }}
         BOOTSTRAP_TIMEOUT_SECONDS: ${{ inputs.bootstrap-timeout-seconds }}

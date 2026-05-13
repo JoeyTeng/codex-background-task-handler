@@ -211,6 +211,27 @@ export function hasNewCompletionComment(baselineComment, currentComment, markerC
   return !sameIssueCommentIdentity(baselineComment, currentComment);
 }
 
+export function markerAckTimeoutSecondsForHistory(history, headSha, baseSeconds, maxSeconds) {
+  let timeoutSeconds = baseSeconds;
+  for (const marker of [...(history || [])].reverse()) {
+    if (marker.headSha !== headSha || (marker.outcome || marker.state) !== "missed_ack") {
+      break;
+    }
+    timeoutSeconds = Math.min(timeoutSeconds * 2, maxSeconds);
+  }
+  return timeoutSeconds;
+}
+
+export function activeMarkerAckTimedOut(activeMarker, nowMs, fallbackAckTimeoutSeconds) {
+  if (!activeMarker || activeMarker.state !== "waiting_ack") {
+    return false;
+  }
+
+  const ackTimeoutSeconds = activeMarker.ackTimeoutSeconds || fallbackAckTimeoutSeconds;
+  const markerAgeMs = nowMs - parseTimestamp(activeMarker.createdAt, "marker creation time");
+  return markerAgeMs >= ackTimeoutSeconds * 1000;
+}
+
 export function codexAutoReviewLooksOngoing(reactions) {
   if (!reactions.eyes) {
     return false;
@@ -533,20 +554,22 @@ export function parseStateCommentBody(body) {
 }
 
 export function buildMarkerCommentBody(marker) {
-  return [
-    "@codex review",
-    "",
-    buildHiddenJson(MARKER_COMMENT, {
-      version: STATE_VERSION,
-      headSha: marker.headSha,
-      runUrl: marker.runUrl,
-      runId: marker.runId,
-      runAttempt: marker.runAttempt,
-      attempt: marker.attempt,
-      baseline: marker.baseline,
-      state: marker.state || "waiting_ack",
-    }),
-  ].join("\n");
+  const hidden = {
+    version: STATE_VERSION,
+    headSha: marker.headSha,
+    runUrl: marker.runUrl,
+    runId: marker.runId,
+    runAttempt: marker.runAttempt,
+    attempt: marker.attempt,
+    baseline: marker.baseline,
+    state: marker.state || "waiting_ack",
+  };
+
+  if (marker.ackTimeoutSeconds !== undefined) {
+    hidden.ackTimeoutSeconds = marker.ackTimeoutSeconds;
+  }
+
+  return ["@codex review", "", buildHiddenJson(MARKER_COMMENT, hidden)].join("\n");
 }
 
 export function parseMarkerCommentBody(body) {

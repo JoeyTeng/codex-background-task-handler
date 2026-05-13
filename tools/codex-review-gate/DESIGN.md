@@ -31,7 +31,7 @@ The state should record at least:
 - known Codex inline review-comment ids and review-body finding ids already counted as baseline
 - outstanding marker comment id, marker head sha, marker creation time, and marker attempt number
 - marker baseline `+1`, `eyes`, and top-level completion comment identities
-- marker state: `waiting_ack`, `waiting_result`, `pass_candidate`, `stalled`, `passed`, or `failed`
+- marker state: `waiting_ack`, `waiting_result`, `pass_candidate`, `missed_ack`, `stalled`, `passed`, or `failed`
 - last status write head and run url
 
 The script should also be able to reconstruct enough state from PR comments, reactions, and review comments if the sticky comment is missing. If reconstruction is ambiguous, fail closed or stay pending instead of passing. In particular, if the sticky state comment is missing but a trusted marker comment is still visible, that marker must not be reactivated as an active pass candidate. The safe recovery path records the marker as `state_lost`, baselines the currently visible reactions, and issues a fresh marker for the current head.
@@ -72,6 +72,16 @@ If a push happens while a marker is outstanding, the new head should remain `pen
 `After the marker` means the Codex reaction timestamp must be strictly later than the marker comment timestamp. Even though GitHub exposes reaction timestamps with second-level granularity, the gate assumes a real Codex completion signal should arrive materially after the marker, on the order of at least several seconds and usually much longer. A reaction with the same timestamp second as the marker is therefore treated as not attributable to that marker instead of being accepted as a pass candidate.
 
 Observed Codex behavior suggests that newer `@codex review` triggers can supersede earlier onflight reviews. Older marker comments may keep their `eyes` reaction even when their review never produces a completion. The gate therefore treats stale marker `eyes` as non-terminal evidence and relies on current-head review comments, current-head `+1` transitions, and explicit marker state instead of assuming every `eyes` has a matching completion.
+
+## Missed Ack Retry
+
+The gate separates "Codex did not acknowledge the marker" from "Codex acknowledged the marker but has not finished reviewing".
+
+While a marker is still `waiting_ack`, the runner waits only for the marker's ack timeout. The default first timeout is 300 seconds. If no new Codex `eyes`, `+1`, or top-level completion comment appears in that window, the marker is closed as `missed_ack`, the latest visible Codex signals are recorded, and the runner immediately creates a fresh marker.
+
+Consecutive `missed_ack` outcomes on the same head use exponential backoff to avoid comment spam: 300 seconds, 600 seconds, 1200 seconds, then a default cap of 1800 seconds. A head change or any non-`missed_ack` marker outcome resets this ack backoff.
+
+Once Codex posts `eyes`, the marker moves to `waiting_result` and the fast ack retry no longer applies. That path uses the longer marker result timeout.
 
 ## Stalled Retry
 

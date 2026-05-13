@@ -6,6 +6,7 @@ import {
   GateFailure,
   NonJsonResponseError,
   STATUS_CONTEXT,
+  activeMarkerAckTimedOut,
   activeMarkerIsObsolete,
   buildMarkerCommentBody,
   buildStateCommentBody,
@@ -20,6 +21,7 @@ import {
   hasNewPlusOneTransition,
   isoNow,
   isRetryableHttpStatus,
+  markerAckTimeoutSecondsForHistory,
   markerFromComment,
   normalizeState,
   parseLoginSet,
@@ -379,7 +381,25 @@ async function advanceMarker(state, stateComment, snapshot) {
     return { kind: "pass", state, stateComment };
   }
 
-  const markerAgeMs = Date.now() - parseTimestamp(activeMarker.createdAt, "marker creation time");
+  const nowMs = Date.now();
+  const markerAgeMs = nowMs - parseTimestamp(activeMarker.createdAt, "marker creation time");
+  const ackTimeoutSeconds = activeMarker.ackTimeoutSeconds || config.markerAckTimeoutSeconds;
+  if (activeMarkerAckTimedOut(activeMarker, nowMs, config.markerAckTimeoutSeconds)) {
+    state = closeActiveMarker(state, "missed_ack", isoNow(), {
+      ackTimeoutSeconds,
+      lastObservedPlusOne: snapshot.reactions.plusOne,
+      lastObservedEyes: snapshot.reactions.eyes,
+      lastObservedCompletionComment: snapshot.completionComment,
+    });
+    stateComment = await saveState(state, stateComment);
+    await setCommitStatus("pending", "Codex review marker was not acknowledged; retrying");
+    console.log(
+      `Marker ${activeMarker.id} was not acknowledged after ${ackTimeoutSeconds}s; ` +
+        "re-baselining before retry.",
+    );
+    return { kind: "continue", state, stateComment };
+  }
+
   if (markerAgeMs >= config.markerTimeoutMs) {
     state = closeActiveMarker(state, "stalled", isoNow(), {
       stalledAfterSeconds: Math.round(config.markerTimeoutMs / 1000),
@@ -393,10 +413,19 @@ async function advanceMarker(state, stateComment, snapshot) {
     return { kind: "continue", state, stateComment };
   }
 
-  const remainingSeconds = Math.round((config.markerTimeoutMs - markerAgeMs) / 1000);
+  const waitTimeoutMs =
+    activeMarker.state === "waiting_ack"
+      ? Math.min(config.markerTimeoutMs, ackTimeoutSeconds * 1000)
+      : config.markerTimeoutMs;
+  const remainingSeconds = Math.round((waitTimeoutMs - markerAgeMs) / 1000);
+  const waitDescription =
+    activeMarker.state === "waiting_ack"
+      ? `Waiting for Codex ack transition (${remainingSeconds}s before marker retry)`
+      : `Waiting for Codex +1 transition (${remainingSeconds}s before marker retry)`;
+
   return {
     kind: "wait",
-    description: `Waiting for Codex +1 transition (${remainingSeconds}s before marker retry)`,
+    description: waitDescription,
     state,
     stateComment,
   };
@@ -404,6 +433,12 @@ async function advanceMarker(state, stateComment, snapshot) {
 
 async function createGateMarker(reactionBaseline, state) {
   const attempt = (state.history || []).length + 1;
+  const ackTimeoutSeconds = markerAckTimeoutSecondsForHistory(
+    state.history,
+    statusSha,
+    config.markerAckTimeoutSeconds,
+    config.markerAckTimeoutMaxSeconds,
+  );
   const marker = {
     version: 1,
     headSha: statusSha,
@@ -413,6 +448,7 @@ async function createGateMarker(reactionBaseline, state) {
     attempt,
     baseline: reactionBaseline,
     state: "waiting_ack",
+    ackTimeoutSeconds,
   };
 
   const { data } = await request("POST", `${repoPath}/issues/${config.prNumber}/comments`, {
@@ -488,6 +524,22 @@ function readConfig() {
 
   const apiUrl = stripTrailingSlash(process.env.GITHUB_API_URL || "https://api.github.com");
   const serverUrl = stripTrailingSlash(process.env.GITHUB_SERVER_URL || "https://github.com");
+  const markerTimeoutSeconds = secondsEnv("MARKER_TIMEOUT_SECONDS", 3600, { allowZero: false });
+  const markerAckTimeoutSeconds = secondsEnv("MARKER_ACK_TIMEOUT_SECONDS", 300, { allowZero: false });
+  const markerAckTimeoutMaxSeconds = secondsEnv("MARKER_ACK_TIMEOUT_MAX_SECONDS", 1800, {
+    allowZero: false,
+  });
+
+  if (markerAckTimeoutSeconds > markerAckTimeoutMaxSeconds) {
+    throw new Error(
+      "MARKER_ACK_TIMEOUT_SECONDS must be less than or equal to MARKER_ACK_TIMEOUT_MAX_SECONDS",
+    );
+  }
+  if (markerAckTimeoutMaxSeconds > markerTimeoutSeconds) {
+    throw new Error(
+      "MARKER_ACK_TIMEOUT_MAX_SECONDS must be less than or equal to MARKER_TIMEOUT_SECONDS",
+    );
+  }
 
   return {
     token,
@@ -500,7 +552,9 @@ function readConfig() {
     runId: requiredEnv("GITHUB_RUN_ID"),
     runAttempt: process.env.GITHUB_RUN_ATTEMPT || "1",
     maxWaitMs: secondsEnv("MAX_WAIT_SECONDS", 7200, { allowZero: false }) * 1000,
-    markerTimeoutMs: secondsEnv("MARKER_TIMEOUT_SECONDS", 3600, { allowZero: false }) * 1000,
+    markerTimeoutMs: markerTimeoutSeconds * 1000,
+    markerAckTimeoutSeconds,
+    markerAckTimeoutMaxSeconds,
     pollIntervalMs: secondsEnv("POLL_INTERVAL_SECONDS", 30, { allowZero: false }) * 1000,
     bootstrapGraceSeconds: secondsEnv("BOOTSTRAP_GRACE_SECONDS", 60, { allowZero: true }),
     codexBotLogins: parseLoginSet(process.env.CODEX_BOT_LOGINS || "", DEFAULT_CODEX_BOT_LOGINS),
