@@ -29,7 +29,7 @@ Migration PR: https://github.com/JoeyTeng/codex-background-task-handler/pull/37
 
 ## Repo CI / review gate
 
-- `codex/review-gate` 已抽成 repo 内部子项目：[codex-review-gate](https://github.com/JoeyTeng/codex-review-gate)。顶层 workflow 只保留 `.github/workflows/codex-review-gate.yml` thin wrapper。
+- `codex/review-gate` 已抽成 repo 内部子项目：[tools/codex-review-gate](../tools/codex-review-gate/README.md)。顶层 workflow 只保留 `.github/workflows/codex-review-gate.yml` thin wrapper。
 - 当前 runner 已改成 reaction-driven serialized marker design，并通过本地 composite action wrapper 调用；ruleset 已要求 `codex/review-gate`、Rust CI 和 resolved conversations。
 - 2026-05-04 已补做 resolved/remapped inline thread live validation：PR #14 的 Codex comment `3148673469` 在 REST 中 `commit_id` 被映射到 head `6a2d9e57...`，但 GraphQL thread `PRRT_kwDOSJZ-as594_hR` 为 `isResolved=true`；当前默认分支 workflow dispatch run `25316273973` 成功通过，证明该旧 inline thread 不再被误判为 current-head blocker。
 - 本地确定性 Rust gate 现在有 repo-tracked githooks 入口：[docs/GIT_HOOKS.md](GIT_HOOKS.md)。安装后 pre-commit 会在 Rust/Cargo staged changes 上运行 `cargo fmt --all`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked`。
@@ -722,7 +722,7 @@ scripts/desktop_thread_inject_poc.py
 
 当前仍有几条关键 capability / contract 没实证完成；在这些项完成前，不应把 v1 描述成端到端已验证。
 
-- [x] 用 live PR 验证 repo 内部子项目 [codex-review-gate](https://github.com/JoeyTeng/codex-review-gate) 的 reaction-driven gate，然后配置 required status check 和 conversations-resolved branch protection。
+- [x] 用 live PR 验证 repo 内部子项目 [tools/codex-review-gate](../tools/codex-review-gate/README.md) 的 reaction-driven gate，然后配置 required status check 和 conversations-resolved branch protection。
 - [x] 合入 `codex/review-gate-review-body-findings` 后，在 #12 或后续测试 PR 上验证 Codex review-body findings 会让 `codex/review-gate` deterministic failure，而旧 commit 的 review-body findings 不会 block 新 head。
 - [x] 合入 `codex/review-gate-resolved-threads` 后，在 #12 或后续测试 PR 上验证已 resolved / outdated 的旧 Codex inline review thread 不会被 REST `commit_id` remap 误判为 current-head blocker。证据：PR #14 comment `3148673469` 的 REST `commit_id` remap 到 head `6a2d9e57...`，GraphQL thread `isResolved=true`，workflow run `25316273973` 通过。
 - [x] 把 deterministic fake e2e 纳入默认 Rust gate：job/batch/attempt delivered path 与 `cbth cli run` passive no-delivery-RPC guard 都由 `cargo test --locked` 覆盖。
