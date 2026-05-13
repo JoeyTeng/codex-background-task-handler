@@ -8,5 +8,6 @@ Active backlog lives in [current follow-ups](project_journal/2026/05/2026-05-05-
 - [done] Follow up `cbth resume` hardening in order: cwd UX parity, canonical permission profile parsing, Codex 0.129 stable built-in request-side permission profile selection with legacy fallback, and Codex CLI version compatibility warnings.
 - [done] Improve `cbth` operator UX with clearer help, `cli app-servers --format json|human`, and `self update --interactive`.
 - [done] Adapt managed CLI accepted-turn reconcile for Codex 0.130 `thread/turns/list`, keep `thread/read(includeTurns=true)` fallback for older app-server surfaces, and update the soft validated Codex CLI range to `0.130.x`.
+- [pending] Implement host-level plugin runtime and generic delivery in the C1-C7 / W1-W7 sequence recorded in [Host plugin runtime design](project_journal/2026/05/2026-05-13-host-plugin-runtime-design-143a38f.md).
 - [pending] Implement external code-review delegation, app-server output bridge, and PR / GitHub Actions polling integrations.
 - [done] Migrate the long-form top-level trackers into project journal entries without dropping the original records.

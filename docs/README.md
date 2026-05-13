@@ -16,7 +16,7 @@ The repository root [README.md](../README.md) is the default `en-GB` entrypoint.
 
 ## Internal Records
 
-- [design/](design/) contains architecture and implementation design records.
+- [design/](design/) contains architecture and implementation design records, including [Host Plugin Runtime And Generic Delivery](design/HOST_PLUGIN_RUNTIME_AND_DELIVERY.md).
 - [plans/](plans/) contains phased implementation and delivery plans.
 - [validation/](validation/) contains live validation harnesses, probes, and evidence records.
 

@@ -16,7 +16,7 @@
 
 ## 内部记录
 
-- [design/](design/) 包含 architecture 和 implementation design records。
+- [design/](design/) 包含 architecture 和 implementation design records，包括 [Host Plugin Runtime And Generic Delivery](design/HOST_PLUGIN_RUNTIME_AND_DELIVERY.md)。
 - [plans/](plans/) 包含 phased implementation 和 delivery plans。
 - [validation/](validation/) 包含 live validation harnesses、probes 和 evidence records。
 
