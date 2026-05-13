@@ -4516,20 +4516,11 @@ fn desktop_writeback_dropbox_probe_writes_once_without_daemon_or_store() {
 #[test]
 fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
     let degraded_home = temp_home();
-    cbth(
+    repair_validated_desktop_installation_and_binding(
         &degraded_home,
-        &[
-            "desktop",
-            "binding",
-            "repair",
-            "--source-thread-id",
-            "thread-degraded-export",
-            "--caller-automation-id",
-            "automation-degraded-export",
-            "--json",
-            "--now",
-            "2400",
-        ],
+        "thread-degraded-export",
+        "automation-degraded-export",
+        2400,
     );
     create_desktop_batch_and_prepared_attempt(
         &degraded_home,
@@ -4539,6 +4530,15 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
         2401,
     );
     force_desktop_attempt_arm_pending(&degraded_home, "attempt-degraded-export", 2402);
+    let conn = Connection::open(degraded_home.path().join("cbth.sqlite3")).expect("open db");
+    conn.execute(
+        "UPDATE delivery_attempts
+         SET bridge_arm_lease_deadline = ?, arm_pending_deadline = ?
+         WHERE attempt_id = ?",
+        params![2402, 2402, "attempt-degraded-export"],
+    )
+    .unwrap();
+    drop(conn);
     cbth(
         &degraded_home,
         &[
@@ -4578,6 +4578,21 @@ fn desktop_bridge_preflight_exports_only_current_bound_eligible_arm_pending() {
     assert_eq!(
         current["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["count"],
         1
+    );
+    let current_path =
+        current["desktop_bridge_preflight"]["snapshots"]["arm_pending_bindings"]["path"]
+            .as_str()
+            .unwrap();
+    let current_arm_pending = read_json_file(current_path);
+    assert_eq!(
+        current_arm_pending["arm_pending_bindings"]["entries"][0]["source_thread_id"],
+        "thread-second-export"
+    );
+    assert!(
+        current_arm_pending["arm_pending_bindings"]["entries"][0]["arm_accepted_marker"]
+            .as_str()
+            .unwrap()
+            .starts_with("CBTH_DESKTOP_RELAY_ARM_ACCEPTED_")
     );
     cbth(
         &degraded_home,

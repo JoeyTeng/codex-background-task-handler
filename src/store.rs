@@ -3187,6 +3187,8 @@ impl Store {
                AND batches.delivery_requires_write_access = 0
                AND batches.requires_artifact_read = 0
                AND batches.redelivery_window_ends_at > ?
+               AND delivery_attempts.bridge_arm_lease_deadline > ?
+               AND delivery_attempts.arm_pending_deadline > ?
                AND delivery_attempts.generation = (
                  SELECT MAX(current_attempt.generation)
                  FROM delivery_attempts AS current_attempt
@@ -3199,7 +3201,7 @@ impl Store {
              LIMIT 1",
         )?;
         let rows = stmt
-            .query_map(params![now], |row| {
+            .query_map(params![now, now, now], |row| {
                 let deadline: Option<i64> = row.get(9)?;
                 Ok(serde_json::json!({
                     "source_thread_id": row.get::<_, String>(0)?,
