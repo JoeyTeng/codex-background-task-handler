@@ -2,6 +2,12 @@
 
 All notable release changes for `cbth` are documented here.
 
+## Unreleased
+
+### Changed
+
+- Changed `cbth cli app-servers` to inspect all known daemon generations by default, newest generation first, and added `--latest-generation` for the previous single-generation view; default-only legacy daemon deployments keep the existing single-endpoint JSON shape, and `--all-daemons` remains a compatibility alias for the new default.
+
 ## v0.2.1 - 2026-05-13
 
 ### Added
