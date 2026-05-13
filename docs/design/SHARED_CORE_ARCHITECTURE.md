@@ -1476,6 +1476,7 @@ cbth batch close-head --source-thread-id <thread_id> --reason operator_closed_un
 cbth batch close-head --source-thread-id <thread_id> --reason operator_confirmed_delivery --json
 cbth batch inspect-head --source-thread-id <thread_id> --json
 cbth batch inspect --batch-id <batch_id> --json
+cbth desktop relay marker issue --bridge-thread-id <bridge_thread_id> --kind arm-pending|arm-accepted --source-thread-id <thread_id> --attempt-id <attempt_id> --generation <generation> --bridge-request-id <request_id> --json
 cbth desktop relay consume-transcript --rollout-path <rollout_jsonl> --marker <marker> --json
 cbth desktop binding unbind --source-thread-id <thread_id> --delete-automation <true|false> --json
 ```

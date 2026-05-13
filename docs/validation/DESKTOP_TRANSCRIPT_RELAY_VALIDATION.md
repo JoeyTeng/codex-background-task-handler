@@ -43,12 +43,30 @@ Only `trusted_auto` is a future automatic writeback input. `diagnostic_only` and
 The relay now also supports writeback request envelopes for the existing Desktop arm CAS primitives. These emit helpers are still heartbeat-safe stdout-only commands:
 
 ```sh
+cbth desktop relay marker issue \
+  --bridge-thread-id <bridge-thread-id> \
+  --kind arm-pending \
+  --source-thread-id <source-thread-id> \
+  --attempt-id <attempt-id> \
+  --generation <generation> \
+  --bridge-request-id <request-id> \
+  --json
+
 cbth desktop validation emit-transcript-arm-pending \
   --source-thread-id <source-thread-id> \
   --attempt-id <attempt-id> \
   --generation <generation> \
   --bridge-request-id <request-id> \
-  --marker <unique-marker> \
+  --marker <issued-marker> \
+  --json
+
+cbth desktop relay marker issue \
+  --bridge-thread-id <bridge-thread-id> \
+  --kind arm-accepted \
+  --source-thread-id <source-thread-id> \
+  --attempt-id <attempt-id> \
+  --generation <generation> \
+  --bridge-request-id <request-id> \
   --json
 
 cbth desktop validation emit-transcript-arm \
@@ -57,16 +75,16 @@ cbth desktop validation emit-transcript-arm \
   --generation <generation> \
   --bridge-request-id <request-id> \
   --bridge-arm-lease-id <lease-id> \
-  --marker <unique-marker> \
+  --marker <issued-marker> \
   --json
 ```
 
-The non-Desktop consumer scans the rollout and, only for exactly one trusted `function_call_output` envelope, applies the matching durable CAS transition:
+The non-Desktop consumer scans the rollout and, only for exactly one trusted `function_call_output` envelope for an issued marker whose fields still match the durable binding / attempt snapshot, applies the matching durable CAS transition:
 
 ```sh
 cbth desktop relay consume-transcript \
   --rollout-path <rollout-jsonl> \
-  --marker <unique-marker> \
+  --marker <issued-marker> \
   --json
 ```
 
@@ -75,7 +93,7 @@ Envelope kinds:
 - `arm_pending_requested`: calls the same store CAS as `cbth desktop note-arm-pending`.
 - `arm_requested`: calls the same store CAS as `cbth desktop note-arm` and must include `bridge_arm_lease_id`.
 
-Replay protection is durable and marker-scoped. The first accepted marker stores the canonical envelope hash and CAS outcome; replaying the same marker/hash returns the stored outcome without another CAS call, while the same marker with a different hash fails closed. Duplicate trusted envelopes, malformed trusted envelopes, prompt copies, final assistant text, unsupported envelope kinds, and wrong markers do not mutate state.
+Replay protection is durable and marker-scoped. `consume-transcript` is an operator/debug surface for issued relay markers, not a free-form validation marker path: an unissued marker fails before CAS. The first accepted issued marker stores the canonical envelope hash and CAS outcome; replaying the same marker/hash returns the stored outcome without another CAS call, while the same marker with a different hash fails closed. Duplicate trusted envelopes, malformed trusted envelopes, prompt copies, final assistant text, unsupported envelope kinds, unissued markers, stale binding snapshots, and wrong markers do not mutate state.
 
 ## Production Scanner Foundation
 
@@ -122,11 +140,12 @@ The daemon scans only while issued markers with active scanner bindings, issued 
 ## Live Validation Flow
 
 1. Build or install the current `cbth` binary so the Desktop heartbeat can execute it.
-2. Pick a unique marker, for example `CBTH_TRANSCRIPT_RELAY_LIVE_<timestamp>`.
-3. In the Desktop heartbeat thread, run the emit command once and ask the agent not to run cleanup or capability repair.
+2. For the pure transport probe, pick a unique marker, for example `CBTH_TRANSCRIPT_RELAY_LIVE_<timestamp>`.
+3. In the Desktop heartbeat thread, run the transport emit command once and ask the agent not to run cleanup or capability repair.
 4. From an operator shell, scan the known rollout path for that marker.
 5. Success requires `auto_decision.trusted=true`, `reason=single_trusted_auto_envelope`, and `counts.trusted_auto=1`.
-6. Record marker, rollout path, carrier, scanner JSON, and thread id in the focused Desktop relay scanner live-validation journal.
+6. For durable writeback validation, first issue a relay marker with `cbth desktop relay marker issue ...`, then pass the returned marker to the heartbeat emit helper and to `consume-transcript`.
+7. Record marker, rollout path, carrier, scanner JSON or consumer JSON, and thread id in the focused Desktop relay scanner live-validation journal.
 
 An interactive Desktop tool-output probe is useful as a lower-level transport sanity check when heartbeat scheduling cannot be triggered immediately. It proves that a real Desktop thread stores helper stdout in a `response_item.payload.type=function_call_output` carrier and that the scanner accepts that carrier.
 

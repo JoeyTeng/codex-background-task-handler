@@ -465,7 +465,7 @@ enum DesktopRelayCommand {
     EmitArmAccepted(DesktopRelayEmitArmAcceptedArgs),
     #[command(
         name = "consume-transcript",
-        about = "Consume one trusted Desktop transcript writeback envelope"
+        about = "Consume one trusted Desktop transcript writeback envelope for an issued marker"
     )]
     ConsumeTranscript(DesktopRelayConsumeTranscriptArgs),
     #[command(about = "Manage the production Desktop transcript relay scanner")]
