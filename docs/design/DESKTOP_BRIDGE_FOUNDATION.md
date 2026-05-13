@@ -147,7 +147,9 @@ cbth desktop relay emit-arm-accepted ... --marker <issued-marker> --json
 - 相同的 `created_at`
 - 相同的 `bridge_thread_id`
 
-`ready_threads.entries` 仍为空，`count = 0`，因为真实 ready selection 和 attempt creation 还未实现。`arm_pending_bindings.entries` 会导出当前 open head Desktop attempts 中处于 `arm_pending` 的 reconcile metadata；`pause_due_bindings.entries` 会导出已 armed、未 quiesced、且 `pause_deadline <= now` 的 bound bindings。当前 PR 只发布这些 reconcile entries，不执行 pause cleanup 或 automatic delivery。
+Next ready/arm workflow work changes this foundation boundary: `ready_threads.entries` will no longer be permanently empty. `bridge-preflight` may materialize at most one eligible Desktop head batch into a ready entry with an issued `arm_pending_requested` marker, while `arm_pending_bindings.entries` may carry issued `arm_accepted` markers for attempts already durably in `arm_pending`. `pause_due_bindings.entries` continue to export armed, unquiesced bindings with `pause_deadline <= now`.
+
+This still does not enable full Desktop automatic delivery. Caller wake, production `automation_update`, pause cleanup, `note-boundary-crossed`, and artifact payload reads remain separate work.
 
 ## Desktop Writeback Helpers
 
