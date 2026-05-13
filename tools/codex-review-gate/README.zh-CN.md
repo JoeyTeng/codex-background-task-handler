@@ -17,6 +17,7 @@
 - 把 PR-open automatic review output 只当作第一轮 baseline。
 - 串行维护受控 `@codex review` marker comments。
 - 把 Codex `eyes` reactions 只视为 liveness。
+- 对未被 ack 的 marker 在 300 秒后重试，并使用指数退避，最高封顶 1800 秒且不超过 marker result timeout。
 - 只有在 active marker baseline 之后出现新的 Codex PR-body `+1` reaction identity 或 Codex top-level completion comment，且当前 head 没有 Codex findings 时才通过。
 - 对未变化的旧 `+1` reactions 保持 pending 或 stalled，不复用它们。
 
@@ -36,6 +37,8 @@
     github-token: ${{ github.token }}
     pull-request: ${{ github.event.pull_request.number }}
     head-sha: ${{ github.event.pull_request.head.sha }}
+    marker-ack-timeout-seconds: 300
+    marker-ack-timeout-max-seconds: 1800
 ```
 
 ## 仓库设置
@@ -59,4 +62,4 @@ Workflow 合入 default branch 并至少运行一次后，把 `codex/review-gate
 - 为了让信号最干净，建议关闭 Codex automatic review-on-push，只让 gate marker comment 触发 current-head review。
 - Runner 同时使用 REST pull request comments 和 GraphQL `reviewThreads` metadata，避免把已 resolved 或 outdated 的 Codex inline threads 当成当前 findings。
 - Review-body findings 没有可 resolve 的 review threads，所以 runner 通过 `PullRequestReview.commit_id` 和 current-head blob links 匹配它们。
-- 当前默认 timeout 是 overall 2 小时、每个 marker 1 小时、bootstrap grace 60 秒。
+- 当前默认 timeout 是 overall 2 小时、首次 marker ack 5 分钟、ack 退避上限 30 分钟且不超过 marker result timeout、每个 marker result 1 小时、bootstrap grace 60 秒。
