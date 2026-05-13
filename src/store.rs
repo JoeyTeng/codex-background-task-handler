@@ -2594,8 +2594,35 @@ impl Store {
         Ok(record)
     }
 
-    pub fn materialize_desktop_ready_entries(
+    pub fn materialize_desktop_ready_and_arm_pending_entries(
         &mut self,
+        bridge_thread_id: &str,
+        snapshot_revision: &str,
+        installation_state: &DesktopInstallationStateRecord,
+        now: i64,
+    ) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ready_entries = Self::materialize_desktop_ready_entries_tx(
+            &tx,
+            bridge_thread_id,
+            snapshot_revision,
+            installation_state,
+            now,
+        )?;
+        let arm_pending_bindings = Self::list_desktop_arm_pending_bindings_tx(
+            &tx,
+            bridge_thread_id,
+            installation_state,
+            now,
+        )?;
+        tx.commit()?;
+        Ok((ready_entries, arm_pending_bindings))
+    }
+
+    fn materialize_desktop_ready_entries_tx(
+        tx: &Transaction<'_>,
         bridge_thread_id: &str,
         snapshot_revision: &str,
         installation_state: &DesktopInstallationStateRecord,
@@ -2609,19 +2636,15 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        cap_desktop_ready_marker_expiries_tx(&tx, bridge_thread_id)?;
+        cap_desktop_ready_marker_expiries_tx(tx, bridge_thread_id)?;
         let mut ready_entries = list_existing_desktop_ready_entries_tx(
-            &tx,
+            tx,
             bridge_thread_id,
             snapshot_revision,
             installation_state,
             now,
         )?;
         if ready_entries.len() >= DESKTOP_READY_SNAPSHOT_MAX_ENTRIES {
-            tx.commit()?;
             return Ok(ready_entries);
         }
         let mut stmt = tx.prepare(
@@ -2721,8 +2744,8 @@ impl Store {
         drop(stmt);
 
         for batch_id in candidate_ids {
-            let batch = query_batch_tx(&tx, &batch_id)?;
-            let binding = query_desktop_binding_tx(&tx, &batch.source_thread_id)?;
+            let batch = query_batch_tx(tx, &batch_id)?;
+            let binding = query_desktop_binding_tx(tx, &batch.source_thread_id)?;
             if !desktop_binding_matches_installation(&binding, installation_state)
                 || ensure_desktop_binding_quiesced_for_fresh_arm(&binding).is_err()
                 || ensure_batch_allows_desktop_delivery(&batch).is_err()
@@ -2740,21 +2763,21 @@ impl Store {
             }
 
             let active_attempts =
-                query_active_delivery_attempts_for_thread_tx(&tx, &batch.source_thread_id)?;
+                query_active_delivery_attempts_for_thread_tx(tx, &batch.source_thread_id)?;
             let attempt = match active_attempts.as_slice() {
-                [] => create_desktop_prepared_attempt_tx(&tx, &batch, now)?,
+                [] => create_desktop_prepared_attempt_tx(tx, &batch, now)?,
                 [attempt]
                     if attempt.batch_id == batch.batch_id
                         && attempt.adapter_kind == "desktop"
                         && attempt.state == "prepared"
-                        && ensure_attempt_is_current_generation_tx(&tx, attempt).is_ok() =>
+                        && ensure_attempt_is_current_generation_tx(tx, attempt).is_ok() =>
                 {
                     attempt.clone()
                 }
                 _ => continue,
             };
             let marker = find_or_issue_desktop_relay_marker_tx(
-                &tx,
+                tx,
                 &DesktopRelayMarkerRequest {
                     bridge_thread_id,
                     envelope_kind: "arm_pending_requested",
@@ -2777,10 +2800,8 @@ impl Store {
                 &marker,
                 snapshot_revision,
             ));
-            tx.commit()?;
             return Ok(ready_entries);
         }
-        tx.commit()?;
         Ok(ready_entries)
     }
 
@@ -3191,16 +3212,13 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn list_desktop_arm_pending_bindings(
-        &mut self,
+    fn list_desktop_arm_pending_bindings_tx(
+        tx: &Transaction<'_>,
         bridge_thread_id: &str,
         installation_state: &DesktopInstallationStateRecord,
         now: i64,
     ) -> Result<Vec<serde_json::Value>> {
         ensure_nonempty_value("bridge_thread_id", bridge_thread_id)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut stmt = tx.prepare(
             "SELECT desktop_bindings.source_thread_id,
                     desktop_bindings.caller_automation_id,
@@ -3293,7 +3311,7 @@ impl Store {
             let arm_pending_deadline = entry
                 .get("arm_pending_deadline")
                 .and_then(serde_json::Value::as_i64);
-            let binding = query_desktop_binding_tx(&tx, &source_thread_id)?;
+            let binding = query_desktop_binding_tx(tx, &source_thread_id)?;
             if lease_deadline.is_some_and(|deadline| deadline > now)
                 && arm_pending_deadline.is_some_and(|deadline| deadline > now)
                 && installation_state.read_transport_capability == "validated"
@@ -3301,7 +3319,7 @@ impl Store {
                 && desktop_binding_matches_installation(&binding, installation_state)
             {
                 let marker = find_or_issue_desktop_relay_marker_tx(
-                    &tx,
+                    tx,
                     &DesktopRelayMarkerRequest {
                         bridge_thread_id,
                         envelope_kind: "arm_accepted",
@@ -3331,7 +3349,6 @@ impl Store {
             }
             entries.push(entry);
         }
-        tx.commit()?;
         Ok(entries)
     }
 

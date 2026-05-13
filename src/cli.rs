@@ -11265,17 +11265,13 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
             let delivery_state =
                 desktop_installation_state_for_current_helper(&state, &fingerprint);
             let snapshot_revision = new_id();
-            let ready_threads = store.materialize_desktop_ready_entries(
-                &args.bridge_thread_id,
-                &snapshot_revision,
-                &delivery_state,
-                now,
-            )?;
-            let arm_pending_bindings = store.list_desktop_arm_pending_bindings(
-                &args.bridge_thread_id,
-                &delivery_state,
-                now,
-            )?;
+            let (ready_threads, arm_pending_bindings) = store
+                .materialize_desktop_ready_and_arm_pending_entries(
+                    &args.bridge_thread_id,
+                    &snapshot_revision,
+                    &delivery_state,
+                    now,
+                )?;
             let pause_due_bindings = store.list_desktop_pause_due_bindings(now)?;
             let preflight = publish_desktop_bridge_preflight(DesktopBridgePreflightPublish {
                 layout,
