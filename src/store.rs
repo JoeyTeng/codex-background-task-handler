@@ -44,6 +44,7 @@ const DESKTOP_PAUSE_NOT_BEFORE_SECONDS: i64 = 90;
 const DESKTOP_PAUSE_DEADLINE_GRACE_SECONDS: i64 = 90;
 const DESKTOP_TRANSCRIPT_RELAY_MARKER_TTL_SECONDS: i64 = 6 * 60 * 60;
 const DESKTOP_TRANSCRIPT_RELAY_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
+const DESKTOP_READY_SNAPSHOT_MAX_ENTRIES: usize = 64;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_millis(100);
 const SQLITE_TASK_SUPERVISOR_SETUP_TIMEOUT: Duration = Duration::from_millis(100);
@@ -2612,6 +2613,17 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         cap_desktop_ready_marker_expiries_tx(&tx, bridge_thread_id)?;
+        let mut ready_entries = list_existing_desktop_ready_entries_tx(
+            &tx,
+            bridge_thread_id,
+            snapshot_revision,
+            installation_state,
+            now,
+        )?;
+        if ready_entries.len() >= DESKTOP_READY_SNAPSHOT_MAX_ENTRIES {
+            tx.commit()?;
+            return Ok(ready_entries);
+        }
         let mut stmt = tx.prepare(
             "SELECT batches.batch_id
              FROM batches
@@ -2758,22 +2770,18 @@ impl Store {
                 },
                 now,
             )?;
+            ready_entries.push(desktop_ready_entry_json(
+                &batch,
+                &binding,
+                &attempt,
+                &marker,
+                snapshot_revision,
+            ));
             tx.commit()?;
-            return Ok(vec![serde_json::json!({
-                "source_thread_id": batch.source_thread_id,
-                "caller_automation_id": binding.caller_automation_id,
-                "batch_id": batch.batch_id,
-                "attempt_id": attempt.attempt_id,
-                "generation": attempt.generation,
-                "bridge_request_id": marker.bridge_request_id,
-                "arm_pending_marker": marker.marker,
-                "marker_expires_at": marker.expires_at,
-                "snapshot_revision": snapshot_revision,
-                "requires_artifact_read": false,
-            })]);
+            return Ok(ready_entries);
         }
         tx.commit()?;
-        Ok(Vec::new())
+        Ok(ready_entries)
     }
 
     pub fn list_active_desktop_transcript_relay_markers(
@@ -6983,6 +6991,140 @@ fn cap_desktop_ready_marker_expiries_tx(
         )?;
     }
     Ok(())
+}
+
+fn list_existing_desktop_ready_entries_tx(
+    tx: &Transaction<'_>,
+    bridge_thread_id: &str,
+    snapshot_revision: &str,
+    installation_state: &DesktopInstallationStateRecord,
+    now: i64,
+) -> Result<Vec<serde_json::Value>> {
+    let limit = i64::try_from(DESKTOP_READY_SNAPSHOT_MAX_ENTRIES)
+        .expect("Desktop ready snapshot max fits i64");
+    let mut stmt = tx.prepare(
+        "SELECT desktop_transcript_relay_markers.marker
+         FROM desktop_transcript_relay_markers
+         JOIN delivery_attempts
+           ON delivery_attempts.attempt_id =
+              desktop_transcript_relay_markers.attempt_id
+          AND delivery_attempts.generation =
+              desktop_transcript_relay_markers.generation
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         JOIN desktop_bindings
+           ON desktop_bindings.source_thread_id = batches.source_thread_id
+         WHERE desktop_transcript_relay_markers.bridge_thread_id = ?
+           AND desktop_transcript_relay_markers.envelope_kind = 'arm_pending_requested'
+           AND desktop_transcript_relay_markers.marker_state = 'issued'
+           AND desktop_transcript_relay_markers.expires_at > ?
+           AND desktop_transcript_relay_markers.caller_automation_id =
+               desktop_bindings.caller_automation_id
+           AND desktop_transcript_relay_markers.read_transport_generation =
+               desktop_bindings.read_transport_generation
+           AND desktop_transcript_relay_markers.validation_fingerprint =
+               desktop_bindings.validation_fingerprint
+           AND batches.state = 'open'
+           AND batches.replay_policy = 'automatic'
+           AND batches.delivery_read_only = 1
+           AND batches.delivery_requires_approval = 0
+           AND batches.delivery_requires_network = 0
+           AND batches.delivery_requires_write_access = 0
+           AND batches.requires_artifact_read = 0
+           AND batches.delivery_attempt_count < batches.max_delivery_attempts
+           AND batches.redelivery_window_ends_at > ?
+           AND batches.batch_id = (
+             SELECT head.batch_id
+             FROM batches AS head
+             WHERE head.source_thread_id = batches.source_thread_id
+               AND head.state = 'open'
+             ORDER BY head.created_at ASC, head.batch_id ASC
+             LIMIT 1
+           )
+           AND desktop_bindings.binding_state = 'bound'
+           AND desktop_bindings.read_transport = ?
+           AND desktop_bindings.read_transport_generation = ?
+           AND desktop_bindings.validation_fingerprint = ?
+           AND delivery_attempts.adapter_kind = 'desktop'
+           AND delivery_attempts.state = 'prepared'
+           AND delivery_attempts.generation = (
+             SELECT MAX(current_attempt.generation)
+             FROM delivery_attempts AS current_attempt
+             WHERE current_attempt.batch_id = batches.batch_id
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM delivery_attempts AS active_attempt
+             WHERE active_attempt.source_thread_id = batches.source_thread_id
+               AND active_attempt.state IN ('accept_pending', 'arm_pending', 'cooldown')
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM delivery_attempts AS prepared_attempt
+             WHERE prepared_attempt.source_thread_id = batches.source_thread_id
+               AND prepared_attempt.state = 'prepared'
+               AND prepared_attempt.attempt_id != delivery_attempts.attempt_id
+           )
+           AND (
+             desktop_bindings.armed_generation IS NULL
+             OR desktop_bindings.armed_generation_quiesced_at IS NOT NULL
+           )
+         ORDER BY batches.created_at ASC,
+                  batches.source_thread_id ASC,
+                  batches.batch_id ASC,
+                  desktop_transcript_relay_markers.issued_at ASC,
+                  desktop_transcript_relay_markers.marker ASC
+         LIMIT ?",
+    )?;
+    let markers = stmt
+        .query_map(
+            params![
+                bridge_thread_id,
+                now,
+                now,
+                &installation_state.read_transport,
+                installation_state.read_transport_generation,
+                &installation_state.validation_fingerprint,
+                limit,
+            ],
+            |row| row.get::<_, String>("marker"),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut entries = Vec::with_capacity(markers.len());
+    for marker_id in markers {
+        let marker = query_desktop_transcript_relay_marker_tx(tx, &marker_id)?;
+        let attempt = query_delivery_attempt_tx(tx, &marker.attempt_id)?;
+        let batch = query_batch_tx(tx, &attempt.batch_id)?;
+        let binding = query_desktop_binding_tx(tx, &batch.source_thread_id)?;
+        entries.push(desktop_ready_entry_json(
+            &batch,
+            &binding,
+            &attempt,
+            &marker,
+            snapshot_revision,
+        ));
+    }
+    Ok(entries)
+}
+
+fn desktop_ready_entry_json(
+    batch: &BatchRecord,
+    binding: &DesktopBindingRecord,
+    attempt: &DeliveryAttemptRecord,
+    marker: &DesktopTranscriptRelayMarkerRecord,
+    snapshot_revision: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "source_thread_id": batch.source_thread_id,
+        "caller_automation_id": binding.caller_automation_id,
+        "batch_id": batch.batch_id,
+        "attempt_id": attempt.attempt_id,
+        "generation": attempt.generation,
+        "bridge_request_id": marker.bridge_request_id,
+        "arm_pending_marker": marker.marker,
+        "marker_expires_at": marker.expires_at,
+        "snapshot_revision": snapshot_revision,
+        "requires_artifact_read": false,
+    })
 }
 
 struct DesktopRelayMarkerRequest<'a> {

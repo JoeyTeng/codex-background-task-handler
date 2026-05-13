@@ -953,6 +953,8 @@ fn desktop_bridge_preflight_materializes_ready_entry_and_claim_peeks_it() {
             .starts_with("CBTH_DESKTOP_RELAY_ARM_PENDING_")
     );
     assert_eq!(entry["marker_expires_at"], 3015);
+    let attempt_id = entry["attempt_id"].as_str().unwrap().to_owned();
+    let marker = entry["arm_pending_marker"].as_str().unwrap().to_owned();
     let claim = cbth(
         &home,
         &[
@@ -979,19 +981,15 @@ fn desktop_bridge_preflight_materializes_ready_entry_and_claim_peeks_it() {
         ],
     );
     let second = &second["desktop_bridge_preflight"];
-    assert_eq!(second["snapshots"]["ready_threads"]["count"], 0);
+    assert_eq!(second["snapshots"]["ready_threads"]["count"], 1);
     let second_ready = read_json_file(
         second["snapshots"]["ready_threads"]["path"]
             .as_str()
             .unwrap(),
     );
-    assert_eq!(
-        second_ready["ready_threads"]["entries"]
-            .as_array()
-            .unwrap()
-            .len(),
-        0
-    );
+    let second_entry = &second_ready["ready_threads"]["entries"][0];
+    assert_eq!(second_entry["attempt_id"], attempt_id);
+    assert_eq!(second_entry["arm_pending_marker"], marker);
 }
 
 #[test]
@@ -1051,10 +1049,9 @@ fn desktop_bridge_preflight_caps_reused_ready_marker_after_redelivery_shortens()
         .as_str()
         .expect("ready path");
     let ready = read_json_file(ready_path);
-    assert_eq!(
-        ready["ready_threads"]["entries"].as_array().unwrap().len(),
-        0
-    );
+    let entry = &ready["ready_threads"]["entries"][0];
+    assert_eq!(entry["arm_pending_marker"], marker);
+    assert_eq!(entry["marker_expires_at"], 3070);
     let conn = Connection::open(home.path().join("cbth.sqlite3")).expect("open db");
     let expires_at: i64 = conn
         .query_row(
@@ -1194,7 +1191,17 @@ fn desktop_bridge_preflight_rotates_past_active_ready_marker() {
             .as_str()
             .expect("second ready path");
     let second_ready = read_json_file(second_ready_path);
-    let second_entry = &second_ready["ready_threads"]["entries"][0];
+    let second_entries = second_ready["ready_threads"]["entries"].as_array().unwrap();
+    assert_eq!(second_entries.len(), 2);
+    assert_eq!(
+        second_entries[0]["source_thread_id"],
+        "thread-ready-rotate-a"
+    );
+    assert_eq!(
+        second_entries[0]["arm_pending_marker"],
+        first_entry["arm_pending_marker"]
+    );
+    let second_entry = &second_entries[1];
     assert_eq!(second_entry["source_thread_id"], "thread-ready-rotate-b");
     assert_ne!(
         second_entry["arm_pending_marker"],
