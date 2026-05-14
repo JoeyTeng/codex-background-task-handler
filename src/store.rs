@@ -2375,8 +2375,13 @@ impl Store {
     pub fn consume_desktop_transcript_relay(
         &mut self,
         consumption: NewDesktopTranscriptRelayConsumption,
+        current_validation_fingerprint: &str,
     ) -> Result<DesktopTranscriptRelayConsumptionRecord> {
         validate_desktop_transcript_relay_consumption(&consumption)?;
+        ensure_nonempty_value(
+            "current_validation_fingerprint",
+            current_validation_fingerprint,
+        )?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2398,7 +2403,11 @@ impl Store {
             DesktopTranscriptRelayReplayTxResult::None => {}
         }
         ensure_desktop_relay_marker_matches_consumption(&marker, &consumption)?;
-        ensure_desktop_relay_marker_matches_current_desktop_binding_tx(&tx, &marker)?;
+        ensure_desktop_relay_marker_matches_current_desktop_binding_tx(
+            &tx,
+            &marker,
+            current_validation_fingerprint,
+        )?;
         match consume_desktop_transcript_relay_tx(&tx, &consumption)? {
             DesktopTranscriptRelayConsumeTxResult::Consumed(record) => {
                 tx.commit()?;
@@ -2415,18 +2424,27 @@ impl Store {
         &mut self,
         consumption: NewDesktopTranscriptRelayConsumption,
         scanner_binding: &DesktopRelayScannerBindingRecord,
+        current_validation_fingerprint: &str,
     ) -> Result<(
         DesktopTranscriptRelayConsumptionRecord,
         DesktopTranscriptRelayMarkerRecord,
     )> {
         validate_desktop_transcript_relay_consumption(&consumption)?;
+        ensure_nonempty_value(
+            "current_validation_fingerprint",
+            current_validation_fingerprint,
+        )?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let marker = query_desktop_transcript_relay_marker_tx(&tx, &consumption.marker)?;
         ensure_desktop_relay_marker_matches_consumption(&marker, &consumption)?;
         ensure_desktop_relay_scanner_binding_matches_tx(&tx, scanner_binding, &marker)?;
-        ensure_desktop_relay_marker_matches_current_desktop_binding_tx(&tx, &marker)?;
+        ensure_desktop_relay_marker_matches_current_desktop_binding_tx(
+            &tx,
+            &marker,
+            current_validation_fingerprint,
+        )?;
         match consume_desktop_transcript_relay_tx(&tx, &consumption)? {
             DesktopTranscriptRelayConsumeTxResult::Consumed(record) => {
                 tx.execute(
@@ -5923,6 +5941,7 @@ fn ensure_desktop_relay_scanner_binding_matches_tx(
 fn ensure_desktop_relay_marker_matches_current_desktop_binding_tx(
     tx: &Transaction<'_>,
     marker: &DesktopTranscriptRelayMarkerRecord,
+    current_validation_fingerprint: &str,
 ) -> Result<()> {
     let binding = query_desktop_binding_tx(tx, &marker.source_thread_id)?;
     if binding.binding_state != "bound"
@@ -5933,6 +5952,12 @@ fn ensure_desktop_relay_marker_matches_current_desktop_binding_tx(
         bail!(
             "Desktop binding {} changed since transcript relay marker {} was issued",
             marker.source_thread_id,
+            marker.marker
+        );
+    }
+    if marker.validation_fingerprint != current_validation_fingerprint {
+        bail!(
+            "Desktop helper fingerprint changed since transcript relay marker {} was issued",
             marker.marker
         );
     }
@@ -8576,6 +8601,7 @@ mod tests {
                     now: 13,
                 },
                 &scanner_binding,
+                &fixture.binding.validation_fingerprint,
             )
             .expect_err("non-issued marker must fail before CAS");
         assert!(
@@ -8657,6 +8683,7 @@ mod tests {
                     now: 23,
                 },
                 &stale_binding,
+                &fixture.binding.validation_fingerprint,
             )
             .expect_err("stale scanner binding must fail before CAS");
         assert!(
@@ -8770,6 +8797,7 @@ mod tests {
                     now: 33,
                 },
                 &scanner_binding,
+                &fixture.binding.validation_fingerprint,
             )
             .expect_err("stale Desktop binding marker must fail before CAS");
         assert!(
@@ -8790,6 +8818,87 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM desktop_transcript_relay_consumptions WHERE marker = ?",
                 params!["marker-atomic-desktop-binding"],
+                |row| row.get(0),
+            )
+            .expect("count consumptions");
+        assert_eq!(consumptions, 0);
+    }
+
+    #[test]
+    fn desktop_relay_marker_cas_requires_current_helper_fingerprint() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let fixture = store
+            .prepare_desktop_writeback_fixture(NewDesktopWritebackFixture {
+                source_thread_id: "thread-atomic-helper-fingerprint".to_owned(),
+                caller_automation_id: "automation-atomic-helper-fingerprint".to_owned(),
+                bridge_request_id: "request-atomic-helper-fingerprint".to_owned(),
+                default_validation_fingerprint: "fp-atomic-helper-old".to_owned(),
+                now: 34,
+            })
+            .expect("prepare fixture");
+        store
+            .issue_desktop_transcript_relay_marker(NewDesktopTranscriptRelayMarker {
+                marker: "marker-atomic-helper-fingerprint".to_owned(),
+                bridge_thread_id: "bridge-atomic-helper-fingerprint".to_owned(),
+                envelope_kind: "arm_pending_requested".to_owned(),
+                source_thread_id: fixture.source_thread_id.clone(),
+                attempt_id: fixture.attempt.attempt_id.clone(),
+                generation: fixture.attempt.generation,
+                bridge_request_id: fixture.bridge_request_id.clone(),
+                issued_at: 35,
+                expires_at: 100,
+                retention_until: 200,
+            })
+            .expect("issue marker");
+        let scanner_binding = store
+            .bind_desktop_relay_scanner(NewDesktopRelayScannerBinding {
+                bridge_thread_id: "bridge-atomic-helper-fingerprint".to_owned(),
+                rollout_path: "/tmp/atomic-helper-fingerprint.jsonl".to_owned(),
+                rollout_identity: "unix:34:35".to_owned(),
+                cursor_byte_offset: 0,
+                cursor_line_number: 0,
+                now: 35,
+            })
+            .expect("bind scanner");
+
+        let error = store
+            .consume_issued_desktop_transcript_relay_marker(
+                NewDesktopTranscriptRelayConsumption {
+                    marker: "marker-atomic-helper-fingerprint".to_owned(),
+                    envelope_hash: "hash-atomic-helper-fingerprint".to_owned(),
+                    envelope_kind: "arm_pending_requested".to_owned(),
+                    envelope_json: "{}".to_owned(),
+                    source_thread_id: fixture.source_thread_id.clone(),
+                    attempt_id: fixture.attempt.attempt_id.clone(),
+                    generation: fixture.attempt.generation,
+                    bridge_request_id: fixture.bridge_request_id.clone(),
+                    bridge_arm_lease_id: None,
+                    now: 36,
+                },
+                &scanner_binding,
+                "fp-atomic-helper-current",
+            )
+            .expect_err("stale helper fingerprint marker must fail before CAS");
+        assert!(
+            error
+                .to_string()
+                .contains("helper fingerprint changed since transcript relay marker"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            store
+                .inspect_attempt(&fixture.attempt.attempt_id)
+                .expect("inspect attempt")
+                .state,
+            "prepared"
+        );
+        let consumptions: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM desktop_transcript_relay_consumptions WHERE marker = ?",
+                params!["marker-atomic-helper-fingerprint"],
                 |row| row.get(0),
             )
             .expect("count consumptions");
@@ -8885,6 +8994,7 @@ mod tests {
                     now: 42,
                 },
                 &scanner_binding,
+                &fixture.binding.validation_fingerprint,
             )
             .expect("consume backfilled marker");
         assert_eq!(consumption.replay_state, "fresh");

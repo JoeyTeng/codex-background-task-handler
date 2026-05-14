@@ -12222,7 +12222,10 @@ fn consume_prepared_desktop_transcript_relay(
     now: i64,
 ) -> Result<Value> {
     prepared.request.now = now;
-    let record = store.consume_desktop_transcript_relay(prepared.request)?;
+    let current_validation_fingerprint =
+        desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
+    let record = store
+        .consume_desktop_transcript_relay(prepared.request, &current_validation_fingerprint)?;
     Ok(json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
         "rollout_path": prepared.rollout_path,
@@ -12416,6 +12419,8 @@ fn run_desktop_relay_scanner_scan_once(
     let reconciled_markers = store.reconcile_desktop_transcript_relay_consumed_markers(now)?;
     let expired_markers = store.expire_desktop_transcript_relay_markers(now)?;
     let retention_deleted = store.cleanup_desktop_transcript_relay_retention(now)?;
+    let current_validation_fingerprint =
+        desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
     let bindings = store.list_desktop_relay_scanner_bindings(bridge_thread_id)?;
     let mut reports = Vec::new();
     let mut scanned_bindings = 0_usize;
@@ -12425,7 +12430,9 @@ fn run_desktop_relay_scanner_scan_once(
         if binding.binding_state != "active" {
             continue;
         }
-        let Some(report) = scan_desktop_relay_binding_once(store, &binding, now)? else {
+        let Some(report) =
+            scan_desktop_relay_binding_once(store, &binding, now, &current_validation_fingerprint)?
+        else {
             continue;
         };
         scanned_bindings += 1;
@@ -12470,6 +12477,7 @@ fn scan_desktop_relay_binding_once(
     store: &mut Store,
     binding: &DesktopRelayScannerBindingRecord,
     now: i64,
+    current_validation_fingerprint: &str,
 ) -> Result<Option<Value>> {
     let path = Path::new(&binding.rollout_path);
     let pre_open_metadata = match fs::symlink_metadata(path) {
@@ -12784,7 +12792,14 @@ fn scan_desktop_relay_binding_once(
             }));
             continue;
         };
-        match consume_desktop_relay_scanner_envelope(store, binding, &marker_record, entry, now) {
+        match consume_desktop_relay_scanner_envelope(
+            store,
+            binding,
+            &marker_record,
+            entry,
+            now,
+            current_validation_fingerprint,
+        ) {
             Ok(report) => consumed_reports.push(report),
             Err(error) => {
                 let reason = error.to_string();
@@ -12828,6 +12843,7 @@ fn consume_desktop_relay_scanner_envelope(
     marker_record: &DesktopTranscriptRelayMarkerRecord,
     entry: DesktopRelayTrustedEnvelope,
     now: i64,
+    current_validation_fingerprint: &str,
 ) -> Result<Value> {
     let kind = json_str_field(&entry.envelope, "kind", "transcript envelope")?;
     if kind != marker_record.envelope_kind {
@@ -12904,6 +12920,7 @@ fn consume_desktop_relay_scanner_envelope(
             now,
         },
         binding,
+        current_validation_fingerprint,
     )?;
     finish_desktop_relay_scanner_consumption(entry, consumption, marker)
 }
