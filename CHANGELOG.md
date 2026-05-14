@@ -4,9 +4,16 @@ All notable release changes for `cbth` are documented here.
 
 ## Unreleased
 
+## v0.2.2 - 2026-05-14
+
+### Added
+
+- Added Desktop ready materialization and the two-phase bridge arm workflow, including ready snapshot publication, `arm_pending` / `arm_accepted` marker issuance, helper-fingerprint fencing, and the `desktop-ready-arm-workflow` daemon capability.
+
 ### Changed
 
 - Changed `cbth cli app-servers` to inspect all known daemon generations by default, newest generation first, and added `--latest-generation` for the previous single-generation view; default-only legacy daemon deployments keep the existing single-endpoint JSON shape, and `--all-daemons` remains a compatibility alias for the new default.
+- Replaced the repo-local Codex review gate implementation with the pinned standalone `JoeyTeng/codex-review-gate` action while keeping the `codex/review-gate` status context.
 
 ## v0.2.1 - 2026-05-13
 
