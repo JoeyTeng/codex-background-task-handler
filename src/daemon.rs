@@ -104,6 +104,7 @@ const DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-writeback-live-validation-fixture",
     "desktop-transcript-relay-consumer",
     "desktop-transcript-relay-scanner",
+    "desktop-ready-arm-workflow",
     DAEMON_HANDOFF_CAPABILITY,
 ];
 const CLI_THREAD_START_BOOTSTRAP_BOUND_THREAD_ID: &str = "__cbth_thread_start_bootstrap__";
@@ -690,6 +691,7 @@ impl DaemonLifecycleCache {
             || (!maintenance_suppressed && self.status.cli_acceptances_stale_now > 0)
             || (!maintenance_suppressed && self.status.cli_observations_due_now > 0)
             || (!maintenance_suppressed && self.status.active_desktop_relay_markers > 0)
+            || (!maintenance_suppressed && self.status.desktop_attempts_due_within_idle > 0)
             || (!maintenance_suppressed && self.status.open_batches_due_within_idle > 0)
     }
 }

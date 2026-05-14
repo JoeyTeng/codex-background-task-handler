@@ -64,7 +64,7 @@ cbth desktop relay emit-arm-pending ... --marker <issued-marker> --json
 cbth desktop relay emit-arm-accepted ... --marker <issued-marker> --json
 ```
 
-所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation`、validation-only `desktop-writeback-live-validation-fixture`、`desktop-transcript-relay-consumer` 或 `desktop-transcript-relay-scanner` capability 时会按现有 capability gate fail closed 或重启。`read-snapshot` / `list-*` / `claim-next-ready` 是 no-DB read helpers：它们只读取已经发布的 inbox JSON，不打开 SQLite、不连接 daemon、不写文件。
+所有输出都是 JSON。mutating / preflight 命令通过 same-user daemon IPC 路由；旧 daemon 缺少 `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation`、validation-only `desktop-writeback-live-validation-fixture`、`desktop-transcript-relay-consumer`、`desktop-transcript-relay-scanner` 或 `desktop-ready-arm-workflow` capability 时会按现有 capability gate fail closed 或重启。`read-snapshot` / `list-*` / `claim-next-ready` 是 no-DB read helpers：它们只读取已经发布的 inbox JSON，不打开 SQLite、不连接 daemon、不写文件。
 
 另有一个 hidden validation-only probe：`cbth desktop validation writeback-dropbox-probe ...`。它不属于稳定 operator surface，只用于验证真实 Desktop heartbeat 能否在不打开 SQLite、不连接 daemon、不触碰 `startup.lock` 的情况下创建或 append `~/.cbth/inbox/writeback-dropbox/probes/<probe_id>.json`。
 
@@ -115,7 +115,7 @@ cbth desktop relay emit-arm-accepted ... --marker <issued-marker> --json
 
 同一个 active caller automation 只能被一个 source thread 占用。`binding repair` 会拒绝把已经属于其他 `bound` / `degraded` binding 的 `caller_automation_id` 绑定给新的 `source_thread_id`。
 
-本阶段没有实现 `binding unbind`、caller automation cleanup、quiesced generation writeback 或 ready attempt materialization。
+本阶段没有实现 `binding unbind`、caller automation cleanup 或 quiesced generation writeback。
 
 ## Bridge Preflight Snapshots
 
@@ -147,11 +147,13 @@ cbth desktop relay emit-arm-accepted ... --marker <issued-marker> --json
 - 相同的 `created_at`
 - 相同的 `bridge_thread_id`
 
-`ready_threads.entries` 仍为空，`count = 0`，因为真实 ready selection 和 attempt creation 还未实现。`arm_pending_bindings.entries` 会导出当前 open head Desktop attempts 中处于 `arm_pending` 的 reconcile metadata；`pause_due_bindings.entries` 会导出已 armed、未 quiesced、且 `pause_deadline <= now` 的 bound bindings。当前 PR 只发布这些 reconcile entries，不执行 pause cleanup 或 automatic delivery。
+Ready/arm workflow work changes this foundation boundary: `ready_threads.entries` is no longer permanently empty. `bridge-preflight` may materialize at most one eligible Desktop head batch into a ready entry with an issued bridge-scoped `arm_pending_requested` marker, while `arm_pending_bindings.entries` may carry issued `arm_accepted` markers for attempts already durably in `arm_pending`. If a heartbeat bridge is replaced before consuming a ready marker, the replacement bridge may reissue its own marker for the same prepared attempt; if replacement happens after the pending marker was consumed, the replacement bridge may still issue its own accepted marker after current binding and installation tokens are revalidated. The durable CAS path still allows only one pending transition and one final arm transition. `pause_due_bindings.entries` continue to export armed, unquiesced bindings with `pause_deadline <= now`.
+
+This still does not enable full Desktop automatic delivery. Caller wake, production `automation_update`, pause cleanup, `note-boundary-crossed`, and artifact payload reads remain separate work.
 
 ## Desktop Writeback Helpers
 
-`note-arm-pending` 和 `note-arm` 是 Desktop bridge 后续执行 caller wake 前后的 durable writeback primitives。它们只对已经存在的 `adapter_kind=desktop`、当前 head、当前 generation 的 prepared attempt 生效；本阶段仍不创建 ready attempt，也不调用 `automation_update`。
+`note-arm-pending` 和 `note-arm` 是 Desktop bridge 后续执行 caller wake 前后的 durable writeback primitives。它们只对已经存在的 `adapter_kind=desktop`、当前 head、当前 generation 的 prepared attempt 生效；helper 本身不创建 ready attempt，也不调用 `automation_update`。Ready attempt creation belongs to `bridge-preflight` materialization and is gated by the same Desktop binding, capability, policy, budget, and redelivery checks.
 
 - `note-arm-pending` 以 `(source_thread_id, attempt_id, generation, bridge_request_id)` 做 CAS，只允许 `prepared -> arm_pending`。成功时写入 `bridge_request_id`、`bridge_arm_lease_id`、`bridge_arm_lease_deadline`、`arm_pending_since` 和 `arm_pending_deadline`。
 - 同一 request 重试 `note-arm-pending` 会返回同一个 lease；不同 request 遇到 existing `arm_pending` 会 fail closed，不泄露 lease。
@@ -163,7 +165,7 @@ cbth desktop relay emit-arm-accepted ... --marker <issued-marker> --json
 
 真实 Desktop heartbeat 已证明 daemon-routed writeback helper 会在 `note-arm-pending` 前被 `startup.lock` sandbox `EPERM` 阻断。后续 hidden writeback dropbox probe 又证明 heartbeat 不能在 `~/.cbth/inbox/writeback-dropbox` 下创建目录、创建 probe file，或打开预创建的 probe file 追加写入。因此 Desktop v1 不应继续依赖 heartbeat-authored local filesystem writeback。
 
-当前首选的 side channel 是 transcript / tool-output relay：heartbeat 只运行 pure stdout helper，输出带 `CBTH_TRANSCRIPT_WRITEBACK_V1` 前缀的结构化 envelope；外部 operator / sidecar 从 Codex rollout 的 `function_call_output` carrier 中读取精确 stdout，再在 Desktop sandbox 外执行真实 durable CAS writeback。scanner 必须把 `function_call_output` 视为唯一当前 `trusted_auto` carrier，把 assistant final text 归类为 `diagnostic_only`，把 heartbeat prompt 归类为 `ignored_prompt`，避免 prompt 自触发。`cbth desktop relay consume-transcript` 可以手动消费单个可信 `arm_pending_requested` / `arm_requested` envelope，并通过 marker + canonical envelope hash 做 durable replay fence 后调用既有 `note-arm-pending` / `note-arm` CAS。
+当前首选的 side channel 是 transcript / tool-output relay：heartbeat 只运行 pure stdout helper，输出带 `CBTH_TRANSCRIPT_WRITEBACK_V1` 前缀的结构化 envelope；外部 operator / sidecar 从 Codex rollout 的 `function_call_output` carrier 中读取精确 stdout，再在 Desktop sandbox 外执行真实 durable CAS writeback。scanner 必须把 `function_call_output` 视为唯一当前 `trusted_auto` carrier，把 assistant final text 归类为 `diagnostic_only`，把 heartbeat prompt 归类为 `ignored_prompt`，避免 prompt 自触发。`cbth desktop relay consume-transcript` 可以手动消费单个可信 `arm_pending_requested` / `arm_requested` envelope，但 marker 必须已经通过 `cbth desktop relay marker issue ...` 签发，且 durable binding / attempt snapshot 仍匹配；通过 marker + canonical envelope hash 做 durable replay fence 后才调用既有 `note-arm-pending` / `note-arm` CAS。
 
 Production scanner foundation 在手动 consumer 之上增加了三层约束：
 
@@ -171,7 +173,7 @@ Production scanner foundation 在手动 consumer 之上增加了三层约束：
 - `desktop_transcript_relay_markers` 是 issued marker allowlist，保存 expected envelope kind、source / attempt / generation / request tokens、expiry 和 retention。daemon worker 在存在 issued marker + active scanner binding、issued marker + existing consumption fence、expired issued marker，或 due relay retention cleanup 时每 2 秒扫描一次；每 tick 先用 `symlink_metadata` 验证 bound rollout path 是同一 regular file，再用 nonblocking open 打开并用 opened handle 的 metadata / identity 冻结 tick-start EOF，最后读取 active marker set。这样 FIFO / special-file replacement 会在打开前或 nonblocking open 后 fail closed degrade，不会卡住 lifecycle maintenance。每 tick 最多处理 tick-start EOF 之前的 256 个完整 JSONL records 或 1 MiB，首条 record 超过预算时 fail-closed degrade binding。
 - Cursor publication, binding degradation, and marker rejection are conditional on the binding still being active at the expected prior path / identity / byte cursor / line cursor / monotonic `binding_revision`. `updated_at` remains observational only and is not a CAS token because it has seconds-level resolution. Older overlapping scanner ticks cannot move the durable cursor backward, clear a degraded binding, degrade a replacement binding, or reject a marker after rebind.
 - If a bounded tick sees marker evidence before it reaches tick-start EOF, the scanner degrades the binding instead of consuming or rejecting the marker. This preserves duplicate detection without allowing unbounded rollout reads.
-- Fresh scanner consumption re-checks marker state, expiry, expected fields, hash fence, and the scanner binding path / identity / cursor in the same immediate SQLite transaction that applies the arm CAS and marks the marker consumed. This prevents a concurrent reject/expire or rebind/cursor advance from racing with `note-arm-pending` or `note-arm`.
+- Fresh scanner consumption re-checks marker state, expiry, expected fields, hash fence, the current helper validation fingerprint, and the scanner binding path / identity / cursor in the same immediate SQLite transaction that applies the arm CAS and marks the marker consumed. This prevents helper drift, a concurrent reject/expire, or rebind/cursor advance from racing with `note-arm-pending` or `note-arm`.
 - Production `emit-arm-accepted` envelope 不带 `bridge_arm_lease_id`，scanner 也会拒绝任何带该字段的 trusted `arm_accepted` envelope。`arm-accepted` marker 只能在 attempt 已 durable 进入 `arm_pending`、request/generation/lease 均匹配且 lease 尚未过期时签发；scanner 在 Desktop sandbox 外从该 durable attempt 解析 lease，再调用已有 `note-arm` CAS。这避免把 lease 暴露给 heartbeat prompt/output text，同时保持 CAS token 校验。
 - `arm_accepted` 在 pending-only lease lookup 前会先检查同 marker/hash 的成功 replay fence，且 scan maintenance 会先 reconcile 已有 consumption fence 再过期 issued marker，避免 CAS 已提交但 marker 尚未标 consumed 的 crash 窗口把成功写回误判为 expired/rejected。production 不允许先签发 accepted marker 再依赖同 tick pending envelope 排序来补救状态。
 
@@ -200,23 +202,21 @@ Production scanner foundation 在手动 consumer 之上增加了三层约束：
 
 - 未 validated 的 installation state 不允许 automatic Desktop delivery。
 - `degraded` binding 不允许 automatic Desktop delivery。
-- 默认 daemon-routed preflight / writeback 缺少 daemon capability `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation`、validation-only `desktop-writeback-live-validation-fixture` 或 `desktop-transcript-relay-consumer` 时不执行 preflight / repair / writeback / fixture setup / relay consume。
+- 默认 daemon-routed preflight / writeback 缺少 daemon capability `desktop-bridge-foundation-dispatch`、`desktop-inbox-revisioned-installation-state`、`desktop-writeback-helper-foundation`、validation-only `desktop-writeback-live-validation-fixture`、`desktop-transcript-relay-consumer`、`desktop-transcript-relay-scanner` 或 `desktop-ready-arm-workflow` 时不执行 preflight / repair / writeback / fixture setup / relay consume / ready materialization。
 - preflight 失败时 bridge 不得读取旧 snapshot 继续 arm。
 - no-DB read helper 发现 manifest / snapshot 不一致时不得继续 delivery。
 - writeback helper 发现 CAS token、binding、batch、attempt 或 policy 不匹配时不得推进 durable state。
 - transcript relay consumer 只接受单个 trusted `function_call_output` envelope；prompt、assistant text、duplicate trusted、malformed trusted、wrong marker 或 replay hash mismatch 都不得推进 durable state。
-- production transcript relay scanner 只消费已签发、未过期、字段完全匹配的 marker；scan tick 先对 path 做 pre-open regular-file / identity gate，再用 nonblocking open 和 opened file handle metadata / EOF 冻结，且 fresh CAS 与 marker consumed/rejected 写回同事务完成并复核 scanner binding path / identity / cursor / `binding_revision`；cursor 发布带 expected prior cursor 和 monotonic revision 条件；`arm-accepted` marker 签发要求 attempt 已 durable `arm_pending`，successful replay fences 优先于 pending-only lease lookup 和 marker expiry；partial trailing rollout lines 和 tick-start EOF 之后追加的 lines 会延后处理，special-file replacement / truncate / inode drift / oversized first tick record / marker evidence before tick-start EOF 都会 degrade binding，unissued / expired-without-replay / duplicate / malformed / wrong-field envelopes 和 failed-CAS replay fences 都不得推进 durable state。
+- production transcript relay scanner 只消费已签发、未过期、字段完全匹配的 marker；scan tick 先对 path 做 pre-open regular-file / identity gate，再用 nonblocking open 和 opened file handle metadata / EOF 冻结，且 fresh CAS 与 marker consumed/rejected 写回同事务完成并复核 current helper validation fingerprint、scanner binding path / identity / cursor / `binding_revision`；cursor 发布带 expected prior cursor 和 monotonic revision 条件；`arm-accepted` marker 签发要求 attempt 已 durable `arm_pending`，successful replay fences 优先于 pending-only lease lookup 和 marker expiry；partial trailing rollout lines 和 tick-start EOF 之后追加的 lines 会延后处理，special-file replacement / truncate / inode drift / oversized first tick record / marker evidence before tick-start EOF 都会 degrade binding，unissued / expired-without-replay / malformed / wrong-field envelopes 和 failed-CAS replay fences 都不得推进 durable state；同 hash duplicate trusted carrier evidence 只能幂等去重为一次 CAS，hash 冲突的 duplicate trusted envelope fail closed。
 - writeback dropbox probe 只允许 validation-only file creation；它不得绕过 `note-arm-pending` / `note-arm` 的 durable CAS，也不得被解释为 automatic Desktop delivery 已启用。
-- `ready_threads.entries` 为空不是“没有任何未来工作”的最终语义；它只是本阶段尚未实现 ready materialization。
+- `ready_threads.entries` 为空不是“没有任何未来工作”的最终语义；它只表示当前 preflight 没有找到可安全 materialize 或可重发的 eligible ready entry。
 
 ## Out Of Scope
 
 本阶段不实现：
 
 - caller heartbeat wake / `automation_update` 调用。
-- ready attempt materialization。
 - `note-boundary-crossed`。
-- writeback helper live Desktop heartbeat validation beyond the validation-only dropbox probe.
 - Desktop automatic delivery live validation；preflight/read validation workflow is documented separately in [DESKTOP_LIVE_PREFLIGHT_VALIDATION.md](../validation/DESKTOP_LIVE_PREFLIGHT_VALIDATION.md).
 - 大 artifact automatic continuation。
 - 外部 Webex / GitHub / PR polling integrations。
