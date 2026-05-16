@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 use semver::Version;
@@ -45,7 +45,7 @@ fn is_peer_disconnect_kind(kind: std::io::ErrorKind) -> bool {
     )
 }
 
-const TEST_DAEMON_CAPABILITIES_JSON: &str = r#"["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-thread-start-params","cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","desktop-transcript-relay-scanner","daemon-handoff-v1"]"#;
+const TEST_DAEMON_CAPABILITIES_JSON: &str = r#"["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-thread-start-params","cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","desktop-transcript-relay-scanner","desktop-ready-arm-workflow","daemon-handoff-v1"]"#;
 
 fn cbth(home: &TempDir, args: &[&str]) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
@@ -523,6 +523,7 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "desktop-writeback-live-validation-fixture",
             "desktop-transcript-relay-consumer",
             "desktop-transcript-relay-scanner",
+            "desktop-ready-arm-workflow",
             "daemon-handoff-v1"
         ])
     );
@@ -566,6 +567,7 @@ fn daemon_ensure_starts_ping_status_and_stop() {
             "desktop-writeback-live-validation-fixture",
             "desktop-transcript-relay-consumer",
             "desktop-transcript-relay-scanner",
+            "desktop-ready-arm-workflow",
             "daemon-handoff-v1"
         ])
     );
@@ -675,6 +677,7 @@ fn daemon_ensure_restarts_incompatible_daemon() {
             "desktop-writeback-live-validation-fixture",
             "desktop-transcript-relay-consumer",
             "desktop-transcript-relay-scanner",
+            "desktop-ready-arm-workflow",
             "daemon-handoff-v1"
         ])
     );
@@ -781,15 +784,39 @@ fn daemon_ensure_coexists_with_incompatible_default_without_stop() {
         }),
         "generation daemon endpoint should be visible in status --all: {all_status}"
     );
-    let app_servers = cbth(&home, &["cli", "app-servers", "--all-daemons"]);
+    let app_servers = cbth(&home, &["cli", "app-servers"]);
     let app_server_daemons = app_servers["daemons"]
         .as_array()
         .expect("app-server daemon reports");
     assert!(
         app_server_daemons.len() >= 2,
-        "app-servers --all-daemons should include both endpoints: {app_servers}"
+        "app-servers should include all known daemon endpoints by default: {app_servers}"
+    );
+    assert_eq!(
+        app_server_daemons[0]["socket_path"],
+        generation_socket_path.display().to_string(),
+        "newest generation daemon should be listed first: {app_servers}"
+    );
+    assert_eq!(
+        app_server_daemons[app_server_daemons.len() - 1]["socket_path"],
+        socket_path.display().to_string(),
+        "legacy default daemon should be listed last: {app_servers}"
     );
     assert_eq!(app_servers["cli_app_servers"], json!([]));
+
+    let latest_app_servers = cbth(&home, &["cli", "app-servers", "--latest-generation"]);
+    assert!(
+        latest_app_servers["daemons"]
+            .as_array()
+            .expect("latest-generation daemon reports")
+            .is_empty(),
+        "latest-generation should use the single-endpoint report shape: {latest_app_servers}"
+    );
+    assert_eq!(
+        latest_app_servers["daemon"]["socket_path"],
+        generation_socket_path.display().to_string(),
+        "latest-generation should inspect the newest generation socket: {latest_app_servers}"
+    );
 
     done_tx.send(()).expect("signal old daemon");
     handle.join().expect("old daemon thread");
@@ -1494,6 +1521,7 @@ fn daemon_dispatch_uses_probed_socket_when_ping_omits_socket_path() {
                     "desktop-writeback-live-validation-fixture",
                     "desktop-transcript-relay-consumer",
                     "desktop-transcript-relay-scanner",
+                    "desktop-ready-arm-workflow",
                     "daemon-handoff-v1"
                 ],
                 "message": "pong"
@@ -1624,6 +1652,14 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
         .join("cbth.sock");
     let mut generation_daemon = spawn_daemon(&home, "300", &["--socket-kind", "generation"]);
     wait_for_path(&generation_socket_path);
+    let now: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_secs()
+        .try_into()
+        .expect("epoch seconds fit in i64");
+    let fixture_now = now.to_string();
+    let consume_now = (now + 20).to_string();
 
     let fixture = cbth(
         &home,
@@ -1638,14 +1674,42 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
             "--bridge-request-id",
             "bridge-request-generation-relay",
             "--now",
-            "8120",
+            &fixture_now,
             "--json",
         ],
     );
     let attempt_id = fixture["desktop_writeback_fixture"]["attempt"]["attempt_id"]
         .as_str()
         .expect("attempt id");
-    let marker = "CBTH_GENERATION_RELAY_ENDPOINT";
+    let marker_now = (now + 5).to_string();
+    let marker = cbth(
+        &home,
+        &[
+            "desktop",
+            "relay",
+            "marker",
+            "issue",
+            "--bridge-thread-id",
+            "bridge-generation-relay",
+            "--kind",
+            "arm-pending",
+            "--source-thread-id",
+            "thread-generation-relay",
+            "--attempt-id",
+            attempt_id,
+            "--generation",
+            "1",
+            "--bridge-request-id",
+            "bridge-request-generation-relay",
+            "--now",
+            &marker_now,
+            "--json",
+        ],
+    );
+    let marker = marker["desktop_transcript_relay_marker"]["record"]["marker"]
+        .as_str()
+        .expect("marker")
+        .to_owned();
     let envelope = json!({
         "schema_version": 1,
         "channel": "desktop_transcript_writeback",
@@ -1654,8 +1718,8 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
         "attempt_id": attempt_id,
         "generation": 1,
         "bridge_request_id": "bridge-request-generation-relay",
-        "marker": marker,
-        "created_at": 8130,
+        "marker": &marker,
+        "created_at": now + 10,
     });
     let rollout = home.path().join("generation-relay-rollout.jsonl");
     write_function_call_rollout(
@@ -1675,10 +1739,10 @@ fn desktop_relay_dispatch_uses_ensured_generation_daemon_endpoint() {
             "--rollout-path",
             rollout.to_str().unwrap(),
             "--marker",
-            marker,
+            &marker,
             "--json",
             "--now",
-            "8140",
+            &consume_now,
         ],
     );
     assert_eq!(
@@ -2213,6 +2277,7 @@ fn daemon_ensure_restarts_daemon_missing_turn_observation_capability() {
             "desktop-writeback-live-validation-fixture",
             "desktop-transcript-relay-consumer",
             "desktop-transcript-relay-scanner",
+            "desktop-ready-arm-workflow",
             "daemon-handoff-v1"
         ])
     );
@@ -2299,6 +2364,7 @@ fn daemon_ensure_restarts_daemon_missing_auto_delivery_capability() {
             "desktop-writeback-live-validation-fixture",
             "desktop-transcript-relay-consumer",
             "desktop-transcript-relay-scanner",
+            "desktop-ready-arm-workflow",
             "daemon-handoff-v1"
         ])
     );
@@ -2385,6 +2451,7 @@ fn daemon_ensure_restarts_daemon_missing_session_capability_dispatch() {
             "desktop-writeback-live-validation-fixture",
             "desktop-transcript-relay-consumer",
             "desktop-transcript-relay-scanner",
+            "desktop-ready-arm-workflow",
             "daemon-handoff-v1"
         ])
     );
@@ -2453,7 +2520,7 @@ fn daemon_ensure_accepts_concurrent_compatible_replacement() {
                     assert!(request.contains("\"ping\""));
                     if let Err(error) = stream.write_all(
                         br#"{"ok":true,"response":{"daemon":{"pid":5151},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-thread-start-params",
-            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","desktop-transcript-relay-scanner","daemon-handoff-v1"],"message":"pong"}}"#,
+            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","desktop-transcript-relay-scanner","desktop-ready-arm-workflow","daemon-handoff-v1"],"message":"pong"}}"#,
                     ) {
                         if is_peer_disconnect(&error) {
                             continue;
@@ -2521,7 +2588,7 @@ fn daemon_ensure_retries_busy_daemon_without_spawning() {
                 r#"{"ok":false,"error":"daemon connection limit reached"}"#
             } else {
                 r#"{"ok":true,"response":{"daemon":{"pid":4242},"protocol_version":1,"capabilities":["dispatch","attempt-dispatch","cli-app-server-lifecycle","cli-app-server-probe","cli-thread-start-bootstrap","cli-thread-start-params",
-            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","desktop-transcript-relay-scanner","daemon-handoff-v1"],"message":"pong"}}"#
+            "cli-foreground-thread-bootstrap","cli-session-dispatch","cli-session-capability-dispatch","cli-session-permission-dispatch","cli-session-proof-invalidation-dispatch","cli-session-recovery-dispatch","cli-turn-observation-dispatch","cli-turn-observation-expiry-dispatch","cli-auto-delivery-dispatch","task-supervisor","desktop-bridge-foundation-dispatch","desktop-inbox-revisioned-installation-state","desktop-writeback-helper-foundation","desktop-writeback-live-validation-fixture","desktop-transcript-relay-consumer","desktop-transcript-relay-scanner","desktop-ready-arm-workflow","daemon-handoff-v1"],"message":"pong"}}"#
             };
             stream
                 .write_all(response.as_bytes())

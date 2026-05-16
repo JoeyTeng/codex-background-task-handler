@@ -19,7 +19,7 @@ cbth doctor cli
 安装指定版本或目录：
 
 ```bash
-CBTH_VERSION=v0.2.0 CBTH_INSTALL_DIR="$HOME/.local/bin" \
+CBTH_VERSION=v0.2.2 CBTH_INSTALL_DIR="$HOME/.local/bin" \
   sh scripts/install.sh
 ```
 
@@ -147,9 +147,10 @@ cbth cli session inspect --managed-session-id <managed-session-id>
 ```bash
 cbth cli app-servers
 cbth cli app-servers --human
+cbth cli app-servers --latest-generation --human
 ```
 
-当 app-server 支持 `thread/loaded/list` 时，JSON output 可能包含可选字段 `loaded_non_bound_codex_sessions`，`--human` / `-H` 也可能打印 `loaded non-bound codex sessions`。这只是 best-effort 的 loaded-thread 诊断信息；它不表示 foreground/current session，也不会改变投递路由。API 不支持、返回错误或列表为空时，该字段会被省略。
+`cbth cli app-servers` 默认检查所有已知 daemon generation，最新 generation 排在最前；`--all-daemons` 是这个默认行为的兼容别名。只想看最新 generation 并保留单 endpoint 输出形态时，使用 `--latest-generation`；如果没有 generation socket，`--latest-generation` 会 fallback 到默认 daemon。只有 legacy default daemon 的部署会保留既有 single-endpoint JSON shape。当 app-server 支持 `thread/loaded/list` 时，JSON output 可能包含可选字段 `loaded_non_bound_codex_sessions`，`--human` / `-H` 也可能打印 `loaded non-bound codex sessions`。这只是 best-effort 的 loaded-thread 诊断信息；它不表示 foreground/current session，也不会改变投递路由。API 不支持、返回错误或列表为空时，该字段会被省略。
 
 Daemon control commands：
 
