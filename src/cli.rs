@@ -57,6 +57,7 @@ use crate::models::{
 use crate::self_update::{
     SelfUpdateOptions, current_release_target_triple, run_self_update, run_self_update_interactive,
 };
+use crate::service::{ServiceRunOptions, service_run, status_report, write_status_human};
 use crate::store::{Store, new_id};
 
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
@@ -223,6 +224,16 @@ enum Commands {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    #[command(about = "Run the cbth host plugin service")]
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+    #[command(about = "Inspect host-level plugins")]
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
     },
 }
 
@@ -2287,6 +2298,36 @@ enum DaemonCommand {
     HandoffQuiesce,
 }
 
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    #[command(about = "Run the host plugin supervisor in the foreground")]
+    Run(ServiceRunArgs),
+}
+
+#[derive(Debug, Args)]
+struct ServiceRunArgs {
+    #[arg(long, hide = true)]
+    once: bool,
+
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Debug, Subcommand)]
+enum PluginCommand {
+    #[command(about = "Inspect configured host-level plugin supervisor state")]
+    Status(PluginStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct PluginStatusArgs {
+    #[arg(help = "Only show this plugin")]
+    name: Option<String>,
+
+    #[arg(long, help = "Emit JSON output")]
+    json: bool,
+}
+
 #[derive(Debug, Args)]
 struct DaemonServeArgs {
     #[arg(
@@ -2395,6 +2436,13 @@ pub fn run() -> Result<()> {
         } if args.effective_format() == OutputFormat::Human => {
             let report = collect_cli_app_servers(&layout, args.latest_generation_only());
             write_cli_app_servers_human(&report)?;
+            return Ok(());
+        }
+        Commands::Plugin {
+            command: PluginCommand::Status(args),
+        } if !args.json => {
+            let report = status_report(&layout, args.name.as_deref())?;
+            write_status_human(&report)?;
             return Ok(());
         }
         Commands::New(args) => {
@@ -2915,6 +2963,8 @@ fn dispatch_direct_with_supervisor_generation(
         Commands::Desktop { command } => dispatch_desktop(command, layout),
         Commands::Maintenance { command } => dispatch_maintenance(command, layout),
         Commands::Daemon { command } => dispatch_daemon(command, layout),
+        Commands::Service { command } => dispatch_service(command, layout),
+        Commands::Plugin { command } => dispatch_plugin(command, layout),
     }
 }
 
@@ -9927,7 +9977,9 @@ fn daemon_argv_for_mutating_command(command: &Commands) -> Result<Option<Vec<OsS
                 },
         }
         | Commands::Doctor { .. }
-        | Commands::Daemon { .. } => return Ok(None),
+        | Commands::Daemon { .. }
+        | Commands::Service { .. }
+        | Commands::Plugin { .. } => return Ok(None),
     };
     Ok(Some(argv))
 }
@@ -13656,6 +13708,27 @@ fn dispatch_daemon(command: DaemonCommand, layout: &FsLayout) -> Result<Value> {
         }
         DaemonCommand::Stop => daemon_request(layout, "stop"),
         DaemonCommand::HandoffQuiesce => daemon_request(layout, "handoff_quiesce"),
+    }
+}
+
+fn dispatch_service(command: ServiceCommand, layout: &FsLayout) -> Result<Value> {
+    match command {
+        ServiceCommand::Run(args) => service_run(
+            layout,
+            ServiceRunOptions {
+                once: args.once,
+                now: args.now,
+            },
+        ),
+    }
+}
+
+fn dispatch_plugin(command: PluginCommand, layout: &FsLayout) -> Result<Value> {
+    match command {
+        PluginCommand::Status(args) => {
+            let report = status_report(layout, args.name.as_deref())?;
+            Ok(json!({ "plugin_status": report }))
+        }
     }
 }
 

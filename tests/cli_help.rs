@@ -21,7 +21,39 @@ fn top_level_help_describes_public_command_groups() {
     assert!(stdout.contains("Run and inspect local supervised background tasks"));
     assert!(stdout.contains("Run Codex through the managed cbth CLI bridge"));
     assert!(stdout.contains("Control the same-user cbth daemon"));
+    assert!(stdout.contains("Run the cbth host plugin service"));
+    assert!(stdout.contains("Inspect host-level plugins"));
     assert!(stdout.contains("Use an alternate cbth home directory"));
+}
+
+#[test]
+fn plugin_status_help_describes_optional_name_and_json() {
+    let stdout = help(&["plugin", "status", "--help"]);
+    assert!(stdout.contains("[NAME]"));
+    assert!(stdout.contains("--json"));
+    assert!(stdout.contains("Inspect configured host-level plugin supervisor state"));
+}
+
+#[test]
+fn plugin_status_human_does_not_autostart_service() {
+    let home = tempfile::tempdir().expect("temp home");
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("plugin")
+        .arg("status")
+        .output()
+        .expect("run plugin status human");
+    assert!(
+        output.status.success(),
+        "plugin status failed\nstatus: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No plugins configured."));
+    assert!(!home.path().join("run/plugin-rpc.sock").exists());
 }
 
 #[test]
