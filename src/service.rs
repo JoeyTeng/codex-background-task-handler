@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -258,9 +258,7 @@ pub fn status_report(layout: &FsLayout, name: Option<&str>) -> Result<PluginStat
         }
         let status = match read_plugin_status(layout, &manifest.name)? {
             Some(mut status) => {
-                status.enabled = manifest.enabled;
-                status.configured = true;
-                status.release_id = status.release_id.or(manifest.release_id.clone());
+                apply_manifest_status_overlay(&mut status, &manifest);
                 status
             }
             None => status_from_manifest(layout, &manifest),
@@ -730,7 +728,28 @@ fn unix_stream_peer_pid_impl(stream: &UnixStream) -> Result<Option<u32>> {
         .context("plugin peer pid is out of range")
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn unix_stream_peer_pid_impl(stream: &UnixStream) -> Result<Option<u32>> {
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error()).context("getsockopt SO_PEERCRED");
+    }
+    u32::try_from(credentials.pid)
+        .map(Some)
+        .context("plugin peer pid is out of range")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn unix_stream_peer_pid_impl(_stream: &UnixStream) -> Result<Option<u32>> {
     Ok(None)
 }
@@ -951,6 +970,19 @@ fn status_from_manifest(layout: &FsLayout, manifest: &PluginManifest) -> PluginR
             .join("stderr.log")
             .display()
             .to_string(),
+    }
+}
+
+fn apply_manifest_status_overlay(status: &mut PluginRuntimeStatus, manifest: &PluginManifest) {
+    status.enabled = manifest.enabled;
+    status.configured = true;
+    status.release_id = status.release_id.take().or(manifest.release_id.clone());
+    if !manifest.enabled {
+        status.state = PluginRuntimeState::Disabled;
+        status.pid = None;
+        status.instance_id = None;
+        status.restart_after_epoch = None;
+        status.last_healthy_at = None;
     }
 }
 
@@ -1453,6 +1485,61 @@ mod tests {
         let decoded: PluginRuntimeStatus = serde_json::from_str(&encoded).expect("deserialize");
 
         assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn status_report_forces_disabled_manifest_state_over_persisted_runtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        layout.ensure_plugin_home("webex").expect("plugin home");
+        let registry = PluginRegistry {
+            schema_version: 1,
+            plugins: vec![PluginManifest {
+                enabled: false,
+                ..manifest("webex")
+            }],
+        };
+        atomic_write_private(
+            &layout.plugin_registry_path(),
+            &serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("write registry");
+        let mut persisted = status_from_manifest(&layout, &manifest("webex"));
+        persisted.enabled = true;
+        persisted.state = PluginRuntimeState::Running;
+        persisted.pid = Some(1234);
+        persisted.instance_id = Some("stale-instance".to_owned());
+        persisted.restart_after_epoch = Some(2_000);
+        persisted.last_healthy_at = Some(1_999);
+        atomic_write_private(
+            &layout.plugin_status_path("webex"),
+            &serde_json::to_vec_pretty(&persisted).expect("status json"),
+        )
+        .expect("write status");
+
+        let report = status_report(&layout, None).expect("status report");
+
+        let status = report.plugins.first().expect("plugin status");
+        assert!(!status.enabled);
+        assert_eq!(status.state, PluginRuntimeState::Disabled);
+        assert_eq!(status.pid, None);
+        assert_eq!(status.instance_id, None);
+        assert_eq!(status.restart_after_epoch, None);
+        assert_eq!(status.last_healthy_at, None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_stream_peer_pid_reads_current_process() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("peer.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind peer socket");
+        let _client = UnixStream::connect(&socket_path).expect("connect peer socket");
+        let (server, _) = listener.accept().expect("accept peer socket");
+
+        let peer_pid = unix_stream_peer_pid(&server).expect("peer pid");
+
+        assert_eq!(peer_pid, Some(std::process::id()));
     }
 
     #[test]

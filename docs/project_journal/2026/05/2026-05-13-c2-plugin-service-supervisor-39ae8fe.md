@@ -1,7 +1,7 @@
 ---
 id: 20260513-39ae8fe-c2-plugin-service-supervisor
 title: C2 Plugin Service Supervisor
-status: active
+status: completed
 created: 2026-05-13
 updated: 2026-05-16
 branch: codex/c2-plugin-service-supervisor
@@ -22,20 +22,20 @@ superseded_by:
 
 - `cbth service run` reads `~/.cbth/plugins/registry.json`, prepares `~/.cbth/plugins/<plugin_name>/`, launches enabled plugin processes, exposes a service UDS for C1 `plugin.hello`, and persists per-plugin supervisor status under plugin state.
 - `cbth plugin status [name]` reads registry/status files and does not autostart the service or any plugin.
-- The C2 branch has merged the updated C1 branch head `afc1736`; real integration still depends on C1 PR #78 landing first.
+- C2 is based on the landed C1 plugin RPC skeleton on `master`.
 
 ## Next Steps
 
-- Keep this PR based on `codex/c1-plugin-rpc-skeleton` until C1 lands or is rebased.
 - Follow-up C3 should add plugin-scoped `app_server.ensure/refresh/stop` RPC rather than extending this C2 supervisor slice.
 - Follow-up C4/C5/C6 remain responsible for delivery, service install/manage, and release lifecycle respectively.
 
 ## Evidence
 
-- Base branch head: `afc1736`
+- Base branch head: `326748a`
 - Branch: `codex/c2-plugin-service-supervisor`
-- Dependency: C1 PR #78
+- Dependency: C1 PR #78 merged before PR #81 was retargeted to `master`.
 - CI follow-up: PR #81 clippy failures from `clippy::bool-assert-comparison` in `service_shutdown_reaps_managed_plugin_child` and Linux-only `AsRawFd` import drift after the C1 base update were fixed on 2026-05-16.
+- Codex review follow-up: Linux now validates plugin UDS peers with `SO_PEERCRED`, and `cbth plugin status` forces disabled manifests to report `Disabled` without stale process identity.
 - Local review: helper-backed `codex-review` found active-socket replacement, idle status persistence, failed-hello status, reserved environment, foreground signal shutdown, and stale runtime health identity issues; all were fixed before commit.
 - Validation:
   - `cargo fmt --check`
@@ -46,6 +46,7 @@ superseded_by:
   - `cargo test --test desktop_foundation -- --test-threads=1`
   - `cargo test --test daemon_phase2 -- --test-threads=1`
   - `env CARGO_TARGET_DIR=/private/tmp/cbth-pr81/target cargo clippy --locked --all-targets -- -D warnings`
+  - `env CARGO_TARGET_DIR=/private/tmp/cbth-pr81/target cargo test --locked service::tests -- --test-threads=1`
   - `env CARGO_TARGET_DIR=/private/tmp/cbth-pr81/target cargo test --locked`
   - `uv run /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo .`
   - `git diff --check`
