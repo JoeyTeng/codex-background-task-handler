@@ -200,6 +200,12 @@ impl SupervisedPlugin {
         }
     }
 
+    fn new_reconciled(layout: &FsLayout, manifest: PluginManifest, now: i64) -> Result<Self> {
+        let mut plugin = Self::new(layout, manifest, now);
+        reconcile_persisted_plugin_process(layout, &mut plugin)?;
+        Ok(plugin)
+    }
+
     fn can_restart(&self) -> bool {
         self.manifest.enabled && self.status.crash_count < self.manifest.restart.max_crashes
     }
@@ -211,7 +217,6 @@ pub fn service_run(layout: &FsLayout, options: ServiceRunOptions) -> Result<Valu
     let registry = load_plugin_registry(layout)?;
     validate_plugin_registry(layout, &registry)?;
     let now = options.now.unwrap_or(current_epoch_seconds()?);
-    let shared = Arc::new(Mutex::new(ServiceSharedState::new(layout, &registry, now)));
 
     let socket_path = layout.service_socket_path();
     prepare_service_socket(&socket_path)?;
@@ -221,6 +226,7 @@ pub fn service_run(layout: &FsLayout, options: ServiceRunOptions) -> Result<Valu
     listener
         .set_nonblocking(true)
         .with_context(|| format!("set nonblocking service socket {}", _cleanup.path.display()))?;
+    let shared = Arc::new(Mutex::new(ServiceSharedState::new(layout, &registry, now)?));
     persist_all_status_if_dirty(layout, &shared)?;
     let mut process_cleanup = ServiceProcessCleanup::new(layout.clone(), Arc::clone(&shared));
 
@@ -329,22 +335,20 @@ struct PluginConnectionIdentity {
 }
 
 impl ServiceSharedState {
-    fn new(layout: &FsLayout, registry: &PluginRegistry, now: i64) -> Self {
+    fn new(layout: &FsLayout, registry: &PluginRegistry, now: i64) -> Result<Self> {
         let plugins = registry
             .plugins
             .iter()
             .cloned()
             .map(|manifest| {
-                (
-                    manifest.name.clone(),
-                    SupervisedPlugin::new(layout, manifest, now),
-                )
+                let plugin = SupervisedPlugin::new_reconciled(layout, manifest, now)?;
+                Ok((plugin.manifest.name.clone(), plugin))
             })
-            .collect();
-        Self {
+            .collect::<Result<HashMap<_, _>>>()?;
+        Ok(Self {
             plugins,
             dirty: true,
-        }
+        })
     }
 
     fn mark_dirty(&mut self) {
@@ -559,6 +563,45 @@ fn schedule_restart(plugin: &mut SupervisedPlugin, now: i64) {
     let doubled = delay.saturating_mul(2);
     let max = Duration::from_millis(plugin.manifest.restart.max_delay_ms);
     plugin.current_backoff = doubled.min(max);
+}
+
+fn reconcile_persisted_plugin_process(
+    layout: &FsLayout,
+    plugin: &mut SupervisedPlugin,
+) -> Result<()> {
+    if !plugin.manifest.enabled {
+        return Ok(());
+    }
+    let Some(persisted) = read_plugin_status(layout, &plugin.manifest.name)? else {
+        return Ok(());
+    };
+    let Some(pid) = persisted.pid else {
+        return Ok(());
+    };
+    if !process_group_exists(pid) {
+        return Ok(());
+    }
+
+    if terminate_orphaned_plugin_process_group(pid) {
+        plugin.status.last_exit = Some(format!(
+            "terminated stale plugin process group {pid} before service start"
+        ));
+        return Ok(());
+    }
+
+    plugin.status.state = PluginRuntimeState::Failed;
+    plugin.status.pid = Some(pid);
+    plugin.status.instance_id = persisted.instance_id;
+    plugin.status.crash_count = persisted.crash_count;
+    plugin.status.last_started_at = persisted.last_started_at;
+    plugin.status.last_healthy_at = persisted.last_healthy_at;
+    plugin.status.last_exit = persisted.last_exit;
+    plugin.status.last_error = Some(format!(
+        "stale plugin process group {pid} is still running; refusing to launch duplicate"
+    ));
+    plugin.status.restart_after_epoch = None;
+    plugin.next_restart = None;
+    Ok(())
 }
 
 fn accept_plugin_connections(
@@ -1223,6 +1266,37 @@ fn terminate_plugin_child_best_effort(child: &mut Child, pid: u32) {
     let _ = child.wait();
 }
 
+fn terminate_orphaned_plugin_process_group(pid: u32) -> bool {
+    signal_process_group(pid, libc::SIGTERM);
+    if wait_for_process_group_exit(pid, PLUGIN_TERM_GRACE) {
+        return true;
+    }
+    signal_process_group(pid, libc::SIGKILL);
+    wait_for_process_group_exit(pid, PLUGIN_KILL_GRACE)
+}
+
+fn wait_for_process_group_exit(pid: u32, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        reap_process_if_child(pid);
+        if !process_group_exists(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn reap_process_if_child(pid: u32) -> bool {
+    let Some(pid) = process_group_pid(pid) else {
+        return false;
+    };
+    let mut status = 0;
+    unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) == pid }
+}
+
 fn plugin_process_group_is_gone(child: &mut Child, pid: u32) -> bool {
     match child.try_wait() {
         Ok(Some(_)) => !process_group_exists(pid),
@@ -1232,16 +1306,25 @@ fn plugin_process_group_is_gone(child: &mut Child, pid: u32) -> bool {
 }
 
 fn signal_process_group(pid: u32, signal: libc::c_int) -> bool {
-    let pgid = pid as libc::pid_t;
+    let Some(pgid) = process_group_pid(pid) else {
+        return false;
+    };
     unsafe { libc::killpg(pgid, signal) == 0 }
 }
 
 fn process_group_exists(pid: u32) -> bool {
-    let pgid = pid as libc::pid_t;
+    let Some(pgid) = process_group_pid(pid) else {
+        return false;
+    };
     if unsafe { libc::killpg(pgid, 0) } == 0 {
         return true;
     }
     !matches!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
+}
+
+fn process_group_pid(pid: u32) -> Option<libc::pid_t> {
+    let pid = i32::try_from(pid).ok()?;
+    if pid > 0 { Some(pid) } else { None }
 }
 
 fn validate_nonempty_ascii_token(value: &str, name: &str) -> Result<()> {
@@ -1317,6 +1400,23 @@ mod tests {
             capabilities: vec!["health".to_owned()],
             restart: PluginRestartPolicy::default(),
             environment: HashMap::new(),
+        }
+    }
+
+    struct ProcessGroupCleanup {
+        pid: u32,
+    }
+
+    impl ProcessGroupCleanup {
+        fn new(pid: u32) -> Self {
+            Self { pid }
+        }
+    }
+
+    impl Drop for ProcessGroupCleanup {
+        fn drop(&mut self) {
+            signal_process_group(self.pid, libc::SIGKILL);
+            reap_process_if_child(self.pid);
         }
     }
 
@@ -1432,9 +1532,9 @@ mod tests {
                 ..manifest("webex")
             }],
         };
-        let shared = Arc::new(Mutex::new(ServiceSharedState::new(
-            &layout, &registry, 1_000,
-        )));
+        let shared = Arc::new(Mutex::new(
+            ServiceSharedState::new(&layout, &registry, 1_000).expect("shared state"),
+        ));
 
         supervise_tick(&layout, &shared, 1_000).expect("first tick");
         {
@@ -1461,9 +1561,9 @@ mod tests {
             schema_version: 1,
             plugins: vec![manifest("webex")],
         };
-        let shared = Arc::new(Mutex::new(ServiceSharedState::new(
-            &layout, &registry, 1_000,
-        )));
+        let shared = Arc::new(Mutex::new(
+            ServiceSharedState::new(&layout, &registry, 1_000).expect("shared state"),
+        ));
 
         supervise_tick(&layout, &shared, 1_000).expect("tick");
         let state = shared.lock().expect("state");
@@ -1601,6 +1701,71 @@ mod tests {
     }
 
     #[test]
+    fn service_start_reconciles_live_persisted_plugin_process_before_relaunch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        layout.ensure_plugin_home("webex").expect("plugin home");
+        let registry = PluginRegistry {
+            schema_version: 1,
+            plugins: vec![PluginManifest {
+                executable_path: PathBuf::from("/bin/sleep"),
+                args: vec!["30".to_owned()],
+                ..manifest("webex")
+            }],
+        };
+        let stale_child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn stale child");
+        let stale_pid = stale_child.id();
+        let _stale_cleanup = ProcessGroupCleanup::new(stale_pid);
+        drop(stale_child);
+        let mut persisted = status_from_manifest(&layout, &manifest("webex"));
+        persisted.state = PluginRuntimeState::Running;
+        persisted.pid = Some(stale_pid);
+        persisted.instance_id = Some("old-instance".to_owned());
+        persisted.last_healthy_at = Some(1_999);
+        atomic_write_private(
+            &layout.plugin_status_path("webex"),
+            &serde_json::to_vec_pretty(&persisted).expect("status json"),
+        )
+        .expect("write status");
+
+        let shared = Arc::new(Mutex::new(
+            ServiceSharedState::new(&layout, &registry, 2_000).expect("shared state"),
+        ));
+
+        assert!(!process_group_exists(stale_pid));
+        {
+            let state = shared.lock().expect("state");
+            let plugin = state.plugins.get("webex").expect("plugin");
+            assert!(plugin.process.is_none());
+            assert_eq!(plugin.status.pid, None);
+            assert_eq!(plugin.status.instance_id, None);
+            assert_eq!(plugin.status.last_healthy_at, None);
+            assert_eq!(plugin.status.state, PluginRuntimeState::Starting);
+            assert_eq!(plugin.status.restart_after_epoch, Some(2_000));
+            assert!(
+                plugin
+                    .status
+                    .last_exit
+                    .as_deref()
+                    .expect("last exit")
+                    .contains("terminated stale plugin process group")
+            );
+        }
+
+        supervise_tick(&layout, &shared, 2_000).expect("tick");
+        let state = shared.lock().expect("state");
+        let plugin = state.plugins.get("webex").expect("plugin");
+        assert!(plugin.process.is_some());
+        assert!(plugin.status.pid.is_some());
+        drop(state);
+        shutdown_managed_plugins(&layout, &shared);
+    }
+
+    #[test]
     fn fake_plugin_hello_updates_status_and_returns_policy() {
         let temp = tempfile::tempdir().expect("tempdir");
         let layout = layout_for_tempdir(&temp);
@@ -1608,9 +1773,9 @@ mod tests {
             schema_version: 1,
             plugins: vec![manifest("webex")],
         };
-        let shared = Arc::new(Mutex::new(ServiceSharedState::new(
-            &layout, &registry, 1_000,
-        )));
+        let shared = Arc::new(Mutex::new(
+            ServiceSharedState::new(&layout, &registry, 1_000).expect("shared state"),
+        ));
         layout.ensure_plugin_home("webex").expect("plugin home");
         let child = Command::new("/bin/sleep")
             .arg("30")
@@ -1669,9 +1834,9 @@ mod tests {
             schema_version: 1,
             plugins: vec![manifest("webex")],
         };
-        let shared = Arc::new(Mutex::new(ServiceSharedState::new(
-            &layout, &registry, 1_000,
-        )));
+        let shared = Arc::new(Mutex::new(
+            ServiceSharedState::new(&layout, &registry, 1_000).expect("shared state"),
+        ));
         let child = Command::new("/bin/sleep")
             .arg("30")
             .process_group(0)
@@ -1712,9 +1877,9 @@ mod tests {
             schema_version: 1,
             plugins: vec![manifest("webex")],
         };
-        let shared = Arc::new(Mutex::new(ServiceSharedState::new(
-            &layout, &registry, 1_000,
-        )));
+        let shared = Arc::new(Mutex::new(
+            ServiceSharedState::new(&layout, &registry, 1_000).expect("shared state"),
+        ));
         {
             let mut state = shared.lock().expect("state");
             let plugin = state.plugins.get_mut("webex").expect("plugin");
@@ -1746,9 +1911,9 @@ mod tests {
             schema_version: 1,
             plugins: vec![manifest("webex")],
         };
-        let shared = Arc::new(Mutex::new(ServiceSharedState::new(
-            &layout, &registry, 1_000,
-        )));
+        let shared = Arc::new(Mutex::new(
+            ServiceSharedState::new(&layout, &registry, 1_000).expect("shared state"),
+        ));
         let child = Command::new("/bin/sleep")
             .arg("30")
             .process_group(0)
@@ -1796,9 +1961,9 @@ mod tests {
             schema_version: 1,
             plugins: vec![manifest("webex")],
         };
-        let shared = Arc::new(Mutex::new(ServiceSharedState::new(
-            &layout, &registry, 1_000,
-        )));
+        let shared = Arc::new(Mutex::new(
+            ServiceSharedState::new(&layout, &registry, 1_000).expect("shared state"),
+        ));
         layout.ensure_plugin_home("webex").expect("plugin home");
         let child = Command::new("/bin/sleep")
             .arg("30")
@@ -1858,9 +2023,9 @@ mod tests {
             schema_version: 1,
             plugins: vec![manifest("webex")],
         };
-        let shared = Arc::new(Mutex::new(ServiceSharedState::new(
-            &layout, &registry, 1_000,
-        )));
+        let shared = Arc::new(Mutex::new(
+            ServiceSharedState::new(&layout, &registry, 1_000).expect("shared state"),
+        ));
         let child = Command::new("/bin/sleep")
             .arg("30")
             .process_group(0)
@@ -1892,9 +2057,9 @@ mod tests {
             schema_version: 1,
             plugins: vec![manifest("webex")],
         };
-        let shared = Arc::new(Mutex::new(ServiceSharedState::new(
-            &layout, &registry, 1_000,
-        )));
+        let shared = Arc::new(Mutex::new(
+            ServiceSharedState::new(&layout, &registry, 1_000).expect("shared state"),
+        ));
         layout.ensure_plugin_home("webex").expect("plugin home");
         let (mut client, server) = UnixStream::pair().expect("socket pair");
         let server_layout = layout.clone();
