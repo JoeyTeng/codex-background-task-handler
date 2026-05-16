@@ -1791,7 +1791,7 @@ mod tests {
         assert!(!process_group_exists(pid));
         let state = shared.lock().expect("state");
         let plugin = state.plugins.get("webex").expect("plugin");
-        assert_eq!(plugin.process.is_some(), false);
+        assert!(plugin.process.is_none());
         assert_eq!(plugin.status.pid, None);
         assert_eq!(plugin.status.last_healthy_at, None);
     }

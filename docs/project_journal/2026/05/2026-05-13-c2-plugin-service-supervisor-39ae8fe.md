@@ -3,9 +3,9 @@ id: 20260513-39ae8fe-c2-plugin-service-supervisor
 title: C2 Plugin Service Supervisor
 status: active
 created: 2026-05-13
-updated: 2026-05-13
+updated: 2026-05-16
 branch: codex/c2-plugin-service-supervisor
-pr:
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/81
 supersedes:
 superseded_by:
 ---
@@ -35,14 +35,19 @@ superseded_by:
 - Base: `39ae8fe49ba25615385b292cdd6ed1e6628ba460`
 - Branch: `codex/c2-plugin-service-supervisor`
 - Dependency: C1 draft PR #78
+- CI follow-up: PR #81 clippy failure from `clippy::bool-assert-comparison` in `service_shutdown_reaps_managed_plugin_child` was fixed on 2026-05-16.
 - Local review: helper-backed `codex-review` found active-socket replacement, idle status persistence, failed-hello status, reserved environment, foreground signal shutdown, and stale runtime health identity issues; all were fixed before commit.
 - Validation:
   - `cargo fmt --check`
+  - `cargo fmt --all -- --check`
   - `cargo test --lib service::tests -- --test-threads=1`
   - `cargo test --lib plugin_rpc::tests -- --test-threads=1`
   - `cargo test --test cli_help -- --test-threads=1`
   - `cargo test --test desktop_foundation -- --test-threads=1`
   - `cargo test --test daemon_phase2 -- --test-threads=1`
-  - `uv run /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo /Users/hoteng/Program/GitHub/codex-background-task-handler`
+  - `env CARGO_TARGET_DIR=/private/tmp/cbth-pr81/target cargo clippy --locked --all-targets -- -D warnings`
+  - `env CARGO_TARGET_DIR=/private/tmp/cbth-pr81/target cargo test --locked`
+  - `uv run /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo .`
   - `git diff --check`
 - Full-suite note: `cargo test -- --test-threads=1` reached one non-C2 intermittent failure in `cli_run_trusted_all_task_run_auto_delivery_closes_delivered`; the exact test then passed, and `cargo test --test cli_run -- --test-threads=1` passed 63/63.
+- Local sandbox note: full-suite socket tests require running outside the Codex filesystem sandbox; the sandboxed retry failed with `Operation not permitted` on Unix socket bind, and the same `cargo test --locked` command passed after escalation.
