@@ -22,7 +22,7 @@ superseded_by:
 
 - `cbth service run` reads `~/.cbth/plugins/registry.json`, prepares `~/.cbth/plugins/<plugin_name>/`, launches enabled plugin processes, exposes a service UDS for C1 `plugin.hello`, and persists per-plugin supervisor status under plugin state.
 - `cbth plugin status [name]` reads registry/status files and does not autostart the service or any plugin.
-- The C2 branch is stacked on C1 head `39ae8fe49ba25615385b292cdd6ed1e6628ba460`; real integration still depends on C1 PR #78 landing first.
+- The C2 branch has merged the updated C1 branch head `afc1736`; real integration still depends on C1 PR #78 landing first.
 
 ## Next Steps
 
@@ -32,10 +32,10 @@ superseded_by:
 
 ## Evidence
 
-- Base: `39ae8fe49ba25615385b292cdd6ed1e6628ba460`
+- Base branch head: `afc1736`
 - Branch: `codex/c2-plugin-service-supervisor`
-- Dependency: C1 draft PR #78
-- CI follow-up: PR #81 clippy failure from `clippy::bool-assert-comparison` in `service_shutdown_reaps_managed_plugin_child` was fixed on 2026-05-16.
+- Dependency: C1 PR #78
+- CI follow-up: PR #81 clippy failures from `clippy::bool-assert-comparison` in `service_shutdown_reaps_managed_plugin_child` and Linux-only `AsRawFd` import drift after the C1 base update were fixed on 2026-05-16.
 - Local review: helper-backed `codex-review` found active-socket replacement, idle status persistence, failed-hello status, reserved environment, foreground signal shutdown, and stale runtime health identity issues; all were fixed before commit.
 - Validation:
   - `cargo fmt --check`
