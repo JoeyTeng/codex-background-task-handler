@@ -5,7 +5,7 @@ status: completed
 created: 2026-05-13
 updated: 2026-05-13
 branch: codex/c1-plugin-rpc-skeleton
-pr:
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/78
 supersedes:
 superseded_by:
 ---
@@ -33,4 +33,4 @@ superseded_by:
 
 - Base: `542dab68a8d374af75d9d1210b5f9708e0d9f48e`
 - Branch: `codex/c1-plugin-rpc-skeleton`
-- PR:
+- PR: https://github.com/JoeyTeng/codex-background-task-handler/pull/78
