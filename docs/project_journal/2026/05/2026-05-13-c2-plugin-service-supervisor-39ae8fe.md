@@ -35,7 +35,7 @@ superseded_by:
 - Branch: `codex/c2-plugin-service-supervisor`
 - Dependency: C1 PR #78 merged before PR #81 was retargeted to `master`.
 - CI follow-up: PR #81 clippy failures from `clippy::bool-assert-comparison` in `service_shutdown_reaps_managed_plugin_child` and Linux-only `AsRawFd` import drift after the C1 base update were fixed on 2026-05-16.
-- Codex review follow-up: Linux now validates plugin UDS peers with `SO_PEERCRED`, `cbth plugin status` forces disabled manifests to report `Disabled` without stale process identity, and service startup reconciles live persisted plugin process groups before relaunching.
+- Codex review follow-up: Linux now validates plugin UDS peers with `SO_PEERCRED`, `cbth plugin status` forces disabled manifests to report `Disabled` without stale process identity, and service startup fails closed instead of relaunching or killing when only a persisted PID identifies a live process group.
 - Local review: helper-backed `codex-review` found active-socket replacement, idle status persistence, failed-hello status, reserved environment, foreground signal shutdown, and stale runtime health identity issues; all were fixed before commit.
 - Validation:
   - `cargo fmt --check`

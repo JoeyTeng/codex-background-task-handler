@@ -582,13 +582,6 @@ fn reconcile_persisted_plugin_process(
         return Ok(());
     }
 
-    if terminate_orphaned_plugin_process_group(pid) {
-        plugin.status.last_exit = Some(format!(
-            "terminated stale plugin process group {pid} before service start"
-        ));
-        return Ok(());
-    }
-
     plugin.status.state = PluginRuntimeState::Failed;
     plugin.status.pid = Some(pid);
     plugin.status.instance_id = persisted.instance_id;
@@ -597,7 +590,7 @@ fn reconcile_persisted_plugin_process(
     plugin.status.last_healthy_at = persisted.last_healthy_at;
     plugin.status.last_exit = persisted.last_exit;
     plugin.status.last_error = Some(format!(
-        "stale plugin process group {pid} is still running; refusing to launch duplicate"
+        "persisted plugin process group {pid} is still running; refusing to launch duplicate without a process identity fence"
     ));
     plugin.status.restart_after_epoch = None;
     plugin.next_restart = None;
@@ -1266,37 +1259,6 @@ fn terminate_plugin_child_best_effort(child: &mut Child, pid: u32) {
     let _ = child.wait();
 }
 
-fn terminate_orphaned_plugin_process_group(pid: u32) -> bool {
-    signal_process_group(pid, libc::SIGTERM);
-    if wait_for_process_group_exit(pid, PLUGIN_TERM_GRACE) {
-        return true;
-    }
-    signal_process_group(pid, libc::SIGKILL);
-    wait_for_process_group_exit(pid, PLUGIN_KILL_GRACE)
-}
-
-fn wait_for_process_group_exit(pid: u32, grace: Duration) -> bool {
-    let deadline = Instant::now() + grace;
-    loop {
-        reap_process_if_child(pid);
-        if !process_group_exists(pid) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn reap_process_if_child(pid: u32) -> bool {
-    let Some(pid) = process_group_pid(pid) else {
-        return false;
-    };
-    let mut status = 0;
-    unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) == pid }
-}
-
 fn plugin_process_group_is_gone(child: &mut Child, pid: u32) -> bool {
     match child.try_wait() {
         Ok(Some(_)) => !process_group_exists(pid),
@@ -1400,23 +1362,6 @@ mod tests {
             capabilities: vec!["health".to_owned()],
             restart: PluginRestartPolicy::default(),
             environment: HashMap::new(),
-        }
-    }
-
-    struct ProcessGroupCleanup {
-        pid: u32,
-    }
-
-    impl ProcessGroupCleanup {
-        fn new(pid: u32) -> Self {
-            Self { pid }
-        }
-    }
-
-    impl Drop for ProcessGroupCleanup {
-        fn drop(&mut self) {
-            signal_process_group(self.pid, libc::SIGKILL);
-            reap_process_if_child(self.pid);
         }
     }
 
@@ -1701,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn service_start_reconciles_live_persisted_plugin_process_before_relaunch() {
+    fn service_start_blocks_relaunch_when_persisted_process_group_is_live() {
         let temp = tempfile::tempdir().expect("tempdir");
         let layout = layout_for_tempdir(&temp);
         layout.ensure_plugin_home("webex").expect("plugin home");
@@ -1713,18 +1658,17 @@ mod tests {
                 ..manifest("webex")
             }],
         };
-        let stale_child = Command::new("/bin/sleep")
+        let mut stale_child = Command::new("/bin/sleep")
             .arg("30")
             .process_group(0)
             .spawn()
             .expect("spawn stale child");
         let stale_pid = stale_child.id();
-        let _stale_cleanup = ProcessGroupCleanup::new(stale_pid);
-        drop(stale_child);
         let mut persisted = status_from_manifest(&layout, &manifest("webex"));
         persisted.state = PluginRuntimeState::Running;
         persisted.pid = Some(stale_pid);
         persisted.instance_id = Some("old-instance".to_owned());
+        persisted.last_started_at = Some(1_998);
         persisted.last_healthy_at = Some(1_999);
         atomic_write_private(
             &layout.plugin_status_path("webex"),
@@ -1736,33 +1680,35 @@ mod tests {
             ServiceSharedState::new(&layout, &registry, 2_000).expect("shared state"),
         ));
 
-        assert!(!process_group_exists(stale_pid));
+        assert!(process_group_exists(stale_pid));
         {
             let state = shared.lock().expect("state");
             let plugin = state.plugins.get("webex").expect("plugin");
             assert!(plugin.process.is_none());
-            assert_eq!(plugin.status.pid, None);
-            assert_eq!(plugin.status.instance_id, None);
-            assert_eq!(plugin.status.last_healthy_at, None);
-            assert_eq!(plugin.status.state, PluginRuntimeState::Starting);
-            assert_eq!(plugin.status.restart_after_epoch, Some(2_000));
+            assert_eq!(plugin.status.state, PluginRuntimeState::Failed);
+            assert_eq!(plugin.status.pid, Some(stale_pid));
+            assert_eq!(plugin.status.instance_id.as_deref(), Some("old-instance"));
+            assert_eq!(plugin.status.last_started_at, Some(1_998));
+            assert_eq!(plugin.status.last_healthy_at, Some(1_999));
+            assert_eq!(plugin.status.restart_after_epoch, None);
+            assert_eq!(plugin.next_restart, None);
             assert!(
                 plugin
                     .status
-                    .last_exit
+                    .last_error
                     .as_deref()
-                    .expect("last exit")
-                    .contains("terminated stale plugin process group")
+                    .expect("last error")
+                    .contains("refusing to launch duplicate")
             );
         }
 
         supervise_tick(&layout, &shared, 2_000).expect("tick");
         let state = shared.lock().expect("state");
         let plugin = state.plugins.get("webex").expect("plugin");
-        assert!(plugin.process.is_some());
-        assert!(plugin.status.pid.is_some());
+        assert!(plugin.process.is_none());
+        assert_eq!(plugin.status.pid, Some(stale_pid));
         drop(state);
-        shutdown_managed_plugins(&layout, &shared);
+        terminate_plugin_child_best_effort(&mut stale_child, stale_pid);
     }
 
     #[test]
