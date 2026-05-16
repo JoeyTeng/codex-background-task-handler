@@ -1,3 +1,4 @@
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{CStr, OsStr, OsString};
@@ -124,6 +125,7 @@ const DOCTOR_REQUIRED_DAEMON_CAPABILITIES: &[&str] = &[
     "desktop-writeback-live-validation-fixture",
     "desktop-transcript-relay-consumer",
     "desktop-transcript-relay-scanner",
+    "desktop-ready-arm-workflow",
     "daemon-handoff-v1",
 ];
 
@@ -475,7 +477,7 @@ enum DesktopRelayCommand {
     EmitArmAccepted(DesktopRelayEmitArmAcceptedArgs),
     #[command(
         name = "consume-transcript",
-        about = "Consume one trusted Desktop transcript writeback envelope"
+        about = "Consume one trusted Desktop transcript writeback envelope for an issued marker"
     )]
     ConsumeTranscript(DesktopRelayConsumeTranscriptArgs),
     #[command(about = "Manage the production Desktop transcript relay scanner")]
@@ -1304,7 +1306,7 @@ enum CliCommand {
     #[command(
         name = "app-servers",
         about = "List running daemon-owned Codex app-servers",
-        long_about = "List running daemon-owned Codex app-servers without starting a daemon. JSON output is intended for tools; --human/-H prints a compact operator summary with the websocket URL, Codex session id, cwd, title, and local start time."
+        long_about = "List running daemon-owned Codex app-servers across known daemon generations without starting a daemon. Newer generations are shown first. JSON output is intended for tools; --human/-H prints a compact operator summary with the websocket URL, Codex session id, cwd, title, and local start time. Use --latest-generation to inspect only the newest known generation, or the default daemon when no generation exists."
     )]
     AppServers(CliAppServersArgs),
     #[command(about = "Inspect and recover managed CLI sessions")]
@@ -1333,8 +1335,19 @@ struct CliAppServersArgs {
     )]
     human: bool,
 
-    #[arg(long, help = "Inspect all known daemon endpoints")]
+    #[arg(
+        long,
+        help = "Inspect all known daemon endpoints (default compatibility alias)",
+        conflicts_with = "latest_generation"
+    )]
     all_daemons: bool,
+
+    #[arg(
+        long,
+        help = "Inspect only the newest known daemon generation, or the default daemon when none exists",
+        conflicts_with = "all_daemons"
+    )]
+    latest_generation: bool,
 }
 
 impl CliAppServersArgs {
@@ -1344,6 +1357,10 @@ impl CliAppServersArgs {
         } else {
             self.format
         }
+    }
+
+    fn latest_generation_only(&self) -> bool {
+        self.latest_generation
     }
 }
 
@@ -2417,7 +2434,7 @@ pub fn run() -> Result<()> {
         Commands::Cli {
             command: CliCommand::AppServers(args),
         } if args.effective_format() == OutputFormat::Human => {
-            let report = collect_cli_app_servers(&layout, args.all_daemons);
+            let report = collect_cli_app_servers(&layout, args.latest_generation_only());
             write_cli_app_servers_human(&report)?;
             return Ok(());
         }
@@ -3226,6 +3243,7 @@ struct CliAppServersDaemonSummary {
 
 #[derive(Debug, Serialize)]
 struct CliAppServersDaemonReport {
+    socket_path: String,
     daemon: Option<CliAppServersDaemonSummary>,
     cli_app_servers: Vec<CliAppServerSummary>,
     error: Option<String>,
@@ -3256,21 +3274,27 @@ struct CliAppServerThreadInfo {
     error: Option<String>,
 }
 
-fn collect_cli_app_servers(layout: &FsLayout, all_daemons: bool) -> CliAppServersReport {
-    if all_daemons {
-        return collect_cli_app_servers_all_daemons(layout);
+fn collect_cli_app_servers(layout: &FsLayout, latest_generation_only: bool) -> CliAppServersReport {
+    if latest_generation_only {
+        let endpoint = latest_cli_app_server_endpoint(layout);
+        return collect_cli_app_servers_for_endpoint(layout, &endpoint);
     }
-    let endpoint = DaemonEndpoint::default(layout);
-    collect_cli_app_servers_for_endpoint(layout, &endpoint)
+    collect_cli_app_servers_all_generations(layout)
 }
 
-fn collect_cli_app_servers_all_daemons(layout: &FsLayout) -> CliAppServersReport {
+fn collect_cli_app_servers_all_generations(layout: &FsLayout) -> CliAppServersReport {
+    let endpoints = known_cli_app_server_endpoints(layout);
+    if endpoints.len() == 1 && endpoints[0].socket_path() == layout.daemon_socket_path() {
+        return collect_cli_app_servers_for_endpoint(layout, &endpoints[0]);
+    }
+
     let mut reports = Vec::new();
     let mut all_servers = Vec::new();
-    for endpoint in known_daemon_endpoints(layout) {
+    for endpoint in endpoints {
         let report = collect_cli_app_servers_for_endpoint(layout, &endpoint);
         all_servers.extend(report.cli_app_servers.clone());
         reports.push(CliAppServersDaemonReport {
+            socket_path: endpoint.socket_path().display().to_string(),
             daemon: report.daemon,
             cli_app_servers: report.cli_app_servers,
             error: report.daemon_error,
@@ -3329,6 +3353,64 @@ fn collect_cli_app_servers_for_endpoint(
         daemons: Vec::new(),
         daemon_error: None,
     }
+}
+
+fn latest_cli_app_server_endpoint(layout: &FsLayout) -> DaemonEndpoint {
+    generation_socket_paths_newest_first(layout)
+        .into_iter()
+        .next()
+        .map(DaemonEndpoint::from_socket_path)
+        .unwrap_or_else(|| DaemonEndpoint::default(layout))
+}
+
+fn known_cli_app_server_endpoints(layout: &FsLayout) -> Vec<DaemonEndpoint> {
+    let mut endpoints = generation_socket_paths_newest_first(layout)
+        .into_iter()
+        .map(DaemonEndpoint::from_socket_path)
+        .collect::<Vec<_>>();
+    let default_endpoint = DaemonEndpoint::default(layout);
+    if default_endpoint.socket_path().exists() || endpoints.is_empty() {
+        endpoints.push(default_endpoint);
+    }
+    endpoints
+}
+
+fn generation_socket_paths_newest_first(layout: &FsLayout) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(layout.daemon_generations_dir()) else {
+        return Vec::new();
+    };
+    let mut generation_sockets = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("cbth.sock"))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    generation_sockets
+        .sort_by(|left, right| compare_generation_socket_paths_newest_first(left, right));
+    generation_sockets
+}
+
+fn compare_generation_socket_paths_newest_first(left: &Path, right: &Path) -> CmpOrdering {
+    let left_name = generation_name_from_socket_path(left);
+    let right_name = generation_name_from_socket_path(right);
+    match (
+        Version::parse(left_name.as_ref()),
+        Version::parse(right_name.as_ref()),
+    ) {
+        (Ok(left_version), Ok(right_version)) => right_version
+            .cmp(&left_version)
+            .then_with(|| right_name.cmp(&left_name)),
+        (Ok(_), Err(_)) => CmpOrdering::Less,
+        (Err(_), Ok(_)) => CmpOrdering::Greater,
+        (Err(_), Err(_)) => right_name.cmp(&left_name),
+    }
+}
+
+fn generation_name_from_socket_path(path: &Path) -> String {
+    path.parent()
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn known_daemon_endpoints(layout: &FsLayout) -> Vec<DaemonEndpoint> {
@@ -3524,7 +3606,10 @@ fn write_cli_app_servers_human(report: &CliAppServersReport) -> Result<()> {
                 writeln!(
                     out,
                     "Daemon {}",
-                    daemon.socket_path.as_deref().unwrap_or("<unknown socket>")
+                    daemon
+                        .socket_path
+                        .as_deref()
+                        .unwrap_or(daemon_report.socket_path.as_str())
                 )?;
                 if let Some(pid) = daemon.pid {
                     writeln!(out, "  pid: {pid}")?;
@@ -3548,18 +3633,33 @@ fn write_cli_app_servers_human(report: &CliAppServersReport) -> Result<()> {
             for server in &daemon_report.cli_app_servers {
                 writeln!(
                     out,
-                    "  app-server {} ({}) pid={} lease={}s",
-                    server.codex_session_id,
-                    server.ws_url,
-                    server.pid,
-                    server.lease_seconds_remaining
+                    "  app-server pid={} lease={}s",
+                    server.pid, server.lease_seconds_remaining
                 )?;
+                writeln!(out, "    codex session: {}", server.codex_session_id)?;
+                writeln!(out, "    managed session: {}", server.managed_session_id)?;
+                writeln!(out, "    epoch: {}", server.session_epoch)?;
+                writeln!(out, "    ws: {}", server.ws_url)?;
+                writeln!(
+                    out,
+                    "    title: {}",
+                    server.title.as_deref().unwrap_or("<unknown title>")
+                )?;
+                writeln!(
+                    out,
+                    "    cwd: {}",
+                    server.cwd.as_deref().unwrap_or("<unknown>")
+                )?;
+                writeln!(out, "    started: {}", server.started_at_local)?;
                 if let Some(loaded) = &server.loaded_non_bound_codex_sessions {
                     writeln!(
                         out,
                         "    loaded non-bound codex sessions: {}",
                         loaded.join(", ")
                     )?;
+                }
+                if let Some(error) = &server.thread_info_error {
+                    writeln!(out, "    thread info: unavailable ({error})")?;
                 }
             }
         }
@@ -10927,7 +11027,10 @@ fn dispatch_audit(command: AuditCommand, layout: &FsLayout) -> Result<Value> {
 
 fn dispatch_cli(command: CliCommand, layout: &FsLayout) -> Result<Value> {
     if let CliCommand::AppServers(args) = &command {
-        return Ok(json!(collect_cli_app_servers(layout, args.all_daemons)));
+        return Ok(json!(collect_cli_app_servers(
+            layout,
+            args.latest_generation_only()
+        )));
     }
     let mut store = if cli_command_uses_lifecycle_store_timeout(&command) {
         Store::open_for_daemon_lifecycle(layout)?
@@ -11313,20 +11416,47 @@ fn dispatch_desktop(command: DesktopCommand, layout: &FsLayout) -> Result<Value>
             let fingerprint =
                 desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
             let state = store.desktop_installation_state(&fingerprint)?;
-            let arm_pending_bindings = store.list_desktop_arm_pending_bindings(now)?;
+            let delivery_state =
+                desktop_installation_state_for_current_helper(&state, &fingerprint);
+            let snapshot_revision = new_id();
+            let (ready_threads, arm_pending_bindings) = store
+                .materialize_desktop_ready_and_arm_pending_entries(
+                    &args.bridge_thread_id,
+                    &snapshot_revision,
+                    &delivery_state,
+                    now,
+                )?;
             let pause_due_bindings = store.list_desktop_pause_due_bindings(now)?;
-            let preflight = publish_desktop_bridge_preflight(
+            let preflight = publish_desktop_bridge_preflight(DesktopBridgePreflightPublish {
                 layout,
-                &args.bridge_thread_id,
-                &state,
+                bridge_thread_id: &args.bridge_thread_id,
+                snapshot_revision: &snapshot_revision,
+                installation_state: &delivery_state,
+                ready_threads,
                 arm_pending_bindings,
                 pause_due_bindings,
                 sweep,
                 now,
-            )?;
+            })?;
             Ok(json!({ "desktop_bridge_preflight": preflight }))
         }
     }
+}
+
+fn desktop_installation_state_for_current_helper(
+    state: &DesktopInstallationStateRecord,
+    current_fingerprint: &str,
+) -> DesktopInstallationStateRecord {
+    let mut state = state.clone();
+    if state.read_transport != DesktopReadTransport::DirectFileRead.as_str()
+        || state.validation_fingerprint != current_fingerprint
+    {
+        state.read_transport_capability = "unknown".to_owned();
+        state.artifact_read_capability = "unknown".to_owned();
+        state.writeback_capability = "unknown".to_owned();
+        state.validated_at = None;
+    }
+    state
 }
 
 struct DesktopInboxSnapshot {
@@ -12144,7 +12274,10 @@ fn consume_prepared_desktop_transcript_relay(
     now: i64,
 ) -> Result<Value> {
     prepared.request.now = now;
-    let record = store.consume_desktop_transcript_relay(prepared.request)?;
+    let current_validation_fingerprint =
+        desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
+    let record = store
+        .consume_desktop_transcript_relay(prepared.request, &current_validation_fingerprint)?;
     Ok(json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
         "rollout_path": prepared.rollout_path,
@@ -12338,6 +12471,8 @@ fn run_desktop_relay_scanner_scan_once(
     let reconciled_markers = store.reconcile_desktop_transcript_relay_consumed_markers(now)?;
     let expired_markers = store.expire_desktop_transcript_relay_markers(now)?;
     let retention_deleted = store.cleanup_desktop_transcript_relay_retention(now)?;
+    let current_validation_fingerprint =
+        desktop_validation_fingerprint(DesktopReadTransport::DirectFileRead.as_str())?;
     let bindings = store.list_desktop_relay_scanner_bindings(bridge_thread_id)?;
     let mut reports = Vec::new();
     let mut scanned_bindings = 0_usize;
@@ -12347,7 +12482,9 @@ fn run_desktop_relay_scanner_scan_once(
         if binding.binding_state != "active" {
             continue;
         }
-        let Some(report) = scan_desktop_relay_binding_once(store, &binding, now)? else {
+        let Some(report) =
+            scan_desktop_relay_binding_once(store, &binding, now, &current_validation_fingerprint)?
+        else {
             continue;
         };
         scanned_bindings += 1;
@@ -12392,6 +12529,7 @@ fn scan_desktop_relay_binding_once(
     store: &mut Store,
     binding: &DesktopRelayScannerBindingRecord,
     now: i64,
+    current_validation_fingerprint: &str,
 ) -> Result<Option<Value>> {
     let path = Path::new(&binding.rollout_path);
     let pre_open_metadata = match fs::symlink_metadata(path) {
@@ -12678,8 +12816,19 @@ fn scan_desktop_relay_binding_once(
         let Some(matches) = trusted.remove(&marker) else {
             continue;
         };
-        if matches.len() != 1 {
-            let reason = format!("duplicate trusted envelopes: {}", matches.len());
+        let entry = if matches.len() == 1 {
+            matches.into_iter().next().expect("single trusted match")
+        } else if matches.first().is_some_and(|first| {
+            matches
+                .iter()
+                .all(|entry| entry.envelope_hash == first.envelope_hash)
+        }) {
+            matches
+                .into_iter()
+                .next()
+                .expect("duplicate trusted matches share an envelope hash")
+        } else {
+            let reason = format!("conflicting duplicate trusted envelopes: {}", matches.len());
             let envelope_hash = matches.first().map(|entry| entry.envelope_hash.as_str());
             let record = store.mark_desktop_transcript_relay_marker_rejected_for_scanner(
                 &marker,
@@ -12694,9 +12843,15 @@ fn scan_desktop_relay_binding_once(
                 "record": record,
             }));
             continue;
-        }
-        let entry = matches.into_iter().next().expect("single trusted match");
-        match consume_desktop_relay_scanner_envelope(store, binding, &marker_record, entry, now) {
+        };
+        match consume_desktop_relay_scanner_envelope(
+            store,
+            binding,
+            &marker_record,
+            entry,
+            now,
+            current_validation_fingerprint,
+        ) {
             Ok(report) => consumed_reports.push(report),
             Err(error) => {
                 let reason = error.to_string();
@@ -12740,6 +12895,7 @@ fn consume_desktop_relay_scanner_envelope(
     marker_record: &DesktopTranscriptRelayMarkerRecord,
     entry: DesktopRelayTrustedEnvelope,
     now: i64,
+    current_validation_fingerprint: &str,
 ) -> Result<Value> {
     let kind = json_str_field(&entry.envelope, "kind", "transcript envelope")?;
     if kind != marker_record.envelope_kind {
@@ -12816,6 +12972,7 @@ fn consume_desktop_relay_scanner_envelope(
             now,
         },
         binding,
+        current_validation_fingerprint,
     )?;
     finish_desktop_relay_scanner_consumption(entry, consumption, marker)
 }
@@ -13304,48 +13461,60 @@ fn write_desktop_probe_bytes(path: &Path, file: &mut fs::File, bytes: &[u8]) -> 
     Ok(())
 }
 
-fn publish_desktop_bridge_preflight(
-    layout: &FsLayout,
-    bridge_thread_id: &str,
-    installation_state: &DesktopInstallationStateRecord,
+struct DesktopBridgePreflightPublish<'a> {
+    layout: &'a FsLayout,
+    bridge_thread_id: &'a str,
+    snapshot_revision: &'a str,
+    installation_state: &'a DesktopInstallationStateRecord,
+    ready_threads: Vec<Value>,
     arm_pending_bindings: Vec<Value>,
     pause_due_bindings: Vec<Value>,
     sweep: SweepReport,
     now: i64,
-) -> Result<Value> {
-    let snapshot_revision = new_id();
-    let ready_threads_path = layout.desktop_ready_threads_path(&snapshot_revision);
-    let arm_pending_path = layout.desktop_arm_pending_bindings_path(&snapshot_revision);
-    let pause_due_path = layout.desktop_pause_due_bindings_path(&snapshot_revision);
-    let manifest_path = layout.desktop_current_snapshot_path();
-    let latest_installation_state_path = layout.desktop_installation_state_path();
-    let installation_state_path =
-        layout.desktop_snapshot_installation_state_path(&snapshot_revision);
-    let arm_pending_count =
-        i64::try_from(arm_pending_bindings.len()).context("arm_pending_bindings count overflow")?;
-    let pause_due_count =
-        i64::try_from(pause_due_bindings.len()).context("pause_due_bindings count overflow")?;
+}
+
+fn publish_desktop_bridge_preflight(input: DesktopBridgePreflightPublish<'_>) -> Result<Value> {
+    let ready_threads_path = input
+        .layout
+        .desktop_ready_threads_path(input.snapshot_revision);
+    let arm_pending_path = input
+        .layout
+        .desktop_arm_pending_bindings_path(input.snapshot_revision);
+    let pause_due_path = input
+        .layout
+        .desktop_pause_due_bindings_path(input.snapshot_revision);
+    let manifest_path = input.layout.desktop_current_snapshot_path();
+    let latest_installation_state_path = input.layout.desktop_installation_state_path();
+    let installation_state_path = input
+        .layout
+        .desktop_snapshot_installation_state_path(input.snapshot_revision);
+    let ready_count =
+        i64::try_from(input.ready_threads.len()).context("ready_threads count overflow")?;
+    let arm_pending_count = i64::try_from(input.arm_pending_bindings.len())
+        .context("arm_pending_bindings count overflow")?;
+    let pause_due_count = i64::try_from(input.pause_due_bindings.len())
+        .context("pause_due_bindings count overflow")?;
 
     let base = json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-        "snapshot_revision": snapshot_revision,
-        "created_at": now,
-        "bridge_thread_id": bridge_thread_id,
+        "snapshot_revision": input.snapshot_revision,
+        "created_at": input.now,
+        "bridge_thread_id": input.bridge_thread_id,
         "installation_state": {
-            "read_transport": &installation_state.read_transport,
-            "read_transport_generation": installation_state.read_transport_generation,
-            "read_transport_capability": &installation_state.read_transport_capability,
-            "artifact_read_capability": &installation_state.artifact_read_capability,
-            "writeback_capability": &installation_state.writeback_capability,
-            "validation_fingerprint": &installation_state.validation_fingerprint,
+            "read_transport": &input.installation_state.read_transport,
+            "read_transport_generation": input.installation_state.read_transport_generation,
+            "read_transport_capability": &input.installation_state.read_transport_capability,
+            "artifact_read_capability": &input.installation_state.artifact_read_capability,
+            "writeback_capability": &input.installation_state.writeback_capability,
+            "validation_fingerprint": &input.installation_state.validation_fingerprint,
         }
     });
     let installation_state_export = json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-        "snapshot_revision": snapshot_revision,
-        "published_at": now,
-        "bridge_thread_id": bridge_thread_id,
-        "desktop_installation_state": installation_state,
+        "snapshot_revision": input.snapshot_revision,
+        "published_at": input.now,
+        "bridge_thread_id": input.bridge_thread_id,
+        "desktop_installation_state": input.installation_state,
     });
     write_desktop_snapshot(&installation_state_path, installation_state_export.clone())?;
     write_desktop_snapshot(&latest_installation_state_path, installation_state_export)?;
@@ -13353,12 +13522,12 @@ fn publish_desktop_bridge_preflight(
         &ready_threads_path,
         json!({
             "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-            "snapshot_revision": snapshot_revision,
-            "created_at": now,
-            "bridge_thread_id": bridge_thread_id,
+            "snapshot_revision": input.snapshot_revision,
+            "created_at": input.now,
+            "bridge_thread_id": input.bridge_thread_id,
             "ready_threads": {
-                "entries": [],
-                "count": 0,
+                "entries": input.ready_threads,
+                "count": ready_count,
             },
             "base": base.clone(),
         }),
@@ -13367,11 +13536,11 @@ fn publish_desktop_bridge_preflight(
         &arm_pending_path,
         json!({
             "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-            "snapshot_revision": snapshot_revision,
-            "created_at": now,
-            "bridge_thread_id": bridge_thread_id,
+            "snapshot_revision": input.snapshot_revision,
+            "created_at": input.now,
+            "bridge_thread_id": input.bridge_thread_id,
             "arm_pending_bindings": {
-                "entries": arm_pending_bindings,
+                "entries": input.arm_pending_bindings,
                 "count": arm_pending_count,
             },
             "base": base.clone(),
@@ -13381,11 +13550,11 @@ fn publish_desktop_bridge_preflight(
         &pause_due_path,
         json!({
             "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-            "snapshot_revision": snapshot_revision,
-            "created_at": now,
-            "bridge_thread_id": bridge_thread_id,
+            "snapshot_revision": input.snapshot_revision,
+            "created_at": input.now,
+            "bridge_thread_id": input.bridge_thread_id,
             "pause_due_bindings": {
-                "entries": pause_due_bindings,
+                "entries": input.pause_due_bindings,
                 "count": pause_due_count,
             },
             "base": base,
@@ -13393,15 +13562,15 @@ fn publish_desktop_bridge_preflight(
     )?;
     let manifest = json!({
         "schema_version": DESKTOP_INBOX_SCHEMA_VERSION,
-        "snapshot_revision": snapshot_revision,
-        "created_at": now,
-        "bridge_thread_id": bridge_thread_id,
+        "snapshot_revision": input.snapshot_revision,
+        "created_at": input.now,
+        "bridge_thread_id": input.bridge_thread_id,
         "snapshot_manifest_path": manifest_path.display().to_string(),
         "installation_state_path": installation_state_path.display().to_string(),
         "snapshots": {
             "ready_threads": {
                 "path": ready_threads_path.display().to_string(),
-                "count": 0,
+                "count": ready_count,
             },
             "arm_pending_bindings": {
                 "path": arm_pending_path.display().to_string(),
@@ -13412,11 +13581,11 @@ fn publish_desktop_bridge_preflight(
                 "count": pause_due_count,
             },
         },
-        "installation_state": installation_state,
-        "sweep": sweep,
+        "installation_state": input.installation_state,
+        "sweep": input.sweep,
     });
     write_desktop_snapshot(&manifest_path, manifest.clone())?;
-    prune_desktop_snapshot_revisions(layout, &snapshot_revision)?;
+    prune_desktop_snapshot_revisions(input.layout, input.snapshot_revision)?;
     Ok(manifest)
 }
 
@@ -13849,6 +14018,48 @@ mod tests {
         let updated =
             follow_cli_app_server_handoff_endpoint(&endpoint, &response).expect("stop redirect");
         assert_eq!(updated.socket_path(), Path::new("/tmp/newer-cbth.sock"));
+    }
+
+    #[test]
+    fn cli_app_server_endpoints_put_newest_generation_first() {
+        let home = tempfile::tempdir().expect("temp cbth home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        fs::create_dir_all(layout.run_dir()).expect("create run dir");
+        fs::File::create(layout.daemon_socket_path()).expect("create default socket marker");
+        for generation in ["0.1.0", "0.10.0", "0.2.0", "dev"] {
+            let generation_dir = layout.daemon_generation_dir(generation);
+            fs::create_dir_all(&generation_dir).expect("create generation dir");
+            fs::File::create(generation_dir.join("cbth.sock"))
+                .expect("create generation socket marker");
+        }
+
+        let endpoints = known_cli_app_server_endpoints(&layout);
+        let relative_paths = endpoints
+            .iter()
+            .map(|endpoint| {
+                endpoint
+                    .socket_path()
+                    .strip_prefix(home.path())
+                    .expect("endpoint under home")
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            relative_paths,
+            vec![
+                "run/daemons/0.10.0/cbth.sock",
+                "run/daemons/0.2.0/cbth.sock",
+                "run/daemons/0.1.0/cbth.sock",
+                "run/daemons/dev/cbth.sock",
+                "run/cbth.sock",
+            ]
+        );
+        assert_eq!(
+            latest_cli_app_server_endpoint(&layout).socket_path(),
+            layout.daemon_generation_socket_path("0.10.0")
+        );
     }
 
     #[cfg(unix)]

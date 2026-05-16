@@ -19,7 +19,7 @@ cbth doctor cli
 Install a specific version or directory:
 
 ```bash
-CBTH_VERSION=v0.2.0 CBTH_INSTALL_DIR="$HOME/.local/bin" \
+CBTH_VERSION=v0.2.2 CBTH_INSTALL_DIR="$HOME/.local/bin" \
   sh scripts/install.sh
 ```
 
@@ -147,9 +147,10 @@ Inspect daemon-owned Codex app-servers:
 ```bash
 cbth cli app-servers
 cbth cli app-servers --human
+cbth cli app-servers --latest-generation --human
 ```
 
-When the app-server supports `thread/loaded/list`, JSON output may include optional `loaded_non_bound_codex_sessions`, and `--human` / `-H` may print `loaded non-bound codex sessions`. This is a best-effort loaded-thread diagnostic only. It does not identify the foreground/current session and does not change delivery routing; unsupported, erroring, or empty loaded lists are omitted.
+`cbth cli app-servers` inspects all known daemon generations by default, newest generation first; `--all-daemons` is a compatibility alias for that default. Use `--latest-generation` when you only want the newest generation in the single-endpoint output shape. If no generation socket exists, `--latest-generation` falls back to the default daemon. Default-only legacy daemon deployments keep the existing single-endpoint JSON shape. When the app-server supports `thread/loaded/list`, JSON output may include optional `loaded_non_bound_codex_sessions`, and `--human` / `-H` may print `loaded non-bound codex sessions`. This is a best-effort loaded-thread diagnostic only. It does not identify the foreground/current session and does not change delivery routing; unsupported, erroring, or empty loaded lists are omitted.
 
 Daemon control commands:
 

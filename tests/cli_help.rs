@@ -69,7 +69,10 @@ fn cli_app_servers_help_describes_formats_and_non_autostart_behavior() {
     assert!(stdout.contains("-H"));
     assert!(stdout.contains("--human"));
     assert!(stdout.contains("--format"));
+    assert!(stdout.contains("--latest-generation"));
+    assert!(stdout.contains("--all-daemons"));
     assert!(stdout.contains("without starting a daemon"));
+    assert!(stdout.contains("Newer generations are shown first"));
     assert!(stdout.contains("websocket URL"));
 }
 
@@ -143,6 +146,20 @@ fn cli_app_servers_human_short_conflicts_with_explicit_format() {
         .arg("json")
         .output()
         .expect("run conflicting app-servers output modes");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot be used with"));
+}
+
+#[test]
+fn cli_app_servers_latest_generation_conflicts_with_all_daemons() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cbth"))
+        .arg("cli")
+        .arg("app-servers")
+        .arg("--latest-generation")
+        .arg("--all-daemons")
+        .output()
+        .expect("run conflicting app-server scopes");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cannot be used with"));

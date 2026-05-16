@@ -543,6 +543,9 @@ pub struct DesktopTranscriptRelayMarkerRecord {
     pub bridge_thread_id: String,
     pub envelope_kind: String,
     pub source_thread_id: String,
+    pub caller_automation_id: String,
+    pub read_transport_generation: i64,
+    pub validation_fingerprint: String,
     pub attempt_id: String,
     pub generation: i64,
     pub bridge_request_id: String,
@@ -607,6 +610,8 @@ pub struct DaemonLifecycleStatus {
     pub active_cli_observations: i64,
     pub cli_observations_due_now: i64,
     pub active_desktop_relay_markers: i64,
+    pub desktop_attempts_due_now: i64,
+    pub desktop_attempts_due_within_idle: i64,
     pub open_batches_due_now: i64,
     pub open_batches_due_within_idle: i64,
 }
@@ -615,6 +620,7 @@ impl DaemonLifecycleStatus {
     pub fn has_due_maintenance(&self) -> bool {
         self.cli_acceptances_stale_now > 0
             || self.cli_observations_due_now > 0
+            || self.desktop_attempts_due_now > 0
             || self.open_batches_due_now > 0
     }
 }

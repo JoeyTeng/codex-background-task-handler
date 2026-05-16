@@ -19,7 +19,7 @@ superseded_by:
 
 ## Completed Work
 
-- Repo review gate was extracted to [tools/codex-review-gate](../../../../tools/codex-review-gate/README.md), wired as `codex/review-gate`, and live-validated for reaction-driven gating, review-body findings, resolved/outdated inline threads, and branch protection.
+- Repo review gate was extracted to [codex-review-gate](https://github.com/JoeyTeng/codex-review-gate), wired as `codex/review-gate`, and live-validated for reaction-driven gating, review-body findings, resolved/outdated inline threads, and branch protection.
 - Rust deterministic gate absorbed fake e2e coverage for job / batch / attempt delivery and passive `cbth cli run` no-delivery-RPC behavior.
 - CLI explicit opt-in delivery landed: `cbth cli run --auto-delivery-policy trusted-all`, accepted-turn observation, pre-accept rejection handling, stale sweep to manual resolution, audit records, and `strict_safe` vs `trusted_all` authorization differences.
 - CLI fresh-thread bootstrap landed through `cbth cli run --new-thread`, including fresh unmaterialized thread proof handling and opt-in live validation.
