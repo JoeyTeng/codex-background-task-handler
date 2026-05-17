@@ -96,6 +96,39 @@ v1 推荐方法族：
 - transient daemon unavailable
 - internal error
 
+#### `app_server.*` C3 Contract
+
+C3 只实现 plugin-scoped app-server lease RPC，不实现 generic delivery、service install/manage、release manager 或 Webex 专属行为。
+
+`app_server.ensure` 请求：
+
+- `managed_session_id`
+- `bound_thread_id`
+- `session_epoch`
+- `codex_binary`
+- `lease_id`
+- optional `lease_ttl_seconds`（1..=300；省略时 service 使用默认短租约）
+
+`lease_id` 是 plugin-visible replay fence。`cbth service` 必须把它与 authenticated plugin connection identity（`plugin_name` + `plugin_instance_id`）组合成 daemon-visible scoped lease id，避免不同插件或不同 plugin instance 互相刷新/停止 lease。同一连接上重复 `app_server.ensure` 只有在 `managed_session_id`、`bound_thread_id`、`session_epoch` 与首次请求一致时才是 idempotent replay；目标不同的重复 lease 必须 fail closed。若同一当前 plugin instance 通过多个 RPC socket 重放同一 lease，service 可以共享同一个 daemon lease，但必须按连接记录 holder，避免某个 socket 的 cleanup/stop 误停仍被其他 socket 持有的 app-server。
+
+`app_server.refresh` 请求：
+
+- `managed_session_id`
+- `lease_id`
+- optional `lease_ttl_seconds`（1..=300；省略时 service 使用默认短租约）
+
+`app_server.stop` 请求：
+
+- `managed_session_id`
+- `lease_id`
+
+service 只接受已通过 `plugin.hello` 且仍匹配当前 supervisor process identity 的连接调用这些方法。service 负责：
+
+- 通过 daemon ensure 获取 compatible daemon endpoint，并保留 generation handoff 语义。
+- 复用 daemon-owned `cli_app_server_*` lease machinery，而不是让 plugin 直接 spawn production app-server。
+- 在 daemon 返回 handoff endpoint 时跟随到新 daemon，并更新本连接的 lease endpoint。
+- 在 plugin connection 结束时 release 本连接仍持有的 app-server lease；只有最后一个 connection holder 释放后才 best-effort stop daemon app-server，daemon TTL reaper 仍是 cleanup fallback。
+
 ### cbth -> Plugin Methods
 
 `cbth service` 可以对 active plugin instance 发 lifecycle RPC：
