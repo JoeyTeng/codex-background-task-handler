@@ -1,11 +1,11 @@
 ---
 id: 20260516-8a9a75f-c3-plugin-app-server-rpc
 title: C3 Plugin App-Server Lease RPC
-status: active
+status: completed
 created: 2026-05-16
 updated: 2026-05-17
 branch: codex/c3-plugin-app-server-rpc
-pr:
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/88
 supersedes:
 superseded_by:
 ---
@@ -27,13 +27,13 @@ superseded_by:
 
 ## Next Steps
 
-- Push the implementation branch, open the draft C3 PR, and update this entry with the PR link before marking the workstream completed.
-- Continue with W3 only after C3 lands.
+- Continue with W3 planning on top of the C3 plugin app-server lease RPC contract.
 
 ## Evidence
 
 - Base: `origin/master` at `8a9a75f`
 - Branch: `codex/c3-plugin-app-server-rpc`
+- PR: https://github.com/JoeyTeng/codex-background-task-handler/pull/88
 - Local validation so far:
   - `cargo fmt --check`
   - `cargo test --lib service::tests -- --test-threads=1`
