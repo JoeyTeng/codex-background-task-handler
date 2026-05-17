@@ -575,7 +575,7 @@ impl<'a> DaemonPluginAppServerLeaseBroker<'a> {
     fn register_connection_lease(
         &mut self,
         key: PluginAppServerLeaseKey,
-        record: PluginAppServerLeaseRecord,
+        mut record: PluginAppServerLeaseRecord,
     ) -> Result<(), PluginRpcError> {
         {
             let mut registry = self
@@ -587,10 +587,13 @@ impl<'a> DaemonPluginAppServerLeaseBroker<'a> {
                     if shared.target != record.target {
                         return Err(replayed_plugin_app_server_lease_target_error());
                     }
-                    shared.endpoint = record.endpoint.clone();
-                    shared.scoped_lease_id = record.scoped_lease_id.clone();
-                    shared.endpoint_confirmed = record.endpoint_confirmed;
+                    if record.endpoint_confirmed || !shared.endpoint_confirmed {
+                        shared.endpoint = record.endpoint.clone();
+                        shared.scoped_lease_id = record.scoped_lease_id.clone();
+                        shared.endpoint_confirmed = record.endpoint_confirmed;
+                    }
                     shared.holders.insert(self.connection_id);
+                    record = shared.to_record();
                 }
                 None => {
                     registry.leases.insert(
@@ -3486,6 +3489,59 @@ mod tests {
         let shared = registry.leases.get(&key).expect("shared lease");
         assert_eq!(shared.endpoint.socket_path(), new_endpoint.socket_path());
         assert!(shared.endpoint_confirmed);
+    }
+
+    #[test]
+    fn daemon_broker_registering_stale_placeholder_does_not_downgrade_shared_endpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let registry = app_server_lease_registry();
+        let mut broker_a = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let mut broker_b = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: 42,
+            instance_id: "instance-1".to_owned(),
+        };
+        let key = plugin_app_server_lease_key(&identity, "lease-1");
+        let placeholder_endpoint =
+            DaemonEndpoint::from_socket_path(layout.run_dir().join("placeholder.sock"));
+        let confirmed_endpoint =
+            DaemonEndpoint::from_socket_path(layout.run_dir().join("confirmed.sock"));
+        let placeholder = PluginAppServerLeaseRecord {
+            target: PluginAppServerLeaseTarget {
+                managed_session_id: "managed-1".to_owned(),
+                bound_thread_id: "thread-1".to_owned(),
+                session_epoch: 1,
+            },
+            endpoint: placeholder_endpoint,
+            scoped_lease_id: scoped_plugin_app_server_lease_id(&identity, "lease-1"),
+            endpoint_confirmed: false,
+        };
+
+        broker_a
+            .register_connection_lease(key.clone(), placeholder.clone())
+            .expect("register broker a placeholder");
+        broker_a
+            .update_connection_lease_endpoint(&key, confirmed_endpoint.clone())
+            .expect("confirm endpoint");
+        broker_b
+            .register_connection_lease(key.clone(), placeholder)
+            .expect("register broker b stale placeholder");
+
+        let registry = registry.lock().expect("registry");
+        let shared = registry.leases.get(&key).expect("shared lease");
+        assert_eq!(
+            shared.endpoint.socket_path(),
+            confirmed_endpoint.socket_path()
+        );
+        assert!(shared.endpoint_confirmed);
+        let local_b = broker_b.leases.get(&key).expect("broker b lease");
+        assert_eq!(
+            local_b.endpoint.socket_path(),
+            confirmed_endpoint.socket_path()
+        );
+        assert!(local_b.endpoint_confirmed);
     }
 
     #[test]

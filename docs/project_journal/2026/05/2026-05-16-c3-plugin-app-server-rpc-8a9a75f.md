@@ -22,6 +22,7 @@ superseded_by:
 
 - `src/plugin_rpc.rs` defines typed `app_server.*` request payloads and method constants.
 - `src/service.rs` validates current plugin identity on every app-server RPC, scopes plugin-visible lease ids by plugin name and instance id, fences same-lease replay against target drift, follows daemon handoff endpoints, caps plugin-supplied lease TTLs, and best-effort stops connection-owned or service-shutdown leftover app-server leases.
+- Shared lease holder registration preserves confirmed endpoints when another socket joins with a stale placeholder record.
 - The service reuses daemon `cli_app_server_*` commands and existing generation-aware daemon ensure behavior instead of spawning app-servers directly.
 - `docs/design/HOST_PLUGIN_RUNTIME_AND_DELIVERY.md` now records the C3 method contract.
 
@@ -45,3 +46,5 @@ superseded_by:
 - Fresh-context review:
   - `isolated_review stateful ... --entrypoint codex-review`
   - Final clean state dir: `.codex-tmp/isolated-review-607h0_30`
+- Remote Codex review:
+  - Fixed PR finding `discussion_r3253837702` by preventing unconfirmed placeholder records from downgrading confirmed shared lease endpoints.
