@@ -5,7 +5,7 @@ status: completed
 created: 2026-05-17
 updated: 2026-05-17
 branch: codex/c4-generic-delivery-core
-pr:
+pr: https://github.com/JoeyTeng/codex-background-task-handler/pull/89
 supersedes:
 superseded_by:
 ---
@@ -57,6 +57,7 @@ superseded_by:
 ## Evidence
 
 - Base: C3 merge commit `8241b68d58663045fd23d045d95d38a6921d45ec`
+- PR: https://github.com/JoeyTeng/codex-background-task-handler/pull/89
 - Branch: `codex/c4-generic-delivery-core`
 - Local validation so far:
   - `cargo check --lib`
