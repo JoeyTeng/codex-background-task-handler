@@ -26,10 +26,12 @@ use crate::models::{
     DesktopRelayScannerBindingRecord, DesktopTranscriptRelayConsumptionRecord,
     DesktopTranscriptRelayMarkerRecord, JobRecord, LostPendingTaskProcess, NewArtifact,
     NewAuditDecision, NewBatch, NewCliAcceptPendingAttempt, NewCliManagedSessionPermissionSnapshot,
-    NewDesktopInstallationRepair, NewDesktopRelayScannerBinding,
-    NewDesktopTranscriptRelayConsumption, NewDesktopTranscriptRelayMarker,
-    NewDesktopWritebackFixture, NewJob, NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS,
-    POST_CLOSE_ARTIFACT_TTL_SECONDS, SweepReport, TaskRecord,
+    NewCodexAppServerAcceptPendingAttempt, NewDesktopInstallationRepair,
+    NewDesktopRelayScannerBinding, NewDesktopTranscriptRelayConsumption,
+    NewDesktopTranscriptRelayMarker, NewDesktopWritebackFixture, NewJob, NewPluginDelivery,
+    NewTask, ORPHAN_ARTIFACT_GRACE_SECONDS, POST_CLOSE_ARTIFACT_TTL_SECONDS,
+    PluginDeliveryEnqueueRecord, PluginDeliveryInspectRecord, PluginDeliveryManualizeRecord,
+    SweepReport, TaskRecord,
 };
 
 const MAX_STALE_ARTIFACT_INGESTS_PER_SWEEP: i64 = 100;
@@ -38,6 +40,7 @@ const MAX_DELETABLE_ARTIFACTS_PER_SWEEP: i64 = 100;
 const MAX_DELETABLE_TASK_LOG_DIRS_PER_SWEEP: i64 = 100;
 const MAX_MANIFEST_SYNCS_PER_SWEEP: i64 = 100;
 const CLI_ACCEPT_PENDING_TIMEOUT_SECONDS: i64 = 5 * 60;
+const CODEX_APP_SERVER_ACCEPT_PENDING_TIMEOUT_SECONDS: i64 = 2 * 60;
 const DESKTOP_BRIDGE_ARM_LEASE_TTL_SECONDS: i64 = 5 * 60;
 const DESKTOP_ARM_PENDING_TIMEOUT_SECONDS: i64 = 5 * 60;
 const DESKTOP_PAUSE_NOT_BEFORE_SECONDS: i64 = 90;
@@ -54,6 +57,12 @@ const SQLITE_OPEN_RETRY_MAX_DELAY: Duration = Duration::from_millis(500);
 #[derive(Debug)]
 struct DurableDesktopArmFailure {
     message: String,
+}
+
+struct PluginDeliveryRequestRecord {
+    request_fingerprint: String,
+    job_id: String,
+    batch_id: String,
 }
 
 impl fmt::Display for DurableDesktopArmFailure {
@@ -107,6 +116,14 @@ struct LostTaskRecovery {
     redelivery_window_seconds: i64,
     cancel_requested_at: Option<i64>,
     supervisor_daemon_generation: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CodexAppServerLifecycleCounts {
+    active_acceptances: i64,
+    stale_acceptances: i64,
+    active_observations: i64,
+    due_observations: i64,
 }
 
 fn supervisor_generation_matches_recovery_owners(
@@ -1050,6 +1067,238 @@ impl Store {
         Ok(inspect)
     }
 
+    #[cfg(test)]
+    pub fn enqueue_plugin_delivery(
+        &mut self,
+        delivery: NewPluginDelivery,
+    ) -> Result<PluginDeliveryEnqueueRecord> {
+        validate_new_plugin_delivery(&delivery)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let enqueue = enqueue_plugin_delivery_tx(&tx, &delivery)?;
+        tx.commit()?;
+        Ok(enqueue)
+    }
+
+    pub fn enqueue_plugin_delivery_with_codex_app_server_attempt_if_head(
+        &mut self,
+        delivery: NewPluginDelivery,
+        attempt: NewCodexAppServerAcceptPendingAttempt,
+    ) -> Result<(PluginDeliveryEnqueueRecord, Option<DeliveryAttemptRecord>)> {
+        validate_new_plugin_delivery(&delivery)?;
+        validate_codex_app_server_accept_pending_attempt(&attempt)?;
+        if attempt.batch_id != delivery.batch_id {
+            bail!("codex_app_server attempt batch_id must match plugin delivery batch_id");
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let enqueue = enqueue_plugin_delivery_tx(&tx, &delivery)?;
+        let batch = query_batch_tx(&tx, &delivery.batch_id)?;
+        let attempt = if enqueue.created && batch_is_thread_head_tx(&tx, &batch)? {
+            Some(begin_codex_app_server_accept_pending_attempt_tx(&tx, &attempt)?.0)
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok((enqueue, attempt))
+    }
+
+    #[cfg(test)]
+    pub fn enqueue_plugin_delivery_with_codex_app_server_attempt(
+        &mut self,
+        delivery: NewPluginDelivery,
+        attempt: NewCodexAppServerAcceptPendingAttempt,
+    ) -> Result<(PluginDeliveryEnqueueRecord, DeliveryAttemptRecord)> {
+        validate_new_plugin_delivery(&delivery)?;
+        validate_codex_app_server_accept_pending_attempt(&attempt)?;
+        if attempt.batch_id != delivery.batch_id {
+            bail!("codex_app_server attempt batch_id must match plugin delivery batch_id");
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let enqueue = enqueue_plugin_delivery_tx(&tx, &delivery)?;
+        let attempt = begin_codex_app_server_accept_pending_attempt_tx(&tx, &attempt)?.0;
+        tx.commit()?;
+        Ok((enqueue, attempt))
+    }
+
+    pub fn replay_plugin_delivery_enqueue(
+        &self,
+        plugin_name: &str,
+        idempotency_key: &str,
+        request_fingerprint: &str,
+    ) -> Result<Option<PluginDeliveryEnqueueRecord>> {
+        ensure_nonempty_value("plugin_name", plugin_name)?;
+        ensure_nonempty_value("idempotency_key", idempotency_key)?;
+        ensure_nonempty_value("request_fingerprint", request_fingerprint)?;
+        let Some(existing) =
+            query_plugin_delivery_request(&self.conn, plugin_name, idempotency_key)?
+        else {
+            return Ok(None);
+        };
+        if existing.request_fingerprint != request_fingerprint {
+            bail!(
+                "plugin delivery idempotency key {} for plugin {} was already used with a different request",
+                idempotency_key,
+                plugin_name
+            );
+        }
+        Ok(Some(PluginDeliveryEnqueueRecord {
+            created: false,
+            idempotency_key: idempotency_key.to_owned(),
+            job: query_job(&self.conn, &existing.job_id)?,
+            batch: query_batch_inspect(&self.conn, &existing.batch_id)?,
+        }))
+    }
+
+    pub fn inspect_plugin_delivery(
+        &self,
+        plugin_name: &str,
+        idempotency_key: Option<&str>,
+        job_id: Option<&str>,
+        batch_id: Option<&str>,
+    ) -> Result<PluginDeliveryInspectRecord> {
+        let (job, batch) = match (idempotency_key, job_id, batch_id) {
+            (Some(key), None, None) => {
+                ensure_nonempty_value("plugin_name", plugin_name)?;
+                ensure_nonempty_value("idempotency_key", key)?;
+                let existing = query_plugin_delivery_request(&self.conn, plugin_name, key)?
+                    .ok_or_else(|| {
+                        anyhow!("plugin delivery request not found: {plugin_name}/{key}")
+                    })?;
+                (
+                    Some(query_job(&self.conn, &existing.job_id)?),
+                    Some(query_batch_inspect(&self.conn, &existing.batch_id)?),
+                )
+            }
+            (None, Some(job_id), None) => {
+                ensure_nonempty_value("plugin_name", plugin_name)?;
+                let existing =
+                    query_plugin_delivery_request_by_job(&self.conn, plugin_name, job_id)?
+                        .ok_or_else(|| {
+                            anyhow!("plugin delivery job not found: {plugin_name}/{job_id}")
+                        })?;
+                let job = query_job(&self.conn, &existing.job_id)?;
+                let batch = query_batch_inspect(&self.conn, &existing.batch_id)?;
+                (Some(job), Some(batch))
+            }
+            (None, None, Some(batch_id)) => {
+                ensure_nonempty_value("plugin_name", plugin_name)?;
+                let existing =
+                    query_plugin_delivery_request_by_batch(&self.conn, plugin_name, batch_id)?
+                        .ok_or_else(|| {
+                            anyhow!("plugin delivery batch not found: {plugin_name}/{batch_id}")
+                        })?;
+                (
+                    Some(query_job(&self.conn, &existing.job_id)?),
+                    Some(query_batch_inspect(&self.conn, &existing.batch_id)?),
+                )
+            }
+            _ => bail!("provide exactly one of idempotency_key, job_id, or batch_id"),
+        };
+        let attempts = if let Some(batch) = &batch {
+            query_delivery_attempts_for_batch(&self.conn, &batch.batch.batch_id)?
+        } else {
+            Vec::new()
+        };
+        Ok(PluginDeliveryInspectRecord {
+            job,
+            batch,
+            attempts,
+        })
+    }
+
+    pub fn has_active_codex_app_server_delivery_for_target(
+        &self,
+        managed_session_id: &str,
+        session_epoch: i64,
+    ) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM delivery_attempts
+             JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+             WHERE delivery_attempts.adapter_kind = 'codex_app_server'
+               AND delivery_attempts.managed_session_id = ?
+               AND delivery_attempts.session_epoch = ?
+               AND delivery_attempts.state IN ('accept_pending', 'cooldown')
+               AND batches.state = 'open'",
+            params![managed_session_id, session_epoch],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn batch_is_thread_head(&self, batch_id: &str) -> Result<bool> {
+        let batch = query_batch(&self.conn, batch_id)?;
+        let head_batch_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT batch_id FROM batches
+                 WHERE source_thread_id = ?
+                   AND state = 'open'
+                 ORDER BY created_at ASC, batch_id ASC
+                 LIMIT 1",
+                params![batch.source_thread_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(head_batch_id.as_deref() == Some(batch.batch_id.as_str()))
+    }
+
+    pub fn manualize_plugin_delivery(
+        &mut self,
+        batch_id: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<PluginDeliveryManualizeRecord> {
+        ensure_nonempty_value("batch_id", batch_id)?;
+        ensure_nonempty_value("reason", reason)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let batch = query_batch_tx(&tx, batch_id)?;
+        ensure_batch_open(&batch)?;
+        let manual_resolution_window_ends_at = checked_timestamp_add(
+            now,
+            DEFAULT_REDELIVERY_WINDOW_SECONDS,
+            "manual_resolution_window_seconds",
+        )?;
+        tx.execute(
+            "UPDATE batches
+             SET replay_policy = 'manual_resolution_only',
+                 redelivery_window_ends_at = max(redelivery_window_ends_at, ?),
+                 updated_at = ?
+             WHERE batch_id = ?
+               AND state = 'open'",
+            params![manual_resolution_window_ends_at, now, batch_id],
+        )?;
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'abandoned',
+                 delivery_rpc_state = CASE
+                   WHEN adapter_kind = 'codex_app_server'
+                    AND delivery_rpc_state = 'pending_acceptance' THEN 'unknown'
+                   WHEN delivery_rpc_state = 'pending_acceptance' THEN 'rejected_before_accept'
+                   ELSE delivery_rpc_state
+                 END,
+                 delivery_observation_state = CASE
+                   WHEN delivery_observation_state = 'tracking' THEN 'abandoned'
+                   ELSE delivery_observation_state
+                 END,
+                 updated_at = ?,
+                 abandoned_at = ?
+             WHERE batch_id = ?
+               AND state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown')",
+            params![now, now, batch_id],
+        )?;
+        let batch = query_batch_inspect_tx(&tx, batch_id)?;
+        tx.commit()?;
+        Ok(PluginDeliveryManualizeRecord { batch })
+    }
+
     pub fn inspect_job(&self, job_id: &str) -> Result<JobRecord> {
         query_job(&self.conn, job_id)
     }
@@ -1537,6 +1786,7 @@ impl Store {
         ensure_batch_open(&batch)?;
         ensure_batch_is_thread_head_tx(&tx, &batch)?;
         ensure_batch_allows_automatic_delivery(&batch)?;
+        ensure_batch_is_not_plugin_delivery_tx(&tx, &batch)?;
         ensure_batch_allows_cli_delivery_for_authorization(&batch, &attempt.authorization_mode)?;
         let session = query_cli_managed_session_tx(&tx, &attempt.managed_session_id)?;
         ensure_cli_session_allows_delivery(
@@ -1582,6 +1832,29 @@ impl Store {
         Ok(record)
     }
 
+    #[cfg(test)]
+    pub fn begin_codex_app_server_accept_pending_attempt(
+        &mut self,
+        attempt: NewCodexAppServerAcceptPendingAttempt,
+    ) -> Result<DeliveryAttemptRecord> {
+        Ok(self
+            .begin_codex_app_server_accept_pending_attempt_with_created(attempt)?
+            .0)
+    }
+
+    pub fn begin_codex_app_server_accept_pending_attempt_with_created(
+        &mut self,
+        attempt: NewCodexAppServerAcceptPendingAttempt,
+    ) -> Result<(DeliveryAttemptRecord, bool)> {
+        validate_codex_app_server_accept_pending_attempt(&attempt)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = begin_codex_app_server_accept_pending_attempt_tx(&tx, &attempt)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
     pub fn accept_cli_attempt(
         &mut self,
         attempt_id: &str,
@@ -1602,13 +1875,80 @@ impl Store {
             tx.commit()?;
             return Ok(attempt);
         }
-        ensure_attempt_accept_pending(&attempt)?;
+        ensure_cli_attempt_accept_pending(&attempt)?;
         let batch = query_batch_tx(&tx, &attempt.batch_id)?;
         ensure_batch_open(&batch)?;
         ensure_batch_is_thread_head_tx(&tx, &batch)?;
         ensure_batch_allows_automatic_delivery(&batch)?;
         ensure_batch_allows_cli_delivery_for_authorization(&batch, &attempt.authorization_mode)?;
         ensure_cli_attempt_has_current_managed_session_for_batch_tx(&tx, &attempt, &batch)?;
+        ensure_attempt_budget_remaining(&batch)?;
+        ensure_attempt_is_current_generation_tx(&tx, &attempt)?;
+
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'cooldown',
+                 delivery_rpc_state = 'accepted',
+                 delivery_turn_id = ?,
+                 delivery_accepted_at = ?,
+                 delivery_observation_state = 'tracking',
+                 delivery_observation_deadline = ?,
+                 updated_at = ?
+             WHERE attempt_id = ?
+               AND state = 'accept_pending'
+               AND delivery_rpc_state = 'pending_acceptance'",
+            params![
+                delivery_turn_id,
+                delivery_accepted_at,
+                delivery_observation_deadline,
+                delivery_accepted_at,
+                attempt_id,
+            ],
+        )?;
+        let changed = tx.execute(
+            "UPDATE batches
+             SET delivery_attempt_count = delivery_attempt_count + 1,
+                 updated_at = ?
+             WHERE batch_id = ?
+               AND state = 'open'
+               AND delivery_attempt_count < max_delivery_attempts",
+            params![delivery_accepted_at, attempt.batch_id],
+        )?;
+        if changed != 1 {
+            bail!(
+                "batch {} has no remaining delivery attempts",
+                attempt.batch_id
+            );
+        }
+        let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn accept_codex_app_server_attempt(
+        &mut self,
+        attempt_id: &str,
+        delivery_turn_id: &str,
+        delivery_accepted_at: i64,
+        delivery_observation_deadline: i64,
+    ) -> Result<DeliveryAttemptRecord> {
+        ensure_nonempty_value("delivery_turn_id", delivery_turn_id)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
+        if attempt.state == "cooldown"
+            && attempt.delivery_rpc_state.as_deref() == Some("accepted")
+            && attempt.delivery_turn_id.as_deref() == Some(delivery_turn_id)
+        {
+            tx.commit()?;
+            return Ok(attempt);
+        }
+        ensure_codex_app_server_attempt_accept_pending(&attempt)?;
+        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
+        ensure_batch_open(&batch)?;
+        ensure_batch_is_thread_head_tx(&tx, &batch)?;
+        ensure_batch_allows_automatic_delivery(&batch)?;
         ensure_attempt_budget_remaining(&batch)?;
         ensure_attempt_is_current_generation_tx(&tx, &attempt)?;
 
@@ -1681,7 +2021,7 @@ impl Store {
                 return Ok(attempt);
             }
         }
-        ensure_attempt_accept_pending(&attempt)?;
+        ensure_cli_attempt_accept_pending(&attempt)?;
         let batch = query_batch_tx(&tx, &attempt.batch_id)?;
         ensure_batch_open(&batch)?;
         ensure_batch_is_thread_head_tx(&tx, &batch)?;
@@ -1708,6 +2048,118 @@ impl Store {
             attempt.session_epoch,
             rejected_at,
         )?;
+        let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn reject_codex_app_server_attempt_before_accept(
+        &mut self,
+        attempt_id: &str,
+        rejected_at: i64,
+        manual_resolution_only: bool,
+    ) -> Result<DeliveryAttemptRecord> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
+        if attempt.state == "abandoned"
+            && attempt.delivery_rpc_state.as_deref() == Some("rejected_before_accept")
+        {
+            if manual_resolution_only {
+                manualize_codex_app_server_batch_after_rejection_tx(&tx, &attempt, rejected_at)?;
+                let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+                tx.commit()?;
+                return Ok(record);
+            }
+            tx.commit()?;
+            return Ok(attempt);
+        }
+        ensure_codex_app_server_attempt_accept_pending(&attempt)?;
+        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
+        ensure_batch_open(&batch)?;
+        ensure_batch_is_thread_head_tx(&tx, &batch)?;
+        ensure_attempt_is_current_generation_tx(&tx, &attempt)?;
+        let changed_attempt = tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'abandoned',
+                 delivery_rpc_state = 'rejected_before_accept',
+                 delivery_observation_state = 'abandoned',
+                 updated_at = ?,
+                 abandoned_at = ?
+             WHERE attempt_id = ?
+               AND state = 'accept_pending'
+               AND delivery_rpc_state = 'pending_acceptance'",
+            params![rejected_at, rejected_at, attempt_id],
+        )?;
+        if changed_attempt != 1 {
+            bail!("codex_app_server attempt {attempt_id} is not accept-pending");
+        }
+        let changed_batch = tx.execute(
+            "UPDATE batches
+             SET delivery_attempt_count = delivery_attempt_count + 1,
+                 updated_at = ?
+             WHERE batch_id = ?
+               AND state = 'open'
+               AND delivery_attempt_count < max_delivery_attempts",
+            params![rejected_at, attempt.batch_id],
+        )?;
+        if changed_batch != 1 {
+            bail!(
+                "batch {} has no remaining delivery attempts",
+                attempt.batch_id
+            );
+        }
+        let attempts_exhausted =
+            batch.delivery_attempt_count.saturating_add(1) >= batch.max_delivery_attempts;
+        if manual_resolution_only || attempts_exhausted {
+            manualize_codex_app_server_batch_after_rejection_tx(&tx, &attempt, rejected_at)?;
+        }
+        let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn abandon_codex_app_server_attempt_as_unknown(
+        &mut self,
+        attempt_id: &str,
+        observed_at: i64,
+        manual_resolution_only: bool,
+    ) -> Result<DeliveryAttemptRecord> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
+        if attempt.state == "abandoned" && attempt.delivery_rpc_state.as_deref() == Some("unknown")
+        {
+            if manual_resolution_only {
+                manualize_codex_app_server_batch_tx(&tx, &attempt, observed_at)?;
+                let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+                tx.commit()?;
+                return Ok(record);
+            }
+            tx.commit()?;
+            return Ok(attempt);
+        }
+        ensure_codex_app_server_attempt_accept_pending(&attempt)?;
+        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
+        ensure_batch_open(&batch)?;
+        ensure_attempt_is_current_generation_tx(&tx, &attempt)?;
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'abandoned',
+                 delivery_rpc_state = 'unknown',
+                 delivery_observation_state = 'abandoned',
+                 updated_at = ?,
+                 abandoned_at = ?
+             WHERE attempt_id = ?
+               AND state = 'accept_pending'
+               AND delivery_rpc_state = 'pending_acceptance'",
+            params![observed_at, observed_at, attempt_id],
+        )?;
+        if manual_resolution_only {
+            manualize_codex_app_server_batch_tx(&tx, &attempt, observed_at)?;
+        }
         let record = query_delivery_attempt_tx(&tx, attempt_id)?;
         tx.commit()?;
         Ok(record)
@@ -1883,6 +2335,105 @@ impl Store {
                     manualize_cli_batch_after_observation_loss_tx(&tx, &attempt, observed_at)?;
                 }
                 other => bail!("unsupported CLI turn event {other}"),
+            }
+        }
+
+        let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+        tx.commit()?;
+        let _ = sync_artifact_manifests(&mut self.conn, layout, &artifacts_to_sync, observed_at);
+        Ok(record)
+    }
+
+    pub fn observe_codex_app_server_turn_event(
+        &mut self,
+        layout: &FsLayout,
+        attempt_id: &str,
+        delivery_turn_id: &str,
+        turn_event: &str,
+        observed_at: i64,
+    ) -> Result<DeliveryAttemptRecord> {
+        ensure_nonempty_value("delivery_turn_id", delivery_turn_id)?;
+        ensure_cli_turn_event_value(turn_event)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let attempt = query_delivery_attempt_tx(&tx, attempt_id)?;
+        ensure_cli_turn_observation_matches_attempt(&attempt, delivery_turn_id)?;
+        if is_idempotent_terminal_cli_turn_observation(&attempt, turn_event) {
+            tx.commit()?;
+            return Ok(attempt);
+        }
+        if can_record_late_cli_turn_evidence(&attempt, turn_event) {
+            record_late_cli_turn_evidence_tx(&tx, &attempt, turn_event, observed_at)?;
+            let record = query_delivery_attempt_tx(&tx, attempt_id)?;
+            tx.commit()?;
+            return Ok(record);
+        }
+        ensure_attempt_tracking_codex_app_server_turn_observation(&attempt)?;
+        let batch = query_batch_tx(&tx, &attempt.batch_id)?;
+        ensure_batch_open(&batch)?;
+        ensure_batch_is_thread_head_tx(&tx, &batch)?;
+        ensure_attempt_is_current_generation_tx(&tx, &attempt)?;
+
+        let mut artifacts_to_sync = Vec::new();
+        if cli_turn_observation_is_after_deadline(&attempt, observed_at)? {
+            abandon_cli_turn_observation_tx(&tx, &attempt, turn_event, "expired", observed_at)?;
+            manualize_codex_app_server_batch_after_observation_loss_tx(&tx, &attempt, observed_at)?;
+        } else {
+            match turn_event {
+                "turn_started" => {
+                    tx.execute(
+                        "UPDATE delivery_attempts
+                         SET last_observed_turn_event = ?,
+                             last_observed_turn_event_at = ?,
+                             updated_at = ?
+                         WHERE attempt_id = ?
+                           AND state = 'cooldown'
+                           AND delivery_observation_state = 'tracking'",
+                        params![turn_event, observed_at, observed_at, attempt_id],
+                    )?;
+                }
+                "turn_completed" => {
+                    ensure_batch_allows_automatic_delivery(&batch)?;
+                    tx.execute(
+                        "UPDATE delivery_attempts
+                         SET delivery_observation_state = 'completed',
+                             last_observed_turn_event = ?,
+                             last_observed_turn_event_at = ?,
+                             updated_at = ?
+                         WHERE attempt_id = ?
+                           AND state = 'cooldown'
+                           AND delivery_observation_state = 'tracking'",
+                        params![turn_event, observed_at, observed_at, attempt_id],
+                    )?;
+                    close_batch_tx(
+                        &tx,
+                        &attempt.batch_id,
+                        "delivered",
+                        Some("observed codex_app_server turn completion"),
+                        observed_at,
+                    )?;
+                    artifacts_to_sync = extend_closed_batch_artifact_retention_tx(
+                        &tx,
+                        &attempt.batch_id,
+                        observed_at,
+                    )?;
+                }
+                "turn_failed" | "turn_interrupted" | "turn_replaced" => {
+                    abandon_cli_turn_observation_tx(
+                        &tx,
+                        &attempt,
+                        turn_event,
+                        "abandoned",
+                        observed_at,
+                    )?;
+                    manualize_codex_app_server_batch_after_observation_loss_tx(
+                        &tx,
+                        &attempt,
+                        observed_at,
+                    )?;
+                }
+                other => bail!("unsupported codex_app_server turn event {other}"),
             }
         }
 
@@ -2661,6 +3212,11 @@ impl Store {
                AND batches.delivery_requires_network = 0
                AND batches.delivery_requires_write_access = 0
                AND batches.requires_artifact_read = 0
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM plugin_delivery_requests
+                 WHERE plugin_delivery_requests.batch_id = batches.batch_id
+               )
                AND batches.delivery_attempt_count < batches.max_delivery_attempts
                AND batches.redelivery_window_ends_at > ?
                AND batches.batch_id = (
@@ -2756,6 +3312,7 @@ impl Store {
             let binding = query_desktop_binding_tx(tx, &batch.source_thread_id)?;
             if !desktop_binding_matches_installation(&binding, installation_state)
                 || ensure_desktop_binding_quiesced_for_fresh_arm(&binding).is_err()
+                || ensure_batch_is_not_plugin_delivery_tx(tx, &batch).is_err()
                 || ensure_batch_allows_desktop_delivery(&batch).is_err()
                 || ensure_attempt_budget_remaining(&batch).is_err()
                 || ensure_batch_redelivery_window_open(&batch, now).is_err()
@@ -3196,6 +3753,11 @@ impl Store {
                AND batches.delivery_requires_network = 0
                AND batches.delivery_requires_write_access = 0
                AND batches.requires_artifact_read = 0
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM plugin_delivery_requests
+                 WHERE plugin_delivery_requests.batch_id = batches.batch_id
+               )
                AND batches.redelivery_window_ends_at > ?
                AND delivery_attempts.bridge_arm_lease_deadline > ?
                AND delivery_attempts.arm_pending_deadline > ?
@@ -3364,6 +3926,7 @@ impl Store {
         let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
         let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
         let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let codex_app_server = codex_app_server_lifecycle_counts(&self.conn, now)?;
         let desktop_attempts_due_now = count_desktop_attempts_due_at(&self.conn, now)?;
         let desktop_attempts_due_within_idle =
             count_desktop_attempts_due_at(&self.conn, idle_horizon_at)?;
@@ -3377,6 +3940,10 @@ impl Store {
             cli_acceptances_stale_now,
             active_cli_observations,
             cli_observations_due_now,
+            active_codex_app_server_acceptances: codex_app_server.active_acceptances,
+            codex_app_server_acceptances_stale_now: codex_app_server.stale_acceptances,
+            active_codex_app_server_observations: codex_app_server.active_observations,
+            codex_app_server_observations_due_now: codex_app_server.due_observations,
             active_desktop_relay_markers,
             desktop_attempts_due_now,
             desktop_attempts_due_within_idle,
@@ -3409,6 +3976,7 @@ impl Store {
         let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
         let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
         let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let codex_app_server = codex_app_server_lifecycle_counts(&self.conn, now)?;
         let desktop_attempts_due_now = count_desktop_attempts_due_at(&self.conn, now)?;
         let desktop_attempts_due_within_idle =
             count_desktop_attempts_due_at(&self.conn, idle_horizon_at)?;
@@ -3422,6 +3990,10 @@ impl Store {
             cli_acceptances_stale_now,
             active_cli_observations,
             cli_observations_due_now,
+            active_codex_app_server_acceptances: codex_app_server.active_acceptances,
+            codex_app_server_acceptances_stale_now: codex_app_server.stale_acceptances,
+            active_codex_app_server_observations: codex_app_server.active_observations,
+            codex_app_server_observations_due_now: codex_app_server.due_observations,
             active_desktop_relay_markers,
             desktop_attempts_due_now,
             desktop_attempts_due_within_idle,
@@ -3453,6 +4025,7 @@ impl Store {
         let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
         let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
         let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let codex_app_server = codex_app_server_lifecycle_counts(&self.conn, now)?;
         let desktop_attempts_due_now = count_desktop_attempts_due_at(&self.conn, now)?;
         let desktop_attempts_due_within_idle =
             count_desktop_attempts_due_at(&self.conn, idle_horizon_at)?;
@@ -3466,6 +4039,10 @@ impl Store {
             cli_acceptances_stale_now,
             active_cli_observations,
             cli_observations_due_now,
+            active_codex_app_server_acceptances: codex_app_server.active_acceptances,
+            codex_app_server_acceptances_stale_now: codex_app_server.stale_acceptances,
+            active_codex_app_server_observations: codex_app_server.active_observations,
+            codex_app_server_observations_due_now: codex_app_server.due_observations,
             active_desktop_relay_markers,
             desktop_attempts_due_now,
             desktop_attempts_due_within_idle,
@@ -3523,6 +4100,7 @@ impl Store {
         let cli_acceptances_stale_now = count_stale_cli_acceptances(&self.conn, now)?;
         let active_cli_observations = count_active_cli_observations(&self.conn, now)?;
         let cli_observations_due_now = count_cli_observations_due_now(&self.conn, now)?;
+        let codex_app_server = codex_app_server_lifecycle_counts(&self.conn, now)?;
         let desktop_attempts_due_now = count_desktop_attempts_due_at(&self.conn, now)?;
         let desktop_attempts_due_within_idle =
             count_desktop_attempts_due_at(&self.conn, idle_horizon_at)?;
@@ -3536,6 +4114,10 @@ impl Store {
             cli_acceptances_stale_now,
             active_cli_observations,
             cli_observations_due_now,
+            active_codex_app_server_acceptances: codex_app_server.active_acceptances,
+            codex_app_server_acceptances_stale_now: codex_app_server.stale_acceptances,
+            active_codex_app_server_observations: codex_app_server.active_observations,
+            codex_app_server_observations_due_now: codex_app_server.due_observations,
             active_desktop_relay_markers,
             desktop_attempts_due_now,
             desktop_attempts_due_within_idle,
@@ -3590,6 +4172,10 @@ impl Store {
         let tx = self.conn.transaction()?;
         let stale_cli_acceptances_abandoned = expire_stale_cli_acceptances_tx(&tx, now)?;
         let expired_cli_observations_abandoned = expire_due_cli_observations_tx(&tx, now)?;
+        let stale_codex_app_server_acceptances_abandoned =
+            expire_stale_codex_app_server_acceptances_tx(&tx, now)?;
+        let expired_codex_app_server_observations_abandoned =
+            expire_due_codex_app_server_observations_tx(&tx, now)?;
         expire_expired_desktop_prepared_attempts_tx(&tx, now)?;
         expire_expired_desktop_arm_pending_attempts_tx(&tx, now)?;
         let (expired_manual_batches_closed, artifacts_to_sync) =
@@ -3642,6 +4228,8 @@ impl Store {
         Ok(SweepReport {
             stale_cli_acceptances_abandoned,
             expired_cli_observations_abandoned,
+            stale_codex_app_server_acceptances_abandoned,
+            expired_codex_app_server_observations_abandoned,
             expired_manual_batches_closed,
             expired_automatic_batches_closed,
             artifacts_deleted: deleted_artifact_ids.len(),
@@ -3652,6 +4240,20 @@ impl Store {
             artifact_manifest_sync_failures: manifest_report.failed,
             task_log_dirs_deleted: task_log_report.deleted,
             task_log_delete_failures: task_log_report.failed,
+        })
+    }
+
+    pub fn sweep_codex_app_server_delivery_cleanup(&mut self, now: i64) -> Result<SweepReport> {
+        let tx = self.conn.transaction()?;
+        let stale_codex_app_server_acceptances_abandoned =
+            expire_stale_codex_app_server_acceptances_tx(&tx, now)?;
+        let expired_codex_app_server_observations_abandoned =
+            expire_due_codex_app_server_observations_tx(&tx, now)?;
+        tx.commit()?;
+        Ok(SweepReport {
+            stale_codex_app_server_acceptances_abandoned,
+            expired_codex_app_server_observations_abandoned,
+            ..SweepReport::default()
         })
     }
 
@@ -4066,6 +4668,23 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_batches_manual_expiry
             ON batches(state, replay_policy, redelivery_window_ends_at);
 
+        CREATE TABLE IF NOT EXISTS plugin_delivery_requests (
+            plugin_name TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            plugin_instance_id TEXT NOT NULL,
+            request_fingerprint TEXT NOT NULL,
+            job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+            batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(plugin_name, idempotency_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_plugin_delivery_requests_job
+            ON plugin_delivery_requests(job_id);
+        CREATE INDEX IF NOT EXISTS idx_plugin_delivery_requests_batch
+            ON plugin_delivery_requests(batch_id);
+
         CREATE TABLE IF NOT EXISTS cli_managed_sessions (
             managed_session_id TEXT PRIMARY KEY,
             bound_thread_id TEXT NOT NULL,
@@ -4105,7 +4724,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             attempt_id TEXT PRIMARY KEY,
             batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
             source_thread_id TEXT NOT NULL,
-            adapter_kind TEXT NOT NULL CHECK (adapter_kind IN ('cli', 'desktop')),
+            adapter_kind TEXT NOT NULL CHECK (adapter_kind IN ('cli', 'desktop', 'codex_app_server')),
             authorization_mode TEXT NOT NULL DEFAULT 'strict_safe' CHECK (authorization_mode IN ('strict_safe', 'trusted_all')),
             state TEXT NOT NULL CHECK (state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown', 'abandoned', 'superseded', 'closed')),
             generation INTEGER NOT NULL,
@@ -4430,17 +5049,8 @@ fn migrate(conn: &Connection) -> Result<()> {
         "desktop_armed_at",
         "ALTER TABLE delivery_attempts ADD COLUMN desktop_armed_at INTEGER",
     )?;
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_attempts_desktop_bridge_arm_lease
-         ON delivery_attempts(bridge_arm_lease_id)
-         WHERE bridge_arm_lease_id IS NOT NULL",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_delivery_attempts_desktop_arm_pending
-         ON delivery_attempts(adapter_kind, state, arm_pending_deadline)",
-        [],
-    )?;
+    ensure_delivery_attempts_codex_app_server_adapter_kind(conn)?;
+    ensure_delivery_attempt_indexes(conn)?;
     ensure_column(
         conn,
         "desktop_bindings",
@@ -4564,6 +5174,113 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_delivery_attempts_codex_app_server_adapter_kind(conn: &Connection) -> Result<()> {
+    let table_sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'delivery_attempts'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+    if table_sql.contains("'codex_app_server'") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = OFF;
+        ALTER TABLE delivery_attempts RENAME TO delivery_attempts_old;
+        CREATE TABLE delivery_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+            source_thread_id TEXT NOT NULL,
+            adapter_kind TEXT NOT NULL CHECK (adapter_kind IN ('cli', 'desktop', 'codex_app_server')),
+            authorization_mode TEXT NOT NULL DEFAULT 'strict_safe' CHECK (authorization_mode IN ('strict_safe', 'trusted_all')),
+            state TEXT NOT NULL CHECK (state IN ('prepared', 'accept_pending', 'arm_pending', 'cooldown', 'abandoned', 'superseded', 'closed')),
+            generation INTEGER NOT NULL,
+            delivery_rpc_request_id TEXT UNIQUE,
+            delivery_rpc_kind TEXT CHECK (delivery_rpc_kind IS NULL OR delivery_rpc_kind IN ('turn_start', 'turn_steer')),
+            delivery_rpc_state TEXT CHECK (delivery_rpc_state IS NULL OR delivery_rpc_state IN ('pending_acceptance', 'accepted', 'rejected_before_accept', 'unknown')),
+            delivery_rpc_correlation_marker TEXT,
+            delivery_rpc_started_at INTEGER,
+            managed_session_id TEXT,
+            session_epoch INTEGER,
+            session_activity_revision INTEGER NOT NULL DEFAULT 0,
+            session_capability_revision INTEGER NOT NULL DEFAULT 0,
+            delivery_turn_id TEXT,
+            delivery_accepted_at INTEGER,
+            delivery_observation_state TEXT CHECK (delivery_observation_state IS NULL OR delivery_observation_state IN ('tracking', 'completed', 'expired', 'abandoned')),
+            delivery_observation_deadline INTEGER,
+            last_observed_turn_event TEXT CHECK (last_observed_turn_event IS NULL OR last_observed_turn_event IN ('turn_started', 'turn_completed', 'turn_failed', 'turn_interrupted', 'turn_replaced')),
+            last_observed_turn_event_at INTEGER,
+            bridge_request_id TEXT,
+            bridge_arm_lease_id TEXT,
+            bridge_arm_lease_deadline INTEGER,
+            arm_pending_since INTEGER,
+            arm_pending_deadline INTEGER,
+            desktop_armed_at INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            abandoned_at INTEGER,
+            closed_at INTEGER,
+            UNIQUE(batch_id, generation)
+        );
+        INSERT INTO delivery_attempts (
+            attempt_id, batch_id, source_thread_id, adapter_kind,
+            authorization_mode, state, generation, delivery_rpc_request_id,
+            delivery_rpc_kind, delivery_rpc_state, delivery_rpc_correlation_marker,
+            delivery_rpc_started_at, managed_session_id, session_epoch,
+            session_activity_revision, session_capability_revision, delivery_turn_id,
+            delivery_accepted_at, delivery_observation_state, delivery_observation_deadline,
+            last_observed_turn_event, last_observed_turn_event_at, bridge_request_id,
+            bridge_arm_lease_id, bridge_arm_lease_deadline, arm_pending_since,
+            arm_pending_deadline, desktop_armed_at, created_at, updated_at,
+            abandoned_at, closed_at
+        )
+        SELECT
+            attempt_id, batch_id, source_thread_id, adapter_kind,
+            authorization_mode, state, generation, delivery_rpc_request_id,
+            delivery_rpc_kind, delivery_rpc_state, delivery_rpc_correlation_marker,
+            delivery_rpc_started_at, managed_session_id, session_epoch,
+            session_activity_revision, session_capability_revision, delivery_turn_id,
+            delivery_accepted_at, delivery_observation_state, delivery_observation_deadline,
+            last_observed_turn_event, last_observed_turn_event_at, bridge_request_id,
+            bridge_arm_lease_id, bridge_arm_lease_deadline, arm_pending_since,
+            arm_pending_deadline, desktop_armed_at, created_at, updated_at,
+            abandoned_at, closed_at
+        FROM delivery_attempts_old;
+        DROP TABLE delivery_attempts_old;
+        PRAGMA foreign_keys = ON;
+        ",
+    )?;
+    Ok(())
+}
+
+fn ensure_delivery_attempt_indexes(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delivery_attempts_batch_state
+         ON delivery_attempts(batch_id, state, generation)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delivery_attempts_cli_observation
+         ON delivery_attempts(adapter_kind, delivery_observation_state, delivery_observation_deadline)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_attempts_desktop_bridge_arm_lease
+         ON delivery_attempts(bridge_arm_lease_id)
+         WHERE bridge_arm_lease_id IS NOT NULL",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delivery_attempts_desktop_arm_pending
+         ON delivery_attempts(adapter_kind, state, arm_pending_deadline)",
+        [],
+    )?;
+    Ok(())
+}
+
 fn ensure_column(
     conn: &Connection,
     table_name: &str,
@@ -4619,6 +5336,234 @@ fn insert_batch_tx(tx: &Transaction<'_>, batch: &NewBatch, job_ids: &[String]) -
         )?;
     }
     Ok(())
+}
+
+fn validate_new_plugin_delivery(delivery: &NewPluginDelivery) -> Result<()> {
+    ensure_nonempty_value("plugin_name", &delivery.plugin_name)?;
+    ensure_nonempty_value("plugin_instance_id", &delivery.plugin_instance_id)?;
+    ensure_nonempty_value("idempotency_key", &delivery.idempotency_key)?;
+    ensure_nonempty_value("request_fingerprint", &delivery.request_fingerprint)?;
+    ensure_nonempty_value("source_thread_id", &delivery.source_thread_id)?;
+    ensure_nonempty_value("summary", &delivery.summary)?;
+    validate_id_path_component(&delivery.job_id, "job_id")?;
+    validate_id_path_component(&delivery.batch_id, "batch_id")?;
+    ensure_positive_value("max_delivery_attempts", delivery.max_delivery_attempts)?;
+    ensure_positive_value(
+        "redelivery_window_seconds",
+        delivery.redelivery_window_seconds,
+    )?;
+    if delivery.inline_payload_bytes < 0 {
+        bail!("inline_payload_bytes must not be negative");
+    }
+    if let Some(artifact) = &delivery.artifact {
+        validate_id_path_component(&artifact.artifact_id, "artifact_id")?;
+        validate_plugin_delivery_artifact_reference(
+            &artifact.artifact_id,
+            &artifact.relative_path,
+            artifact.size_bytes,
+            artifact.retention_until,
+            delivery.created_at,
+        )?;
+    }
+    Ok(())
+}
+
+fn enqueue_plugin_delivery_tx(
+    tx: &Transaction<'_>,
+    delivery: &NewPluginDelivery,
+) -> Result<PluginDeliveryEnqueueRecord> {
+    if let Some(existing) =
+        query_plugin_delivery_request_tx(tx, &delivery.plugin_name, &delivery.idempotency_key)?
+    {
+        if existing.request_fingerprint != delivery.request_fingerprint {
+            bail!(
+                "plugin delivery idempotency key {} for plugin {} was already used with a different request",
+                delivery.idempotency_key,
+                delivery.plugin_name
+            );
+        }
+        let job = query_job_tx(tx, &existing.job_id)?;
+        let batch = query_batch_inspect_tx(tx, &existing.batch_id)?;
+        return Ok(PluginDeliveryEnqueueRecord {
+            created: false,
+            idempotency_key: delivery.idempotency_key.clone(),
+            job,
+            batch,
+        });
+    }
+
+    tx.execute(
+        "INSERT INTO jobs (
+            job_id, source_thread_id, status, summary, metadata_json,
+            created_at, updated_at, completed_at, result_artifact_id,
+            delivery_read_only, delivery_requires_approval,
+            delivery_requires_network, delivery_requires_write_access
+        ) VALUES (?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            &delivery.job_id,
+            &delivery.source_thread_id,
+            &delivery.summary,
+            &delivery.metadata_json,
+            delivery.created_at,
+            delivery.created_at,
+            delivery.created_at,
+            delivery
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.artifact_id.as_str()),
+            bool_to_i64(delivery.policy.delivery_read_only),
+            bool_to_i64(delivery.policy.delivery_requires_approval),
+            bool_to_i64(delivery.policy.delivery_requires_network),
+            bool_to_i64(delivery.policy.delivery_requires_write_access),
+        ],
+    )?;
+    let requires_artifact_read = delivery.artifact.is_some();
+    if let Some(artifact) = &delivery.artifact {
+        tx.execute(
+            "INSERT INTO artifacts (
+                artifact_id, job_id, relative_path, original_filename,
+                size_bytes, sha256, created_at, retention_until,
+                manifest_synced_retention_until, manifest_sync_attempted_at,
+                gc_attempted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                &artifact.artifact_id,
+                &delivery.job_id,
+                &artifact.relative_path,
+                &artifact.original_filename,
+                artifact.size_bytes,
+                &artifact.sha256,
+                delivery.created_at,
+                artifact.retention_until,
+                0_i64,
+                0_i64,
+                0_i64,
+            ],
+        )?;
+    }
+
+    let batch_created_at =
+        plugin_delivery_batch_created_at_tx(tx, &delivery.source_thread_id, delivery.created_at)?;
+    let redelivery_window_ends_at = checked_timestamp_add(
+        batch_created_at,
+        delivery.redelivery_window_seconds,
+        "redelivery_window_seconds",
+    )?;
+    let batch = NewBatch {
+        batch_id: delivery.batch_id.clone(),
+        source_thread_id: delivery.source_thread_id.clone(),
+        summary: delivery.summary.clone(),
+        created_at: batch_created_at,
+        redelivery_window_ends_at,
+        max_delivery_attempts: delivery.max_delivery_attempts,
+        policy: delivery.policy.clone(),
+        inline_payload_bytes: delivery.inline_payload_bytes,
+        requires_artifact_read,
+    };
+    insert_batch_tx(tx, &batch, std::slice::from_ref(&delivery.job_id))?;
+    tx.execute(
+        "INSERT INTO plugin_delivery_requests (
+            plugin_name, idempotency_key, plugin_instance_id,
+            request_fingerprint, job_id, batch_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            &delivery.plugin_name,
+            &delivery.idempotency_key,
+            &delivery.plugin_instance_id,
+            &delivery.request_fingerprint,
+            &delivery.job_id,
+            &delivery.batch_id,
+            delivery.created_at,
+            delivery.created_at,
+        ],
+    )?;
+    let job = query_job_tx(tx, &delivery.job_id)?;
+    let batch = query_batch_inspect_tx(tx, &delivery.batch_id)?;
+    Ok(PluginDeliveryEnqueueRecord {
+        created: true,
+        idempotency_key: delivery.idempotency_key.clone(),
+        job,
+        batch,
+    })
+}
+
+fn plugin_delivery_batch_created_at_tx(
+    tx: &Transaction<'_>,
+    source_thread_id: &str,
+    requested_created_at: i64,
+) -> Result<i64> {
+    let max_open_created_at = tx.query_row(
+        "SELECT MAX(created_at) FROM batches
+         WHERE source_thread_id = ?
+           AND state = 'open'",
+        params![source_thread_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    match max_open_created_at {
+        Some(max_open_created_at) if max_open_created_at >= requested_created_at => {
+            checked_timestamp_add(max_open_created_at, 1, "plugin_delivery_batch_created_at")
+        }
+        _ => Ok(requested_created_at),
+    }
+}
+
+fn validate_codex_app_server_accept_pending_attempt(
+    attempt: &NewCodexAppServerAcceptPendingAttempt,
+) -> Result<()> {
+    validate_id_path_component(&attempt.attempt_id, "attempt_id")?;
+    ensure_nonempty_value("managed_session_id", &attempt.managed_session_id)?;
+    ensure_positive_value("session_epoch", attempt.session_epoch)?;
+    ensure_nonempty_value("delivery_rpc_request_id", &attempt.delivery_rpc_request_id)?;
+    ensure_nonempty_value(
+        "delivery_rpc_correlation_marker",
+        &attempt.delivery_rpc_correlation_marker,
+    )?;
+    Ok(())
+}
+
+fn begin_codex_app_server_accept_pending_attempt_tx(
+    tx: &Transaction<'_>,
+    attempt: &NewCodexAppServerAcceptPendingAttempt,
+) -> Result<(DeliveryAttemptRecord, bool)> {
+    if let Some(existing) =
+        query_delivery_attempt_by_rpc_request_id_tx(tx, &attempt.delivery_rpc_request_id)?
+    {
+        ensure_existing_codex_app_server_accept_matches_request(&existing, attempt)?;
+        return Ok((existing, false));
+    }
+    let batch = query_batch_tx(tx, &attempt.batch_id)?;
+    ensure_batch_open(&batch)?;
+    ensure_batch_is_thread_head_tx(tx, &batch)?;
+    ensure_batch_allows_automatic_delivery(&batch)?;
+    ensure_batch_redelivery_window_open(&batch, attempt.delivery_rpc_started_at)?;
+    ensure_attempt_budget_remaining(&batch)?;
+    ensure_no_active_attempt_for_thread_tx(tx, &batch.source_thread_id)?;
+    let generation = next_attempt_generation_tx(tx, &attempt.batch_id)?;
+
+    tx.execute(
+        "INSERT INTO delivery_attempts (
+            attempt_id, batch_id, source_thread_id, adapter_kind,
+            authorization_mode, state,
+            generation, delivery_rpc_request_id, delivery_rpc_kind,
+            delivery_rpc_state, delivery_rpc_correlation_marker,
+            delivery_rpc_started_at, managed_session_id, session_epoch,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, 'codex_app_server', 'trusted_all', 'accept_pending', ?, ?, 'turn_start', 'pending_acceptance', ?, ?, ?, ?, ?, ?)",
+        params![
+            &attempt.attempt_id,
+            &attempt.batch_id,
+            &batch.source_thread_id,
+            generation,
+            &attempt.delivery_rpc_request_id,
+            &attempt.delivery_rpc_correlation_marker,
+            attempt.delivery_rpc_started_at,
+            &attempt.managed_session_id,
+            attempt.session_epoch,
+            attempt.delivery_rpc_started_at,
+            attempt.delivery_rpc_started_at,
+        ],
+    )?;
+    Ok((query_delivery_attempt_tx(tx, &attempt.attempt_id)?, true))
 }
 
 fn close_batch_tx(
@@ -4902,6 +5847,44 @@ fn manualize_cli_batch_after_pre_accept_rejection_tx(
         params![manual_resolution_window_ends_at, now, attempt.batch_id],
     )?;
     park_cli_managed_session_tx(tx, attempt.managed_session_id.as_deref(), now)
+}
+
+fn manualize_codex_app_server_batch_after_rejection_tx(
+    tx: &Transaction<'_>,
+    attempt: &DeliveryAttemptRecord,
+    now: i64,
+) -> Result<()> {
+    manualize_codex_app_server_batch_tx(tx, attempt, now)
+}
+
+fn manualize_codex_app_server_batch_after_observation_loss_tx(
+    tx: &Transaction<'_>,
+    attempt: &DeliveryAttemptRecord,
+    now: i64,
+) -> Result<()> {
+    manualize_codex_app_server_batch_tx(tx, attempt, now)
+}
+
+fn manualize_codex_app_server_batch_tx(
+    tx: &Transaction<'_>,
+    attempt: &DeliveryAttemptRecord,
+    now: i64,
+) -> Result<()> {
+    let manual_resolution_window_ends_at = checked_timestamp_add(
+        now,
+        DEFAULT_REDELIVERY_WINDOW_SECONDS,
+        "manual_resolution_window_seconds",
+    )?;
+    tx.execute(
+        "UPDATE batches
+         SET replay_policy = 'manual_resolution_only',
+             redelivery_window_ends_at = max(redelivery_window_ends_at, ?),
+             updated_at = ?
+         WHERE batch_id = ?
+           AND state = 'open'",
+        params![manual_resolution_window_ends_at, now, attempt.batch_id],
+    )?;
+    Ok(())
 }
 
 fn abandon_cli_observations_for_session_epoch_loss_tx(
@@ -5278,6 +6261,80 @@ fn count_cli_observations_due_now(conn: &Connection, now: i64) -> Result<i64> {
     .context("count due CLI delivery observations for daemon lifecycle")
 }
 
+fn codex_app_server_lifecycle_counts(
+    conn: &Connection,
+    now: i64,
+) -> Result<CodexAppServerLifecycleCounts> {
+    Ok(CodexAppServerLifecycleCounts {
+        active_acceptances: count_active_codex_app_server_acceptances(conn, now)?,
+        stale_acceptances: count_stale_codex_app_server_acceptances(conn, now)?,
+        active_observations: count_active_codex_app_server_observations(conn, now)?,
+        due_observations: count_codex_app_server_observations_due_now(conn, now)?,
+    })
+}
+
+fn count_active_codex_app_server_acceptances(conn: &Connection, now: i64) -> Result<i64> {
+    let stale_started_at = now.saturating_sub(CODEX_APP_SERVER_ACCEPT_PENDING_TIMEOUT_SECONDS);
+    conn.query_row(
+        "SELECT COUNT(*) FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'codex_app_server'
+           AND delivery_attempts.state = 'accept_pending'
+           AND delivery_attempts.delivery_rpc_state = 'pending_acceptance'
+           AND delivery_attempts.delivery_rpc_started_at > ?
+           AND batches.state = 'open'",
+        params![stale_started_at],
+        |row| row.get::<_, i64>(0),
+    )
+    .context("count active codex_app_server accept-pending attempts for daemon lifecycle")
+}
+
+fn count_stale_codex_app_server_acceptances(conn: &Connection, now: i64) -> Result<i64> {
+    let stale_started_at = now.saturating_sub(CODEX_APP_SERVER_ACCEPT_PENDING_TIMEOUT_SECONDS);
+    conn.query_row(
+        "SELECT COUNT(*) FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'codex_app_server'
+           AND delivery_attempts.state = 'accept_pending'
+           AND delivery_attempts.delivery_rpc_state = 'pending_acceptance'
+           AND delivery_attempts.delivery_rpc_started_at <= ?
+           AND batches.state = 'open'",
+        params![stale_started_at],
+        |row| row.get::<_, i64>(0),
+    )
+    .context("count stale codex_app_server accept-pending attempts for daemon lifecycle")
+}
+
+fn count_active_codex_app_server_observations(conn: &Connection, now: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'codex_app_server'
+           AND delivery_attempts.state = 'cooldown'
+           AND delivery_attempts.delivery_observation_state = 'tracking'
+           AND delivery_attempts.delivery_observation_deadline > ?
+           AND batches.state = 'open'",
+        params![now],
+        |row| row.get::<_, i64>(0),
+    )
+    .context("count active codex_app_server delivery observations for daemon lifecycle")
+}
+
+fn count_codex_app_server_observations_due_now(conn: &Connection, now: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'codex_app_server'
+           AND delivery_attempts.state = 'cooldown'
+           AND delivery_attempts.delivery_observation_state = 'tracking'
+           AND delivery_attempts.delivery_observation_deadline <= ?
+           AND batches.state = 'open'",
+        params![now],
+        |row| row.get::<_, i64>(0),
+    )
+    .context("count due codex_app_server delivery observations for daemon lifecycle")
+}
+
 fn expire_stale_cli_acceptances_tx(tx: &Transaction<'_>, now: i64) -> Result<usize> {
     let stale_started_at = now.saturating_sub(CLI_ACCEPT_PENDING_TIMEOUT_SECONDS);
     let manual_resolution_window_ends_at = checked_timestamp_add(
@@ -5421,6 +6478,87 @@ fn expire_due_cli_observations_tx(tx: &Transaction<'_>, now: i64) -> Result<usiz
     Ok(attempts.len())
 }
 
+fn expire_stale_codex_app_server_acceptances_tx(tx: &Transaction<'_>, now: i64) -> Result<usize> {
+    let stale_started_at = now.saturating_sub(CODEX_APP_SERVER_ACCEPT_PENDING_TIMEOUT_SECONDS);
+    let mut stmt = tx.prepare(
+        "SELECT delivery_attempts.attempt_id
+         FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'codex_app_server'
+           AND delivery_attempts.state = 'accept_pending'
+           AND delivery_attempts.delivery_rpc_state = 'pending_acceptance'
+           AND delivery_attempts.delivery_rpc_started_at <= ?
+           AND batches.state = 'open'
+         ORDER BY delivery_attempts.delivery_rpc_started_at ASC,
+                  delivery_attempts.attempt_id ASC
+         LIMIT ?",
+    )?;
+    let attempt_ids = stmt
+        .query_map(
+            params![stale_started_at, MAX_EXPIRED_BATCHES_PER_SWEEP],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for attempt_id in &attempt_ids {
+        let attempt = query_delivery_attempt_tx(tx, attempt_id)?;
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'abandoned',
+                 delivery_rpc_state = 'unknown',
+                 delivery_observation_state = 'abandoned',
+                 updated_at = ?,
+                 abandoned_at = ?
+             WHERE attempt_id = ?
+               AND state = 'accept_pending'
+               AND delivery_rpc_state = 'pending_acceptance'",
+            params![now, now, attempt_id],
+        )?;
+        manualize_codex_app_server_batch_tx(tx, &attempt, now)?;
+    }
+    Ok(attempt_ids.len())
+}
+
+fn expire_due_codex_app_server_observations_tx(tx: &Transaction<'_>, now: i64) -> Result<usize> {
+    let mut stmt = tx.prepare(
+        "SELECT delivery_attempts.attempt_id
+         FROM delivery_attempts
+         JOIN batches ON batches.batch_id = delivery_attempts.batch_id
+         WHERE delivery_attempts.adapter_kind = 'codex_app_server'
+           AND delivery_attempts.state = 'cooldown'
+           AND delivery_attempts.delivery_observation_state = 'tracking'
+           AND delivery_attempts.delivery_observation_deadline <= ?
+           AND batches.state = 'open'
+         ORDER BY delivery_attempts.delivery_observation_deadline ASC,
+                  delivery_attempts.attempt_id ASC
+         LIMIT ?",
+    )?;
+    let attempt_ids = stmt
+        .query_map(params![now, MAX_EXPIRED_BATCHES_PER_SWEEP], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for attempt_id in &attempt_ids {
+        let attempt = query_delivery_attempt_tx(tx, attempt_id)?;
+        tx.execute(
+            "UPDATE delivery_attempts
+             SET state = 'abandoned',
+                 delivery_observation_state = 'expired',
+                 updated_at = ?,
+                 abandoned_at = ?
+             WHERE attempt_id = ?
+               AND state = 'cooldown'
+               AND delivery_observation_state = 'tracking'",
+            params![now, now, attempt_id],
+        )?;
+        manualize_codex_app_server_batch_after_observation_loss_tx(tx, &attempt, now)?;
+    }
+    Ok(attempt_ids.len())
+}
+
 fn close_expired_automatic_batches_tx(
     tx: &Transaction<'_>,
     now: i64,
@@ -5559,6 +6697,70 @@ fn query_job_tx(tx: &Transaction<'_>, job_id: &str) -> Result<JobRecord> {
     )
     .optional()?
     .ok_or_else(|| anyhow!("job not found: {job_id}"))
+}
+
+fn query_plugin_delivery_request(
+    conn: &Connection,
+    plugin_name: &str,
+    idempotency_key: &str,
+) -> Result<Option<PluginDeliveryRequestRecord>> {
+    conn.query_row(
+        "SELECT request_fingerprint, job_id, batch_id
+         FROM plugin_delivery_requests
+         WHERE plugin_name = ? AND idempotency_key = ?",
+        params![plugin_name, idempotency_key],
+        plugin_delivery_request_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn query_plugin_delivery_request_by_job(
+    conn: &Connection,
+    plugin_name: &str,
+    job_id: &str,
+) -> Result<Option<PluginDeliveryRequestRecord>> {
+    conn.query_row(
+        "SELECT request_fingerprint, job_id, batch_id
+         FROM plugin_delivery_requests
+         WHERE plugin_name = ? AND job_id = ?",
+        params![plugin_name, job_id],
+        plugin_delivery_request_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn query_plugin_delivery_request_by_batch(
+    conn: &Connection,
+    plugin_name: &str,
+    batch_id: &str,
+) -> Result<Option<PluginDeliveryRequestRecord>> {
+    conn.query_row(
+        "SELECT request_fingerprint, job_id, batch_id
+         FROM plugin_delivery_requests
+         WHERE plugin_name = ? AND batch_id = ?",
+        params![plugin_name, batch_id],
+        plugin_delivery_request_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn query_plugin_delivery_request_tx(
+    tx: &Transaction<'_>,
+    plugin_name: &str,
+    idempotency_key: &str,
+) -> Result<Option<PluginDeliveryRequestRecord>> {
+    tx.query_row(
+        "SELECT request_fingerprint, job_id, batch_id
+         FROM plugin_delivery_requests
+         WHERE plugin_name = ? AND idempotency_key = ?",
+        params![plugin_name, idempotency_key],
+        plugin_delivery_request_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn query_task(conn: &Connection, task_id: &str) -> Result<TaskRecord> {
@@ -6140,6 +7342,20 @@ fn query_delivery_attempt(conn: &Connection, attempt_id: &str) -> Result<Deliver
     .ok_or_else(|| anyhow!("delivery attempt not found: {attempt_id}"))
 }
 
+fn query_delivery_attempts_for_batch(
+    conn: &Connection,
+    batch_id: &str,
+) -> Result<Vec<DeliveryAttemptRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM delivery_attempts
+         WHERE batch_id = ?
+         ORDER BY generation ASC, attempt_id ASC",
+    )?;
+    stmt.query_map(params![batch_id], delivery_attempt_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 fn query_delivery_attempt_tx(
     tx: &Transaction<'_>,
     attempt_id: &str,
@@ -6503,6 +7719,18 @@ fn abandon_desktop_arm_pending_tx(tx: &Transaction<'_>, attempt_id: &str, now: i
 }
 
 fn ensure_batch_is_thread_head_tx(tx: &Transaction<'_>, batch: &BatchRecord) -> Result<()> {
+    if batch_is_thread_head_tx(tx, batch)? {
+        Ok(())
+    } else {
+        bail!(
+            "batch {} is not the head batch for thread {}",
+            batch.batch_id,
+            batch.source_thread_id
+        )
+    }
+}
+
+fn batch_is_thread_head_tx(tx: &Transaction<'_>, batch: &BatchRecord) -> Result<bool> {
     let head_batch_id: Option<String> = tx
         .query_row(
             "SELECT batch_id FROM batches
@@ -6514,15 +7742,7 @@ fn ensure_batch_is_thread_head_tx(tx: &Transaction<'_>, batch: &BatchRecord) -> 
             |row| row.get(0),
         )
         .optional()?;
-    if head_batch_id.as_deref() == Some(batch.batch_id.as_str()) {
-        Ok(())
-    } else {
-        bail!(
-            "batch {} is not the head batch for thread {}",
-            batch.batch_id,
-            batch.source_thread_id
-        )
-    }
+    Ok(head_batch_id.as_deref() == Some(batch.batch_id.as_str()))
 }
 
 fn next_attempt_generation_tx(tx: &Transaction<'_>, batch_id: &str) -> Result<i64> {
@@ -6693,6 +7913,16 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
             delivery_requires_write_access: row.get::<_, i64>("delivery_requires_write_access")?
                 != 0,
         },
+    })
+}
+
+fn plugin_delivery_request_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PluginDeliveryRequestRecord> {
+    Ok(PluginDeliveryRequestRecord {
+        request_fingerprint: row.get("request_fingerprint")?,
+        job_id: row.get("job_id")?,
+        batch_id: row.get("batch_id")?,
     })
 }
 
@@ -7120,6 +8350,11 @@ fn list_existing_desktop_ready_entries_tx(
            AND batches.delivery_requires_network = 0
            AND batches.delivery_requires_write_access = 0
            AND batches.requires_artifact_read = 0
+           AND NOT EXISTS (
+             SELECT 1
+             FROM plugin_delivery_requests
+             WHERE plugin_delivery_requests.batch_id = batches.batch_id
+           )
            AND batches.delivery_attempt_count < batches.max_delivery_attempts
            AND batches.redelivery_window_ends_at > ?
            AND batches.batch_id = (
@@ -7547,6 +8782,26 @@ fn ensure_batch_allows_automatic_delivery(batch: &BatchRecord) -> Result<()> {
     }
 }
 
+fn batch_has_plugin_delivery_request_tx(tx: &Transaction<'_>, batch_id: &str) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM plugin_delivery_requests WHERE batch_id = ?
+         )",
+        params![batch_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .map_err(Into::into)
+}
+
+fn ensure_batch_is_not_plugin_delivery_tx(tx: &Transaction<'_>, batch: &BatchRecord) -> Result<()> {
+    if batch_has_plugin_delivery_request_tx(tx, &batch.batch_id)? {
+        bail!("batch {} is reserved for plugin delivery", batch.batch_id)
+    } else {
+        Ok(())
+    }
+}
+
 fn ensure_batch_allows_detached_cli_delivery(batch: &BatchRecord) -> Result<()> {
     let policy = &batch.delivery_policy;
     if policy.delivery_read_only
@@ -7665,6 +8920,7 @@ fn ensure_desktop_attempt_head_and_batch_eligible(
     ensure_batch_open(batch)?;
     ensure_batch_is_thread_head_tx(tx, batch)?;
     ensure_batch_allows_automatic_delivery(batch)?;
+    ensure_batch_is_not_plugin_delivery_tx(tx, batch)?;
     ensure_batch_allows_desktop_delivery(batch)?;
     ensure_attempt_is_current_generation_tx(tx, attempt)
 }
@@ -7917,6 +9173,37 @@ fn ensure_nonempty_value(name: &str, value: &str) -> Result<()> {
     }
 }
 
+fn validate_plugin_delivery_artifact_reference(
+    artifact_id: &str,
+    relative_path: &str,
+    size_bytes: i64,
+    retention_until: i64,
+    now: i64,
+) -> Result<()> {
+    ensure_nonempty_value("artifact.relative_path", relative_path)?;
+    ensure_positive_value("artifact.size_bytes", size_bytes)?;
+    if retention_until <= now {
+        bail!("artifact.retention_until must be in the future");
+    }
+    let path = std::path::Path::new(relative_path);
+    if path.is_absolute() {
+        bail!("artifact.relative_path must be relative");
+    }
+    let expected_relative_path = relative_artifact_payload_path(artifact_id);
+    if relative_path != expected_relative_path {
+        bail!("artifact.relative_path must be the canonical artifact payload path");
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        bail!("artifact.relative_path must not escape cbth home");
+    }
+    Ok(())
+}
+
 fn ensure_cli_session_epoch_matches(
     session: &CliManagedSessionRecord,
     session_epoch: i64,
@@ -8102,6 +9389,12 @@ fn ensure_existing_cli_accept_matches_request(
     existing: &DeliveryAttemptRecord,
     attempt: &NewCliAcceptPendingAttempt,
 ) -> Result<()> {
+    if existing.adapter_kind != "cli" {
+        bail!(
+            "delivery RPC request {} already belongs to a different adapter kind",
+            attempt.delivery_rpc_request_id
+        );
+    }
     if existing.batch_id != attempt.batch_id {
         bail!(
             "delivery RPC request {} already belongs to batch {}",
@@ -8136,6 +9429,44 @@ fn ensure_existing_cli_accept_matches_request(
     Ok(())
 }
 
+fn ensure_existing_codex_app_server_accept_matches_request(
+    existing: &DeliveryAttemptRecord,
+    attempt: &NewCodexAppServerAcceptPendingAttempt,
+) -> Result<()> {
+    if existing.adapter_kind != "codex_app_server" {
+        bail!(
+            "delivery RPC request {} already belongs to a different adapter kind",
+            attempt.delivery_rpc_request_id
+        );
+    }
+    if existing.batch_id != attempt.batch_id {
+        bail!(
+            "delivery RPC request {} already belongs to batch {}",
+            attempt.delivery_rpc_request_id,
+            existing.batch_id
+        );
+    }
+    if existing.managed_session_id.as_deref() != Some(attempt.managed_session_id.as_str()) {
+        bail!(
+            "delivery RPC request {} already belongs to a different managed session",
+            attempt.delivery_rpc_request_id
+        );
+    }
+    if existing.session_epoch != Some(attempt.session_epoch) {
+        bail!(
+            "delivery RPC request {} already belongs to a different session epoch",
+            attempt.delivery_rpc_request_id
+        );
+    }
+    if existing.delivery_rpc_kind.as_deref() != Some("turn_start") {
+        bail!(
+            "delivery RPC request {} already belongs to a different RPC kind",
+            attempt.delivery_rpc_request_id
+        );
+    }
+    Ok(())
+}
+
 fn ensure_attempt_budget_remaining(batch: &BatchRecord) -> Result<()> {
     if batch.delivery_attempt_count < batch.max_delivery_attempts {
         Ok(())
@@ -8152,15 +9483,26 @@ fn ensure_batch_redelivery_window_open(batch: &BatchRecord, now: i64) -> Result<
     }
 }
 
-fn ensure_attempt_accept_pending(attempt: &DeliveryAttemptRecord) -> Result<()> {
-    if attempt.adapter_kind == "cli"
+fn ensure_cli_attempt_accept_pending(attempt: &DeliveryAttemptRecord) -> Result<()> {
+    ensure_attempt_accept_pending_for_adapter(attempt, "cli")
+}
+
+fn ensure_codex_app_server_attempt_accept_pending(attempt: &DeliveryAttemptRecord) -> Result<()> {
+    ensure_attempt_accept_pending_for_adapter(attempt, "codex_app_server")
+}
+
+fn ensure_attempt_accept_pending_for_adapter(
+    attempt: &DeliveryAttemptRecord,
+    adapter_kind: &str,
+) -> Result<()> {
+    if attempt.adapter_kind == adapter_kind
         && attempt.state == "accept_pending"
         && attempt.delivery_rpc_state.as_deref() == Some("pending_acceptance")
     {
         Ok(())
     } else {
         bail!(
-            "delivery attempt {} is not a pending CLI acceptance",
+            "delivery attempt {} is not a pending {adapter_kind} acceptance",
             attempt.attempt_id
         )
     }
@@ -8196,7 +9538,20 @@ fn ensure_cli_turn_observation_matches_attempt(
 }
 
 fn ensure_attempt_tracking_cli_turn_observation(attempt: &DeliveryAttemptRecord) -> Result<()> {
-    if attempt.adapter_kind == "cli"
+    ensure_attempt_tracking_turn_observation_for_adapter(attempt, "cli")
+}
+
+fn ensure_attempt_tracking_codex_app_server_turn_observation(
+    attempt: &DeliveryAttemptRecord,
+) -> Result<()> {
+    ensure_attempt_tracking_turn_observation_for_adapter(attempt, "codex_app_server")
+}
+
+fn ensure_attempt_tracking_turn_observation_for_adapter(
+    attempt: &DeliveryAttemptRecord,
+    adapter_kind: &str,
+) -> Result<()> {
+    if attempt.adapter_kind == adapter_kind
         && attempt.state == "cooldown"
         && attempt.delivery_rpc_state.as_deref() == Some("accepted")
         && attempt.delivery_observation_state.as_deref() == Some("tracking")
@@ -8205,7 +9560,7 @@ fn ensure_attempt_tracking_cli_turn_observation(attempt: &DeliveryAttemptRecord)
         Ok(())
     } else {
         bail!(
-            "delivery attempt {} is not tracking an accepted CLI turn",
+            "delivery attempt {} is not tracking an accepted {adapter_kind} turn",
             attempt.attempt_id
         )
     }
@@ -8340,6 +9695,396 @@ mod tests {
                 },
             )
             .expect("create task");
+    }
+
+    fn new_plugin_delivery(
+        plugin_name: &str,
+        idempotency_key: &str,
+        suffix: &str,
+    ) -> NewPluginDelivery {
+        NewPluginDelivery {
+            plugin_name: plugin_name.to_owned(),
+            plugin_instance_id: format!("{plugin_name}-instance"),
+            idempotency_key: idempotency_key.to_owned(),
+            request_fingerprint: format!("fingerprint-{suffix}"),
+            job_id: format!("plugin-job-{suffix}"),
+            batch_id: format!("plugin-batch-{suffix}"),
+            source_thread_id: "thread-1".to_owned(),
+            summary: "plugin delivery".to_owned(),
+            metadata_json: format!(r#"{{"plugin":"{plugin_name}","suffix":"{suffix}"}}"#),
+            policy: DeliveryPolicy::fail_closed(),
+            inline_payload_bytes: 12,
+            artifact: None,
+            max_delivery_attempts: 2,
+            redelivery_window_seconds: 3600,
+            created_at: 100,
+        }
+    }
+
+    #[test]
+    fn plugin_delivery_enqueue_replays_same_request_and_rejects_fingerprint_mismatch() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let delivery = new_plugin_delivery("webex", "idem-1", "webex-1");
+
+        let created = store
+            .enqueue_plugin_delivery(delivery.clone())
+            .expect("enqueue");
+        let replay = store
+            .enqueue_plugin_delivery(delivery.clone())
+            .expect("idempotent replay");
+
+        assert!(created.created);
+        assert!(!replay.created);
+        assert_eq!(created.job.job_id, replay.job.job_id);
+        assert_eq!(created.batch.batch.batch_id, replay.batch.batch.batch_id);
+        let replay_before_driver = store
+            .replay_plugin_delivery_enqueue("webex", "idem-1", "fingerprint-webex-1")
+            .expect("replay query")
+            .expect("existing replay");
+        assert_eq!(created.job.job_id, replay_before_driver.job.job_id);
+
+        let mut changed = delivery;
+        changed.request_fingerprint = "fingerprint-other".to_owned();
+        let error = store
+            .enqueue_plugin_delivery(changed)
+            .expect_err("fingerprint mismatch");
+        assert!(
+            error
+                .to_string()
+                .contains("already used with a different request")
+        );
+    }
+
+    #[test]
+    fn plugin_delivery_requests_are_scoped_by_plugin_name() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let webex = store
+            .enqueue_plugin_delivery(new_plugin_delivery("webex", "shared-key", "webex"))
+            .expect("webex enqueue");
+        let slack = store
+            .enqueue_plugin_delivery(new_plugin_delivery("slack", "shared-key", "slack"))
+            .expect("slack enqueue");
+
+        assert_ne!(webex.job.job_id, slack.job.job_id);
+        assert!(
+            store
+                .inspect_plugin_delivery("webex", None, None, Some(&slack.batch.batch.batch_id))
+                .is_err()
+        );
+        let inspected = store
+            .inspect_plugin_delivery("slack", Some("shared-key"), None, None)
+            .expect("slack inspect");
+        assert_eq!(
+            inspected.batch.expect("batch").batch.batch_id,
+            slack.batch.batch.batch_id
+        );
+    }
+
+    #[test]
+    fn plugin_delivery_can_enqueue_batch_and_codex_app_server_attempt_atomically() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let delivery = new_plugin_delivery("webex", "atomic-key", "atomic");
+
+        let (enqueue, pending) = store
+            .enqueue_plugin_delivery_with_codex_app_server_attempt(
+                delivery.clone(),
+                NewCodexAppServerAcceptPendingAttempt {
+                    attempt_id: "plugin-attempt-atomic".to_owned(),
+                    batch_id: delivery.batch_id.clone(),
+                    managed_session_id: "session-1".to_owned(),
+                    session_epoch: 1,
+                    delivery_rpc_request_id: "turn-start-atomic".to_owned(),
+                    delivery_rpc_correlation_marker: "marker-atomic".to_owned(),
+                    delivery_rpc_started_at: 110,
+                },
+            )
+            .expect("enqueue with attempt");
+        let inspected = store
+            .inspect_plugin_delivery("webex", Some("atomic-key"), None, None)
+            .expect("inspect");
+
+        assert!(enqueue.created);
+        assert_eq!(pending.adapter_kind, "codex_app_server");
+        assert_eq!(pending.state, "accept_pending");
+        assert_eq!(inspected.attempts.len(), 1);
+        assert_eq!(inspected.attempts[0].attempt_id, pending.attempt_id);
+        assert_eq!(inspected.attempts[0].adapter_kind, "codex_app_server");
+    }
+
+    #[test]
+    fn codex_app_server_begin_reports_existing_attempt_without_creating() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let delivery = new_plugin_delivery("webex", "begin-existing-key", "begin-existing");
+        let request = NewCodexAppServerAcceptPendingAttempt {
+            attempt_id: "plugin-attempt-existing".to_owned(),
+            batch_id: delivery.batch_id.clone(),
+            managed_session_id: "session-1".to_owned(),
+            session_epoch: 1,
+            delivery_rpc_request_id: "turn-start-existing".to_owned(),
+            delivery_rpc_correlation_marker: "marker-existing".to_owned(),
+            delivery_rpc_started_at: 110,
+        };
+        let (_enqueue, pending) = store
+            .enqueue_plugin_delivery_with_codex_app_server_attempt(delivery, request.clone())
+            .expect("enqueue with attempt");
+
+        let (existing, created) = store
+            .begin_codex_app_server_accept_pending_attempt_with_created(request)
+            .expect("idempotent begin");
+
+        assert!(!created);
+        assert_eq!(existing.attempt_id, pending.attempt_id);
+        assert_eq!(
+            existing.delivery_rpc_state.as_deref(),
+            Some("pending_acceptance")
+        );
+    }
+
+    #[test]
+    fn plugin_delivery_batches_are_reserved_from_generic_delivery_drivers() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let delivery = store
+            .enqueue_plugin_delivery(new_plugin_delivery("webex", "reserved-key", "reserved"))
+            .expect("enqueue plugin delivery");
+        let batch_id = delivery.batch.batch.batch_id.clone();
+        let session = store
+            .attach_or_create_cli_managed_session(
+                "thread-1",
+                CliManagedSessionProfile {
+                    session_allows_approval: true,
+                    session_allows_network: true,
+                    session_allows_write_access: true,
+                },
+                CliManagedSessionProfileRequirement {
+                    session_allows_approval: None,
+                    session_allows_network: None,
+                    session_allows_write_access: None,
+                },
+                0,
+            )
+            .expect("attach CLI session");
+        store
+            .note_cli_managed_session_capabilities(
+                &session.session.managed_session_id,
+                session.session.session_epoch,
+                1,
+                CliManagedSessionCapabilities {
+                    capability_thread_resume: true,
+                    capability_turn_start: true,
+                    capability_current_state_sync: true,
+                    capability_turn_completed_event: true,
+                    capability_negative_terminal_events: true,
+                    capability_thread_start: false,
+                    capability_turn_steer: false,
+                },
+                1,
+            )
+            .expect("note capabilities");
+        store
+            .note_cli_managed_session_activity(
+                &session.session.managed_session_id,
+                session.session.session_epoch,
+                "idle",
+                1,
+                1,
+            )
+            .expect("note idle");
+
+        let cli_error = store
+            .begin_cli_accept_pending_attempt(NewCliAcceptPendingAttempt {
+                attempt_id: "attempt-cli-reserved".to_owned(),
+                batch_id: batch_id.clone(),
+                managed_session_id: session.session.managed_session_id.clone(),
+                session_epoch: session.session.session_epoch,
+                authorization_mode: "trusted_all".to_owned(),
+                delivery_rpc_request_id: "rpc-cli-reserved".to_owned(),
+                delivery_rpc_kind: "turn_start".to_owned(),
+                delivery_rpc_correlation_marker: "marker-cli-reserved".to_owned(),
+                delivery_rpc_started_at: 120,
+            })
+            .expect_err("CLI must not claim plugin delivery batch");
+        assert!(
+            cli_error
+                .to_string()
+                .contains("reserved for plugin delivery")
+        );
+
+        let tx = store.conn.transaction().expect("transaction");
+        let batch = query_batch_tx(&tx, &batch_id).expect("batch");
+        let desktop_attempt =
+            create_desktop_prepared_attempt_tx(&tx, &batch, 121).expect("desktop attempt");
+        let desktop_error =
+            ensure_desktop_attempt_head_and_batch_eligible(&tx, &desktop_attempt, &batch)
+                .expect_err("Desktop must not claim plugin delivery batch");
+        assert!(
+            desktop_error
+                .to_string()
+                .contains("reserved for plugin delivery")
+        );
+    }
+
+    #[test]
+    fn plugin_delivery_batches_preserve_fifo_order_with_same_second_enqueue() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let mut first = new_plugin_delivery("webex", "fifo-first-key", "fifo-first");
+        first.batch_id = "plugin-batch-z-first".to_owned();
+        first.created_at = 100;
+        let first_batch_id = first.batch_id.clone();
+        let (_first_enqueue, first_attempt) = store
+            .enqueue_plugin_delivery_with_codex_app_server_attempt(
+                first,
+                NewCodexAppServerAcceptPendingAttempt {
+                    attempt_id: "plugin-attempt-fifo-first".to_owned(),
+                    batch_id: first_batch_id.clone(),
+                    managed_session_id: "session-1".to_owned(),
+                    session_epoch: 1,
+                    delivery_rpc_request_id: "turn-start-fifo-first".to_owned(),
+                    delivery_rpc_correlation_marker: "marker-fifo-first".to_owned(),
+                    delivery_rpc_started_at: 100,
+                },
+            )
+            .expect("enqueue first head attempt");
+        let mut second = new_plugin_delivery("webex", "fifo-second-key", "fifo-second");
+        second.batch_id = "plugin-batch-a-second".to_owned();
+        second.created_at = 100;
+        let second_batch_id = second.batch_id.clone();
+
+        let (second_enqueue, second_attempt) = store
+            .enqueue_plugin_delivery_with_codex_app_server_attempt_if_head(
+                second,
+                NewCodexAppServerAcceptPendingAttempt {
+                    attempt_id: "plugin-attempt-fifo-second".to_owned(),
+                    batch_id: second_batch_id.clone(),
+                    managed_session_id: "session-1".to_owned(),
+                    session_epoch: 1,
+                    delivery_rpc_request_id: "turn-start-fifo-second".to_owned(),
+                    delivery_rpc_correlation_marker: "marker-fifo-second".to_owned(),
+                    delivery_rpc_started_at: 100,
+                },
+            )
+            .expect("enqueue second queued batch");
+
+        assert!(second_enqueue.created);
+        assert!(second_attempt.is_none());
+        assert!(
+            store
+                .batch_is_thread_head(&first_batch_id)
+                .expect("first head")
+        );
+        assert!(
+            !store
+                .batch_is_thread_head(&second_batch_id)
+                .expect("second queued")
+        );
+        assert_eq!(first_attempt.batch_id, first_batch_id);
+        assert_eq!(second_enqueue.batch.batch.created_at, 101);
+    }
+
+    #[test]
+    fn plugin_delivery_artifacts_must_use_canonical_payload_paths() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let mut delivery = new_plugin_delivery("webex", "artifact-key", "artifact");
+        delivery.inline_payload_bytes = 0;
+        delivery.artifact = Some(crate::models::PluginDeliveryArtifactInput {
+            artifact_id: "plugin-artifact".to_owned(),
+            relative_path: "artifacts/other/payload".to_owned(),
+            original_filename: Some("payload.txt".to_owned()),
+            size_bytes: 7,
+            sha256: "sha".to_owned(),
+            retention_until: 200,
+        });
+
+        let error = store
+            .enqueue_plugin_delivery(delivery)
+            .expect_err("non-canonical artifact path rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("canonical artifact payload path")
+        );
+    }
+
+    #[test]
+    fn plugin_delivery_artifact_sets_completed_job_result_artifact_id() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let mut delivery = new_plugin_delivery("webex", "artifact-result-key", "artifact-result");
+        let artifact_id = "plugin-artifact-result";
+        let artifact_dir = layout.artifact_dir(artifact_id);
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        fs::write(artifact_dir.join("payload"), b"payload").expect("payload");
+        delivery.inline_payload_bytes = 0;
+        delivery.artifact = Some(crate::models::PluginDeliveryArtifactInput {
+            artifact_id: artifact_id.to_owned(),
+            relative_path: relative_artifact_payload_path(artifact_id),
+            original_filename: Some("payload.txt".to_owned()),
+            size_bytes: 7,
+            sha256: "sha".to_owned(),
+            retention_until: 200,
+        });
+
+        let created = store.enqueue_plugin_delivery(delivery).expect("enqueue");
+
+        assert_eq!(created.job.result_artifact_id.as_deref(), Some(artifact_id));
+        assert_eq!(pending_manifest_sync_count(&store.conn), 1);
+
+        let report = store.sweep(&layout, 101).expect("sweep");
+
+        assert_eq!(report.artifact_manifests_synced, 1);
+        assert_eq!(pending_manifest_sync_count(&store.conn), 0);
+        assert_eq!(artifact_manifest_retention_until(&artifact_dir), 200);
+    }
+
+    #[test]
+    fn codex_app_server_pre_accept_failure_manualizes_batch_without_desktop_success() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let delivery = store
+            .enqueue_plugin_delivery(new_plugin_delivery("webex", "manual-key", "manual"))
+            .expect("enqueue");
+        let pending = store
+            .begin_codex_app_server_accept_pending_attempt(NewCodexAppServerAcceptPendingAttempt {
+                attempt_id: "plugin-attempt-manual".to_owned(),
+                batch_id: delivery.batch.batch.batch_id.clone(),
+                managed_session_id: "session-1".to_owned(),
+                session_epoch: 1,
+                delivery_rpc_request_id: "turn-start-manual".to_owned(),
+                delivery_rpc_correlation_marker: "marker-manual".to_owned(),
+                delivery_rpc_started_at: 110,
+            })
+            .expect("begin attempt");
+
+        let rejected = store
+            .reject_codex_app_server_attempt_before_accept(&pending.attempt_id, 111, true)
+            .expect("reject before accept");
+        let inspected = store
+            .inspect_plugin_delivery("webex", Some("manual-key"), None, None)
+            .expect("inspect");
+
+        assert_eq!(rejected.adapter_kind, "codex_app_server");
+        assert_eq!(rejected.state, "abandoned");
+        assert_eq!(
+            inspected.batch.expect("batch").batch.replay_policy,
+            "manual_resolution_only"
+        );
+        assert!(rejected.delivery_turn_id.is_none());
     }
 
     #[test]
@@ -9869,6 +11614,247 @@ mod tests {
         assert_eq!(generation_stale.cli_acceptances_stale_now, 1);
         assert_eq!(generation_stale.open_batches_due_now, 0);
         assert!(generation_stale.has_due_maintenance());
+    }
+
+    #[test]
+    fn daemon_lifecycle_reports_codex_app_server_acceptance_cleanup() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let delivery =
+            new_plugin_delivery("webex", "codex-accept-lifecycle", "codex-accept-lifecycle");
+
+        let (_enqueue, pending) = store
+            .enqueue_plugin_delivery_with_codex_app_server_attempt(
+                delivery.clone(),
+                NewCodexAppServerAcceptPendingAttempt {
+                    attempt_id: "codex-accept-attempt-lifecycle".to_owned(),
+                    batch_id: delivery.batch_id,
+                    managed_session_id: "session-1".to_owned(),
+                    session_epoch: 1,
+                    delivery_rpc_request_id: "codex-accept-rpc-lifecycle".to_owned(),
+                    delivery_rpc_correlation_marker: "marker-codex-accept-lifecycle".to_owned(),
+                    delivery_rpc_started_at: 100,
+                },
+            )
+            .expect("enqueue codex accept");
+
+        let active_now = 100 + CODEX_APP_SERVER_ACCEPT_PENDING_TIMEOUT_SECONDS - 1;
+        let stale_now = 100 + CODEX_APP_SERVER_ACCEPT_PENDING_TIMEOUT_SECONDS;
+        let active = store
+            .daemon_lifecycle_status(active_now, active_now + 1)
+            .expect("active");
+        assert_eq!(active.active_codex_app_server_acceptances, 1);
+        assert_eq!(active.codex_app_server_acceptances_stale_now, 0);
+        assert!(!active.has_due_maintenance());
+
+        let stale = store
+            .daemon_lifecycle_status(stale_now, stale_now + 1)
+            .expect("stale");
+        assert_eq!(stale.active_codex_app_server_acceptances, 0);
+        assert_eq!(stale.codex_app_server_acceptances_stale_now, 1);
+        assert!(stale.has_due_maintenance());
+
+        let report = store
+            .sweep(&layout, stale_now)
+            .expect("sweep stale codex accept");
+        assert_eq!(report.stale_codex_app_server_acceptances_abandoned, 1);
+        let inspected = store
+            .inspect_plugin_delivery("webex", Some("codex-accept-lifecycle"), None, None)
+            .expect("inspect");
+        assert_eq!(inspected.attempts.len(), 1);
+        assert_eq!(inspected.attempts[0].attempt_id, pending.attempt_id);
+        assert_eq!(inspected.attempts[0].state, "abandoned");
+        assert_eq!(
+            inspected.attempts[0].delivery_rpc_state.as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(
+            inspected.batch.expect("batch").batch.replay_policy,
+            "manual_resolution_only"
+        );
+    }
+
+    #[test]
+    fn codex_app_server_cleanup_sweep_does_not_run_suppressed_cli_cleanup() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let policy = DeliveryPolicy {
+            delivery_read_only: true,
+            delivery_requires_approval: false,
+            delivery_requires_network: false,
+            delivery_requires_write_access: false,
+        };
+        store
+            .submit_job(NewJob {
+                job_id: "job-cli-suppressed-cleanup".to_owned(),
+                source_thread_id: "thread-cli-suppressed-cleanup".to_owned(),
+                summary: "suppressed CLI cleanup".to_owned(),
+                metadata_json: "{}".to_owned(),
+                policy,
+                created_at: 0,
+            })
+            .expect("submit CLI cleanup job");
+        let cli_batch = store
+            .fail_job("job-cli-suppressed-cleanup", "ready", 0, 3, 1000)
+            .expect("fail CLI cleanup job");
+        let session = store
+            .attach_or_create_cli_managed_session(
+                "thread-cli-suppressed-cleanup",
+                CliManagedSessionProfile {
+                    session_allows_approval: false,
+                    session_allows_network: false,
+                    session_allows_write_access: false,
+                },
+                CliManagedSessionProfileRequirement {
+                    session_allows_approval: Some(false),
+                    session_allows_network: Some(false),
+                    session_allows_write_access: Some(false),
+                },
+                0,
+            )
+            .expect("bind CLI cleanup session");
+        store
+            .note_cli_managed_session_capabilities(
+                &session.session.managed_session_id,
+                session.session.session_epoch,
+                1,
+                CliManagedSessionCapabilities {
+                    capability_thread_resume: true,
+                    capability_turn_start: true,
+                    capability_current_state_sync: true,
+                    capability_turn_completed_event: true,
+                    capability_negative_terminal_events: true,
+                    capability_thread_start: false,
+                    capability_turn_steer: false,
+                },
+                0,
+            )
+            .expect("note CLI cleanup capabilities");
+        store
+            .note_cli_managed_session_activity(
+                &session.session.managed_session_id,
+                session.session.session_epoch,
+                "idle",
+                1,
+                0,
+            )
+            .expect("note CLI cleanup idle");
+        store
+            .begin_cli_accept_pending_attempt(NewCliAcceptPendingAttempt {
+                attempt_id: "attempt-cli-suppressed-cleanup".to_owned(),
+                batch_id: cli_batch.batch.batch_id,
+                managed_session_id: session.session.managed_session_id,
+                session_epoch: 1,
+                authorization_mode: "strict_safe".to_owned(),
+                delivery_rpc_request_id: "rpc-cli-suppressed-cleanup".to_owned(),
+                delivery_rpc_kind: "turn_start".to_owned(),
+                delivery_rpc_correlation_marker: "cbth:suppressed-cleanup".to_owned(),
+                delivery_rpc_started_at: 100,
+            })
+            .expect("begin stale CLI cleanup attempt");
+
+        let delivery = new_plugin_delivery("webex", "codex-only-cleanup", "codex-only-cleanup");
+        let (_enqueue, pending) = store
+            .enqueue_plugin_delivery_with_codex_app_server_attempt(
+                delivery.clone(),
+                NewCodexAppServerAcceptPendingAttempt {
+                    attempt_id: "codex-only-cleanup-attempt".to_owned(),
+                    batch_id: delivery.batch_id,
+                    managed_session_id: "session-1".to_owned(),
+                    session_epoch: 1,
+                    delivery_rpc_request_id: "codex-only-cleanup-rpc".to_owned(),
+                    delivery_rpc_correlation_marker: "marker-codex-only-cleanup".to_owned(),
+                    delivery_rpc_started_at: 100,
+                },
+            )
+            .expect("enqueue codex-only cleanup");
+
+        let report = store
+            .sweep_codex_app_server_delivery_cleanup(400)
+            .expect("codex-only cleanup sweep");
+
+        assert_eq!(report.stale_codex_app_server_acceptances_abandoned, 1);
+        assert_eq!(report.stale_cli_acceptances_abandoned, 0);
+        assert_eq!(report.expired_automatic_batches_closed, 0);
+        let cli_attempt = query_delivery_attempt(&store.conn, "attempt-cli-suppressed-cleanup")
+            .expect("CLI attempt");
+        assert_eq!(cli_attempt.state, "accept_pending");
+        assert_eq!(
+            cli_attempt.delivery_rpc_state.as_deref(),
+            Some("pending_acceptance")
+        );
+        let inspected = store
+            .inspect_plugin_delivery("webex", Some("codex-only-cleanup"), None, None)
+            .expect("inspect codex cleanup");
+        assert_eq!(inspected.attempts[0].attempt_id, pending.attempt_id);
+        assert_eq!(inspected.attempts[0].state, "abandoned");
+        assert_eq!(
+            inspected.batch.expect("batch").batch.replay_policy,
+            "manual_resolution_only"
+        );
+    }
+
+    #[test]
+    fn daemon_lifecycle_reports_codex_app_server_observation_cleanup() {
+        let home = tempfile::tempdir().expect("temp home");
+        let layout = FsLayout::resolve(Some(home.path().to_path_buf())).expect("layout");
+        let mut store = Store::open(&layout).expect("store");
+        let delivery = new_plugin_delivery(
+            "webex",
+            "codex-observe-lifecycle",
+            "codex-observe-lifecycle",
+        );
+        let (_enqueue, pending) = store
+            .enqueue_plugin_delivery_with_codex_app_server_attempt(
+                delivery.clone(),
+                NewCodexAppServerAcceptPendingAttempt {
+                    attempt_id: "codex-observe-attempt-lifecycle".to_owned(),
+                    batch_id: delivery.batch_id,
+                    managed_session_id: "session-1".to_owned(),
+                    session_epoch: 1,
+                    delivery_rpc_request_id: "codex-observe-rpc-lifecycle".to_owned(),
+                    delivery_rpc_correlation_marker: "marker-codex-observe-lifecycle".to_owned(),
+                    delivery_rpc_started_at: 100,
+                },
+            )
+            .expect("enqueue codex observe");
+        store
+            .accept_codex_app_server_attempt(&pending.attempt_id, "turn-codex-lifecycle", 110, 200)
+            .expect("accept codex observe");
+
+        let active = store
+            .daemon_lifecycle_status(199, 200)
+            .expect("active observation");
+        assert_eq!(active.active_codex_app_server_observations, 1);
+        assert_eq!(active.codex_app_server_observations_due_now, 0);
+        assert!(!active.has_due_maintenance());
+
+        let due = store
+            .daemon_lifecycle_status(200, 201)
+            .expect("due observation");
+        assert_eq!(due.active_codex_app_server_observations, 0);
+        assert_eq!(due.codex_app_server_observations_due_now, 1);
+        assert!(due.has_due_maintenance());
+
+        let report = store
+            .sweep(&layout, 200)
+            .expect("sweep due codex observation");
+        assert_eq!(report.expired_codex_app_server_observations_abandoned, 1);
+        let inspected = store
+            .inspect_plugin_delivery("webex", Some("codex-observe-lifecycle"), None, None)
+            .expect("inspect");
+        assert_eq!(inspected.attempts.len(), 1);
+        assert_eq!(inspected.attempts[0].state, "abandoned");
+        assert_eq!(
+            inspected.attempts[0].delivery_observation_state.as_deref(),
+            Some("expired")
+        );
+        assert_eq!(
+            inspected.batch.expect("batch").batch.replay_policy,
+            "manual_resolution_only"
+        );
     }
 
     #[test]

@@ -688,12 +688,32 @@ impl DaemonLifecycleCache {
             || self.status.nonterminal_tasks > 0
             || self.status.active_cli_acceptances > 0
             || self.status.active_cli_observations > 0
+            || self.status.active_codex_app_server_acceptances > 0
+            || self.status.active_codex_app_server_observations > 0
             || (!maintenance_suppressed && self.status.cli_acceptances_stale_now > 0)
             || (!maintenance_suppressed && self.status.cli_observations_due_now > 0)
+            || codex_app_server_delivery_cleanup_due(&self.status)
             || (!maintenance_suppressed && self.status.active_desktop_relay_markers > 0)
             || (!maintenance_suppressed && self.status.desktop_attempts_due_within_idle > 0)
             || (!maintenance_suppressed && self.status.open_batches_due_within_idle > 0)
     }
+}
+
+fn codex_app_server_delivery_cleanup_due(status: &DaemonLifecycleStatus) -> bool {
+    status.codex_app_server_acceptances_stale_now > 0
+        || status.codex_app_server_observations_due_now > 0
+}
+
+fn lifecycle_sweep_due(status: &DaemonLifecycleStatus, maintenance_suppressed: bool) -> bool {
+    (!maintenance_suppressed || codex_app_server_delivery_cleanup_due(status))
+        && status.has_due_maintenance()
+}
+
+fn lifecycle_sweep_codex_app_server_delivery_only(
+    status: &DaemonLifecycleStatus,
+    maintenance_suppressed: bool,
+) -> bool {
+    maintenance_suppressed && codex_app_server_delivery_cleanup_due(status)
 }
 
 pub fn daemon_serve(layout: &FsLayout, options: DaemonServeOptions) -> Result<Value> {
@@ -912,6 +932,8 @@ fn handoff_drain_is_complete(state: &DaemonState, cache: &DaemonLifecycleCache) 
     !cache.refresh_failed
         && cache.status.active_jobs == 0
         && cache.status.nonterminal_tasks == 0
+        && cache.status.active_codex_app_server_acceptances == 0
+        && cache.status.active_codex_app_server_observations == 0
         && !has_active_non_handed_off_cli_app_servers(state)
         && !has_active_cli_app_server_reservations(state)
         && !has_active_cli_thread_start_bootstraps(state)
@@ -3095,7 +3117,9 @@ fn maybe_spawn_lifecycle_maintenance(
     let should_recover_lost_tasks = cache.status.nonterminal_tasks > 0;
     let should_scan_desktop_relay =
         !maintenance_suppressed && cache.status.active_desktop_relay_markers > 0;
-    let should_sweep = !maintenance_suppressed && cache.status.has_due_maintenance();
+    let should_sweep = lifecycle_sweep_due(&cache.status, maintenance_suppressed);
+    let should_sweep_codex_app_server_delivery_only =
+        lifecycle_sweep_codex_app_server_delivery_only(&cache.status, maintenance_suppressed);
     if worker.is_some()
         || cache.refresh_failed
         || (!should_recover_lost_tasks && !should_sweep && !should_scan_desktop_relay)
@@ -3135,7 +3159,11 @@ fn maybe_spawn_lifecycle_maintenance(
             if state.stop_requested.load(Ordering::Acquire) {
                 return;
             };
-            let _ = store.sweep(&state.layout, now);
+            if should_sweep_codex_app_server_delivery_only {
+                let _ = store.sweep_codex_app_server_delivery_cleanup(now);
+            } else {
+                let _ = store.sweep(&state.layout, now);
+            }
         }
     }));
 }
@@ -7480,6 +7508,54 @@ mod tests {
             task_recovery_scope: TaskRecoveryScope::Unowned,
             supervisor_daemon_generation: None,
         }
+    }
+
+    #[test]
+    fn lifecycle_sweep_due_escapes_suppression_for_codex_app_server_delivery_cleanup() {
+        let stale_acceptance = DaemonLifecycleStatus {
+            codex_app_server_acceptances_stale_now: 1,
+            ..DaemonLifecycleStatus::default()
+        };
+        assert!(codex_app_server_delivery_cleanup_due(&stale_acceptance));
+        assert!(lifecycle_sweep_due(&stale_acceptance, true));
+        assert!(lifecycle_sweep_codex_app_server_delivery_only(
+            &stale_acceptance,
+            true
+        ));
+        let cache = DaemonLifecycleCache {
+            refreshed_at: Some(Instant::now()),
+            refresh_failed: false,
+            status: stale_acceptance,
+        };
+        assert!(cache.has_exit_blockers(true));
+
+        let due_observation = DaemonLifecycleStatus {
+            codex_app_server_observations_due_now: 1,
+            ..DaemonLifecycleStatus::default()
+        };
+        assert!(codex_app_server_delivery_cleanup_due(&due_observation));
+        assert!(lifecycle_sweep_due(&due_observation, true));
+        assert!(lifecycle_sweep_codex_app_server_delivery_only(
+            &due_observation,
+            true
+        ));
+
+        let cli_observation = DaemonLifecycleStatus {
+            cli_observations_due_now: 1,
+            ..DaemonLifecycleStatus::default()
+        };
+        assert!(!codex_app_server_delivery_cleanup_due(&cli_observation));
+        assert!(!lifecycle_sweep_due(&cli_observation, true));
+        assert!(!lifecycle_sweep_codex_app_server_delivery_only(
+            &cli_observation,
+            true
+        ));
+        let cache = DaemonLifecycleCache {
+            refreshed_at: Some(Instant::now()),
+            refresh_failed: false,
+            status: cli_observation,
+        };
+        assert!(!cache.has_exit_blockers(true));
     }
 
     fn handle_test_request(state: &DaemonState, command: &str, payload: Value) -> Value {

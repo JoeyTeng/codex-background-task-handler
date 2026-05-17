@@ -34,7 +34,7 @@ pub struct SubmitMetadata {
     pub extra: Value,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartialDeliveryPolicy {
     #[serde(alias = "read_only")]
@@ -200,6 +200,55 @@ pub struct NewBatch {
     pub policy: DeliveryPolicy,
     pub inline_payload_bytes: i64,
     pub requires_artifact_read: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PluginDeliveryArtifactInput {
+    pub artifact_id: String,
+    pub relative_path: String,
+    pub original_filename: Option<String>,
+    pub size_bytes: i64,
+    pub sha256: String,
+    pub retention_until: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewPluginDelivery {
+    pub plugin_name: String,
+    pub plugin_instance_id: String,
+    pub idempotency_key: String,
+    pub request_fingerprint: String,
+    pub job_id: String,
+    pub batch_id: String,
+    pub source_thread_id: String,
+    pub summary: String,
+    pub metadata_json: String,
+    pub policy: DeliveryPolicy,
+    pub inline_payload_bytes: i64,
+    pub artifact: Option<PluginDeliveryArtifactInput>,
+    pub max_delivery_attempts: i64,
+    pub redelivery_window_seconds: i64,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PluginDeliveryEnqueueRecord {
+    pub created: bool,
+    pub idempotency_key: String,
+    pub job: JobRecord,
+    pub batch: BatchInspect,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PluginDeliveryManualizeRecord {
+    pub batch: BatchInspect,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PluginDeliveryInspectRecord {
+    pub job: Option<JobRecord>,
+    pub batch: Option<BatchInspect>,
+    pub attempts: Vec<DeliveryAttemptRecord>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -369,6 +418,17 @@ pub struct NewCliAcceptPendingAttempt {
     pub authorization_mode: String,
     pub delivery_rpc_request_id: String,
     pub delivery_rpc_kind: String,
+    pub delivery_rpc_correlation_marker: String,
+    pub delivery_rpc_started_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewCodexAppServerAcceptPendingAttempt {
+    pub attempt_id: String,
+    pub batch_id: String,
+    pub managed_session_id: String,
+    pub session_epoch: i64,
+    pub delivery_rpc_request_id: String,
     pub delivery_rpc_correlation_marker: String,
     pub delivery_rpc_started_at: i64,
 }
@@ -589,6 +649,8 @@ pub struct AuditDecisionRecord {
 pub struct SweepReport {
     pub stale_cli_acceptances_abandoned: usize,
     pub expired_cli_observations_abandoned: usize,
+    pub stale_codex_app_server_acceptances_abandoned: usize,
+    pub expired_codex_app_server_observations_abandoned: usize,
     pub expired_manual_batches_closed: usize,
     pub expired_automatic_batches_closed: usize,
     pub artifacts_deleted: usize,
@@ -609,6 +671,10 @@ pub struct DaemonLifecycleStatus {
     pub cli_acceptances_stale_now: i64,
     pub active_cli_observations: i64,
     pub cli_observations_due_now: i64,
+    pub active_codex_app_server_acceptances: i64,
+    pub codex_app_server_acceptances_stale_now: i64,
+    pub active_codex_app_server_observations: i64,
+    pub codex_app_server_observations_due_now: i64,
     pub active_desktop_relay_markers: i64,
     pub desktop_attempts_due_now: i64,
     pub desktop_attempts_due_within_idle: i64,
@@ -620,6 +686,8 @@ impl DaemonLifecycleStatus {
     pub fn has_due_maintenance(&self) -> bool {
         self.cli_acceptances_stale_now > 0
             || self.cli_observations_due_now > 0
+            || self.codex_app_server_acceptances_stale_now > 0
+            || self.codex_app_server_observations_due_now > 0
             || self.desktop_attempts_due_now > 0
             || self.open_batches_due_now > 0
     }

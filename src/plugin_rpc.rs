@@ -5,6 +5,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::models::PartialDeliveryPolicy;
+
 pub const PLUGIN_RPC_PROTOCOL_VERSION_V1: u32 = 1;
 pub const PLUGIN_RPC_SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[PLUGIN_RPC_PROTOCOL_VERSION_V1];
 pub const PLUGIN_RPC_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
@@ -12,6 +14,9 @@ pub const PLUGIN_RPC_HELLO_METHOD: &str = "plugin.hello";
 pub const PLUGIN_RPC_APP_SERVER_ENSURE_METHOD: &str = "app_server.ensure";
 pub const PLUGIN_RPC_APP_SERVER_REFRESH_METHOD: &str = "app_server.refresh";
 pub const PLUGIN_RPC_APP_SERVER_STOP_METHOD: &str = "app_server.stop";
+pub const PLUGIN_RPC_DELIVERY_ENQUEUE_METHOD: &str = "delivery.enqueue";
+pub const PLUGIN_RPC_DELIVERY_INSPECT_METHOD: &str = "delivery.inspect";
+pub const PLUGIN_RPC_DELIVERY_MANUALIZE_METHOD: &str = "delivery.manualize";
 
 const PLUGIN_RPC_JSONRPC_VERSION: &str = "2.0";
 const FRAME_LENGTH_PREFIX_BYTES: usize = 4;
@@ -208,6 +213,76 @@ pub struct PluginAppServerRefreshRequest {
 pub struct PluginAppServerStopRequest {
     pub managed_session_id: String,
     pub lease_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDeliveryTarget {
+    pub driver: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_server_lease_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_epoch: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDeliveryArtifactReference {
+    pub artifact_id: String,
+    pub relative_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_filename: Option<String>,
+    pub size_bytes: i64,
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_until: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDeliveryEnqueueRequest {
+    pub source_thread_id: String,
+    pub summary: String,
+    pub idempotency_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_payload: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<PluginDeliveryArtifactReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_policy: Option<PartialDeliveryPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_delivery_attempts: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redelivery_window_seconds: Option<i64>,
+    pub target: PluginDeliveryTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_metadata: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDeliveryInspectRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_server_lease_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDeliveryManualizeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    pub manualize_key: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
