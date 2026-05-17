@@ -9,6 +9,9 @@ pub const PLUGIN_RPC_PROTOCOL_VERSION_V1: u32 = 1;
 pub const PLUGIN_RPC_SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[PLUGIN_RPC_PROTOCOL_VERSION_V1];
 pub const PLUGIN_RPC_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const PLUGIN_RPC_HELLO_METHOD: &str = "plugin.hello";
+pub const PLUGIN_RPC_APP_SERVER_ENSURE_METHOD: &str = "app_server.ensure";
+pub const PLUGIN_RPC_APP_SERVER_REFRESH_METHOD: &str = "app_server.refresh";
+pub const PLUGIN_RPC_APP_SERVER_STOP_METHOD: &str = "app_server.stop";
 
 const PLUGIN_RPC_JSONRPC_VERSION: &str = "2.0";
 const FRAME_LENGTH_PREFIX_BYTES: usize = 4;
@@ -177,6 +180,34 @@ impl DaemonEndpointHint {
             endpoint: endpoint.into(),
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginAppServerEnsureRequest {
+    pub managed_session_id: String,
+    pub bound_thread_id: String,
+    pub session_epoch: i64,
+    pub codex_binary: String,
+    pub lease_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_ttl_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginAppServerRefreshRequest {
+    pub managed_session_id: String,
+    pub lease_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_ttl_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginAppServerStopRequest {
+    pub managed_session_id: String,
+    pub lease_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

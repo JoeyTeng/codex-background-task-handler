@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,14 +18,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
+use crate::daemon::{
+    DaemonEndpoint, DaemonEnsureOptions, daemon_endpoint_from_response, daemon_ensure,
+    daemon_request_payload_timeout_at_endpoint, error_is_daemon_endpoint_gone,
+};
 use crate::fs_layout::{
     FsLayout, atomic_write_private, ensure_private_dir, set_private_file_permissions_if_exists,
     sync_dir, validate_id_path_component,
 };
 use crate::plugin_rpc::{
-    DaemonEndpointHint, PLUGIN_RPC_MAX_FRAME_BYTES, PluginHandshakePolicy, PluginHelloRequest,
-    PluginRpcError, PluginRpcErrorKind, PluginRpcPolicy, PluginRpcRequestFrame,
+    DaemonEndpointHint, PLUGIN_RPC_APP_SERVER_ENSURE_METHOD, PLUGIN_RPC_APP_SERVER_REFRESH_METHOD,
+    PLUGIN_RPC_APP_SERVER_STOP_METHOD, PLUGIN_RPC_MAX_FRAME_BYTES, PluginAppServerEnsureRequest,
+    PluginAppServerRefreshRequest, PluginAppServerStopRequest, PluginHandshakePolicy,
+    PluginHelloRequest, PluginRpcError, PluginRpcErrorKind, PluginRpcPolicy, PluginRpcRequestFrame,
     PluginRpcResponseFrame, ServiceCapability, handle_plugin_hello_frame, read_plugin_rpc_frame,
     write_plugin_rpc_frame,
 };
@@ -36,10 +43,17 @@ const DEFAULT_RESTART_MAX_DELAY_MS: u64 = 30_000;
 const DEFAULT_RESTART_MAX_CRASHES: u32 = 32;
 const DEFAULT_LOG_MAX_BYTES: u64 = 1024 * 1024;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+const SERVICE_DAEMON_IDLE_TIMEOUT_SECONDS: u64 = 300;
+const SERVICE_DAEMON_STARTUP_TIMEOUT_SECONDS: u64 = 15;
+const PLUGIN_APP_SERVER_ENSURE_TIMEOUT: Duration = Duration::from_secs(15);
+const PLUGIN_APP_SERVER_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_PLUGIN_APP_SERVER_LEASE_TTL_SECONDS: u64 = 60;
+const MAX_PLUGIN_APP_SERVER_LEASE_TTL_SECONDS: u64 = 300;
 const PLUGIN_TERM_GRACE: Duration = Duration::from_millis(500);
 const PLUGIN_KILL_GRACE: Duration = Duration::from_secs(2);
 const PLUGIN_HEALTH_UPDATE_METHOD: &str = "plugin.health.update";
 static SERVICE_TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+static PLUGIN_APP_SERVER_CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug)]
 pub struct ServiceRunOptions {
@@ -227,13 +241,14 @@ pub fn service_run(layout: &FsLayout, options: ServiceRunOptions) -> Result<Valu
         .set_nonblocking(true)
         .with_context(|| format!("set nonblocking service socket {}", _cleanup.path.display()))?;
     let shared = Arc::new(Mutex::new(ServiceSharedState::new(layout, &registry, now)?));
+    let app_server_leases = Arc::new(Mutex::new(PluginAppServerLeaseRegistry::default()));
     persist_all_status_if_dirty(layout, &shared)?;
     let mut process_cleanup = ServiceProcessCleanup::new(layout.clone(), Arc::clone(&shared));
 
     loop {
         let now = current_epoch_seconds()?;
         supervise_tick(layout, &shared, now)?;
-        accept_plugin_connections(layout, &listener, &shared)?;
+        accept_plugin_connections(layout, &listener, &shared, &app_server_leases)?;
         persist_all_status_if_dirty(layout, &shared)?;
         if options.once {
             break;
@@ -245,6 +260,7 @@ pub fn service_run(layout: &FsLayout, options: ServiceRunOptions) -> Result<Valu
     }
 
     process_cleanup.shutdown()?;
+    cleanup_all_plugin_app_server_leases(layout, &app_server_leases);
     persist_all_status_if_dirty(layout, &shared)?;
     let report = status_report(layout, None)?;
     Ok(
@@ -327,11 +343,981 @@ struct ServiceSharedState {
     dirty: bool,
 }
 
+#[derive(Default)]
+struct PluginAppServerLeaseRegistry {
+    leases: HashMap<PluginAppServerLeaseKey, PluginAppServerSharedLeaseRecord>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PluginConnectionIdentity {
     plugin_name: String,
     pid: u32,
     instance_id: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PluginAppServerLeaseKey {
+    plugin_name: String,
+    instance_id: String,
+    lease_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PluginAppServerLeaseTarget {
+    managed_session_id: String,
+    bound_thread_id: String,
+    session_epoch: i64,
+}
+
+#[derive(Clone, Debug)]
+struct PluginAppServerLeaseRecord {
+    target: PluginAppServerLeaseTarget,
+    endpoint: DaemonEndpoint,
+    scoped_lease_id: String,
+    endpoint_confirmed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PluginAppServerSharedLeaseRecord {
+    target: PluginAppServerLeaseTarget,
+    endpoint: DaemonEndpoint,
+    scoped_lease_id: String,
+    endpoint_confirmed: bool,
+    holders: HashSet<u64>,
+}
+
+impl PluginAppServerSharedLeaseRecord {
+    fn from_record(record: PluginAppServerLeaseRecord, holder: u64) -> Self {
+        Self {
+            target: record.target,
+            endpoint: record.endpoint,
+            scoped_lease_id: record.scoped_lease_id,
+            endpoint_confirmed: record.endpoint_confirmed,
+            holders: HashSet::from([holder]),
+        }
+    }
+
+    fn to_record(&self) -> PluginAppServerLeaseRecord {
+        PluginAppServerLeaseRecord {
+            target: self.target.clone(),
+            endpoint: self.endpoint.clone(),
+            scoped_lease_id: self.scoped_lease_id.clone(),
+            endpoint_confirmed: self.endpoint_confirmed,
+        }
+    }
+}
+
+trait PluginAppServerLeaseBroker {
+    fn ensure(
+        &mut self,
+        identity: &PluginConnectionIdentity,
+        request: PluginAppServerEnsureRequest,
+    ) -> Result<Value, PluginRpcError>;
+
+    fn refresh(
+        &mut self,
+        identity: &PluginConnectionIdentity,
+        request: PluginAppServerRefreshRequest,
+    ) -> Result<Value, PluginRpcError>;
+
+    fn stop(
+        &mut self,
+        identity: &PluginConnectionIdentity,
+        request: PluginAppServerStopRequest,
+    ) -> Result<Value, PluginRpcError>;
+
+    fn cleanup_connection_leases(&mut self);
+}
+
+struct DaemonPluginAppServerLeaseBroker<'a> {
+    layout: &'a FsLayout,
+    connection_id: u64,
+    registry: Arc<Mutex<PluginAppServerLeaseRegistry>>,
+    leases: HashMap<PluginAppServerLeaseKey, PluginAppServerLeaseRecord>,
+    seen_targets: HashMap<PluginAppServerLeaseKey, PluginAppServerLeaseTarget>,
+}
+
+impl<'a> DaemonPluginAppServerLeaseBroker<'a> {
+    fn new(layout: &'a FsLayout, registry: Arc<Mutex<PluginAppServerLeaseRegistry>>) -> Self {
+        Self {
+            layout,
+            connection_id: next_plugin_app_server_connection_id(),
+            registry,
+            leases: HashMap::new(),
+            seen_targets: HashMap::new(),
+        }
+    }
+
+    fn ensure_daemon_endpoint(&self) -> Result<(DaemonEndpoint, Value), PluginRpcError> {
+        let ensured = daemon_ensure(
+            self.layout,
+            DaemonEnsureOptions {
+                idle_timeout_seconds: SERVICE_DAEMON_IDLE_TIMEOUT_SECONDS,
+                startup_timeout_seconds: SERVICE_DAEMON_STARTUP_TIMEOUT_SECONDS,
+                startup_sweep_now: Some(current_epoch_seconds().map_err(PluginRpcError::internal)?),
+                replace_incompatible: false,
+            },
+        )
+        .map_err(daemon_dispatch_error)?;
+        let endpoint = daemon_endpoint_from_response(self.layout, &ensured)
+            .map_err(|error| PluginRpcError::internal(format!("{error:#}")))?;
+        Ok((endpoint, ensured))
+    }
+
+    fn ensure_app_server_at_endpoint(
+        &self,
+        endpoint: &DaemonEndpoint,
+        request: &PluginAppServerEnsureRequest,
+        scoped_lease_id: &str,
+    ) -> Result<Value, anyhow::Error> {
+        let payload = plugin_app_server_ensure_payload(request, scoped_lease_id);
+        match daemon_request_payload_timeout_at_endpoint(
+            self.layout,
+            endpoint,
+            "cli_app_server_ensure",
+            payload.clone(),
+            PLUGIN_APP_SERVER_ENSURE_TIMEOUT,
+        ) {
+            Ok(response) => Ok(response),
+            Err(error) if daemon_error_needs_app_server_reservation(&error) => {
+                daemon_request_payload_timeout_at_endpoint(
+                    self.layout,
+                    endpoint,
+                    "cli_app_server_reserve",
+                    plugin_app_server_reserve_payload(request, scoped_lease_id),
+                    PLUGIN_APP_SERVER_CONTROL_TIMEOUT,
+                )
+                .context("reserve plugin app-server lease")?;
+                match daemon_request_payload_timeout_at_endpoint(
+                    self.layout,
+                    endpoint,
+                    "cli_app_server_ensure",
+                    payload,
+                    PLUGIN_APP_SERVER_ENSURE_TIMEOUT,
+                ) {
+                    Ok(response) => Ok(response),
+                    Err(ensure_error) => {
+                        release_plugin_app_server_reservation_best_effort(
+                            self.layout,
+                            endpoint,
+                            &request.bound_thread_id,
+                            scoped_lease_id,
+                        );
+                        Err(ensure_error)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn refresh_app_server_at_endpoint(
+        &self,
+        endpoint: &DaemonEndpoint,
+        record: &PluginAppServerLeaseRecord,
+        lease_ttl_seconds: Option<u64>,
+    ) -> Result<Value, anyhow::Error> {
+        daemon_request_payload_timeout_at_endpoint(
+            self.layout,
+            endpoint,
+            "cli_app_server_refresh",
+            json!({
+                "managed_session_id": record.target.managed_session_id.as_str(),
+                "lease_id": record.scoped_lease_id.as_str(),
+                "lease_ttl_seconds": lease_ttl_seconds
+                    .or(Some(DEFAULT_PLUGIN_APP_SERVER_LEASE_TTL_SECONDS)),
+            }),
+            PLUGIN_APP_SERVER_CONTROL_TIMEOUT,
+        )
+    }
+
+    fn follow_app_server_handoff(
+        &self,
+        endpoint: &DaemonEndpoint,
+        command: &str,
+        payload: Value,
+        response: Value,
+        timeout: Duration,
+    ) -> Result<(DaemonEndpoint, Value), PluginRpcError> {
+        let Some(handoff_socket_path) = app_server_handoff_socket_path(&response) else {
+            return Ok((endpoint.clone(), response));
+        };
+        let handoff_endpoint = DaemonEndpoint::from_socket_path(PathBuf::from(handoff_socket_path));
+        let handoff_response = daemon_request_payload_timeout_at_endpoint(
+            self.layout,
+            &handoff_endpoint,
+            command,
+            payload,
+            timeout,
+        )
+        .map_err(daemon_dispatch_error)?;
+        Ok((handoff_endpoint, handoff_response))
+    }
+
+    fn shared_lease_record(
+        &self,
+        key: &PluginAppServerLeaseKey,
+        target: &PluginAppServerLeaseTarget,
+    ) -> Result<Option<PluginAppServerLeaseRecord>, PluginRpcError> {
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| PluginRpcError::internal("app-server lease registry lock poisoned"))?;
+        let Some(record) = registry.leases.get(key) else {
+            return Ok(None);
+        };
+        if record.target != *target {
+            return Err(replayed_plugin_app_server_lease_target_error());
+        }
+        Ok(Some(record.to_record()))
+    }
+
+    fn register_connection_lease(
+        &mut self,
+        key: PluginAppServerLeaseKey,
+        record: PluginAppServerLeaseRecord,
+    ) -> Result<(), PluginRpcError> {
+        {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| PluginRpcError::internal("app-server lease registry lock poisoned"))?;
+            match registry.leases.get_mut(&key) {
+                Some(shared) => {
+                    if shared.target != record.target {
+                        return Err(replayed_plugin_app_server_lease_target_error());
+                    }
+                    shared.endpoint = record.endpoint.clone();
+                    shared.scoped_lease_id = record.scoped_lease_id.clone();
+                    shared.endpoint_confirmed = record.endpoint_confirmed;
+                    shared.holders.insert(self.connection_id);
+                }
+                None => {
+                    registry.leases.insert(
+                        key.clone(),
+                        PluginAppServerSharedLeaseRecord::from_record(
+                            record.clone(),
+                            self.connection_id,
+                        ),
+                    );
+                }
+            }
+        }
+        self.seen_targets.insert(key.clone(), record.target.clone());
+        self.leases.insert(key, record);
+        Ok(())
+    }
+
+    fn update_connection_lease_endpoint(
+        &mut self,
+        key: &PluginAppServerLeaseKey,
+        endpoint: DaemonEndpoint,
+    ) -> Result<(), PluginRpcError> {
+        if let Some(record) = self.leases.get_mut(key) {
+            record.endpoint = endpoint.clone();
+            record.endpoint_confirmed = true;
+        }
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| PluginRpcError::internal("app-server lease registry lock poisoned"))?;
+        if let Some(shared) = registry.leases.get_mut(key)
+            && shared.holders.contains(&self.connection_id)
+        {
+            shared.endpoint = endpoint;
+            shared.endpoint_confirmed = true;
+        }
+        Ok(())
+    }
+
+    fn latest_connection_lease_record(
+        &mut self,
+        key: &PluginAppServerLeaseKey,
+        fallback: PluginAppServerLeaseRecord,
+    ) -> Result<PluginAppServerLeaseRecord, PluginRpcError> {
+        let latest = {
+            let registry = self
+                .registry
+                .lock()
+                .map_err(|_| PluginRpcError::internal("app-server lease registry lock poisoned"))?;
+            registry
+                .leases
+                .get(key)
+                .filter(|shared| shared.holders.contains(&self.connection_id))
+                .map(PluginAppServerSharedLeaseRecord::to_record)
+        };
+        if let Some(record) = latest {
+            self.leases.insert(key.clone(), record.clone());
+            Ok(record)
+        } else {
+            Ok(fallback)
+        }
+    }
+
+    fn stop_app_server_record_best_effort(&self, record: &PluginAppServerLeaseRecord) {
+        stop_plugin_app_server_record_best_effort(self.layout, record);
+    }
+
+    fn rollback_preregistered_lease_after_failed_ensure(
+        &mut self,
+        key: &PluginAppServerLeaseKey,
+        fallback: PluginAppServerLeaseRecord,
+        stop_last_holder: bool,
+    ) {
+        self.leases.remove(key);
+        let Ok(mut registry) = self.registry.lock() else {
+            return;
+        };
+        let stop_record = if let Some(shared) = registry.leases.get_mut(key) {
+            shared.holders.remove(&self.connection_id);
+            if !shared.holders.is_empty() {
+                return;
+            }
+            shared.to_record()
+        } else {
+            fallback
+        };
+        if stop_last_holder {
+            self.stop_app_server_record_best_effort(&stop_record);
+        }
+        registry.leases.remove(key);
+    }
+}
+
+impl PluginAppServerLeaseBroker for DaemonPluginAppServerLeaseBroker<'_> {
+    fn ensure(
+        &mut self,
+        identity: &PluginConnectionIdentity,
+        request: PluginAppServerEnsureRequest,
+    ) -> Result<Value, PluginRpcError> {
+        validate_plugin_app_server_ensure_request(&request)?;
+        let key = plugin_app_server_lease_key(identity, &request.lease_id);
+        let target = plugin_app_server_lease_target(&request);
+        let scoped_lease_id = scoped_plugin_app_server_lease_id(identity, &request.lease_id);
+        if let Some(seen_target) = self.seen_targets.get(&key)
+            && *seen_target != target
+        {
+            return Err(replayed_plugin_app_server_lease_target_error());
+        }
+        if let Some(record) = self.leases.get(&key)
+            && record.target != target
+        {
+            return Err(replayed_plugin_app_server_lease_target_error());
+        }
+
+        let had_local_holder = self.leases.contains_key(&key);
+        let existing_record = self
+            .shared_lease_record(&key, &target)?
+            .or_else(|| self.leases.get(&key).cloned());
+        let pre_registered_holder = if had_local_holder {
+            false
+        } else {
+            self.register_connection_lease(
+                key.clone(),
+                existing_record
+                    .clone()
+                    .unwrap_or_else(|| PluginAppServerLeaseRecord {
+                        target: target.clone(),
+                        endpoint: DaemonEndpoint::default(self.layout),
+                        scoped_lease_id: scoped_lease_id.clone(),
+                        endpoint_confirmed: false,
+                    }),
+            )?;
+            true
+        };
+        let mut daemon_lease_accepted = false;
+        let result = (|| {
+            let (mut initial_endpoint, mut daemon) = match existing_record {
+                Some(record) if record.endpoint_confirmed => (record.endpoint, Value::Null),
+                _ => {
+                    let (endpoint, daemon) = self.ensure_daemon_endpoint()?;
+                    self.update_connection_lease_endpoint(&key, endpoint.clone())?;
+                    (endpoint, daemon)
+                }
+            };
+            let payload = plugin_app_server_ensure_payload(&request, &scoped_lease_id);
+            let response = match self.ensure_app_server_at_endpoint(
+                &initial_endpoint,
+                &request,
+                &scoped_lease_id,
+            ) {
+                Ok(response) => response,
+                Err(error) if daemon_error_needs_endpoint_refresh(&error) => {
+                    let (endpoint, ensured) = self.ensure_daemon_endpoint()?;
+                    self.update_connection_lease_endpoint(&key, endpoint.clone())?;
+                    initial_endpoint = endpoint;
+                    daemon = ensured;
+                    self.ensure_app_server_at_endpoint(
+                        &initial_endpoint,
+                        &request,
+                        &scoped_lease_id,
+                    )
+                    .map_err(daemon_dispatch_error)?
+                }
+                Err(error) => return Err(daemon_dispatch_error(error)),
+            };
+            daemon_lease_accepted = true;
+            let (endpoint, response) = self.follow_app_server_handoff(
+                &initial_endpoint,
+                "cli_app_server_ensure",
+                payload,
+                response,
+                PLUGIN_APP_SERVER_ENSURE_TIMEOUT,
+            )?;
+            self.register_connection_lease(
+                key.clone(),
+                PluginAppServerLeaseRecord {
+                    target,
+                    endpoint: endpoint.clone(),
+                    scoped_lease_id,
+                    endpoint_confirmed: true,
+                },
+            )?;
+            Ok(plugin_app_server_response(
+                &request.lease_id,
+                &endpoint,
+                if daemon.is_null() { None } else { Some(daemon) },
+                response,
+            ))
+        })();
+        if result.is_err()
+            && pre_registered_holder
+            && let Some(record) = self.leases.get(&key).cloned()
+        {
+            self.rollback_preregistered_lease_after_failed_ensure(
+                &key,
+                record,
+                daemon_lease_accepted,
+            );
+        }
+        result
+    }
+
+    fn refresh(
+        &mut self,
+        identity: &PluginConnectionIdentity,
+        request: PluginAppServerRefreshRequest,
+    ) -> Result<Value, PluginRpcError> {
+        validate_plugin_app_server_refresh_request(&request)?;
+        let key = plugin_app_server_lease_key(identity, &request.lease_id);
+        let record = self
+            .leases
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| stale_plugin_app_server_lease(&request.lease_id))?;
+        let record = self.latest_connection_lease_record(&key, record)?;
+        if record.target.managed_session_id != request.managed_session_id {
+            return Err(PluginRpcError::new(
+                PluginRpcErrorKind::PolicyBlocked,
+                "app-server lease refresh targets a different managed session",
+            ));
+        }
+        let payload = json!({
+            "managed_session_id": record.target.managed_session_id.as_str(),
+            "lease_id": record.scoped_lease_id.as_str(),
+            "lease_ttl_seconds": request
+                .lease_ttl_seconds
+                .or(Some(DEFAULT_PLUGIN_APP_SERVER_LEASE_TTL_SECONDS)),
+        });
+        let mut request_endpoint = record.endpoint.clone();
+        let response = match self.refresh_app_server_at_endpoint(
+            &request_endpoint,
+            &record,
+            request.lease_ttl_seconds,
+        ) {
+            Ok(response) => response,
+            Err(error) if daemon_error_needs_endpoint_refresh(&error) => {
+                let (endpoint, _) = self.ensure_daemon_endpoint()?;
+                self.update_connection_lease_endpoint(&key, endpoint.clone())?;
+                request_endpoint = endpoint;
+                self.refresh_app_server_at_endpoint(
+                    &request_endpoint,
+                    &record,
+                    request.lease_ttl_seconds,
+                )
+                .map_err(daemon_dispatch_error)?
+            }
+            Err(error) => return Err(daemon_dispatch_error(error)),
+        };
+        let (endpoint, response) = self.follow_app_server_handoff(
+            &request_endpoint,
+            "cli_app_server_refresh",
+            payload,
+            response,
+            PLUGIN_APP_SERVER_CONTROL_TIMEOUT,
+        )?;
+        self.update_connection_lease_endpoint(&key, endpoint.clone())?;
+        Ok(plugin_app_server_response(
+            &request.lease_id,
+            &endpoint,
+            None,
+            response,
+        ))
+    }
+
+    fn stop(
+        &mut self,
+        identity: &PluginConnectionIdentity,
+        request: PluginAppServerStopRequest,
+    ) -> Result<Value, PluginRpcError> {
+        validate_plugin_app_server_stop_request(&request)?;
+        let key = plugin_app_server_lease_key(identity, &request.lease_id);
+        let record = self
+            .leases
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| stale_plugin_app_server_lease(&request.lease_id))?;
+        let record = self.latest_connection_lease_record(&key, record)?;
+        if record.target.managed_session_id != request.managed_session_id {
+            return Err(PluginRpcError::new(
+                PluginRpcErrorKind::PolicyBlocked,
+                "app-server lease stop targets a different managed session",
+            ));
+        }
+        let payload = json!({
+            "managed_session_id": record.target.managed_session_id.as_str(),
+            "lease_id": record.scoped_lease_id.as_str(),
+        });
+        let (endpoint, response) = {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| PluginRpcError::internal("app-server lease registry lock poisoned"))?;
+            if let Some(shared) = registry.leases.get_mut(&key)
+                && shared
+                    .holders
+                    .iter()
+                    .any(|holder| *holder != self.connection_id)
+            {
+                shared.holders.remove(&self.connection_id);
+                let retained = shared.to_record();
+                drop(registry);
+                self.leases.remove(&key);
+                return Ok(plugin_app_server_retained_stop_response(
+                    &request.lease_id,
+                    &retained.endpoint,
+                ));
+            }
+            let mut request_endpoint = record.endpoint.clone();
+            let response = match daemon_request_payload_timeout_at_endpoint(
+                self.layout,
+                &request_endpoint,
+                "cli_app_server_stop",
+                payload.clone(),
+                PLUGIN_APP_SERVER_CONTROL_TIMEOUT,
+            ) {
+                Ok(response) => response,
+                Err(error) if daemon_error_needs_endpoint_refresh(&error) => {
+                    let (endpoint, _) = self.ensure_daemon_endpoint()?;
+                    request_endpoint = endpoint.clone();
+                    if let Some(local) = self.leases.get_mut(&key) {
+                        local.endpoint = endpoint.clone();
+                        local.endpoint_confirmed = true;
+                    }
+                    if let Some(shared) = registry.leases.get_mut(&key) {
+                        shared.endpoint = endpoint;
+                        shared.endpoint_confirmed = true;
+                    }
+                    daemon_request_payload_timeout_at_endpoint(
+                        self.layout,
+                        &request_endpoint,
+                        "cli_app_server_stop",
+                        payload.clone(),
+                        PLUGIN_APP_SERVER_CONTROL_TIMEOUT,
+                    )
+                    .map_err(daemon_dispatch_error)?
+                }
+                Err(error) => return Err(daemon_dispatch_error(error)),
+            };
+            let (endpoint, response) =
+                if let Some(handoff_socket_path) = app_server_handoff_socket_path(&response) {
+                    let handoff_endpoint =
+                        DaemonEndpoint::from_socket_path(PathBuf::from(handoff_socket_path));
+                    let handoff_response = daemon_request_payload_timeout_at_endpoint(
+                        self.layout,
+                        &handoff_endpoint,
+                        "cli_app_server_stop",
+                        payload,
+                        PLUGIN_APP_SERVER_CONTROL_TIMEOUT,
+                    )
+                    .map_err(daemon_dispatch_error)?;
+                    (handoff_endpoint, handoff_response)
+                } else {
+                    (request_endpoint, response)
+                };
+            registry.leases.remove(&key);
+            (endpoint, response)
+        };
+        self.leases.remove(&key);
+        Ok(plugin_app_server_stop_response(
+            &request.lease_id,
+            &endpoint,
+            response,
+        ))
+    }
+
+    fn cleanup_connection_leases(&mut self) {
+        let records = self.leases.drain().collect::<Vec<_>>();
+        for (key, record) in records {
+            let Ok(mut registry) = self.registry.lock() else {
+                continue;
+            };
+            let stop_record = if let Some(shared) = registry.leases.get_mut(&key) {
+                shared.holders.remove(&self.connection_id);
+                if !shared.holders.is_empty() {
+                    continue;
+                }
+                shared.to_record()
+            } else {
+                record
+            };
+            self.stop_app_server_record_best_effort(&stop_record);
+            registry.leases.remove(&key);
+        }
+    }
+}
+
+fn stop_plugin_app_server_record_best_effort(
+    layout: &FsLayout,
+    record: &PluginAppServerLeaseRecord,
+) {
+    let payload = json!({
+        "managed_session_id": record.target.managed_session_id.as_str(),
+        "lease_id": record.scoped_lease_id.as_str(),
+    });
+    if let Ok(response) = daemon_request_payload_timeout_at_endpoint(
+        layout,
+        &record.endpoint,
+        "cli_app_server_stop",
+        payload.clone(),
+        PLUGIN_APP_SERVER_CONTROL_TIMEOUT,
+    ) && let Some(handoff_socket_path) = app_server_handoff_socket_path(&response)
+    {
+        let handoff_endpoint = DaemonEndpoint::from_socket_path(PathBuf::from(handoff_socket_path));
+        let _ = daemon_request_payload_timeout_at_endpoint(
+            layout,
+            &handoff_endpoint,
+            "cli_app_server_stop",
+            payload,
+            PLUGIN_APP_SERVER_CONTROL_TIMEOUT,
+        );
+    }
+}
+
+fn cleanup_all_plugin_app_server_leases(
+    layout: &FsLayout,
+    registry: &Arc<Mutex<PluginAppServerLeaseRegistry>>,
+) {
+    let records = match registry.lock() {
+        Ok(mut registry) => registry
+            .leases
+            .drain()
+            .map(|(_, record)| record.to_record())
+            .collect::<Vec<_>>(),
+        Err(_) => return,
+    };
+    for record in records {
+        stop_plugin_app_server_record_best_effort(layout, &record);
+    }
+}
+
+fn next_plugin_app_server_connection_id() -> u64 {
+    PLUGIN_APP_SERVER_CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn replayed_plugin_app_server_lease_target_error() -> PluginRpcError {
+    PluginRpcError::new(
+        PluginRpcErrorKind::PolicyBlocked,
+        "app-server lease replay targets a different managed session, thread, or epoch",
+    )
+}
+
+fn validate_plugin_app_server_ensure_request(
+    request: &PluginAppServerEnsureRequest,
+) -> Result<(), PluginRpcError> {
+    validate_nonempty_rpc_field("managed_session_id", &request.managed_session_id)?;
+    validate_nonempty_rpc_field("bound_thread_id", &request.bound_thread_id)?;
+    validate_positive_rpc_i64("session_epoch", request.session_epoch)?;
+    validate_nonempty_rpc_field("codex_binary", &request.codex_binary)?;
+    validate_lease_id(&request.lease_id)?;
+    validate_optional_lease_ttl(request.lease_ttl_seconds)
+}
+
+fn validate_plugin_app_server_refresh_request(
+    request: &PluginAppServerRefreshRequest,
+) -> Result<(), PluginRpcError> {
+    validate_nonempty_rpc_field("managed_session_id", &request.managed_session_id)?;
+    validate_lease_id(&request.lease_id)?;
+    validate_optional_lease_ttl(request.lease_ttl_seconds)
+}
+
+fn validate_plugin_app_server_stop_request(
+    request: &PluginAppServerStopRequest,
+) -> Result<(), PluginRpcError> {
+    validate_nonempty_rpc_field("managed_session_id", &request.managed_session_id)?;
+    validate_lease_id(&request.lease_id)
+}
+
+fn validate_nonempty_rpc_field(name: &str, value: &str) -> Result<(), PluginRpcError> {
+    if value.is_empty() {
+        Err(PluginRpcError::new(
+            PluginRpcErrorKind::InvalidRequest,
+            format!("{name} must not be empty"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_positive_rpc_i64(name: &str, value: i64) -> Result<(), PluginRpcError> {
+    if value > 0 {
+        Ok(())
+    } else {
+        Err(PluginRpcError::new(
+            PluginRpcErrorKind::InvalidRequest,
+            format!("{name} must be positive"),
+        ))
+    }
+}
+
+fn validate_lease_id(value: &str) -> Result<(), PluginRpcError> {
+    validate_nonempty_ascii_token(value, "lease_id").map_err(|error| {
+        PluginRpcError::new(PluginRpcErrorKind::InvalidRequest, format!("{error:#}"))
+    })
+}
+
+fn validate_optional_lease_ttl(value: Option<u64>) -> Result<(), PluginRpcError> {
+    match value {
+        Some(0) => Err(PluginRpcError::new(
+            PluginRpcErrorKind::InvalidRequest,
+            "lease_ttl_seconds must be positive",
+        )),
+        Some(seconds) if seconds > MAX_PLUGIN_APP_SERVER_LEASE_TTL_SECONDS => {
+            Err(PluginRpcError::new(
+                PluginRpcErrorKind::InvalidRequest,
+                format!(
+                    "lease_ttl_seconds must not exceed {MAX_PLUGIN_APP_SERVER_LEASE_TTL_SECONDS}"
+                ),
+            ))
+        }
+        Some(_) | None => Ok(()),
+    }
+}
+
+fn plugin_app_server_lease_key(
+    identity: &PluginConnectionIdentity,
+    lease_id: &str,
+) -> PluginAppServerLeaseKey {
+    PluginAppServerLeaseKey {
+        plugin_name: identity.plugin_name.clone(),
+        instance_id: identity.instance_id.clone(),
+        lease_id: lease_id.to_owned(),
+    }
+}
+
+fn plugin_app_server_lease_target(
+    request: &PluginAppServerEnsureRequest,
+) -> PluginAppServerLeaseTarget {
+    PluginAppServerLeaseTarget {
+        managed_session_id: request.managed_session_id.clone(),
+        bound_thread_id: request.bound_thread_id.clone(),
+        session_epoch: request.session_epoch,
+    }
+}
+
+fn scoped_plugin_app_server_lease_id(
+    identity: &PluginConnectionIdentity,
+    plugin_lease_id: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    update_scoped_hash_field(&mut hasher, &identity.plugin_name);
+    update_scoped_hash_field(&mut hasher, &identity.instance_id);
+    update_scoped_hash_field(&mut hasher, plugin_lease_id);
+    let digest = hasher.finalize();
+    format!("plugin-{}", lowercase_hex(&digest[..16]))
+}
+
+fn update_scoped_hash_field(hasher: &mut Sha256, value: &str) {
+    hasher.update(value.len().to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn plugin_app_server_ensure_payload(
+    request: &PluginAppServerEnsureRequest,
+    scoped_lease_id: &str,
+) -> Value {
+    json!({
+        "managed_session_id": request.managed_session_id.as_str(),
+        "bound_thread_id": request.bound_thread_id.as_str(),
+        "session_epoch": request.session_epoch,
+        "codex_binary": request.codex_binary.as_bytes(),
+        "lease_id": scoped_lease_id,
+        "lease_ttl_seconds": request
+            .lease_ttl_seconds
+            .or(Some(DEFAULT_PLUGIN_APP_SERVER_LEASE_TTL_SECONDS)),
+    })
+}
+
+fn plugin_app_server_reserve_payload(
+    request: &PluginAppServerEnsureRequest,
+    scoped_lease_id: &str,
+) -> Value {
+    json!({
+        "bound_thread_id": request.bound_thread_id.as_str(),
+        "lease_id": scoped_lease_id,
+        "lease_ttl_seconds": request
+            .lease_ttl_seconds
+            .or(Some(DEFAULT_PLUGIN_APP_SERVER_LEASE_TTL_SECONDS)),
+    })
+}
+
+fn release_plugin_app_server_reservation_best_effort(
+    layout: &FsLayout,
+    endpoint: &DaemonEndpoint,
+    bound_thread_id: &str,
+    scoped_lease_id: &str,
+) {
+    let _ = daemon_request_payload_timeout_at_endpoint(
+        layout,
+        endpoint,
+        "cli_app_server_release",
+        json!({
+            "bound_thread_id": bound_thread_id,
+            "lease_id": scoped_lease_id,
+        }),
+        PLUGIN_APP_SERVER_CONTROL_TIMEOUT,
+    );
+}
+
+fn app_server_handoff_socket_path(response: &Value) -> Option<String> {
+    response
+        .get("cli_app_server")
+        .and_then(|server| server.get("handoff_daemon_socket_path"))
+        .or_else(|| response.get("handoff_daemon_socket_path"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn plugin_app_server_response(
+    plugin_lease_id: &str,
+    endpoint: &DaemonEndpoint,
+    daemon_ensure: Option<Value>,
+    daemon_response: Value,
+) -> Value {
+    let mut response = json!({
+        "lease_id": plugin_lease_id,
+        "daemon": {
+            "socket_path": endpoint.socket_path().display().to_string(),
+        },
+        "app_server": daemon_response
+            .get("cli_app_server")
+            .cloned()
+            .unwrap_or(Value::Null),
+    });
+    if let Some(daemon_ensure) = daemon_ensure {
+        response["daemon_ensure"] = daemon_ensure;
+    }
+    response
+}
+
+fn plugin_app_server_stop_response(
+    plugin_lease_id: &str,
+    endpoint: &DaemonEndpoint,
+    daemon_response: Value,
+) -> Value {
+    json!({
+        "lease_id": plugin_lease_id,
+        "daemon": {
+            "socket_path": endpoint.socket_path().display().to_string(),
+        },
+        "stopped": daemon_response
+            .get("stopped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "handoff_daemon_socket_path": daemon_response
+            .get("handoff_daemon_socket_path")
+            .cloned()
+            .unwrap_or(Value::Null),
+    })
+}
+
+fn plugin_app_server_retained_stop_response(
+    plugin_lease_id: &str,
+    endpoint: &DaemonEndpoint,
+) -> Value {
+    json!({
+        "lease_id": plugin_lease_id,
+        "daemon": {
+            "socket_path": endpoint.socket_path().display().to_string(),
+        },
+        "stopped": false,
+        "handoff_daemon_socket_path": Value::Null,
+    })
+}
+
+fn stale_plugin_app_server_lease(lease_id: &str) -> PluginRpcError {
+    PluginRpcError::new(
+        PluginRpcErrorKind::StaleLease,
+        format!("app-server lease is not active for this plugin connection: {lease_id}"),
+    )
+}
+
+fn daemon_error_needs_app_server_reservation(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .contains("does not have an active CLI app-server reservation")
+}
+
+fn daemon_error_needs_endpoint_refresh(error: &anyhow::Error) -> bool {
+    if error_is_daemon_endpoint_gone(error) {
+        return true;
+    }
+    let message = format!("{error:#}");
+    message.contains("daemon is quiescing for handoff") || message.contains("daemon is stopping")
+}
+
+fn daemon_dispatch_error(error: anyhow::Error) -> PluginRpcError {
+    let message = format!("{error:#}");
+    let kind = if error_is_daemon_endpoint_gone(&error)
+        || message.contains("daemon is quiescing for handoff")
+        || message.contains("daemon is stopping")
+        || message.contains("daemon is busy")
+        || message.contains("daemon connection limit reached")
+        || message.contains("daemon startup is already in progress")
+    {
+        PluginRpcErrorKind::TransientDaemonUnavailable
+    } else if message.contains("owned by a different lease")
+        || message.contains("already has an active CLI app-server")
+        || message.contains("already has an active CLI app-server lease")
+        || message.contains("already has an active CLI app-server reservation")
+        || message.contains("already has a registered CLI app-server")
+        || message.contains("is already attached to app-server")
+        || message.contains("app-server is at epoch")
+        || message.contains("different active CLI app-server reservation")
+        || message.contains("targets a different")
+    {
+        PluginRpcErrorKind::PolicyBlocked
+    } else if message.contains("is not running")
+        || message.contains("has exited")
+        || message.contains("does not have an active CLI app-server reservation")
+    {
+        PluginRpcErrorKind::StaleLease
+    } else if message.contains("spawn") || message.contains("codex app-server") {
+        PluginRpcErrorKind::TargetUnavailable
+    } else {
+        PluginRpcErrorKind::Internal
+    };
+    PluginRpcError::new(kind, message)
 }
 
 impl ServiceSharedState {
@@ -601,14 +1587,16 @@ fn accept_plugin_connections(
     layout: &FsLayout,
     listener: &UnixListener,
     shared: &Arc<Mutex<ServiceSharedState>>,
+    app_server_leases: &Arc<Mutex<PluginAppServerLeaseRegistry>>,
 ) -> Result<()> {
     loop {
         match listener.accept() {
             Ok((stream, _addr)) => {
                 let layout = layout.clone();
                 let shared = Arc::clone(shared);
+                let app_server_leases = Arc::clone(app_server_leases);
                 thread::spawn(move || {
-                    let _ = handle_plugin_connection(&layout, stream, &shared);
+                    let _ = handle_plugin_connection(&layout, stream, &shared, &app_server_leases);
                 });
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -621,6 +1609,7 @@ fn handle_plugin_connection(
     layout: &FsLayout,
     mut stream: UnixStream,
     shared: &Arc<Mutex<ServiceSharedState>>,
+    app_server_leases: &Arc<Mutex<PluginAppServerLeaseRegistry>>,
 ) -> Result<()> {
     stream
         .set_read_timeout(Some(Duration::from_millis(DEFAULT_HANDSHAKE_TIMEOUT_MS)))
@@ -640,14 +1629,22 @@ fn handle_plugin_connection(
     stream
         .set_read_timeout(None)
         .context("clear plugin RPC read timeout")?;
+    let mut app_server_broker =
+        DaemonPluginAppServerLeaseBroker::new(layout, Arc::clone(app_server_leases));
 
     while let Ok(frame) =
         read_plugin_rpc_frame::<_, PluginRpcRequestFrame>(&mut stream, PLUGIN_RPC_MAX_FRAME_BYTES)
     {
-        let response = handle_plugin_runtime_frame(shared, &identity, &frame);
-        write_plugin_rpc_frame(&mut stream, &response, PLUGIN_RPC_MAX_FRAME_BYTES)
-            .map_err(|error| anyhow::anyhow!("write plugin RPC response: {error}"))?;
+        let response =
+            handle_plugin_runtime_frame(shared, &identity, &frame, &mut app_server_broker);
+        if let Err(error) =
+            write_plugin_rpc_frame(&mut stream, &response, PLUGIN_RPC_MAX_FRAME_BYTES)
+        {
+            app_server_broker.cleanup_connection_leases();
+            return Err(anyhow::anyhow!("write plugin RPC response: {error}"));
+        }
     }
+    app_server_broker.cleanup_connection_leases();
     Ok(())
 }
 
@@ -790,20 +1787,38 @@ fn unix_stream_peer_pid_impl(_stream: &UnixStream) -> Result<Option<u32>> {
     Ok(None)
 }
 
-fn handle_plugin_runtime_frame(
+fn handle_plugin_runtime_frame<B: PluginAppServerLeaseBroker>(
     shared: &Arc<Mutex<ServiceSharedState>>,
     identity: &PluginConnectionIdentity,
     frame: &PluginRpcRequestFrame,
+    app_server_broker: &mut B,
 ) -> PluginRpcResponseFrame {
-    if frame.method != PLUGIN_HEALTH_UPDATE_METHOD {
-        return PluginRpcResponseFrame::failure(
+    match frame.method.as_str() {
+        PLUGIN_HEALTH_UPDATE_METHOD => handle_plugin_health_update_frame(shared, identity, frame),
+        PLUGIN_RPC_APP_SERVER_ENSURE_METHOD => {
+            handle_plugin_app_server_ensure_frame(shared, identity, frame, app_server_broker)
+        }
+        PLUGIN_RPC_APP_SERVER_REFRESH_METHOD => {
+            handle_plugin_app_server_refresh_frame(shared, identity, frame, app_server_broker)
+        }
+        PLUGIN_RPC_APP_SERVER_STOP_METHOD => {
+            handle_plugin_app_server_stop_frame(shared, identity, frame, app_server_broker)
+        }
+        _ => PluginRpcResponseFrame::failure(
             frame.id.clone(),
             PluginRpcError::new(
                 PluginRpcErrorKind::MethodNotFound,
                 format!("unsupported service method {}", frame.method),
             ),
-        );
+        ),
     }
+}
+
+fn handle_plugin_health_update_frame(
+    shared: &Arc<Mutex<ServiceSharedState>>,
+    identity: &PluginConnectionIdentity,
+    frame: &PluginRpcRequestFrame,
+) -> PluginRpcResponseFrame {
     let now = match current_epoch_seconds() {
         Ok(now) => now,
         Err(error) => {
@@ -816,7 +1831,7 @@ fn handle_plugin_runtime_frame(
     match shared.lock() {
         Ok(mut state) => {
             if let Some(plugin) = state.plugins.get_mut(&identity.plugin_name) {
-                if let Err(error) = validate_health_update_identity(plugin, identity, now) {
+                if let Err(error) = validate_plugin_connection_identity(plugin, identity, now) {
                     state.mark_dirty();
                     return PluginRpcResponseFrame::failure(
                         frame.id.clone(),
@@ -847,7 +1862,112 @@ fn handle_plugin_runtime_frame(
     }
 }
 
-fn validate_health_update_identity(
+fn handle_plugin_app_server_ensure_frame<B: PluginAppServerLeaseBroker>(
+    shared: &Arc<Mutex<ServiceSharedState>>,
+    identity: &PluginConnectionIdentity,
+    frame: &PluginRpcRequestFrame,
+    app_server_broker: &mut B,
+) -> PluginRpcResponseFrame {
+    if let Err(error) = validate_current_plugin_connection(shared, identity) {
+        return PluginRpcResponseFrame::failure(frame.id.clone(), error);
+    }
+    let request = match serde_json::from_value::<PluginAppServerEnsureRequest>(frame.params.clone())
+    {
+        Ok(request) => request,
+        Err(error) => {
+            return PluginRpcResponseFrame::failure(
+                frame.id.clone(),
+                PluginRpcError::new(
+                    PluginRpcErrorKind::InvalidRequest,
+                    format!("invalid app_server.ensure request: {error}"),
+                ),
+            );
+        }
+    };
+    match app_server_broker.ensure(identity, request) {
+        Ok(result) => PluginRpcResponseFrame::success(frame.id.clone(), result),
+        Err(error) => PluginRpcResponseFrame::failure(frame.id.clone(), error),
+    }
+}
+
+fn handle_plugin_app_server_refresh_frame<B: PluginAppServerLeaseBroker>(
+    shared: &Arc<Mutex<ServiceSharedState>>,
+    identity: &PluginConnectionIdentity,
+    frame: &PluginRpcRequestFrame,
+    app_server_broker: &mut B,
+) -> PluginRpcResponseFrame {
+    if let Err(error) = validate_current_plugin_connection(shared, identity) {
+        return PluginRpcResponseFrame::failure(frame.id.clone(), error);
+    }
+    let request =
+        match serde_json::from_value::<PluginAppServerRefreshRequest>(frame.params.clone()) {
+            Ok(request) => request,
+            Err(error) => {
+                return PluginRpcResponseFrame::failure(
+                    frame.id.clone(),
+                    PluginRpcError::new(
+                        PluginRpcErrorKind::InvalidRequest,
+                        format!("invalid app_server.refresh request: {error}"),
+                    ),
+                );
+            }
+        };
+    match app_server_broker.refresh(identity, request) {
+        Ok(result) => PluginRpcResponseFrame::success(frame.id.clone(), result),
+        Err(error) => PluginRpcResponseFrame::failure(frame.id.clone(), error),
+    }
+}
+
+fn handle_plugin_app_server_stop_frame<B: PluginAppServerLeaseBroker>(
+    shared: &Arc<Mutex<ServiceSharedState>>,
+    identity: &PluginConnectionIdentity,
+    frame: &PluginRpcRequestFrame,
+    app_server_broker: &mut B,
+) -> PluginRpcResponseFrame {
+    if let Err(error) = validate_current_plugin_connection(shared, identity) {
+        return PluginRpcResponseFrame::failure(frame.id.clone(), error);
+    }
+    let request = match serde_json::from_value::<PluginAppServerStopRequest>(frame.params.clone()) {
+        Ok(request) => request,
+        Err(error) => {
+            return PluginRpcResponseFrame::failure(
+                frame.id.clone(),
+                PluginRpcError::new(
+                    PluginRpcErrorKind::InvalidRequest,
+                    format!("invalid app_server.stop request: {error}"),
+                ),
+            );
+        }
+    };
+    match app_server_broker.stop(identity, request) {
+        Ok(result) => PluginRpcResponseFrame::success(frame.id.clone(), result),
+        Err(error) => PluginRpcResponseFrame::failure(frame.id.clone(), error),
+    }
+}
+
+fn validate_current_plugin_connection(
+    shared: &Arc<Mutex<ServiceSharedState>>,
+    identity: &PluginConnectionIdentity,
+) -> Result<(), PluginRpcError> {
+    let now = current_epoch_seconds().map_err(PluginRpcError::internal)?;
+    match shared.lock() {
+        Ok(mut state) => {
+            let Some(plugin) = state.plugins.get_mut(&identity.plugin_name) else {
+                return Err(PluginRpcError::new(
+                    PluginRpcErrorKind::PolicyBlocked,
+                    format!("plugin is not configured: {}", identity.plugin_name),
+                ));
+            };
+            validate_plugin_connection_identity(plugin, identity, now).map_err(|error| {
+                state.mark_dirty();
+                PluginRpcError::new(PluginRpcErrorKind::PolicyBlocked, format!("{error:#}"))
+            })
+        }
+        Err(_) => Err(PluginRpcError::internal("service state lock poisoned")),
+    }
+}
+
+fn validate_plugin_connection_identity(
     plugin: &mut SupervisedPlugin,
     identity: &PluginConnectionIdentity,
     now: i64,
@@ -896,6 +2016,10 @@ fn plugin_handshake_policy(layout: &FsLayout) -> PluginHandshakePolicy {
             ServiceCapability::new("plugin-rpc-v1"),
             ServiceCapability::new("plugin-hello"),
             ServiceCapability::new("plugin-health-update"),
+            ServiceCapability::new("app-server-lease-rpc-v1"),
+            ServiceCapability::new(PLUGIN_RPC_APP_SERVER_ENSURE_METHOD),
+            ServiceCapability::new(PLUGIN_RPC_APP_SERVER_REFRESH_METHOD),
+            ServiceCapability::new(PLUGIN_RPC_APP_SERVER_STOP_METHOD),
             ServiceCapability::new("plugin-supervisor-c2"),
         ],
         policy: PluginRpcPolicy::default(),
@@ -1365,6 +2489,108 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakePluginAppServerLeaseBroker {
+        ensure_requests: Vec<(PluginConnectionIdentity, PluginAppServerEnsureRequest)>,
+        refresh_requests: Vec<(PluginConnectionIdentity, PluginAppServerRefreshRequest)>,
+        stop_requests: Vec<(PluginConnectionIdentity, PluginAppServerStopRequest)>,
+        cleanup_count: usize,
+        next_error: Option<PluginRpcError>,
+    }
+
+    impl PluginAppServerLeaseBroker for FakePluginAppServerLeaseBroker {
+        fn ensure(
+            &mut self,
+            identity: &PluginConnectionIdentity,
+            request: PluginAppServerEnsureRequest,
+        ) -> Result<Value, PluginRpcError> {
+            self.ensure_requests
+                .push((identity.clone(), request.clone()));
+            if let Some(error) = self.next_error.take() {
+                return Err(error);
+            }
+            Ok(json!({
+                "lease_id": request.lease_id,
+                "app_server": {
+                    "managed_session_id": request.managed_session_id,
+                    "bound_thread_id": request.bound_thread_id,
+                    "session_epoch": request.session_epoch,
+                    "url": "ws://127.0.0.1:1234",
+                },
+            }))
+        }
+
+        fn refresh(
+            &mut self,
+            identity: &PluginConnectionIdentity,
+            request: PluginAppServerRefreshRequest,
+        ) -> Result<Value, PluginRpcError> {
+            self.refresh_requests
+                .push((identity.clone(), request.clone()));
+            if let Some(error) = self.next_error.take() {
+                return Err(error);
+            }
+            Ok(json!({
+                "lease_id": request.lease_id,
+                "app_server": {
+                    "managed_session_id": request.managed_session_id,
+                    "lease_seconds_remaining": 60,
+                },
+            }))
+        }
+
+        fn stop(
+            &mut self,
+            identity: &PluginConnectionIdentity,
+            request: PluginAppServerStopRequest,
+        ) -> Result<Value, PluginRpcError> {
+            self.stop_requests.push((identity.clone(), request.clone()));
+            if let Some(error) = self.next_error.take() {
+                return Err(error);
+            }
+            Ok(json!({
+                "lease_id": request.lease_id,
+                "stopped": true,
+            }))
+        }
+
+        fn cleanup_connection_leases(&mut self) {
+            self.cleanup_count += 1;
+        }
+    }
+
+    fn shared_with_running_plugin(
+        layout: &FsLayout,
+        instance_id: &str,
+    ) -> (Arc<Mutex<ServiceSharedState>>, u32) {
+        let registry = PluginRegistry {
+            schema_version: 1,
+            plugins: vec![manifest("webex")],
+        };
+        let shared = Arc::new(Mutex::new(
+            ServiceSharedState::new(layout, &registry, 1_000).expect("shared state"),
+        ));
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn child");
+        let child_pid = child.id();
+        {
+            let mut state = shared.lock().expect("state");
+            let plugin = state.plugins.get_mut("webex").expect("plugin");
+            plugin.status.state = PluginRuntimeState::Running;
+            plugin.status.pid = Some(child_pid);
+            plugin.status.instance_id = Some(instance_id.to_owned());
+            plugin.process = Some(child);
+        }
+        (shared, child_pid)
+    }
+
+    fn app_server_lease_registry() -> Arc<Mutex<PluginAppServerLeaseRegistry>> {
+        Arc::new(Mutex::new(PluginAppServerLeaseRegistry::default()))
+    }
+
     #[test]
     fn registry_validation_rejects_unsafe_plugin_name() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1803,8 +3029,9 @@ mod tests {
             instance_id: "instance-1".to_owned(),
         };
         let frame = PluginRpcRequestFrame::new("health-1", PLUGIN_HEALTH_UPDATE_METHOD, json!({}));
+        let mut broker = FakePluginAppServerLeaseBroker::default();
 
-        let response = handle_plugin_runtime_frame(&shared, &identity, &frame);
+        let response = handle_plugin_runtime_frame(&shared, &identity, &frame, &mut broker);
 
         assert!(response.error.is_none());
         let state = shared.lock().expect("state");
@@ -1839,8 +3066,9 @@ mod tests {
             instance_id: "instance-1".to_owned(),
         };
         let frame = PluginRpcRequestFrame::new("health-1", PLUGIN_HEALTH_UPDATE_METHOD, json!({}));
+        let mut broker = FakePluginAppServerLeaseBroker::default();
 
-        let response = handle_plugin_runtime_frame(&shared, &identity, &frame);
+        let response = handle_plugin_runtime_frame(&shared, &identity, &frame, &mut broker);
 
         assert!(response.error.is_some());
         let state = shared.lock().expect("state");
@@ -1880,8 +3108,9 @@ mod tests {
             instance_id: "old-instance".to_owned(),
         };
         let frame = PluginRpcRequestFrame::new("health-1", PLUGIN_HEALTH_UPDATE_METHOD, json!({}));
+        let mut broker = FakePluginAppServerLeaseBroker::default();
 
-        let response = handle_plugin_runtime_frame(&shared, &stale_identity, &frame);
+        let response = handle_plugin_runtime_frame(&shared, &stale_identity, &frame, &mut broker);
 
         assert!(response.error.is_some());
         assert!(
@@ -1897,6 +3126,662 @@ mod tests {
         assert_eq!(plugin.status.last_healthy_at, None);
         drop(state);
         shutdown_managed_plugins(&layout, &shared);
+    }
+
+    #[test]
+    fn handshake_policy_advertises_app_server_lease_rpc() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+
+        let policy = plugin_handshake_policy(&layout);
+        let capabilities = policy
+            .service_capabilities
+            .iter()
+            .map(|capability| capability.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(capabilities.contains(&"app-server-lease-rpc-v1"));
+        assert!(capabilities.contains(&PLUGIN_RPC_APP_SERVER_ENSURE_METHOD));
+        assert!(capabilities.contains(&PLUGIN_RPC_APP_SERVER_REFRESH_METHOD));
+        assert!(capabilities.contains(&PLUGIN_RPC_APP_SERVER_STOP_METHOD));
+    }
+
+    #[test]
+    fn app_server_ensure_brokers_current_plugin_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let (shared, child_pid) = shared_with_running_plugin(&layout, "instance-1");
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: child_pid,
+            instance_id: "instance-1".to_owned(),
+        };
+        let frame = PluginRpcRequestFrame::new(
+            "ensure-1",
+            PLUGIN_RPC_APP_SERVER_ENSURE_METHOD,
+            json!({
+                "managed_session_id": "managed-1",
+                "bound_thread_id": "thread-1",
+                "session_epoch": 1,
+                "codex_binary": "/usr/bin/codex",
+                "lease_id": "lease-1",
+                "lease_ttl_seconds": 90,
+            }),
+        );
+        let mut broker = FakePluginAppServerLeaseBroker::default();
+
+        let response = handle_plugin_runtime_frame(&shared, &identity, &frame, &mut broker);
+
+        assert!(response.error.is_none());
+        assert_eq!(broker.ensure_requests.len(), 1);
+        let (broker_identity, request) = &broker.ensure_requests[0];
+        assert_eq!(broker_identity, &identity);
+        assert_eq!(request.managed_session_id, "managed-1");
+        assert_eq!(request.bound_thread_id, "thread-1");
+        assert_eq!(request.session_epoch, 1);
+        assert_eq!(request.lease_id, "lease-1");
+        assert_eq!(request.lease_ttl_seconds, Some(90));
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .expect("result")
+                .get("lease_id")
+                .and_then(Value::as_str),
+            Some("lease-1")
+        );
+        shutdown_managed_plugins(&layout, &shared);
+    }
+
+    #[test]
+    fn app_server_ensure_rejects_oversized_plugin_lease_ttl() {
+        let error = validate_plugin_app_server_ensure_request(&PluginAppServerEnsureRequest {
+            managed_session_id: "managed-1".to_owned(),
+            bound_thread_id: "thread-1".to_owned(),
+            session_epoch: 1,
+            codex_binary: "/usr/bin/codex".to_owned(),
+            lease_id: "lease-1".to_owned(),
+            lease_ttl_seconds: Some(MAX_PLUGIN_APP_SERVER_LEASE_TTL_SECONDS + 1),
+        })
+        .expect_err("oversized TTL should be rejected");
+
+        assert_eq!(error.kind, PluginRpcErrorKind::InvalidRequest);
+        assert!(error.message.contains("lease_ttl_seconds must not exceed"));
+    }
+
+    #[test]
+    fn app_server_request_rejects_stale_plugin_instance_before_broker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let (shared, child_pid) = shared_with_running_plugin(&layout, "current-instance");
+        let stale_identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: child_pid,
+            instance_id: "old-instance".to_owned(),
+        };
+        let frame = PluginRpcRequestFrame::new(
+            "ensure-1",
+            PLUGIN_RPC_APP_SERVER_ENSURE_METHOD,
+            json!({
+                "managed_session_id": "managed-1",
+                "bound_thread_id": "thread-1",
+                "session_epoch": 1,
+                "codex_binary": "/usr/bin/codex",
+                "lease_id": "lease-1",
+            }),
+        );
+        let mut broker = FakePluginAppServerLeaseBroker::default();
+
+        let response = handle_plugin_runtime_frame(&shared, &stale_identity, &frame, &mut broker);
+
+        assert_eq!(
+            response.error.as_ref().expect("error").kind,
+            PluginRpcErrorKind::PolicyBlocked
+        );
+        assert!(broker.ensure_requests.is_empty());
+        shutdown_managed_plugins(&layout, &shared);
+    }
+
+    #[test]
+    fn app_server_refresh_propagates_broker_stale_lease() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let (shared, child_pid) = shared_with_running_plugin(&layout, "instance-1");
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: child_pid,
+            instance_id: "instance-1".to_owned(),
+        };
+        let frame = PluginRpcRequestFrame::new(
+            "refresh-1",
+            PLUGIN_RPC_APP_SERVER_REFRESH_METHOD,
+            json!({
+                "managed_session_id": "managed-1",
+                "lease_id": "lease-1",
+            }),
+        );
+        let mut broker = FakePluginAppServerLeaseBroker {
+            next_error: Some(stale_plugin_app_server_lease("lease-1")),
+            ..FakePluginAppServerLeaseBroker::default()
+        };
+
+        let response = handle_plugin_runtime_frame(&shared, &identity, &frame, &mut broker);
+
+        assert_eq!(
+            response.error.as_ref().expect("error").kind,
+            PluginRpcErrorKind::StaleLease
+        );
+        assert_eq!(broker.refresh_requests.len(), 1);
+        shutdown_managed_plugins(&layout, &shared);
+    }
+
+    #[test]
+    fn scoped_app_server_lease_id_is_plugin_and_instance_scoped() {
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: 42,
+            instance_id: "instance-1".to_owned(),
+        };
+        let same = scoped_plugin_app_server_lease_id(&identity, "lease-1");
+        let same_again = scoped_plugin_app_server_lease_id(&identity, "lease-1");
+        let other_instance = scoped_plugin_app_server_lease_id(
+            &PluginConnectionIdentity {
+                instance_id: "instance-2".to_owned(),
+                ..identity.clone()
+            },
+            "lease-1",
+        );
+        let other_plugin = scoped_plugin_app_server_lease_id(
+            &PluginConnectionIdentity {
+                plugin_name: "slack".to_owned(),
+                ..identity
+            },
+            "lease-1",
+        );
+
+        assert_eq!(same, same_again);
+        assert_ne!(same, other_instance);
+        assert_ne!(same, other_plugin);
+        assert!(same.starts_with("plugin-"));
+        assert_eq!(same.len(), "plugin-".len() + 32);
+    }
+
+    #[test]
+    fn daemon_broker_cleanup_retains_shared_lease_for_other_connection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let registry = app_server_lease_registry();
+        let mut broker_a = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let mut broker_b = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: 42,
+            instance_id: "instance-1".to_owned(),
+        };
+        let key = plugin_app_server_lease_key(&identity, "lease-1");
+        let record = PluginAppServerLeaseRecord {
+            target: PluginAppServerLeaseTarget {
+                managed_session_id: "managed-1".to_owned(),
+                bound_thread_id: "thread-1".to_owned(),
+                session_epoch: 1,
+            },
+            endpoint: DaemonEndpoint::default(&layout),
+            scoped_lease_id: scoped_plugin_app_server_lease_id(&identity, "lease-1"),
+            endpoint_confirmed: true,
+        };
+        let broker_a_id = broker_a.connection_id;
+        let broker_b_id = broker_b.connection_id;
+        broker_a
+            .register_connection_lease(key.clone(), record.clone())
+            .expect("register broker a");
+        broker_b
+            .register_connection_lease(key.clone(), record)
+            .expect("register broker b");
+
+        broker_a.cleanup_connection_leases();
+
+        assert!(broker_a.leases.is_empty());
+        let registry = registry.lock().expect("registry");
+        let shared = registry.leases.get(&key).expect("shared lease");
+        assert!(!shared.holders.contains(&broker_a_id));
+        assert!(shared.holders.contains(&broker_b_id));
+    }
+
+    #[test]
+    fn daemon_broker_stop_retains_shared_lease_for_other_connection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let registry = app_server_lease_registry();
+        let mut broker_a = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let mut broker_b = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: 42,
+            instance_id: "instance-1".to_owned(),
+        };
+        let key = plugin_app_server_lease_key(&identity, "lease-1");
+        let record = PluginAppServerLeaseRecord {
+            target: PluginAppServerLeaseTarget {
+                managed_session_id: "managed-1".to_owned(),
+                bound_thread_id: "thread-1".to_owned(),
+                session_epoch: 1,
+            },
+            endpoint: DaemonEndpoint::default(&layout),
+            scoped_lease_id: scoped_plugin_app_server_lease_id(&identity, "lease-1"),
+            endpoint_confirmed: true,
+        };
+        let broker_a_id = broker_a.connection_id;
+        let broker_b_id = broker_b.connection_id;
+        broker_a
+            .register_connection_lease(key.clone(), record.clone())
+            .expect("register broker a");
+        broker_b
+            .register_connection_lease(key.clone(), record)
+            .expect("register broker b");
+
+        let response = broker_a
+            .stop(
+                &identity,
+                PluginAppServerStopRequest {
+                    managed_session_id: "managed-1".to_owned(),
+                    lease_id: "lease-1".to_owned(),
+                },
+            )
+            .expect("shared stop");
+
+        assert_eq!(
+            response.get("stopped").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(broker_a.leases.is_empty());
+        let registry = registry.lock().expect("registry");
+        let shared = registry.leases.get(&key).expect("shared lease");
+        assert!(!shared.holders.contains(&broker_a_id));
+        assert!(shared.holders.contains(&broker_b_id));
+    }
+
+    #[test]
+    fn daemon_broker_stop_failure_preserves_final_holder_for_retry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let registry = app_server_lease_registry();
+        let mut broker = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: 42,
+            instance_id: "instance-1".to_owned(),
+        };
+        let key = plugin_app_server_lease_key(&identity, "lease-1");
+        let connection_id = broker.connection_id;
+        broker
+            .register_connection_lease(
+                key.clone(),
+                PluginAppServerLeaseRecord {
+                    target: PluginAppServerLeaseTarget {
+                        managed_session_id: "managed-1".to_owned(),
+                        bound_thread_id: "thread-1".to_owned(),
+                        session_epoch: 1,
+                    },
+                    endpoint: DaemonEndpoint::default(&layout),
+                    scoped_lease_id: scoped_plugin_app_server_lease_id(&identity, "lease-1"),
+                    endpoint_confirmed: true,
+                },
+            )
+            .expect("register lease");
+
+        let error = broker
+            .stop(
+                &identity,
+                PluginAppServerStopRequest {
+                    managed_session_id: "managed-1".to_owned(),
+                    lease_id: "lease-1".to_owned(),
+                },
+            )
+            .expect_err("missing daemon socket should fail stop");
+
+        assert_ne!(error.kind, PluginRpcErrorKind::PolicyBlocked);
+        assert!(broker.leases.contains_key(&key));
+        let registry = registry.lock().expect("registry");
+        let shared = registry.leases.get(&key).expect("shared lease");
+        assert!(shared.holders.contains(&connection_id));
+    }
+
+    #[test]
+    fn daemon_broker_refresh_endpoint_update_reaches_shared_lease_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let registry = app_server_lease_registry();
+        let mut broker_a = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let mut broker_b = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: 42,
+            instance_id: "instance-1".to_owned(),
+        };
+        let key = plugin_app_server_lease_key(&identity, "lease-1");
+        let old_endpoint = DaemonEndpoint::from_socket_path(layout.run_dir().join("old.sock"));
+        let new_endpoint = DaemonEndpoint::from_socket_path(layout.run_dir().join("new.sock"));
+        let record = PluginAppServerLeaseRecord {
+            target: PluginAppServerLeaseTarget {
+                managed_session_id: "managed-1".to_owned(),
+                bound_thread_id: "thread-1".to_owned(),
+                session_epoch: 1,
+            },
+            endpoint: old_endpoint,
+            scoped_lease_id: scoped_plugin_app_server_lease_id(&identity, "lease-1"),
+            endpoint_confirmed: false,
+        };
+        broker_a
+            .register_connection_lease(key.clone(), record.clone())
+            .expect("register broker a");
+        broker_b
+            .register_connection_lease(key.clone(), record)
+            .expect("register broker b");
+
+        broker_b
+            .update_connection_lease_endpoint(&key, new_endpoint.clone())
+            .expect("update endpoint");
+        broker_a.cleanup_connection_leases();
+        let registry = registry.lock().expect("registry");
+        let shared = registry.leases.get(&key).expect("shared lease");
+        assert_eq!(shared.endpoint.socket_path(), new_endpoint.socket_path());
+        assert!(shared.endpoint_confirmed);
+    }
+
+    #[test]
+    fn daemon_broker_ensure_rolls_back_preregistered_shared_holder_on_daemon_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let registry = app_server_lease_registry();
+        let mut broker_a = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let mut broker_b = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: 42,
+            instance_id: "instance-1".to_owned(),
+        };
+        let key = plugin_app_server_lease_key(&identity, "lease-1");
+        let record = PluginAppServerLeaseRecord {
+            target: PluginAppServerLeaseTarget {
+                managed_session_id: "managed-1".to_owned(),
+                bound_thread_id: "thread-1".to_owned(),
+                session_epoch: 1,
+            },
+            endpoint: DaemonEndpoint::default(&layout),
+            scoped_lease_id: scoped_plugin_app_server_lease_id(&identity, "lease-1"),
+            endpoint_confirmed: false,
+        };
+        let broker_a_id = broker_a.connection_id;
+        let broker_b_id = broker_b.connection_id;
+        broker_a
+            .register_connection_lease(key.clone(), record)
+            .expect("register broker a");
+
+        let error = broker_b
+            .ensure(
+                &identity,
+                PluginAppServerEnsureRequest {
+                    managed_session_id: "managed-1".to_owned(),
+                    bound_thread_id: "thread-1".to_owned(),
+                    session_epoch: 1,
+                    codex_binary: "/usr/bin/codex".to_owned(),
+                    lease_id: "lease-1".to_owned(),
+                    lease_ttl_seconds: None,
+                },
+            )
+            .expect_err("daemon ensure should fail without a runnable daemon");
+
+        assert_ne!(error.kind, PluginRpcErrorKind::PolicyBlocked);
+        assert!(broker_b.leases.is_empty());
+        let registry = registry.lock().expect("registry");
+        let shared = registry.leases.get(&key).expect("shared lease");
+        assert!(shared.holders.contains(&broker_a_id));
+        assert!(!shared.holders.contains(&broker_b_id));
+    }
+
+    #[test]
+    fn daemon_broker_registered_target_blocks_concurrent_different_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let registry = app_server_lease_registry();
+        let mut broker_a = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let broker_b = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: 42,
+            instance_id: "instance-1".to_owned(),
+        };
+        let key = plugin_app_server_lease_key(&identity, "lease-1");
+        broker_a
+            .register_connection_lease(
+                key.clone(),
+                PluginAppServerLeaseRecord {
+                    target: PluginAppServerLeaseTarget {
+                        managed_session_id: "managed-1".to_owned(),
+                        bound_thread_id: "thread-1".to_owned(),
+                        session_epoch: 1,
+                    },
+                    endpoint: DaemonEndpoint::default(&layout),
+                    scoped_lease_id: scoped_plugin_app_server_lease_id(&identity, "lease-1"),
+                    endpoint_confirmed: false,
+                },
+            )
+            .expect("register pending target");
+
+        let error = broker_b
+            .shared_lease_record(
+                &key,
+                &PluginAppServerLeaseTarget {
+                    managed_session_id: "managed-2".to_owned(),
+                    bound_thread_id: "thread-2".to_owned(),
+                    session_epoch: 1,
+                },
+            )
+            .expect_err("different target must fail before daemon dispatch");
+
+        assert_eq!(error.kind, PluginRpcErrorKind::PolicyBlocked);
+    }
+
+    #[test]
+    fn daemon_broker_remembers_released_lease_target_for_replay_fence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: 42,
+            instance_id: "instance-1".to_owned(),
+        };
+        let mut broker =
+            DaemonPluginAppServerLeaseBroker::new(&layout, app_server_lease_registry());
+        let key = plugin_app_server_lease_key(&identity, "lease-1");
+        let record = PluginAppServerLeaseRecord {
+            target: PluginAppServerLeaseTarget {
+                managed_session_id: "managed-1".to_owned(),
+                bound_thread_id: "thread-1".to_owned(),
+                session_epoch: 1,
+            },
+            endpoint: DaemonEndpoint::default(&layout),
+            scoped_lease_id: scoped_plugin_app_server_lease_id(&identity, "lease-1"),
+            endpoint_confirmed: true,
+        };
+        broker
+            .register_connection_lease(key.clone(), record.clone())
+            .expect("register lease");
+        broker.rollback_preregistered_lease_after_failed_ensure(&key, record, false);
+
+        let error = broker
+            .ensure(
+                &identity,
+                PluginAppServerEnsureRequest {
+                    managed_session_id: "managed-2".to_owned(),
+                    bound_thread_id: "thread-2".to_owned(),
+                    session_epoch: 1,
+                    codex_binary: "/usr/bin/codex".to_owned(),
+                    lease_id: "lease-1".to_owned(),
+                    lease_ttl_seconds: None,
+                },
+            )
+            .expect_err("released lease id cannot drift to another target");
+
+        assert_eq!(error.kind, PluginRpcErrorKind::PolicyBlocked);
+        assert!(broker.leases.is_empty());
+    }
+
+    #[test]
+    fn daemon_broker_failed_ensure_rollback_cleans_last_holder() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let registry = app_server_lease_registry();
+        let mut broker = DaemonPluginAppServerLeaseBroker::new(&layout, Arc::clone(&registry));
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: 42,
+            instance_id: "instance-1".to_owned(),
+        };
+        let key = plugin_app_server_lease_key(&identity, "lease-1");
+        let record = PluginAppServerLeaseRecord {
+            target: PluginAppServerLeaseTarget {
+                managed_session_id: "managed-1".to_owned(),
+                bound_thread_id: "thread-1".to_owned(),
+                session_epoch: 1,
+            },
+            endpoint: DaemonEndpoint::default(&layout),
+            scoped_lease_id: scoped_plugin_app_server_lease_id(&identity, "lease-1"),
+            endpoint_confirmed: true,
+        };
+        broker
+            .register_connection_lease(key.clone(), record.clone())
+            .expect("register lease");
+
+        broker.rollback_preregistered_lease_after_failed_ensure(&key, record, true);
+
+        assert!(broker.leases.is_empty());
+        assert!(!registry.lock().expect("registry").leases.contains_key(&key));
+    }
+
+    #[test]
+    fn service_shutdown_cleanup_drains_shared_app_server_leases() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let registry = app_server_lease_registry();
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: 42,
+            instance_id: "instance-1".to_owned(),
+        };
+        let key = plugin_app_server_lease_key(&identity, "lease-1");
+        let record = PluginAppServerLeaseRecord {
+            target: PluginAppServerLeaseTarget {
+                managed_session_id: "managed-1".to_owned(),
+                bound_thread_id: "thread-1".to_owned(),
+                session_epoch: 1,
+            },
+            endpoint: DaemonEndpoint::default(&layout),
+            scoped_lease_id: scoped_plugin_app_server_lease_id(&identity, "lease-1"),
+            endpoint_confirmed: true,
+        };
+        registry.lock().expect("registry").leases.insert(
+            key.clone(),
+            PluginAppServerSharedLeaseRecord::from_record(record, 1),
+        );
+
+        cleanup_all_plugin_app_server_leases(&layout, &registry);
+
+        assert!(!registry.lock().expect("registry").leases.contains_key(&key));
+    }
+
+    #[test]
+    fn daemon_broker_rejects_same_lease_with_different_replay_target_before_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_tempdir(&temp);
+        let identity = PluginConnectionIdentity {
+            plugin_name: "webex".to_owned(),
+            pid: 42,
+            instance_id: "instance-1".to_owned(),
+        };
+        let mut broker =
+            DaemonPluginAppServerLeaseBroker::new(&layout, app_server_lease_registry());
+        let key = plugin_app_server_lease_key(&identity, "lease-1");
+        broker.leases.insert(
+            key,
+            PluginAppServerLeaseRecord {
+                target: PluginAppServerLeaseTarget {
+                    managed_session_id: "managed-1".to_owned(),
+                    bound_thread_id: "thread-1".to_owned(),
+                    session_epoch: 1,
+                },
+                endpoint: DaemonEndpoint::default(&layout),
+                scoped_lease_id: scoped_plugin_app_server_lease_id(&identity, "lease-1"),
+                endpoint_confirmed: true,
+            },
+        );
+
+        let error = broker
+            .ensure(
+                &identity,
+                PluginAppServerEnsureRequest {
+                    managed_session_id: "managed-2".to_owned(),
+                    bound_thread_id: "thread-1".to_owned(),
+                    session_epoch: 1,
+                    codex_binary: "/usr/bin/codex".to_owned(),
+                    lease_id: "lease-1".to_owned(),
+                    lease_ttl_seconds: None,
+                },
+            )
+            .expect_err("target mismatch should fail before daemon dispatch");
+
+        assert_eq!(error.kind, PluginRpcErrorKind::PolicyBlocked);
+    }
+
+    #[test]
+    fn daemon_dispatch_errors_map_to_rpc_error_kinds() {
+        let transient = daemon_dispatch_error(anyhow::Error::new(io::Error::new(
+            io::ErrorKind::NotFound,
+            "missing daemon socket",
+        )));
+        assert_eq!(
+            transient.kind,
+            PluginRpcErrorKind::TransientDaemonUnavailable
+        );
+        assert!(transient.retryable);
+
+        let stale = daemon_dispatch_error(anyhow::anyhow!(
+            "CLI app-server for managed session managed-1 is not running"
+        ));
+        assert_eq!(stale.kind, PluginRpcErrorKind::StaleLease);
+
+        let blocked = daemon_dispatch_error(anyhow::anyhow!(
+            "managed session managed-1 already has an active CLI app-server lease"
+        ));
+        assert_eq!(blocked.kind, PluginRpcErrorKind::PolicyBlocked);
+
+        let reservation_blocked = daemon_dispatch_error(anyhow::anyhow!(
+            "thread thread-1 already has an active CLI app-server reservation"
+        ));
+        assert_eq!(reservation_blocked.kind, PluginRpcErrorKind::PolicyBlocked);
+
+        let different_reservation = daemon_dispatch_error(anyhow::anyhow!(
+            "thread thread-1 has a different active CLI app-server reservation"
+        ));
+        assert_eq!(
+            different_reservation.kind,
+            PluginRpcErrorKind::PolicyBlocked
+        );
+
+        let active_thread = daemon_dispatch_error(anyhow::anyhow!(
+            "thread thread-1 already has an active CLI app-server"
+        ));
+        assert_eq!(active_thread.kind, PluginRpcErrorKind::PolicyBlocked);
+
+        let handoff = anyhow::anyhow!("daemon is quiescing for handoff");
+        assert!(daemon_error_needs_endpoint_refresh(&handoff));
+        let handoff = daemon_dispatch_error(handoff);
+        assert_eq!(handoff.kind, PluginRpcErrorKind::TransientDaemonUnavailable);
+
+        let attached_session = daemon_dispatch_error(anyhow::anyhow!(
+            "managed session managed-1 is already attached to app-server for thread thread-1"
+        ));
+        assert_eq!(attached_session.kind, PluginRpcErrorKind::PolicyBlocked);
     }
 
     #[test]
@@ -2010,8 +3895,15 @@ mod tests {
         let (mut client, server) = UnixStream::pair().expect("socket pair");
         let server_layout = layout.clone();
         let server_shared = Arc::clone(&shared);
+        let server_app_server_leases = app_server_lease_registry();
         let worker = thread::spawn(move || {
-            handle_plugin_connection(&server_layout, server, &server_shared).expect("connection");
+            handle_plugin_connection(
+                &server_layout,
+                server,
+                &server_shared,
+                &server_app_server_leases,
+            )
+            .expect("connection");
         });
         let hello = PluginHelloRequest {
             plugin_name: "webex".to_owned(),
